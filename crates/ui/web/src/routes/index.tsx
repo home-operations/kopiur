@@ -13,6 +13,7 @@ import {
 } from "../api/hooks";
 import { type StatusReportView, narrowStatusReport } from "../api/statusReport";
 import type {
+  KindTally,
   DoctorCheckView,
   MaintenanceRow,
   PolicyRow,
@@ -30,7 +31,7 @@ import type { CardRow } from "../components/objectCard";
 import { WorkTable, type WorkRow } from "../components/WorkTable";
 import { OVERVIEW_DOCTOR_CHECKS, doctorOutcomeLamp, summarizeDoctor } from "../components/doctor";
 import { countByHealth, healthLamp } from "../components/health";
-import { overviewVerdict } from "../components/verdict";
+import { overviewVerdict, tallyPhrases } from "../components/verdict";
 import { relativeTime } from "../util/format";
 import { useCurrentNamespace } from "../util/namespace";
 
@@ -83,11 +84,21 @@ function Overview() {
           status.isError ? "the status report" : null,
           doctor.isError ? "doctor" : null,
           overview.isError ? "the fleet overview" : null,
+          policies.isError ? "the policies" : null,
+          schedules.isError ? "the schedules" : null,
+          maintenance.isError ? "maintenance" : null,
         ].filter((source): source is string => source !== null)}
         pending={
-          repositories.isPending || status.isPending || doctor.isPending || overview.isPending
+          repositories.isPending ||
+          status.isPending ||
+          doctor.isPending ||
+          overview.isPending ||
+          policies.isPending ||
+          schedules.isPending ||
+          maintenance.isPending
         }
         at={status.data?.now}
+        tallies={overview.data?.kinds}
       />
 
       <Section title="Fleet by kind" icon={LayoutGrid}>
@@ -129,6 +140,27 @@ function Overview() {
             onRetry={() => void repositories.refetch()}
           />
         ) : null}
+        {policies.isError ? (
+          <ErrorState
+            problem={policies.error.problem}
+            what="policies"
+            onRetry={() => void policies.refetch()}
+          />
+        ) : null}
+        {schedules.isError ? (
+          <ErrorState
+            problem={schedules.error.problem}
+            what="schedules"
+            onRetry={() => void schedules.refetch()}
+          />
+        ) : null}
+        {maintenance.isError ? (
+          <ErrorState
+            problem={maintenance.error.problem}
+            what="maintenance"
+            onRetry={() => void maintenance.refetch()}
+          />
+        ) : null}
         {status.isPending ? (
           <LoadingState what="stalled objects" rows={1} />
         ) : status.isError ? (
@@ -157,14 +189,17 @@ function Overview() {
           <Fixes checks={doctor.data.checks} ranAt={doctor.data.ranAt} now={now} />
         )}
         {nothingNeedsYou({
+          // Every read must have answered: an errored read is not pending,
+          // and "none" from a refused read is not "none failing".
           settled:
-            !repositories.isPending &&
-            !policies.isPending &&
-            !schedules.isPending &&
-            !maintenance.isPending &&
+            repositories.isSuccess &&
+            policies.isSuccess &&
+            schedules.isSuccess &&
+            maintenance.isSuccess &&
+            overview.isSuccess &&
             status.isSuccess &&
-            doctor.isSuccess &&
-            repositories.isSuccess,
+            doctor.isSuccess,
+          fleetFailing: tallyPhrases(overview.data?.kinds ?? []).failed.length,
           cards: attentionCards({
             repositories: repositories.data,
             policies: policies.data,
@@ -264,8 +299,15 @@ function nothingNeedsYou(state: {
   cards: number;
   stalled: number;
   failing: number;
+  fleetFailing: number;
 }): boolean {
-  return state.settled && state.cards === 0 && state.stalled === 0 && state.failing === 0;
+  return (
+    state.settled &&
+    state.cards === 0 &&
+    state.stalled === 0 &&
+    state.failing === 0 &&
+    state.fleetFailing === 0
+  );
 }
 
 interface SectionProps {
@@ -299,6 +341,7 @@ interface VerdictLineProps {
   unavailable: string[];
   pending: boolean;
   at: StatusOverview["now"] | undefined;
+  tallies: readonly KindTally[] | undefined;
 }
 
 /**
@@ -310,7 +353,15 @@ interface VerdictLineProps {
  * belongs under the shell's `h1`, and `role="status"` is also what announces
  * it when it changes.
  */
-function VerdictLine({ repositories, report, doctor, unavailable, pending, at }: VerdictLineProps) {
+function VerdictLine({
+  repositories,
+  report,
+  doctor,
+  unavailable,
+  pending,
+  at,
+  tallies,
+}: VerdictLineProps) {
   if (pending && unavailable.length === 0) {
     const lamp = healthLamp("pending");
     const Icon = lamp.icon;
@@ -329,6 +380,7 @@ function VerdictLine({ repositories, report, doctor, unavailable, pending, at }:
     stalled: report?.stalled.length ?? 0,
     doctor: summarizeDoctor(doctor ?? []),
     unavailable,
+    tallies,
   });
   const lamp = healthLamp(verdict.health);
   const Icon = lamp.icon;

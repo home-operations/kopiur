@@ -1,4 +1,4 @@
-import { screen, within } from "@testing-library/react";
+import { screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { problemBanner } from "../api/problem";
@@ -195,7 +195,7 @@ describe("Overview", () => {
     // The verdict: worst thing first, in one sentence, on a lettered lamp.
     const verdict = await screen.findByRole("status", { name: "Vault verdict" });
     expect(verdict).toHaveTextContent(
-      "Needs attention: 1 repository failed, 1 object stalled, 1 doctor check failing, 1 warning.",
+      "Needs attention: 1 repository failed, 1 maintenance failed, 1 snapshot failed, 1 object stalled, 1 doctor check failing, 1 warning.",
     );
     expect(verdict.querySelector(".verdict__lamp")).toHaveAttribute("data-health", "failed");
     expect(verdict.querySelector("svg")).not.toBeNull();
@@ -291,6 +291,57 @@ describe("Overview", () => {
     const attention = screen.getByRole("region", { name: "Needs attention" });
     expect(await within(attention).findByRole("status")).toHaveTextContent("Nothing needs you");
     expect(within(attention).queryByRole("article")).toBeNull();
+  });
+
+  it("is not healthy beside a failed snapshot tile, and does not say nothing needs you", async () => {
+    mockApi({
+      ...calm(),
+      "/api/v1/status": jsonResponse({
+        now: NOW,
+        report: {
+          ...(status.report as object),
+          stalled: [],
+          inFlight: { snapshots: 0, restores: 0 },
+        },
+      }),
+      "/api/v1/repositories": jsonResponse([repo("nas", "healthy"), repo("offsite", "healthy")]),
+      "/api/v1/doctor": jsonResponse(allGood),
+    });
+    mountApp("/");
+    const verdict = await screen.findByRole("status", { name: "Vault verdict" });
+    await waitFor(() => {
+      expect(verdict.querySelector(".verdict__lamp")).toHaveAttribute("data-health", "failed");
+    });
+    expect(verdict).toHaveTextContent("1 snapshot failed");
+    expect(screen.queryByText("Nothing needs you")).toBeNull();
+  });
+
+  it("never says nothing needs you when the policies read was refused, and says it did not load", async () => {
+    mockApi({
+      ...calm({
+        "/api/v1/overview": jsonResponse(emptyOverview),
+        "/api/v1/policies": problemResponse(
+          forbiddenProblem("Listing policies was refused.", "/api/v1/policies"),
+        ),
+      }),
+      "/api/v1/status": jsonResponse({
+        now: NOW,
+        report: {
+          ...(status.report as object),
+          stalled: [],
+          inFlight: { snapshots: 0, restores: 0 },
+        },
+      }),
+      "/api/v1/repositories": jsonResponse([repo("nas", "healthy"), repo("offsite", "healthy")]),
+      "/api/v1/doctor": jsonResponse(allGood),
+    });
+    mountApp("/");
+    const attention = await screen.findByRole("region", { name: "Needs attention" });
+    expect(await within(attention).findByText(/Listing policies was refused/)).toBeInTheDocument();
+    const verdict = screen.getByRole("status", { name: "Vault verdict" });
+    expect(verdict.querySelector(".verdict__lamp")).not.toHaveAttribute("data-health", "healthy");
+    expect(verdict).toHaveTextContent("the policies");
+    expect(within(attention).queryByText("Nothing needs you")).toBeNull();
   });
 
   it("never calls an empty scope healthy", async () => {
@@ -401,7 +452,7 @@ describe("Overview", () => {
     // Every check that could run passed; the two that warned did so because
     // the console asked the cluster as this user and was refused.
     mockApi({
-      ...calm(),
+      ...calm({ "/api/v1/overview": jsonResponse(emptyOverview) }),
       "/api/v1/status": jsonResponse({
         now: NOW,
         report: {

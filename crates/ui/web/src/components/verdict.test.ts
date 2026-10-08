@@ -10,6 +10,43 @@ const quiet: VerdictInputs = {
 };
 
 describe("overviewVerdict", () => {
+  it("is never healthy beside a failed tile: a failed snapshot tally fails the verdict", () => {
+    const verdict = overviewVerdict({
+      ...quiet,
+      tallies: [
+        {
+          kind: "snapshot",
+          total: 3,
+          byHealth: [
+            { health: "failed", count: 1 },
+            { health: "healthy", count: 2 },
+          ],
+        },
+      ],
+    });
+    expect(verdict).toEqual({ health: "failed", text: "Needs attention: 1 snapshot failed." });
+  });
+
+  it("reads an unknown or degraded tally as degraded, named by its kind", () => {
+    const verdict = overviewVerdict({
+      ...quiet,
+      tallies: [
+        { kind: "restore", total: 1, byHealth: [{ health: "unknown", count: 1 }] },
+        { kind: "snapshotPolicy", total: 2, byHealth: [{ health: "degraded", count: 2 }] },
+      ],
+    });
+    expect(verdict.health).toBe("degraded");
+    expect(verdict.text).toBe("Mostly healthy: 1 restore unknown, 2 policies degraded.");
+  });
+
+  it("leaves repositories to the repository list, so they are not counted twice", () => {
+    const verdict = overviewVerdict({
+      ...quiet,
+      tallies: [{ kind: "repository", total: 3, byHealth: [{ health: "failed", count: 3 }] }],
+    });
+    expect(verdict.health).toBe("healthy");
+  });
+
   it("is healthy only when every source loaded and nothing is lit", () => {
     const verdict = overviewVerdict(quiet);
     expect(verdict.health).toBe("healthy");
