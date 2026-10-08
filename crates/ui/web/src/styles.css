@@ -1448,6 +1448,15 @@ html:has(dialog.side-panel[open]) {
 .drawer-actions > .action-bar {
   order: 2;
 }
+/* In the foot, a question and its answer stack above the buttons, nearest the
+   content they are about; the buttons stay on the bottom line. */
+.side-panel__foot .action-bar > .action > .action__confirm {
+  order: -2;
+}
+.side-panel__foot .action-bar > .action > .receipt,
+.side-panel__foot .action-bar > .action > .problem {
+  order: -1;
+}
 
 /* ---- chain: where a resource sits, read left to right -------------------- */
 .chain {

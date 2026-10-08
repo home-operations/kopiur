@@ -1,5 +1,5 @@
-import { Link } from "@tanstack/react-router";
 import { SearchX } from "lucide-react";
+import { useState } from "react";
 
 import type { ApiProblemError } from "../../api/client";
 import {
@@ -18,12 +18,11 @@ import { LampBadge } from "../HealthBadge";
 import { type InspectTarget, inspectToken, useInspect } from "../inspect";
 import { KIND_META } from "../kind";
 import { LoadingState } from "../LoadingState";
-import { ObjectRef } from "../ObjectRef";
-import { type CardRow, cardFacts } from "../objectCard";
 import { SidePanel } from "../SidePanel";
-import { AbsenceText, StatStrip } from "../StatStrip";
+import { Tabs } from "../Tabs";
 import { useExiting } from "../useExiting";
-import { drawerFacts } from "./drawerFacts";
+import type { DrawerData } from "./drawerData";
+import { drawerView } from "./views";
 
 /**
  * The resource drawer: whatever `?inspect=` names, over whatever page is open.
@@ -49,7 +48,7 @@ type Loaded =
   | { state: "loading" }
   | { state: "missing" }
   | { state: "error"; problem: Problem }
-  | { state: "ready"; card: CardRow };
+  | { state: "ready"; data: DrawerData };
 
 interface Query<T> {
   isPending: boolean;
@@ -59,15 +58,15 @@ interface Query<T> {
 }
 
 /** A read's state as the drawer's; a 404 is "gone", like a name missing from a list. */
-function settle<T>(query: Query<T>, pick: (data: T) => CardRow | undefined): Loaded {
+function settle<T>(query: Query<T>, pick: (data: T) => DrawerData | undefined): Loaded {
   if (query.isError && query.error !== null) {
     return query.error.problem.status === 404
       ? { state: "missing" }
       : { state: "error", problem: query.error.problem };
   }
   if (query.isPending || query.data === undefined) return { state: "loading" };
-  const card = pick(query.data);
-  return card === undefined ? { state: "missing" } : { state: "ready", card };
+  const data = pick(query.data);
+  return data === undefined ? { state: "missing" } : { state: "ready", data };
 }
 
 function named<T extends { name: string }>(rows: readonly T[], name: string): T | undefined {
@@ -75,15 +74,15 @@ function named<T extends { name: string }>(rows: readonly T[], name: string): T 
 }
 
 /**
- * The target's row, read the cheapest honest way: a kind with a detail read
- * asks for that one object; a kind without one reads its namespace's list —
- * already cached when the drawer was opened from that list — and picks the
- * row out by name.
+ * What the drawer shows, read the cheapest honest way: a kind with a detail
+ * read asks for that one object, all of it; a kind without one reads its
+ * namespace's list — already cached when the drawer was opened from that
+ * list — and picks the row out by name.
  *
  * Every hook is called on every render (hooks cannot be conditional); only
  * the one for this kind is enabled.
  */
-function useDrawerRow(target: InspectTarget): Loaded {
+function useDrawerData(target: InspectTarget): Loaded {
   const { kind, name } = target;
   const ns = target.namespace ?? "";
   const isRepo = kind === "repository" || kind === "clusterRepository";
@@ -104,13 +103,13 @@ function useDrawerRow(target: InspectTarget): Loaded {
   switch (kind) {
     case "repository":
     case "clusterRepository":
-      return settle(repository, (d) => ({ kind, row: d.summary }));
+      return settle(repository, (detail) => ({ kind, detail }));
     case "snapshotPolicy":
-      return settle(policy, (d) => ({ kind, row: d.row }));
+      return settle(policy, (detail) => ({ kind, detail }));
     case "snapshot":
-      return settle(snapshot, (d) => ({ kind, row: d.row }));
+      return settle(snapshot, (detail) => ({ kind, detail }));
     case "restore":
-      return settle(restore, (d) => ({ kind, row: d.row }));
+      return settle(restore, (detail) => ({ kind, detail }));
     case "snapshotSchedule":
       return settle(schedules, (rows) => {
         const row = named(rows, name);
@@ -142,9 +141,14 @@ interface DrawerProps {
 }
 
 function Drawer({ target, onClose, leaving, onExited }: DrawerProps) {
-  const loaded = useDrawerRow(target);
+  const loaded = useDrawerData(target);
   const meta = KIND_META[target.kind];
-  const facts = loaded.state === "ready" ? cardFacts(loaded.card, new Date()) : undefined;
+  const token = inspectToken(target);
+  // The open tab belongs to the resource on screen: walking to another one
+  // starts it on its first tab.
+  const [tab, setTab] = useState<{ token: string; id: string }>({ token, id: "" });
+  const selected = tab.token === token ? tab.id : "";
+  const view = loaded.state === "ready" ? drawerView(loaded.data, new Date()) : undefined;
   const where = target.namespace !== undefined ? ` in ${target.namespace}` : "";
   return (
     <SidePanel
@@ -157,80 +161,43 @@ function Drawer({ target, onClose, leaving, onExited }: DrawerProps) {
           {target.name}
         </>
       }
-      status={facts !== undefined ? <LampBadge lamp={facts.lamp} /> : undefined}
+      status={view !== undefined ? <LampBadge lamp={view.lamp} /> : undefined}
       onClose={onClose}
       leaving={leaving}
       onExited={onExited}
-      footer={
-        facts?.to !== undefined ? (
-          <Link className="button" to={facts.to}>
-            Open full page
-          </Link>
-        ) : undefined
-      }
+      layout="fill"
+      footer={view?.actions}
     >
-      {loaded.state === "loading" ? (
-        <LoadingState what={`${meta.label} ${target.name}`} rows={4} />
-      ) : loaded.state === "error" ? (
-        <ErrorState problem={loaded.problem} what={`${meta.label} ${target.name}`} />
-      ) : loaded.state === "missing" ? (
-        <EmptyState title="Not found" icon={SearchX}>
-          No {meta.label} named {target.name}
-          {where}. It may have been deleted.
-        </EmptyState>
+      {view !== undefined ? (
+        <>
+          {view.head}
+          {view.tabs.length > 1 ? (
+            <Tabs
+              label={view.tabsLabel}
+              tabs={view.tabs}
+              selected={selected}
+              onSelect={(id) => {
+                setTab({ token, id });
+              }}
+            />
+          ) : (
+            <div className="drawer__panel">{view.tabs[0]?.render()}</div>
+          )}
+        </>
       ) : (
-        <DrawerBody card={loaded.card} />
+        <div className="drawer__panel">
+          {loaded.state === "loading" ? (
+            <LoadingState what={`${meta.label} ${target.name}`} rows={4} />
+          ) : loaded.state === "error" ? (
+            <ErrorState problem={loaded.problem} what={`${meta.label} ${target.name}`} />
+          ) : (
+            <EmptyState title="Not found" icon={SearchX}>
+              No {meta.label} named {target.name}
+              {where}. It may have been deleted.
+            </EmptyState>
+          )}
+        </div>
       )}
     </SidePanel>
-  );
-}
-
-/**
- * The card's three stats, then the facts a card has no room for, then what the
- * resource names. The card's one-line meta is not repeated: every part of it
- * is a fact below.
- */
-function DrawerBody({ card }: { card: CardRow }) {
-  const now = new Date();
-  const { stats } = cardFacts(card, now);
-  const { facts, related } = drawerFacts(card);
-  const namespace = "namespace" in card.row ? (card.row.namespace ?? undefined) : undefined;
-  return (
-    <>
-      <StatStrip stats={stats} variant="card" label="At a glance" />
-      <section className="drawer__section" aria-label="Facts">
-        <h3 className="drawer__title">Facts</h3>
-        <dl className="drawer__facts">
-          {facts.map((fact) => (
-            <div className="drawer__fact" key={fact.label}>
-              <dt>{fact.label}</dt>
-              <dd className={fact.mono === true ? "mono" : undefined}>
-                {typeof fact.value === "string" ? fact.value : <AbsenceText absence={fact.value} />}
-              </dd>
-            </div>
-          ))}
-        </dl>
-      </section>
-      {related.length > 0 ? (
-        <section className="drawer__section" aria-label="Related">
-          <h3 className="drawer__title">Related</h3>
-          <ul className="drawer__related">
-            {related.map((rel) => (
-              <li
-                key={`${rel.label}:${rel.target.kind}:${rel.target.namespace ?? ""}/${rel.target.name}`}
-              >
-                <span className="drawer__rel-label">{rel.label}</span>
-                <ObjectRef
-                  kind={rel.target.kind}
-                  name={rel.target.name}
-                  namespace={rel.target.namespace}
-                  contextNamespace={namespace}
-                />
-              </li>
-            ))}
-          </ul>
-        </section>
-      ) : null}
-    </>
   );
 }

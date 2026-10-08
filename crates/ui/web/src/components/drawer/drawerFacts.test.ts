@@ -169,6 +169,8 @@ describe("drawerFacts", () => {
       },
     };
     expect(drawerFacts(copy).related.map((r) => r.label)).toEqual(["Source", "Destination"]);
+    // Read left to right: the source feeds it, the destination is fed by it.
+    expect(drawerFacts(copy).related.map((r) => r.side)).toEqual(["before", "after"]);
   });
 
   it("keeps a reference it cannot parse as text, never as a guessed link", () => {

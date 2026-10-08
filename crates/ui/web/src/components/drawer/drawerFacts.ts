@@ -21,6 +21,8 @@ export interface DrawerFact {
 export interface DrawerRelation {
   label: string;
   target: InspectTarget;
+  /** Whether it feeds this resource (`before`) or is fed by it (`after`), for the chain. */
+  side: "before" | "after";
 }
 
 export interface DrawerFacts {
@@ -60,11 +62,15 @@ class Builder {
   }
 
   /** A wire reference string (`Repository/media/nas`). */
-  ref(label: string, value: string | null | undefined): this {
+  ref(
+    label: string,
+    value: string | null | undefined,
+    side: DrawerRelation["side"] = "after",
+  ): this {
     if (value === null || value === undefined || value.length === 0) return this;
     const parsed = parseRef(value);
     if (parsed === null) return this.fact(label, value, true);
-    this.related.push({ label, target: parsed });
+    this.related.push({ label, target: parsed, side });
     return this;
   }
 
@@ -74,9 +80,10 @@ class Builder {
     kind: InspectTarget["kind"],
     name: string | null | undefined,
     namespace: string,
+    side: DrawerRelation["side"] = "after",
   ): this {
     if (name === null || name === undefined || name.length === 0) return this;
-    this.related.push({ label, target: { kind, name, namespace } });
+    this.related.push({ label, target: { kind, name, namespace }, side });
     return this;
   }
 
@@ -127,9 +134,9 @@ export function drawerFacts(card: CardRow): DrawerFacts {
         .fact("Kopia snapshot", text(s.kopiaSnapshotId), true)
         .fact("Pinned", yesNo(s.pinned))
         .fact("Deletion policy", deletionPolicyLabel(s.deletionPolicy));
-      b.sibling("Policy", "snapshotPolicy", s.policy, s.namespace);
-      b.ref("Repository", s.repository);
-      b.ref("Copied from", s.copiedFrom);
+      b.sibling("Policy", "snapshotPolicy", s.policy, s.namespace, "before");
+      b.ref("Repository", s.repository, "before");
+      b.ref("Copied from", s.copiedFrom, "before");
       return b.done();
     }
     case "restore": {
@@ -143,7 +150,7 @@ export function drawerFacts(card: CardRow): DrawerFacts {
           true,
         )
         .fact("Kopia snapshot", text(r.kopiaSnapshotId), true);
-      b.ref("Repository", r.repository);
+      b.ref("Repository", r.repository, "before");
       return b.done();
     }
     case "maintenance": {
@@ -159,7 +166,7 @@ export function drawerFacts(card: CardRow): DrawerFacts {
       b.ref("Repository", m.repository);
       // A projected Maintenance is usually owned by the repository it governs;
       // naming the same object twice says nothing the first did not.
-      if (m.owner !== m.repository) b.ref("Owner", m.owner);
+      if (m.owner !== m.repository) b.ref("Owner", m.owner, "before");
       return b.done();
     }
     case "repositoryReplication": {
@@ -168,7 +175,7 @@ export function drawerFacts(card: CardRow): DrawerFacts {
         .fact("Cron", r.cron, true)
         .fact("Phase", text(replicationPhaseLabel(r.phase)))
         .fact("Suspended", yesNo(r.suspended));
-      b.ref("Source", r.source);
+      b.ref("Source", r.source, "before");
       return b.done();
     }
     case "snapshotReplication": {
@@ -178,7 +185,7 @@ export function drawerFacts(card: CardRow): DrawerFacts {
         .fact("Suspended", yesNo(r.suspended))
         .fact("Identities selected", count(r.identitiesSelected))
         .fact("Pruned", count(r.pruned));
-      b.ref("Source", r.source);
+      b.ref("Source", r.source, "before");
       b.ref("Destination", r.destination);
       return b.done();
     }
