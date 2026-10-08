@@ -174,3 +174,32 @@ describe("Restore detail", () => {
     expect(await screen.findByRole("status", { busy: true })).toBeInTheDocument();
   });
 });
+
+describe("Restore detail — header", () => {
+  it("trails back through the repository to the snapshot it reads", async () => {
+    mockApi({ [PATH]: jsonResponse(detail) });
+    mountApp("/restores/media/recover-db");
+    const trail = await screen.findByRole("list", { name: "Where this sits" });
+    expect(within(trail).getByRole("link", { name: /nightly-1/ })).toHaveAttribute(
+      "href",
+      "/snapshots/media/nightly-1",
+    );
+    expect(within(trail).getByRole("link", { name: /nas/ })).toHaveAttribute(
+      "href",
+      "/repositories/repository/nas?namespace=media",
+    );
+    expect(trail).toHaveTextContent("this restore");
+  });
+
+  it("shows what it restored as the four facts, never a percentage", async () => {
+    mockApi({ [PATH]: jsonResponse(detail) });
+    mountApp("/restores/media/recover-db");
+    await screen.findByRole("status", { name: /verdict/ });
+    const facts = document.querySelector<HTMLElement>("dl.stats");
+    expect(facts?.querySelectorAll(".stats__item")).toHaveLength(4);
+    expect(facts).toHaveTextContent("4.0 KiB");
+    expect(facts).toHaveTextContent("12");
+    expect(facts).toHaveTextContent("Started");
+    expect(facts).not.toHaveTextContent("%");
+  });
+});

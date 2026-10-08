@@ -10,10 +10,12 @@ import {
 import type { ReactNode } from "react";
 
 import type { ConditionView, RestoreDetail } from "../api/types";
-import { EMPTY_CELL, relativeTime } from "../util/format";
+import { EMPTY_CELL, humanBytes, humanDuration, relativeTime } from "../util/format";
+import { DetailHeader, type TrailHop } from "./DetailHeader";
 import { Facts } from "./Facts";
 import { Finding } from "./Finding";
 import { healthLamp } from "./health";
+import { detailHref, parseRef } from "./kind";
 import { restoreProgress, restoreVerdict } from "./restore";
 
 /**
@@ -33,25 +35,77 @@ export interface RestoreDetailViewProps {
   now?: Date | undefined;
 }
 
+/** Seconds from start to end; `null` while it runs or when either is unwritten. */
+function tookSeconds(start: string | null | undefined, end: string | null | undefined) {
+  if (start === null || start === undefined || end === null || end === undefined) return null;
+  const ms = Date.parse(end) - Date.parse(start);
+  return Number.isNaN(ms) ? null : ms / 1000;
+}
+
+/**
+ * Where a restore sits: the repository it reads, then the snapshot it was
+ * pinned to. The wire carries no policy for that snapshot, so the trail stops
+ * there rather than guessing one.
+ */
+function restoreTrail(detail: RestoreDetail): TrailHop[] {
+  const hops: TrailHop[] = [];
+  const repo = detail.row.repository ? parseRef(detail.row.repository) : null;
+  if (repo !== null) {
+    hops.push({
+      kind: repo.kind,
+      name: repo.name,
+      namespace: repo.namespace,
+      to: detailHref(repo.kind, repo.name, repo.namespace),
+    });
+  }
+  const snapshot = detail.source?.snapshot;
+  if (snapshot !== null && snapshot !== undefined) {
+    hops.push({
+      kind: "snapshot",
+      name: snapshot.name,
+      namespace: snapshot.namespace,
+      to: detailHref("snapshot", snapshot.name, snapshot.namespace),
+    });
+  }
+  return hops;
+}
+
 export function RestoreDetailView({ detail, now = new Date() }: RestoreDetailViewProps) {
   const { row } = detail;
   const verdict = restoreVerdict(row);
-  const Lamp = verdict.lamp.icon;
   const source = detail.source;
   const target = detail.target;
 
   return (
     <div className="page">
-      <p className="verdict" role="status" aria-label="Restore verdict">
-        <span className="verdict__lamp" data-health={verdict.lamp.key}>
-          <Lamp size={18} strokeWidth={2} aria-hidden="true" />
-          <span>{verdict.lamp.word}</span>
-        </span>
-        <span className="verdict__text">{verdict.text}</span>
-        <span className="verdict__meta mono">
-          Restore · {row.namespace} · {row.name}
-        </span>
-      </p>
+      <DetailHeader
+        kind="restore"
+        name={row.name}
+        namespace={row.namespace}
+        lamp={verdict.lamp}
+        verdictLabel="Restore verdict"
+        verdict={verdict.text}
+        trail={restoreTrail(detail)}
+        stats={[
+          { label: "Restored", value: humanBytes(row.bytesRestored) },
+          {
+            label: "Files",
+            value:
+              row.filesRestored !== null && row.filesRestored !== undefined
+                ? row.filesRestored.toLocaleString()
+                : { absent: "na" },
+          },
+          { label: "Took", value: humanDuration(tookSeconds(row.startTime, row.endTime)) },
+          {
+            label: "Started",
+            value:
+              row.startTime !== null && row.startTime !== undefined
+                ? relativeTime(row.startTime, now)
+                : { absent: "na" },
+            abs: row.startTime ?? undefined,
+          },
+        ]}
+      />
 
       {detail.failure !== null && detail.failure !== undefined ? (
         <Section title="Why it failed" icon={OctagonX}>

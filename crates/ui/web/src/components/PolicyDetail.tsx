@@ -1,6 +1,5 @@
 import { Link } from "@tanstack/react-router";
 import {
-  CalendarClock,
   Camera,
   Database,
   FolderTree,
@@ -12,17 +11,26 @@ import {
 } from "lucide-react";
 import type { ReactNode } from "react";
 
-import type { ConditionView, PolicyDetail as PolicyDetailData, SnapshotRow } from "../api/types";
+import type {
+  ConditionView,
+  PolicyDetail as PolicyDetailData,
+  PolicyRow,
+  RepositorySummary,
+  SnapshotRow,
+} from "../api/types";
 import { EMPTY_CELL, humanBytes, relativeTime } from "../util/format";
+import { DetailHeader, type TrailHop } from "./DetailHeader";
 import { Facts } from "./Facts";
+import { FlowLanes, type Lane, type LaneItem } from "./FlowLanes";
 import { Finding } from "./Finding";
 import { LampBadge } from "./HealthBadge";
+import { KindChip } from "./KindMark";
 import { LastSuccess } from "./PolicyTable";
 import { gateSeverityLamp } from "./gates";
-import { healthLamp } from "./health";
+import { type Lamp, healthLamp } from "./health";
+import { detailHref, parseRef } from "./kind";
 import { policyVerdict, retentionRules, snapshotCount } from "./policy";
 import { snapshotPhaseLamp } from "./snapshot";
-import { scheduleCron, scheduleFires, firesBySelector } from "./schedule";
 
 /**
  * One policy, in the order an operator needs it.
@@ -42,35 +50,141 @@ export interface PolicyDetailProps {
   /** The snapshot-now and suspend controls, built by the route. */
   actions?: ReactNode;
   now?: Date | undefined;
+  /** Repository rows, to show where it writes as cards; references otherwise. */
+  repositoryRows?: readonly RepositorySummary[] | undefined;
 }
 
-export function PolicyDetail({ detail, actions, now = new Date() }: PolicyDetailProps) {
+/**
+ * The hero's pill: suspended, then the worst gate holding it, else active.
+ * "Never succeeded" and "never verified" are loud facts in the strip below,
+ * not a pill — the same split the overview's policy tile makes.
+ */
+function policyLamp(detail: PolicyDetailData): Lamp {
+  if (detail.row.suspended) return healthLamp("suspended");
+  const gates = detail.gates.map((gate) => gateSeverityLamp(gate.severity));
+  return (
+    gates.find((lamp) => lamp.key === "failed") ??
+    gates[0] ?? { ...healthLamp("healthy"), word: "Active" }
+  );
+}
+
+/**
+ * Where a policy sits: the repository it writes into. A fan-out has no single
+ * upstream — two repositories in a trail would read as a chain — so it gets
+ * no trail, and the Writes-into lane names them all.
+ */
+function policyTrail(row: PolicyRow): TrailHop[] {
+  const only = row.repositories.length === 1 ? parseRef(row.repositories[0] ?? "") : null;
+  if (only === null) return [];
+  return [
+    {
+      kind: only.kind,
+      name: only.name,
+      namespace: only.namespace,
+      to: detailHref(only.kind, only.name, only.namespace),
+    },
+  ];
+}
+
+/**
+ * Fired by → this policy → writes into. A repository the server named with no
+ * row loaded stays a reference; one whose key does not parse stays its text.
+ */
+function policyLanes(
+  detail: PolicyDetailData,
+  repositoryRows: readonly RepositorySummary[] | undefined,
+): Lane[] {
+  const { row } = detail;
+  const writes: LaneItem[] = row.repositories.flatMap((key): LaneItem[] => {
+    const ref = parseRef(key);
+    if (ref === null) return [];
+    const loaded = repositoryRows?.find(
+      (r) =>
+        r.name === ref.name &&
+        (r.kind === "ClusterRepository") === (ref.kind === "clusterRepository") &&
+        (r.namespace ?? undefined) === ref.namespace,
+    );
+    return [
+      loaded !== undefined
+        ? {
+            card: {
+              kind: ref.kind === "clusterRepository" ? "clusterRepository" : "repository",
+              row: loaded,
+            },
+          }
+        : { ref },
+    ];
+  });
+  return [
+    {
+      title: "Fired by",
+      label: "Schedules that fire this policy",
+      items: detail.schedules.map((schedule) => ({
+        card: { kind: "snapshotSchedule", row: schedule },
+      })),
+      empty: "No schedule fires this policy, so it only runs on request.",
+    },
+    {
+      title: "This policy",
+      label: "This policy",
+      items: [{ card: { kind: "snapshotPolicy", row } }],
+      empty: "",
+      variant: "stats",
+    },
+    {
+      title: "Writes into",
+      label: "Writes into",
+      items: writes,
+      empty: "This policy names no repository, so it has nowhere to write.",
+    },
+  ];
+}
+
+export function PolicyDetail({
+  detail,
+  actions,
+  now = new Date(),
+  repositoryRows,
+}: PolicyDetailProps) {
   const { row } = detail;
   const verdict = policyVerdict(row);
-  const lamp = verdict.suspended ? healthLamp("suspended") : undefined;
   const scope = { namespace: row.namespace };
   const rules = retentionRules(detail.retention);
 
   return (
     <div className="page">
-      <p className="verdict" role="status" aria-label="Policy verdict">
-        {lamp !== undefined ? (
-          <span className="verdict__lamp" data-health={lamp.key}>
-            <lamp.icon size={18} strokeWidth={2} aria-hidden="true" />
-            <span>{lamp.word}</span>
-          </span>
-        ) : null}
-        <span className="verdict__text">{verdict.text}</span>
-        <span className="verdict__meta mono">
-          SnapshotPolicy · {row.namespace} · {row.name}
-        </span>
-      </p>
+      <DetailHeader
+        kind="snapshotPolicy"
+        name={row.name}
+        namespace={row.namespace}
+        lamp={policyLamp(detail)}
+        verdictLabel="Policy verdict"
+        verdict={verdict.text}
+        trail={policyTrail(row)}
+        actions={actions}
+        stats={[
+          { label: "Live snapshots", value: snapshotCount(row.activeSnapshotCount) },
+          {
+            label: "Last success",
+            value:
+              row.lastSuccessfulSnapshot !== null && row.lastSuccessfulSnapshot !== undefined
+                ? relativeTime(row.lastSuccessfulSnapshot, now)
+                : { absent: "loud", text: "never succeeded" },
+            abs: row.lastSuccessfulSnapshot ?? undefined,
+          },
+          {
+            label: "Last verified",
+            value:
+              row.lastVerified !== null && row.lastVerified !== undefined
+                ? relativeTime(row.lastVerified, now)
+                : { absent: "loud", text: "never verified" },
+            abs: row.lastVerified ?? undefined,
+          },
+          { label: "Schedules", value: detail.schedules.length.toLocaleString() },
+        ]}
+      />
 
-      {actions !== undefined && actions !== null ? (
-        <section className="page__section" aria-label="Actions">
-          <div className="action-bar">{actions}</div>
-        </section>
-      ) : null}
+      <FlowLanes label="Relationships" lanes={policyLanes(detail, repositoryRows)} />
 
       {detail.gates.length > 0 ? (
         <Section title="Gates holding this policy" icon={ShieldAlert}>
@@ -245,73 +359,6 @@ export function PolicyDetail({ detail, actions, now = new Date() }: PolicyDetail
         </Section>
       </div>
 
-      <Section title="Schedules that fire this policy" icon={CalendarClock}>
-        {detail.schedules.length === 0 ? (
-          <p className="page__section-note">
-            No schedule fires this policy, so it only runs on request. See{" "}
-            <Link to="/schedules" search={scope}>
-              Schedules
-            </Link>
-            .
-          </p>
-        ) : (
-          <>
-            <div className="ledger-scroll">
-              <table className="ledger" aria-label="Schedules">
-                <thead>
-                  <tr>
-                    <th scope="col">Schedule</th>
-                    <th scope="col">Cron</th>
-                    <th scope="col">Fires</th>
-                    <th scope="col">State</th>
-                    <th scope="col" className="num">
-                      Next
-                    </th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {detail.schedules.map((schedule) => (
-                    <tr key={`${schedule.namespace}/${schedule.name}`}>
-                      <td className="mono">{schedule.name}</td>
-                      <td className="mono">{scheduleCron(schedule)}</td>
-                      <td>
-                        {firesBySelector(schedule) ? (
-                          <>
-                            <span className="mono">{scheduleFires(schedule)}</span>{" "}
-                            <span className="policy-table__note">by selector</span>
-                          </>
-                        ) : (
-                          <span className="mono">{scheduleFires(schedule)}</span>
-                        )}
-                      </td>
-                      <td>
-                        {schedule.suspended ? (
-                          <LampBadge lamp={healthLamp("suspended")} />
-                        ) : (
-                          <span className="policy-table__active">Active</span>
-                        )}
-                      </td>
-                      <td className="num">
-                        {schedule.nextFire !== null && schedule.nextFire !== undefined ? (
-                          <time dateTime={schedule.nextFire}>
-                            {relativeTime(schedule.nextFire, now)}
-                          </time>
-                        ) : (
-                          EMPTY_CELL
-                        )}
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-            <p className="page__section-note">
-              Label selectors are evaluated exactly as the operator does.
-            </p>
-          </>
-        )}
-      </Section>
-
       <Section title="Recent snapshots" icon={Camera}>
         <RecentSnapshots snapshots={detail.recentSnapshots} now={now} />
         <p className="page__section-note">
@@ -386,8 +433,19 @@ function RecentSnapshots({ snapshots, now }: { snapshots: readonly SnapshotRow[]
         </thead>
         <tbody>
           {snapshots.map((snapshot) => (
-            <tr key={`${snapshot.namespace}/${snapshot.name}`}>
-              <td className="mono">{snapshot.name}</td>
+            <tr key={`${snapshot.namespace}/${snapshot.name}`} data-kind="snapshot">
+              <td className="has-stripe">
+                <div className="table__object">
+                  <KindChip kind="snapshot" size="sm" />
+                  <Link
+                    className="mono"
+                    to="/snapshots/$namespace/$name"
+                    params={{ namespace: snapshot.namespace, name: snapshot.name }}
+                  >
+                    {snapshot.name}
+                  </Link>
+                </div>
+              </td>
               <td>
                 <SnapshotPhase phase={snapshot.phase} pinned={snapshot.pinned} />
               </td>

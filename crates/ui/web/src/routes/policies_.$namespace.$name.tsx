@@ -2,7 +2,7 @@ import { Link, createFileRoute } from "@tanstack/react-router";
 import { ScrollText } from "lucide-react";
 import { useState } from "react";
 
-import { usePolicy } from "../api/hooks";
+import { usePolicy, useRepositories } from "../api/hooks";
 import { ErrorState } from "../components/ErrorState";
 import { LoadingState } from "../components/LoadingState";
 import { PolicyDetail } from "../components/PolicyDetail";
@@ -37,6 +37,9 @@ type OpenAction = "snapshot" | "suspend" | null;
 function PolicyDetailRoute() {
   const { namespace, name } = Route.useParams();
   const policy = usePolicy(namespace, name);
+  // Cluster-wide: a policy may write into a ClusterRepository, which no
+  // namespace scope returns.
+  const repositories = useRepositories(undefined);
   const [open, setOpen] = useState<OpenAction>(null);
 
   if (policy.isPending) {
@@ -70,6 +73,7 @@ function PolicyDetailRoute() {
   return (
     <PolicyDetail
       detail={policy.data}
+      repositoryRows={repositories.data}
       actions={
         <>
           <SnapshotNowDialog

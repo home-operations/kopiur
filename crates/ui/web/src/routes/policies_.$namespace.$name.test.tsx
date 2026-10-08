@@ -133,14 +133,18 @@ describe("Policy detail", () => {
     expect(within(region).getByText("never verified")).toBeInTheDocument();
   });
 
-  it("lists the schedules that fire it, with the cron exactly as written", async () => {
+  it("puts the schedules that fire it in the Fired-by lane, with the cron exactly as written", async () => {
     mockApi({ [PATH]: jsonResponse(detail) });
     mountApp("/policies/media/nightly");
-    const schedules = await screen.findByRole("table", { name: "Schedules" });
+    const flow = await screen.findByRole("region", { name: "Relationships" });
+    const fired = within(flow).getByRole("region", { name: "Schedules that fire this policy" });
+    const card = within(fired).getByRole("article");
+    expect(card).toHaveAttribute("data-kind", "snapshot-schedule");
     // The H token stays: the resolved slot is the operator's and rewriting it
     // would show a time the reader cannot find in their own manifest.
-    expect(schedules).toHaveTextContent("H 2 * * * (Europe/Berlin)");
-    expect(schedules).toHaveTextContent("nightly-cron");
+    expect(card).toHaveTextContent("H 2 * * *");
+    expect(card).toHaveTextContent("Europe/Berlin");
+    expect(card).toHaveTextContent("nightly-cron");
   });
 
   it("lists recent runs, lamping the phase exactly as the snapshots ledger does", async () => {
@@ -340,5 +344,82 @@ describe("Policy detail", () => {
     fetchMock.mockResponse(() => new Promise<Response>(() => undefined));
     mountApp("/policies/media/nightly");
     expect(await screen.findByRole("status", { busy: true })).toBeInTheDocument();
+  });
+});
+
+describe("Policy detail — header and lanes", () => {
+  const single: PolicyDetail = {
+    ...detail,
+    row: { ...detail.row, repositories: ["Repository/media/nas"], multiRepo: false },
+  };
+
+  it("lamps the verdict even when the policy is active", async () => {
+    mockApi({ [PATH]: jsonResponse(detail) });
+    mountApp("/policies/media/nightly");
+    const verdict = await screen.findByRole("status", { name: "Policy verdict" });
+    const lamp = verdict.querySelector(".verdict__lamp");
+    expect(lamp).toHaveAttribute("data-health", "healthy");
+    expect(lamp?.querySelector("svg")).not.toBeNull();
+  });
+
+  it("trails back to the one repository it writes into", async () => {
+    mockApi({ [PATH]: jsonResponse(single) });
+    mountApp("/policies/media/nightly");
+    const trail = await screen.findByRole("list", { name: "Where this sits" });
+    expect(within(trail).getByRole("link", { name: /nas/ })).toHaveAttribute(
+      "href",
+      "/repositories/repository/nas?namespace=media",
+    );
+    expect(trail).toHaveTextContent("this policy");
+  });
+
+  it("draws no trail for a fan-out — two repositories are not a chain", async () => {
+    mockApi({ [PATH]: jsonResponse(detail) });
+    mountApp("/policies/media/nightly");
+    await screen.findByRole("status", { name: "Policy verdict" });
+    expect(screen.queryByRole("list", { name: "Where this sits" })).toBeNull();
+  });
+
+  it("names every repository it writes into in the Writes-into lane", async () => {
+    mockApi({ [PATH]: jsonResponse(detail), "/api/v1/repositories": jsonResponse([]) });
+    mountApp("/policies/media/nightly");
+    const flow = await screen.findByRole("region", { name: "Relationships" });
+    const writes = within(flow).getByRole("region", { name: "Writes into" });
+    expect(within(writes).getByRole("link", { name: /nas/ })).toHaveAttribute(
+      "href",
+      "/repositories/repository/nas?namespace=media",
+    );
+    expect(within(writes).getByRole("link", { name: /shared/ })).toHaveAttribute(
+      "href",
+      "/repositories/cluster-repository/shared",
+    );
+    const self = within(flow).getByRole("region", { name: "This policy" });
+    expect(within(self).getByRole("article")).toHaveAttribute("data-kind", "snapshot-policy");
+  });
+
+  it("stripes each recent run as a snapshot and links it to its page", async () => {
+    mockApi({ [PATH]: jsonResponse(detail) });
+    mountApp("/policies/media/nightly");
+    const row = nth(bodyRows(await screen.findByRole("table", { name: "Recent snapshots" })), 0);
+    expect(row).toHaveAttribute("data-kind", "snapshot");
+    expect(row.querySelector("td.has-stripe .kind-chip svg")).not.toBeNull();
+    expect(within(row).getByRole("link", { name: "nightly-20260909" })).toHaveAttribute(
+      "href",
+      "/snapshots/media/nightly-20260909",
+    );
+  });
+
+  it("shows the four facts, loud when it has never been verified", async () => {
+    mockApi({
+      [PATH]: jsonResponse({ ...detail, row: { ...detail.row, lastVerified: null } }),
+    });
+    mountApp("/policies/media/nightly");
+    await screen.findByRole("status", { name: /verdict/ });
+    const facts = document.querySelector<HTMLElement>("dl.stats");
+    expect(facts?.querySelectorAll(".stats__item")).toHaveLength(4);
+    expect(facts).toHaveTextContent("Live snapshots");
+    expect(facts).toHaveTextContent("42");
+    expect(facts).toHaveTextContent("never verified");
+    expect(facts).toHaveTextContent("Schedules");
   });
 });
