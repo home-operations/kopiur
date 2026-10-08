@@ -155,6 +155,11 @@ describe("the drawer for a kind with no page of its own", () => {
     expect(confirm?.body).toMatch(/overflow-y:\s*auto/);
   });
 
+  it("leaves no gap above the buttons for a receipt that has not arrived", () => {
+    const rule = cssRules(readStyles()).find((r) => r.selector === ".drawer-actions > :empty");
+    expect(rule?.body).toMatch(/display:\s*none/);
+  });
+
   it("stacks an open confirmation and its receipt above the action buttons", () => {
     const rules = cssRules(readStyles());
     const confirm = rules.find(

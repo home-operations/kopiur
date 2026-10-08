@@ -29,4 +29,12 @@ describe("DrawerHead", () => {
     expect(screen.getByText("a gate")).toBeInTheDocument();
     expect(container.querySelector("h1, h2")).toBeNull();
   });
+
+  it("lays four headline facts in one row, three as a card's", () => {
+    const four = [1, 2, 3, 4].map((n) => ({ label: `F${String(n)}`, value: String(n) }));
+    const { container, rerender } = render(<DrawerHead stats={four} statsLabel="facts" />);
+    expect(container.querySelector("dl.stats")).toHaveClass("stats--page");
+    rerender(<DrawerHead stats={four.slice(0, 3)} statsLabel="facts" />);
+    expect(container.querySelector("dl.stats")).toHaveClass("stats--card");
+  });
 });

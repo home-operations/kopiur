@@ -43,7 +43,12 @@ export function DrawerHead({ verdict, chain, stats, statsLabel, findings }: Draw
       ) : null}
       {chain}
       {stats !== undefined && stats.length > 0 ? (
-        <StatStrip label={statsLabel ?? "At a glance"} variant="card" stats={stats} />
+        // Four facts read as one row (the page strip); three fit a card's.
+        <StatStrip
+          label={statsLabel ?? "At a glance"}
+          variant={stats.length > 3 ? "page" : "card"}
+          stats={stats}
+        />
       ) : null}
       {findings !== undefined && findings !== null && findings !== false ? (
         <div className="drawer__findings">{findings}</div>

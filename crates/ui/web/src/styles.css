@@ -1312,6 +1312,10 @@ html:has(dialog.side-panel[open]) {
 .drawer-actions > .action-bar {
   order: 2;
 }
+/* A receipt's slot before anything has been asked: no box, so no gap. */
+.drawer-actions > :empty {
+  display: none;
+}
 /* A tall question (a fan-out snapshot-now form) scrolls inside itself, so the
    buttons below it stay on screen and the body above keeps its room. */
 .side-panel__foot .action__confirm {
@@ -1412,6 +1416,9 @@ html:has(dialog.side-panel[open]) {
   padding: 0 var(--space-5);
   overflow-x: auto;
   overflow-y: hidden;
+  /* It still scrolls (swipe, shift-wheel, arrow keys move between tabs); a
+     scrollbar under a row of names only reads as clutter. */
+  scrollbar-width: none;
   background: var(--bg-surface);
   box-shadow: inset 0 -1px 0 var(--line);
 }
