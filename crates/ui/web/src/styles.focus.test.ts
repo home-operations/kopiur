@@ -38,8 +38,6 @@ const NEVER_FOCUSED = new Set([
   ".state",
   // A maintenance card is a labelled region, not a control.
   ".maintenance-card",
-  // A detail page's hero card is a labelled region, not a control.
-  ".detail-hero",
   // Floating panels and the open drawer: containers, not controls.
   ".identity__panel",
   ".ns-switcher__panel",

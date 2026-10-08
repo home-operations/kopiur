@@ -111,7 +111,6 @@ describe("cardFacts — each kind carries the three facts that say whether it is
     expect(labels(f.stats)).toEqual(["Snapshots", "Stored", "Last observed"]);
     expect(f.meta).toBe("S3 · ReadWrite");
     expect(f.lamp.key).toBe("failed");
-    expect(f.to).toBe("/repositories/repository/nas-offsite?namespace=media");
   });
 
   it("repository: an observation nothing writes is 'not reported', never a dash", () => {
@@ -134,7 +133,6 @@ describe("cardFacts — each kind carries the three facts that say whether it is
       NOW,
     );
     expect(f.meta).toContain("admits all namespaces");
-    expect(f.to).toBe("/repositories/cluster-repository/nas-offsite");
   });
 
   it("policy: a policy never verified says so loudly", () => {
@@ -151,7 +149,6 @@ describe("cardFacts — each kind carries the three facts that say whether it is
     );
     expect(labels(f.stats)).toEqual(["Next fire", "Last fire", "Failures"]);
     expect(f.lamp).toMatchObject({ key: "failed", word: "3 failed runs" });
-    expect(f.to).toBeUndefined();
   });
 
   it("snapshot: size, files, took — and an unrecognised phase is its raw word, never healthy", () => {
@@ -178,7 +175,6 @@ describe("cardFacts — each kind carries the three facts that say whether it is
     expect(labels(f.stats)).toEqual(["Quick", "Full", "Reclaimed"]);
     expect(f.stats[1].value).toEqual({ absent: "loud", text: "never run" });
     expect(f.lamp).toMatchObject({ key: "failed", word: "2 failed runs" });
-    expect(f.to).toBeUndefined();
   });
 
   it("replications: what was copied, per kind", () => {

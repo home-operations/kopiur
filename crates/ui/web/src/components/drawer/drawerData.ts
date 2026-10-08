@@ -37,21 +37,3 @@ export type DrawerData =
   | { kind: "snapshot"; detail: SnapshotDetail }
   | { kind: "restore"; detail: RestoreDetail }
   | ListOnlyCard;
-
-/** The resource as a card row: the pill, the meta line and the headline stats come from it. */
-export function cardOf(data: DrawerData): CardRow {
-  switch (data.kind) {
-    case "repository":
-    case "clusterRepository":
-      return { kind: data.kind, row: data.detail.summary };
-    case "snapshotPolicy":
-    case "snapshot":
-    case "restore":
-      return { kind: data.kind, row: data.detail.row } as CardRow;
-    case "snapshotSchedule":
-    case "maintenance":
-    case "repositoryReplication":
-    case "snapshotReplication":
-      return data;
-  }
-}

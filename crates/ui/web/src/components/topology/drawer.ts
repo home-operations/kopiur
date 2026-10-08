@@ -10,10 +10,10 @@
  * There is deliberately no kind-to-URL-segment table here. A repository's
  * URL segment is the server's `kindPath` field on `RepositorySummary` /
  * `RepositoryDetail` (addenda item 16), and the graph does not carry it — so
- * a node links to the *section* that lists its object, never to a detail
- * path this bundle guessed from the display kind. When the detail routes land
- * (Task 5), this is the one place that changes, and the segment must come
- * from `kindPath`.
+ * a node links to the *section* that lists its object, never to a path this
+ * bundle guessed from the display kind. A node whose object is a resource is
+ * also opened in the resource drawer, which addresses it by kind, namespace
+ * and name.
  */
 
 import type { NodeKind } from "../../api/types";

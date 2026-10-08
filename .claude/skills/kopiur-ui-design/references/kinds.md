@@ -9,21 +9,21 @@ backend). Those are plain mono identifiers with no stripe and no chip.
 
 ## Identity
 
-| Kind (CRD)            | Token slug (`--kind-…`)  | Glyph (lucide-react) | Nav group                           | Detail route                                               |
-| --------------------- | ------------------------ | -------------------- | ----------------------------------- | ---------------------------------------------------------- |
-| Repository            | `repository`             | `Database`           | Storage                             | `/repositories/repository/$name?namespace=`                |
-| ClusterRepository     | `cluster-repository`     | `Server`             | Storage (listed under Repositories) | `/repositories/cluster-repository/$name`                   |
-| Maintenance           | `maintenance`            | `Wrench`             | Storage                             | none — list rows only (also embedded in repository detail) |
-| RepositoryReplication | `repository-replication` | `Copy`               | Storage (Replications)              | none — list rows only                                      |
-| SnapshotReplication   | `snapshot-replication`   | `ArrowLeftRight`     | Storage (Replications)              | none — list rows only                                      |
-| SnapshotPolicy        | `snapshot-policy`        | `ScrollText`         | Protection                          | `/policies/$ns/$name`                                      |
-| SnapshotSchedule      | `snapshot-schedule`      | `CalendarClock`      | Protection                          | none — list rows only (also embedded in policy detail)     |
-| Snapshot              | `snapshot`               | `Camera`             | Data                                | `/snapshots/$ns/$name`                                     |
-| Restore               | `restore`                | `ArchiveRestore`     | Data                                | `/restores/$ns/$name`                                      |
+| Kind (CRD)            | Token slug (`--kind-…`)  | Glyph (lucide-react) | Nav group                           | Drawer (any page)                           |
+| --------------------- | ------------------------ | -------------------- | ----------------------------------- | ------------------------------------------- |
+| Repository            | `repository`             | `Database`           | Storage                             | `?inspect=repository/$ns/$name`             |
+| ClusterRepository     | `cluster-repository`     | `Server`             | Storage (listed under Repositories) | `?inspect=cluster-repository/$name`         |
+| Maintenance           | `maintenance`            | `Wrench`             | Storage                             | `?inspect=maintenance/$ns/$name`            |
+| RepositoryReplication | `repository-replication` | `Copy`               | Storage (Replications)              | `?inspect=repository-replication/$ns/$name` |
+| SnapshotReplication   | `snapshot-replication`   | `ArrowLeftRight`     | Storage (Replications)              | `?inspect=snapshot-replication/$ns/$name`   |
+| SnapshotPolicy        | `snapshot-policy`        | `ScrollText`         | Protection                          | `?inspect=snapshot-policy/$ns/$name`        |
+| SnapshotSchedule      | `snapshot-schedule`      | `CalendarClock`      | Protection                          | `?inspect=snapshot-schedule/$ns/$name`      |
+| Snapshot              | `snapshot`               | `Camera`             | Data                                | `?inspect=snapshot/$ns/$name`               |
+| Restore               | `restore`                | `ArchiveRestore`     | Data                                | `?inspect=restore/$ns/$name`                |
 
 Use the repository's `kindPath` from the wire for its URL segment; never derive it
-from the display kind. A reference to a kind with no detail route is a mini card
-that is **not a link** (see `primitives.md` → Object reference).
+from the display kind. Every reference is a mini card that opens its target in the
+resource drawer (see `primitives.md` → Object reference).
 
 The kind name is always written exactly as the CRD kind (`SnapshotPolicy`, not
 "Policy") in the small-caps label, because it is the word an operator types into
@@ -71,16 +71,16 @@ The three stat-strip numbers are the facts that answer "is this object doing its
 job?" for that kind. Field names are the camelCase wire names in
 `crates/ui-model/src/views.rs`.
 
-| Kind                           | Meta line                                                                          | Stat 1                               | Stat 2                                            | Stat 3                                               |
-| ------------------------------ | ---------------------------------------------------------------------------------- | ------------------------------------ | ------------------------------------------------- | ---------------------------------------------------- |
-| Repository / ClusterRepository | `backend` · `mode` (· "admits all namespaces" / "admits N namespaces" for cluster) | Snapshots `snapshotCount`            | Stored `totalSizeBytes`                           | Last observed `lastObservedAt`                       |
-| SnapshotPolicy                 | retention summary from `RetentionView` (only the set rules)                        | Live snapshots `activeSnapshotCount` | Last success `lastSuccessfulSnapshot`             | Last verified `lastVerified` (absent ⇒ loud _never_) |
-| SnapshotSchedule               | `cron` (mono) · `timezone`                                                         | Next fire `nextFire`                 | Last fire `lastFire`                              | Failures `consecutiveFailures`                       |
-| Snapshot                       | `origin` · pinned · `deletionPolicy` (only when set)                               | Size `sizeBytes`                     | Files `filesTotal`                                | Took (end − start)                                   |
-| Restore                        | target: "into new claim `name`" / "into `pvc`"                                     | Restored `bytesRestored`             | Files `filesRestored`                             | Took (end − start)                                   |
-| Maintenance                    | "managed by Repository `name`" when `managedByRepository`                          | Quick `quick.lastRunAt`              | Full `full.lastRunAt` (absent ⇒ loud _never run_) | Reclaimed `lastContentReclaimedBytes`                |
-| RepositoryReplication          | "every blob → `destinationBackend`" · `cron`                                       | Last replicated `lastReplicated`     | Copied `lastReplicatedBytes`                      | Blobs `lastReplicatedBlobs`                          |
-| SnapshotReplication            | "selected snapshots" · `cron`                                                      | Copied `snapshotsCopied`             | Already there `alreadyPresent`                    | Failed `failed`                                      |
+| Kind                           | Meta line                                                                          | Stat 1                               | Stat 2                                            | Stat 3                                      |
+| ------------------------------ | ---------------------------------------------------------------------------------- | ------------------------------------ | ------------------------------------------------- | ------------------------------------------- |
+| Repository / ClusterRepository | `backend` · `mode` (· "admits all namespaces" / "admits N namespaces" for cluster) | Snapshots `snapshotCount`            | Stored `totalSizeBytes`                           | Last observed `lastObservedAt`              |
+| SnapshotPolicy                 | retention summary from `RetentionView` (only the set rules)                        | Live snapshots `activeSnapshotCount` | Last success `lastSuccessfulSnapshot`             | `?inspect=snapshot-policy/$ns/$name`        |
+| SnapshotSchedule               | `cron` (mono) · `timezone`                                                         | Next fire `nextFire`                 | Last fire `lastFire`                              | `?inspect=snapshot-schedule/$ns/$name`      |
+| Snapshot                       | `origin` · pinned · `deletionPolicy` (only when set)                               | Size `sizeBytes`                     | Files `filesTotal`                                | `?inspect=snapshot/$ns/$name`               |
+| Restore                        | target: "into new claim `name`" / "into `pvc`"                                     | Restored `bytesRestored`             | Files `filesRestored`                             | `?inspect=restore/$ns/$name`                |
+| Maintenance                    | "managed by Repository `name`" when `managedByRepository`                          | Quick `quick.lastRunAt`              | Full `full.lastRunAt` (absent ⇒ loud _never run_) | `?inspect=maintenance/$ns/$name`            |
+| RepositoryReplication          | "every blob → `destinationBackend`" · `cron`                                       | Last replicated `lastReplicated`     | Copied `lastReplicatedBytes`                      | `?inspect=repository-replication/$ns/$name` |
+| SnapshotReplication            | "selected snapshots" · `cron`                                                      | Copied `snapshotsCopied`             | Already there `alreadyPresent`                    | `?inspect=snapshot-replication/$ns/$name`   |
 
 `ClusterRepository.allowedNamespaceCount` is a count only when the repository
 lists namespaces; when it admits all namespaces say **"admits all namespaces"**.
@@ -88,7 +88,7 @@ lists namespaces; when it admits all namespaces say **"admits all namespaces"**.
 
 ## Relationships
 
-Used by the flow lanes (`composites.md`), the detail-page trail, and card
+Used by the drawer's chain (`composites.md` → Resource drawer) and card
 "from / to" references.
 
 | Kind                  | Upstream (from)                                                                            | Downstream (to)                                                                                                        |
@@ -103,5 +103,5 @@ Used by the flow lanes (`composites.md`), the detail-page trail, and card
 | RepositoryReplication | source repository                                                                          | destination backend (plain mono)                                                                                       |
 | SnapshotReplication   | source repository                                                                          | destination repository                                                                                                 |
 
-Trail for a detail header, top-down: Repository › SnapshotPolicy › Snapshot ›
+Read left to right in the chain: Repository › SnapshotPolicy › Snapshot ›
 Restore. Show only the hops the object actually has.

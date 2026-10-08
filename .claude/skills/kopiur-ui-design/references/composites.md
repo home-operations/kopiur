@@ -65,18 +65,32 @@ segment is not drawn.
 
 ---
 
-## Relationships (flow lanes)
+## Resource drawer (a resource's details)
 
-On a repository's (and policy's) detail page: what feeds it and what it feeds,
-left to right — **Fired by → Written by → This repository → Copies to** — as
-lanes of summary cards with an arrow between lanes. The centre card is the
-object itself with its stat strip. An empty lane says why in a muted line
-("Nothing copies this repository."). A gap that is a problem is loud
-("No schedule fires `app-data-weekly`" as a loud absence under the policy card).
+There are no detail pages. Every resource — whatever its kind — is looked at in
+the side panel (`primitives.md` → Side panel), over the page it was opened from,
+in three bands:
 
-Lanes collapse to a vertical sequence below 900px (arrows rotate to point down).
-The lanes are also the page's spoken account of the relationships, so every card
-is a real link or reference — nothing is drawn-only.
+1. **Main information** (`.drawer__head`): the verdict (a lettered lamp and one
+   sentence; never healthy while anything it reads is loading or refused), then
+   the **chain** — what feeds it → _this_ → what it feeds, each step a list of
+   references with their own pills (`kinds.md` → Relationships) — then three or
+   four headline stats, then any gate holding it or the failure that ended it.
+2. **Tabs** for everything else, one tab per question (Storage, Catalog,
+   Maintenance, Sessions, Conditions for a repository; Backs up, Retention,
+   Verification, Snapshots, Conditions for a policy; Run, Storage, Retention,
+   Lineage, Log, Conditions for a snapshot; Source, Target, Log, Conditions for a
+   restore). The panel is the scroller; a tab that reads something (a snapshot's
+   retention plan) reads it when opened. A kind with one tab draws no tab list.
+3. **Actions** in the foot: the kind's controls in a row, an open inline
+   confirmation and any receipt stacked above them. The buttons never scroll out
+   of view; a tall confirmation scrolls inside itself. A kind with nothing to act
+   on (a Restore) has no foot.
+
+Old detail addresses (`/policies/<ns>/<name>` and the like) redirect to the
+kind's list with the drawer open on the same object. The snapshot file browser
+stays a page of its own (a workspace, not a detail); the snapshot drawer's
+"Browse files" opens it, and its "Back to <name>" returns to the drawer.
 
 The cross-cluster **Topology** screen keeps its graph board; its plates are
 summary object cards (232px) and every edge keeps a word label for its kind and,

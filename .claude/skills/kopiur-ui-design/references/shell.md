@@ -67,7 +67,8 @@ button.
 
 `--bg-canvas`, padded `--space-5`, capped at `--content-max`. Every page starts
 with the **page title** (`--text-xl`, bold) and the scope in mono beside it, then
-the page's own content (detail pages: trail → hero → stat strip).
+the page's own content. A resource's details are never a page: they open in the
+side panel over the page (`composites.md` → Resource drawer).
 
 A global problem banner (a request error not tied to a region) is a finding that
 spans the content width above the page title.
@@ -77,7 +78,8 @@ spans the content width above the page title.
 Below 900px the sidebar becomes an off-canvas drawer opened from a compact bar at
 the top of the content (brand + menu button + the namespace button); the drawer
 holds the same five parts. Type sizes never scale with the viewport. Card grids
-step 4 → 2 → 1 columns; flow lanes stack vertically; stat strips go 4 → 2 columns.
+step 4 → 2 → 1 columns; stat strips go 4 → 2 columns; the side panel fills the
+screen below 560px.
 
 ## Skip link
 

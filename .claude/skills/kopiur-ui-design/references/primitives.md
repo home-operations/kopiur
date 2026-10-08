@@ -245,8 +245,8 @@ status pill.
 ```
 
 **Variants:** show `namespace/` before the name only when it differs from the
-surrounding context. A kind with no detail route (Schedule, Maintenance, the
-replications — see `kinds.md`) renders as a `<span class="ref">`, not a link. A
+surrounding context. Every reference is a link that opens its target in the
+resource drawer, whatever its kind. A
 dangling reference (graph `missing`, a policy naming a repository that does not
 exist) gets a dashed border and the unknown pill reading "not found".
 
@@ -333,7 +333,7 @@ One primary per region. Danger is for actions that stop backups or delete data.
 ## Stat strip (facts)
 
 **What:** a handful of named values about one object. One card, cells divided by
-hairlines, label above value. Four per row on a detail page, three inside an
+hairlines, label above value. Four per row at the top of the drawer, three inside an
 object card.
 
 ```html
@@ -415,7 +415,7 @@ A fact with no value that is none of the three is **dropped**, not rendered.
 
 ## Time
 
-Relative first ("58m ago", "in 39m"), in tabular figures. On detail pages and in
+Relative first ("58m ago", "in 39m"), in tabular figures. In the drawer and in
 stat strips the absolute instant sits beneath in small mono (`.stats__abs`). In
 tables, the absolute instant is the cell's `title` and a `<time datetime>`.
 
@@ -503,8 +503,8 @@ of three (per `kinds.md`). Stripe on the left edge.
 }
 ```
 
-Variant **summary** (no stat strip) is used in flow lanes and topology plates.
-The name is the link to the detail route; the card itself is not one big link.
+Variant **summary** (no stat strip) is used in topology plates.
+The name opens it in the resource drawer; the card itself is not one big link.
 
 ---
 
@@ -601,25 +601,6 @@ inside `.table-wrap` rather than starving a column. Long names wrap at `/` and `
 
 ---
 
-## Detail header
-
-**What:** the top of every object's page. Trail, then the hero, then a stat strip.
-
-1. **Trail** — the object's upstream chain as references separated by `›`, ending
-   in the words "this snapshot" (etc.). Only hops the object actually has
-   (`kinds.md` → Relationships). Objects outside this cluster are named, not linked.
-2. **Hero card** (stripe + `kind-chip--lg`) — kind name, mono name, namespace,
-   status pill on the right; then the **verdict**, one sentence in `--text-lg`
-   saying what state the object is in and why it matters ("Succeeded: a manual run
-   under app-data. It is pinned, so retention will never prune it."); then the
-   **action row**.
-3. **Stat strip** of four, below the hero.
-
-The verdict is never the healthy state while any read on the page is loading,
-refused or empty — then it says so ("Checking…", "Cannot tell: …").
-
----
-
 ## Side panel (the resource drawer)
 
 **What:** a resource's details, floating over the right edge of the page. Every
@@ -641,7 +622,9 @@ resource is looked at without leaving the page you are on.
       <button class="button button--quiet" aria-label="Close details">×</button>
     </header>
     <div class="side-panel__body">…stat strip, facts, related references…</div>
-    <footer class="side-panel__foot"><a>Open full page</a></footer>
+    <footer class="side-panel__foot">
+      <div class="drawer-actions"><div class="action-bar">…</div></div>
+    </footer>
   </div>
 </dialog>
 ```

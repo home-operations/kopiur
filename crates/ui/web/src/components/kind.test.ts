@@ -47,23 +47,3 @@ describe("parseRef", () => {
     expect(parseRef("")).toBeNull();
   });
 });
-
-describe("detailHref", () => {
-  it("is the object's page for a kind that has one, and nothing for a kind that does not", async () => {
-    const { detailHref } = await import("./kind");
-    expect(detailHref("repository", "nas", "media")).toBe(
-      "/repositories/repository/nas?namespace=media",
-    );
-    expect(detailHref("clusterRepository", "shared")).toBe(
-      "/repositories/cluster-repository/shared",
-    );
-    expect(detailHref("snapshotPolicy", "app-data", "kopiur-dev")).toBe(
-      "/policies/kopiur-dev/app-data",
-    );
-    expect(detailHref("snapshot", "s1", "media")).toBe("/snapshots/media/s1");
-    expect(detailHref("restore", "r1", "media")).toBe("/restores/media/r1");
-    expect(detailHref("snapshotSchedule", "nightly", "media")).toBeUndefined();
-    expect(detailHref("maintenance", "nas", "media")).toBeUndefined();
-    expect(detailHref("snapshotReplication", "x", "media")).toBeUndefined();
-  });
-});
