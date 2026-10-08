@@ -52,6 +52,7 @@ import type {
   MaintenanceRunBody,
   Me,
   NamespaceSummary,
+  OverviewView,
   Page,
   PolicyDetail,
   PolicyRow,
@@ -98,6 +99,7 @@ const API = "/api/v1";
 export const paths = {
   me: `${API}/me`,
   namespaces: `${API}/namespaces`,
+  overview: `${API}/overview`,
   status: `${API}/status`,
   graph: `${API}/graph`,
   repositories: `${API}/repositories`,
@@ -197,6 +199,7 @@ export interface TreeParams {
 export const queryKeys = {
   me: (namespace: Namespace) => ["me", { namespace: namespace ?? null }] as const,
   namespaces: () => ["namespaces"] as const,
+  overview: (namespace: Namespace) => ["overview", { namespace: namespace ?? null }] as const,
   status: (namespace: Namespace) => ["status", { namespace: namespace ?? null }] as const,
   graph: (namespace: Namespace) => ["graph", { namespace: namespace ?? null }] as const,
   repositories: (namespace: Namespace) =>
@@ -315,6 +318,15 @@ export function useNamespaces(options: ReadOptions = {}) {
     staleTime: staleTime.list,
     ...options,
   });
+}
+
+/** The fleet by kind: per-kind health tallies for the scope. */
+export function useOverview(namespace: Namespace, options: ReadOptions = {}) {
+  return useApiQuery<OverviewView>(
+    queryKeys.overview(namespace),
+    withQuery(paths.overview, { namespace }),
+    { staleTime: staleTime.list, ...options },
+  );
 }
 
 export function useStatus(namespace: Namespace, options: ReadOptions = {}) {

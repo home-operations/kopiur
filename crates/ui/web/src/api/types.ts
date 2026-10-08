@@ -88,3 +88,7 @@ export type { SnapshotRow } from "./types/SnapshotRow";
 export type { SnapshotStatsView } from "./types/SnapshotStatsView";
 export type { StatusOverview } from "./types/StatusOverview";
 export type { SuspendBody } from "./types/SuspendBody";
+export type { HealthCount } from "./types/HealthCount";
+export type { KindTally } from "./types/KindTally";
+export type { ObjectKind } from "./types/ObjectKind";
+export type { OverviewView } from "./types/OverviewView";

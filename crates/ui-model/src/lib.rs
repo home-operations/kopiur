@@ -53,6 +53,7 @@
 //! | [`views::ReplicationPhaseView`] | `pending`, `replicating`, `succeeded`, `failed`, `suspended` | `{ unknown: { raw: string } }` | `unknown` |
 //! | [`views::OriginView`] | `scheduled`, `manual`, `discovered`, `adopted`, `replicated` | — | **none** — `Origin` is parsed strictly and an unrecognized marker never decodes |
 //! | [`views::DoctorScopeView`] | `namespace`, `installation`, `mixed` | — | **none** |
+//! | [`views::ObjectKind`] | `repository`, `clusterRepository`, `maintenance`, `snapshotPolicy`, `snapshotSchedule`, `snapshot`, `restore`, `repositoryReplication`, `snapshotReplication` | — | **none** — a new kind must be given an identity before it ships |
 //! | [`views::AdmittedNamespacesView`] | `all`, `none` | `{ listed: { count } }`, `{ selector: { selector } }` | **none** — exhaustive over the spec's `AllowedNamespaces` |
 //! | [`views::EntryKind`] | `file`, `dir`, `symlink` | `{ other: { raw: string } }` | **`other`**, not `unknown` |
 //! | [`requests::RestoreSourceBody`] | — | `{ snapshotRef: … }`, `{ fromPolicy: … }`, `{ identity: … }` | none (a request body: the client picks the variant) |
@@ -115,6 +116,7 @@ pub fn export_all(dir: &Path) -> Result<(), ExportError> {
     views::SnapshotReplicationRow::export_all(&cfg)?;
     views::ReplicationsView::export_all(&cfg)?;
     views::NamespaceSummary::export_all(&cfg)?;
+    views::OverviewView::export_all(&cfg)?;
     views::DoctorReportView::export_all(&cfg)?;
     views::GateDescriptor::export_all(&cfg)?;
     views::EventRow::export_all(&cfg)?;
@@ -203,7 +205,7 @@ mod tests {
             .filter(|n| n.ends_with(".ts"))
             .count();
         assert_eq!(
-            exported, 76,
+            exported, 80,
             "expected one .ts file per wire type; add the new type's root to \
              `export_all` and bump this count deliberately. 64 -> 65 when \
              `GateSeverityView` replaced `GateHit.severity`/`GateDescriptor.severity`'s \
@@ -226,7 +228,9 @@ mod tests {
              `ClusterRepository`'s admission from its spec instead of passing \
              the controller's `-1` (all) / `0` (selector) sentinels through as \
              a count; 75 -> 76 for `NamespaceSummary`, the namespace \
-             switcher's list"
+             switcher's list; 76 -> 80 for `OverviewView` and its \
+             `KindTally`, `HealthCount` and `ObjectKind`, the overview's \
+             fleet-by-kind tiles"
         );
     }
 }

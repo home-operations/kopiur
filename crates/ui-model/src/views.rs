@@ -814,6 +814,72 @@ pub struct RepoVerificationView {
     pub last_verified: Option<String>,
 }
 
+/// The nine kopiur kinds the console shows, as one closed vocabulary.
+///
+/// The SPA keys each kind's identity (colour, glyph, label) on this, so a new
+/// kind cannot reach the console without being given one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum ObjectKind {
+    /// `Repository`.
+    Repository,
+    /// `ClusterRepository`.
+    ClusterRepository,
+    /// `Maintenance`.
+    Maintenance,
+    /// `SnapshotPolicy`.
+    SnapshotPolicy,
+    /// `SnapshotSchedule`.
+    SnapshotSchedule,
+    /// `Snapshot`.
+    Snapshot,
+    /// `Restore`.
+    Restore,
+    /// `RepositoryReplication`.
+    RepositoryReplication,
+    /// `SnapshotReplication`.
+    SnapshotReplication,
+}
+
+/// How many objects of one kind are in one health state.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct HealthCount {
+    /// The state.
+    pub health: Health,
+    /// How many objects are in it.
+    pub count: u32,
+}
+
+/// One kind's objects in scope, split by health.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct KindTally {
+    /// The kind.
+    pub kind: ObjectKind,
+    /// Every object of this kind in scope (for snapshots, only the window).
+    pub total: u32,
+    /// Non-zero states only, worst first: failed, degraded, pending, unknown,
+    /// suspended, healthy.
+    pub by_health: Vec<HealthCount>,
+}
+
+/// `GET /api/v1/overview` — the fleet by kind.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct OverviewView {
+    /// All nine kinds, in [`ObjectKind`] order, zero-total ones included.
+    pub kinds: Vec<KindTally>,
+    /// Snapshots are counted over this many trailing hours.
+    pub snapshot_window_hours: u32,
+    /// RFC3339 instant the tallies were taken.
+    pub generated_at: String,
+}
+
 /// A namespace that holds kopiur objects the caller may see.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]

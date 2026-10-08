@@ -35,15 +35,15 @@ The kind name is always written exactly as the CRD kind (`SnapshotPolicy`, not
 Only some kinds publish a health. The pill on every other kind is built from a
 **fact**, worded as the fact, never as an invented verdict.
 
-| Kind                                       | Pill comes from                               | Words                                                                                   |
-| ------------------------------------------ | --------------------------------------------- | --------------------------------------------------------------------------------------- |
-| Repository, ClusterRepository              | `RepositorySummary.health: Health`            | Healthy · Degraded · Failed · Pending · Suspended · Unknown                             |
-| Snapshot                                   | `SnapshotRow.phase: SnapshotPhaseView`        | Pending · Running · Succeeded · Failed · Deleting · Discovered · Unchanged · _raw word_ |
-| Restore                                    | `RestoreRow.phase: RestorePhaseView`          | Pending · Resolving · Restoring · Completed · Failed · _raw word_                       |
-| RepositoryReplication, SnapshotReplication | `phase: ReplicationPhaseView`                 | Pending · Replicating · Succeeded · Failed · Suspended · _raw word_                     |
-| SnapshotPolicy                             | `suspended`, gates                            | Active · Suspended · (error gate ⇒ failed pill with the gate's reason)                  |
-| SnapshotSchedule                           | `suspended`, `consecutiveFailures`            | Active · Suspended · "N failed runs" (failed pill)                                      |
-| Maintenance                                | `quick/full.consecutiveFailures`, `lastRunAt` | OK · "N failed runs" · "never run" (failed pill)                                        |
+| Kind                                       | Pill comes from                        | Words                                                                                   |
+| ------------------------------------------ | -------------------------------------- | --------------------------------------------------------------------------------------- |
+| Repository, ClusterRepository              | `RepositorySummary.health: Health`     | Healthy · Degraded · Failed · Pending · Suspended · Unknown                             |
+| Snapshot                                   | `SnapshotRow.phase: SnapshotPhaseView` | Pending · Running · Succeeded · Failed · Deleting · Discovered · Unchanged · _raw word_ |
+| Restore                                    | `RestoreRow.phase: RestorePhaseView`   | Pending · Resolving · Restoring · Completed · Failed · _raw word_                       |
+| RepositoryReplication, SnapshotReplication | `phase: ReplicationPhaseView`          | Pending · Replicating · Succeeded · Failed · Suspended · _raw word_                     |
+| SnapshotPolicy                             | `suspended`, gates                     | Active · Suspended · (error gate ⇒ failed pill with the gate's reason)                  |
+| SnapshotSchedule                           | `suspended`, `consecutiveFailures`     | Active · Suspended · "N failed runs" (failed pill)                                      |
+| Maintenance                                | `quick/full.consecutiveFailures`       | OK · "N failed runs" (failed pill); "never run" is a loud stat, not the pill            |
 
 Phase → pill state mapping:
 
@@ -51,10 +51,15 @@ Phase → pill state mapping:
 | ---------- | --------------------------------------------------------------------------------------- |
 | healthy    | Succeeded, Completed, Unchanged, Active, OK                                             |
 | pending    | Pending, Running, Resolving, Restoring, Replicating, Initializing, Deleting             |
-| failed     | Failed, any "N failed runs", "never run", "never verified"                              |
+| failed     | Failed, any "N failed runs"; error-gated policies                                       |
 | degraded   | Degraded                                                                                |
 | suspended  | Suspended                                                                               |
 | unknown    | Unknown, Discovered (not ours to judge), **any `{unknown: {raw}}` — show the raw word** |
+
+"never run" and "never verified" are **loud absences** on a card's stat strip
+(`primitives.md` → Stat strip), not pill states: a new repository has not had
+its first full maintenance yet, and that is not something to fix. The overview
+tallies (`/api/v1/overview`) bucket exactly as this table says.
 
 Icon per state: healthy `CircleCheck` · failed `OctagonX` · degraded
 `TriangleAlert` · pending `Clock` (in-flight phases use `CirclePlay`) · suspended
