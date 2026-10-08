@@ -1,4 +1,3 @@
-import { Link } from "@tanstack/react-router";
 import type { ReactNode } from "react";
 
 import type { Lamp } from "../health";
@@ -6,13 +5,14 @@ import { KIND_META } from "../kind";
 import { type CardRow, cardFacts } from "../objectCard";
 import type { TabSpec } from "../Tabs";
 import { Chain, type ChainStep } from "./Chain";
-import { type DrawerData, cardOf } from "./drawerData";
+import type { DrawerData } from "./drawerData";
 import { type DrawerRelation, drawerFacts } from "./drawerFacts";
 import { DrawerHead } from "./DrawerHead";
 import { FactsList } from "./FactsList";
 import { ListActions } from "./ListActions";
 import { policyView } from "./policy/policyView";
 import { repositoryView } from "./repository/repositoryView";
+import { restoreView } from "./restore/restoreView";
 import { snapshotView } from "./snapshot/snapshotView";
 
 /**
@@ -39,19 +39,8 @@ export function drawerView(data: DrawerData, now: Date): DrawerView {
       return policyView(data.detail, data.repositories, now);
     case "snapshot":
       return snapshotView(data.detail, now);
-    case "restore": {
-      const card = cardOf(data);
-      const to = cardFacts(card, now).to;
-      return cardView(
-        card,
-        now,
-        to !== undefined ? (
-          <Link className="button" to={to}>
-            Open full page
-          </Link>
-        ) : undefined,
-      );
-    }
+    case "restore":
+      return restoreView(data.detail, now);
     case "snapshotSchedule":
     case "maintenance":
     case "repositoryReplication":
