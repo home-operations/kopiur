@@ -1,5 +1,5 @@
 import { Camera, Trash2 } from "lucide-react";
-import { useState } from "react";
+import { type ReactNode, useState } from "react";
 
 import { useDeleteSnapshot, useSnapshotNow } from "../api/hooks";
 import type { SnapshotRow } from "../api/types";
@@ -40,12 +40,14 @@ import { useCapabilityReason } from "./useCapabilityReason";
  */
 export interface SnapshotActionsProps {
   row: SnapshotRow;
+  /** More controls for the end of the bar — the drawer's "Browse files". */
+  extra?: ReactNode;
 }
 
 /** Which confirmation is open. */
 type ActionId = "snapshot-now" | "delete";
 
-export function SnapshotActions({ row }: SnapshotActionsProps) {
+export function SnapshotActions({ row, extra }: SnapshotActionsProps) {
   const snapshotNow = useSnapshotNow();
   const remove = useDeleteSnapshot();
   const [open, setOpen] = useState<ActionId | null>(null);
@@ -101,6 +103,7 @@ export function SnapshotActions({ row }: SnapshotActionsProps) {
           <Trash2 size={14} strokeWidth={2} aria-hidden="true" />
           Delete
         </ActionButton>
+        {extra}
       </div>
 
       {open === "snapshot-now" && hasPolicy ? (

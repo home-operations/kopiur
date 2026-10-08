@@ -13,6 +13,7 @@ import { FactsList } from "./FactsList";
 import { ListActions } from "./ListActions";
 import { policyView } from "./policy/policyView";
 import { repositoryView } from "./repository/repositoryView";
+import { snapshotView } from "./snapshot/snapshotView";
 
 /**
  * Everything the drawer shows for one resource, in its three bands: the main
@@ -37,6 +38,7 @@ export function drawerView(data: DrawerData, now: Date): DrawerView {
     case "snapshotPolicy":
       return policyView(data.detail, data.repositories, now);
     case "snapshot":
+      return snapshotView(data.detail, now);
     case "restore": {
       const card = cardOf(data);
       const to = cardFacts(card, now).to;

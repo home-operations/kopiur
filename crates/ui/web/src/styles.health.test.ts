@@ -157,8 +157,9 @@ const INK_ON_TEXT: ReadonlyMap<string, Exception> = new Map<string, Exception>([
       reason:
         "The cell's own text is `N failed` plus a visually-hidden `to read`. " +
         "The word `failed` is already in the sentence the colour emphasises. " +
-        "Two call sites: the ledger cell and the detail's twin of it.",
-      callSites: 2,
+        "Three call sites while the snapshot page is retired: the ledger cell, the " +
+        "page's twin of it, and the drawer's Run tab.",
+      callSites: 3,
     },
   ],
   [

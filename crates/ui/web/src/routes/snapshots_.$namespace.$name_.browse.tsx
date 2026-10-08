@@ -9,6 +9,7 @@ import { LoadingState } from "../components/LoadingState";
 import { Breadcrumbs } from "../components/browse/Breadcrumbs";
 import { DirTable } from "../components/browse/DirTable";
 import { SessionBar } from "../components/browse/SessionBar";
+import { inspectToken } from "../components/inspect";
 import {
   breadcrumbs,
   browseOffsetParam,
@@ -105,10 +106,13 @@ function BrowseRoute() {
       <Link
         className="button"
         to="/snapshots"
-        search={scope !== undefined ? { namespace: scope } : {}}
+        search={{
+          ...(scope !== undefined ? { namespace: scope } : {}),
+          inspect: inspectToken({ kind: "snapshot", namespace, name }),
+        }}
       >
         <Camera size={14} strokeWidth={2} aria-hidden="true" />
-        All snapshots
+        Back to {name}
       </Link>
     </header>
   );

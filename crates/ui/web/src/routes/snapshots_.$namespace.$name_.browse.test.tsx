@@ -476,3 +476,14 @@ describe("Snapshot file browser — refused reads", () => {
     expect(screen.queryByText("The browse session has ended")).toBeNull();
   });
 });
+
+describe("Snapshot file browser — the way back", () => {
+  it("goes back to the snapshot it browses, in the drawer, keeping the scope", async () => {
+    fetchMock.mockResponse(() => new Promise<Response>(() => undefined));
+    mountApp("/snapshots/media/nightly-29/browse?namespace=media");
+    const back = await screen.findByRole("link", { name: /Back to nightly-29/ });
+    expect(back.getAttribute("href")).toBe(
+      "/snapshots?namespace=media&inspect=snapshot%2Fmedia%2Fnightly-29",
+    );
+  });
+});
