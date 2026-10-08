@@ -77,3 +77,21 @@ describe("LoadingState", () => {
     expect(container.querySelector(".spinner")).toBeNull();
   });
 });
+
+describe("page states — compact, left-aligned, led by an icon tile", () => {
+  it("puts the empty state's icon in a tile beside the words", () => {
+    const { container } = render(<EmptyState title="No restores yet">How one is made.</EmptyState>);
+    const tile = container.querySelector(".state__icon");
+    expect(tile?.querySelector("svg")).not.toBeNull();
+    expect(tile).toHaveAttribute("aria-hidden", "true");
+  });
+
+  it("marks a refusal with the shield-x and offers no retry", () => {
+    const { container } = render(
+      <ErrorState problem={forbidden} what="restores" onRetry={vi.fn()} />,
+    );
+    const state = container.querySelector('[data-state="not-permitted"]');
+    expect(state?.querySelector(".state__icon svg.lucide-shield-x")).not.toBeNull();
+    expect(screen.queryByRole("button", { name: /retry/i })).toBeNull();
+  });
+});

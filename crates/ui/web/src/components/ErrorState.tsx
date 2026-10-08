@@ -1,4 +1,4 @@
-import { CircleAlert, ShieldOff } from "lucide-react";
+import { OctagonX, ShieldX } from "lucide-react";
 import type { ReactNode } from "react";
 
 import { isNotPermitted } from "../api/problem";
@@ -28,9 +28,11 @@ export function ErrorState({ problem, what, onRetry, actions }: ErrorStateProps)
     return <NotPermittedState problem={problem} what={what} actions={actions} />;
   }
   return (
-    <div className="state">
+    <div className="state" data-tone="failed">
+      <span className="state__icon" aria-hidden="true">
+        <OctagonX strokeWidth={2} />
+      </span>
       <h2 className="state__title">
-        <CircleAlert size={18} strokeWidth={1.75} aria-hidden="true" />
         <span>{what !== undefined ? `Could not load ${what}` : "Something failed"}</span>
       </h2>
       <ProblemBanner problem={problem} />
@@ -57,9 +59,11 @@ export interface NotPermittedStateProps {
  */
 export function NotPermittedState({ problem, what, actions }: NotPermittedStateProps) {
   return (
-    <div className="state" data-state="not-permitted">
+    <div className="state" data-state="not-permitted" data-tone="degraded">
+      <span className="state__icon" aria-hidden="true">
+        <ShieldX strokeWidth={2} />
+      </span>
       <h2 className="state__title">
-        <ShieldOff size={18} strokeWidth={1.75} aria-hidden="true" />
         <span>{what !== undefined ? `Not permitted to view ${what}` : "Not permitted"}</span>
       </h2>
       <p className="state__body">

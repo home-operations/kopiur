@@ -33,6 +33,9 @@ const NEVER_FOCUSED = new Set([
   // never focusable themselves; the links inside them carry the ring.
   ".stats",
   ".object-card",
+  // A finding (`<article>`/`<div>`) and a page state are cards, not controls.
+  ".finding",
+  ".state",
   // Floating panels and the open drawer: containers, not controls.
   ".identity__panel",
   ".ns-switcher__panel",
