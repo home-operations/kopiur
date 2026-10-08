@@ -270,6 +270,9 @@ pub struct RepositoryDetail {
     pub conditions: Vec<ConditionView>,
     /// Policies that write into this repository.
     pub policies: Vec<PolicyRef>,
+    /// Schedules that fire any policy writing into this repository, sorted by
+    /// namespace then name — the "fired by" end of its relationships.
+    pub schedules: Vec<ScheduleRow>,
     /// Names of replications that read from this repository.
     pub replications_out: Vec<String>,
     /// Names of replications that write into this repository.

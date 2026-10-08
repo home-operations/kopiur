@@ -22,12 +22,12 @@ use kopiur_api::gates::GateScope;
 use kopiur_api::repository::CatalogCoverage;
 use kopiur_api::{
     ClusterRepository, Maintenance, Repository, RepositoryPhase, RepositoryReplication,
-    SnapshotPolicy, SnapshotReplication,
+    SnapshotPolicy, SnapshotReplication, SnapshotSchedule,
 };
 use kopiur_ui_model::graph::GateHit;
 use kopiur_ui_model::views::{
     AdmittedNamespacesView, CatalogCoverageView, CatalogView, HealthProbeView, PolicyRef,
-    RepositoryDetail, RepositorySummary, SeedView, ServerView, SessionInfo,
+    RepositoryDetail, RepositorySummary, ScheduleRow, SeedView, ServerView, SessionInfo,
 };
 
 use crate::AppState;
@@ -35,6 +35,7 @@ use crate::api::graph::repository_health;
 use crate::api::maintenance::maintenance_row;
 use crate::api::policies::writes_into;
 use crate::api::problem::{ApiError, problem};
+use crate::api::schedules::{fires_policy, schedule_row};
 use crate::api::{
     NamespaceQuery, RepositoryKindPath, UiPath, UiQuery, client_for, conditions_view,
     covering_maintenances, gate_hits, ops_ctx, repo_phase_view,
@@ -213,9 +214,12 @@ pub fn view_detail(
     snapshot_replications: &[Arc<SnapshotReplication>],
     repository_replications: &[Arc<RepositoryReplication>],
     maintenances: &[Arc<Maintenance>],
+    schedules: &[Arc<SnapshotSchedule>],
     sessions: Vec<SessionInfo>,
 ) -> RepositoryDetail {
     let name = summary.name.clone();
+    let writing: Vec<&Arc<SnapshotPolicy>> =
+        policies.iter().filter(|p| writes_into(p, key)).collect();
     RepositoryDetail {
         identity_cluster,
         catalog,
@@ -227,6 +231,7 @@ pub fn view_detail(
         gates: gate_hits(conditions, GateScope::covers_repository),
         conditions: conditions_view(conditions),
         policies: policies_writing_into(policies, key),
+        schedules: schedules_firing(schedules, &writing),
         replications_out: replications_from(snapshot_replications, repository_replications, key),
         replications_in: replications_into(snapshot_replications, key),
         sessions,
@@ -247,6 +252,24 @@ fn policies_writing_into(policies: &[Arc<SnapshotPolicy>], key: &str) -> Vec<Pol
             name: p.metadata.name.clone().unwrap_or_default(),
         })
         .collect()
+}
+
+/// **Pure.** The schedules that fire any of `writing`, as rows, sorted.
+///
+/// [`fires_policy`] is the schedule screen's own predicate (a `policyRef` by
+/// name in the schedule's namespace, a `policySelector` with the operator's
+/// matcher), so this lane can never disagree with what the operator fires.
+fn schedules_firing(
+    schedules: &[Arc<SnapshotSchedule>],
+    writing: &[&Arc<SnapshotPolicy>],
+) -> Vec<ScheduleRow> {
+    let mut rows: Vec<ScheduleRow> = schedules
+        .iter()
+        .filter(|s| writing.iter().any(|p| fires_policy(s, p)))
+        .map(|s| schedule_row(s))
+        .collect();
+    rows.sort_by(|a, b| (&a.namespace, &a.name).cmp(&(&b.namespace, &b.name)));
+    rows
 }
 
 /// **Pure.** Names of the replications that *read* from `key` — both kinds, since
@@ -440,6 +463,10 @@ async fn detail(
         .list::<RepositoryReplication>(&id, &client, None)
         .await?;
     let maintenances = app.source.list::<Maintenance>(&id, &client, None).await?;
+    let schedules = app
+        .source
+        .list::<SnapshotSchedule>(&id, &client, None)
+        .await?;
 
     let sessions = load_sessions(&app, client, kind.kind(), repo_ns.as_deref(), &name).await?;
 
@@ -457,6 +484,7 @@ async fn detail(
         &snapshot_replications,
         &repository_replications,
         &maintenances,
+        &schedules,
         sessions,
     )))
 }
@@ -922,6 +950,7 @@ spec:
             &snapshot_replications,
             &repository_replications,
             &[],
+            &[],
             Vec::new(),
         );
 
@@ -937,6 +966,93 @@ spec:
         assert_eq!(detail.replications_in, vec!["inbound"]);
         assert_eq!(detail.identity_cluster.as_deref(), Some("east"));
         assert!(detail.maintenance.is_none());
+    }
+
+    /// The "fired by" lane on the repository page: every schedule that fires a
+    /// policy writing here, whether it names the policy or selects it. A
+    /// schedule firing a policy that writes elsewhere is not listed.
+    #[test]
+    fn the_detail_lists_the_schedules_that_fire_policies_writing_here() {
+        let named_policy: SnapshotPolicy = from_yaml(
+            r#"
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: SnapshotPolicy
+metadata: { name: nightly, namespace: media }
+spec:
+  repository: { kind: Repository, name: nas }
+  sources: [{ pvc: { name: data } }]
+"#,
+        );
+        let gold_policy: SnapshotPolicy = from_yaml(
+            r#"
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: SnapshotPolicy
+metadata: { name: gold, namespace: media, labels: { tier: gold } }
+spec:
+  repository: { kind: Repository, name: nas }
+  sources: [{ pvc: { name: db } }]
+"#,
+        );
+        let elsewhere_policy: SnapshotPolicy = from_yaml(
+            r#"
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: SnapshotPolicy
+metadata: { name: archive, namespace: media }
+spec:
+  repository: { kind: Repository, name: tape }
+  sources: [{ pvc: { name: old } }]
+"#,
+        );
+        let schedule = |name: &str, target: &str| -> Arc<SnapshotSchedule> {
+            Arc::new(from_yaml(&format!(
+                r#"
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: SnapshotSchedule
+metadata: {{ name: {name}, namespace: media }}
+spec:
+  {target}
+  schedule: {{ cron: "0 2 * * *" }}
+"#
+            )))
+        };
+        let schedules = vec![
+            schedule("nightly-cron", "policyRef: { name: nightly }"),
+            schedule(
+                "gold-cron",
+                "policySelector: { matchLabels: { tier: gold } }",
+            ),
+            schedule("archive-cron", "policyRef: { name: archive }"),
+        ];
+        let policies = vec![
+            Arc::new(named_policy),
+            Arc::new(gold_policy),
+            Arc::new(elsewhere_policy),
+        ];
+
+        let detail = view_detail(
+            view_repository(&nas()),
+            "Repository/media/nas",
+            RepositoryKind::Repository,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            &policies,
+            &[],
+            &[],
+            &[],
+            &schedules,
+            Vec::new(),
+        );
+
+        let names: Vec<&str> = detail.schedules.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["gold-cron", "nightly-cron"],
+            "sorted, and archive-cron fires a policy writing elsewhere"
+        );
     }
 
     #[test]

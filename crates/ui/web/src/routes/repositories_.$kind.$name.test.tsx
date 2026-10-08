@@ -90,6 +90,7 @@ const detail: RepositoryDetail = {
     },
   ],
   policies: [{ namespace: "media", name: "nightly" }],
+  schedules: [],
   replicationsOut: ["offsite"],
   replicationsIn: [],
   sessions: [

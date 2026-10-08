@@ -34,6 +34,7 @@ const bare: RepositoryDetailData = {
   gates: [],
   conditions: [],
   policies: [],
+  schedules: [],
   replicationsOut: [],
   replicationsIn: [],
   sessions: [],

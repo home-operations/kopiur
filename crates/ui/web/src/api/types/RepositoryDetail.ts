@@ -6,6 +6,7 @@ import type { HealthProbeView } from "./HealthProbeView";
 import type { MaintenanceRow } from "./MaintenanceRow";
 import type { PolicyRef } from "./PolicyRef";
 import type { RepositorySummary } from "./RepositorySummary";
+import type { ScheduleRow } from "./ScheduleRow";
 import type { SeedView } from "./SeedView";
 import type { ServerView } from "./ServerView";
 import type { SessionInfo } from "./SessionInfo";
@@ -56,6 +57,11 @@ conditions: Array<ConditionView>,
  * Policies that write into this repository.
  */
 policies: Array<PolicyRef>,
+/**
+ * Schedules that fire any policy writing into this repository, sorted by
+ * namespace then name — the "fired by" end of its relationships.
+ */
+schedules: Array<ScheduleRow>,
 /**
  * Names of replications that read from this repository.
  */
