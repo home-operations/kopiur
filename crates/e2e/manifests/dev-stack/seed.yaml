@@ -380,6 +380,52 @@ spec:
   volumeName: kopiur-dev-shared-list
   resources: { requests: { storage: 1Gi } }
 ---
+# A filesystem ClusterRepository is mounted by the claim of the same name in
+# whichever namespace the mover runs: kopiur-dev needs its own, on the same directory.
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: kopiur-dev-shared-list-kopiur-dev
+spec:
+  capacity: { storage: 1Gi }
+  accessModes: [ReadWriteOnce]
+  storageClassName: ""
+  hostPath: { path: /kopiur-dev/shared-list, type: Directory }
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: shared-list
+  namespace: kopiur-dev
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: ""
+  volumeName: kopiur-dev-shared-list-kopiur-dev
+  resources: { requests: { storage: 1Gi } }
+---
+# A filesystem ClusterRepository is mounted by the claim of the same name in
+# whichever namespace the mover runs: media needs its own, on the same directory.
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: kopiur-dev-shared-list-media
+spec:
+  capacity: { storage: 1Gi }
+  accessModes: [ReadWriteOnce]
+  storageClassName: ""
+  hostPath: { path: /kopiur-dev/shared-list, type: Directory }
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: shared-list
+  namespace: media
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: ""
+  volumeName: kopiur-dev-shared-list-media
+  resources: { requests: { storage: 1Gi } }
+---
 apiVersion: v1
 kind: PersistentVolume
 metadata:
