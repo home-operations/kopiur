@@ -863,6 +863,43 @@ a.object-name:hover {
   margin-top: var(--space-3);
 }
 
+/* ---- maintenance: one card per object (it has no detail page of its own) ---- */
+
+.maintenance-card {
+  padding: 14px 16px;
+  border: 1px solid var(--card-border);
+  border-radius: var(--radius-lg);
+  background: var(--bg-surface);
+  box-shadow: var(--shadow-1);
+}
+
+.maintenance-card.has-stripe {
+  border-left: var(--stripe) solid var(--kc);
+}
+
+.maintenance-card__head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-3);
+}
+
+.maintenance-card__title {
+  display: grid;
+  margin: 0;
+  font-size: var(--text-md);
+  line-height: 1.25;
+}
+
+.maintenance-card__for {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin-left: auto;
+  color: var(--fg-muted);
+  font-size: var(--text-sm);
+}
+
 /* ---- skeleton: a ledger row's silhouette, not a spinner ------------------ */
 
 .skeleton {

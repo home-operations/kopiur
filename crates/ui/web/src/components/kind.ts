@@ -150,3 +150,8 @@ export function detailHref(kind: ObjectKind, name: string, namespace?: string): 
       return undefined;
   }
 }
+
+/** A CRD kind as written (`Snapshot`) → its `ObjectKind`; anything else is `null`. */
+export function kindOfLabel(label: string): ObjectKind | null {
+  return BY_LABEL.get(label) ?? null;
+}

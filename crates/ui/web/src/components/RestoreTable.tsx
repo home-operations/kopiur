@@ -1,9 +1,11 @@
 import { Link } from "@tanstack/react-router";
 
 import type { RestoreRow } from "../api/types";
-import { EMPTY_CELL, relativeTime } from "../util/format";
+import { relativeTime } from "../util/format";
 import { LampBadge } from "./HealthBadge";
 import { restorePhaseLamp, restoreProgress } from "./restore";
+import { KindChip } from "./KindMark";
+import { WireRef } from "./ObjectRef";
 
 /**
  * Every `Restore` in scope: where it reads, where it writes, how far it got.
@@ -42,21 +44,23 @@ export function RestoreTable({ restores, now = new Date() }: RestoreTableProps) 
         </thead>
         <tbody>
           {restores.map((restore) => (
-            <tr key={`${restore.namespace}/${restore.name}`}>
-              <td>
-                <div className="restore-table__object">
-                  <span className="label-strip">
-                    <span className="label-strip__kind">Restore</span>
-                    <span className="label-strip__name">
-                      <Link
-                        to="/restores/$namespace/$name"
-                        params={{ namespace: restore.namespace, name: restore.name }}
-                      >
-                        {restore.name}
-                      </Link>
+            <tr key={`${restore.namespace}/${restore.name}`} data-kind="restore">
+              <td className="has-stripe">
+                <div className="table__object">
+                  <KindChip kind="restore" size="sm" />
+                  <div className="restore-table__object">
+                    <span className="label-strip">
+                      <span className="label-strip__name">
+                        <Link
+                          to="/restores/$namespace/$name"
+                          params={{ namespace: restore.namespace, name: restore.name }}
+                        >
+                          {restore.name}
+                        </Link>
+                      </span>
                     </span>
-                  </span>
-                  <span className="restore-table__namespace mono">{restore.namespace}</span>
+                    <span className="restore-table__namespace mono">{restore.namespace}</span>
+                  </div>
                 </div>
               </td>
               <td>
@@ -77,7 +81,9 @@ export function RestoreTable({ restores, now = new Date() }: RestoreTableProps) 
                   ) : null}
                 </div>
               </td>
-              <td className="mono">{restore.repository ?? EMPTY_CELL}</td>
+              <td>
+                <WireRef value={restore.repository} contextNamespace={restore.namespace} />
+              </td>
               <td className="num">{restoreProgress(restore)}</td>
               <td className="num">
                 {restore.startTime !== null && restore.startTime !== undefined ? (

@@ -92,3 +92,20 @@ describe("WorkTable", () => {
     expect(screen.getByText("Nothing is stalled.")).toBeInTheDocument();
   });
 });
+
+describe("WorkTable — kind identity", () => {
+  it("stripes a row whose kind is a kopiur kind, and leaves anything else plain", () => {
+    render(
+      <WorkTable
+        caption="Stalled objects"
+        rows={[...rows, { ...nth(rows, 0), id: "x", kind: "Job" }]}
+        now={new Date("2026-09-09T12:00:00Z")}
+      />,
+    );
+    const body = bodyRows(screen.getByRole("table", { name: "Stalled objects" }));
+    expect(nth(body, 0)).toHaveAttribute("data-kind", "snapshot");
+    expect(nth(body, 0).querySelector("td.has-stripe .kind-chip svg")).not.toBeNull();
+    expect(nth(body, 3)).not.toHaveAttribute("data-kind");
+    expect(nth(body, 3).querySelector("td.has-stripe")).toBeNull();
+  });
+});

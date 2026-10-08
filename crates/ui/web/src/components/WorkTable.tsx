@@ -3,6 +3,8 @@ import type { ReactNode } from "react";
 import type { Health } from "../api/types";
 import { EMPTY_CELL, humanAge } from "../util/format";
 import { HealthBadge } from "./HealthBadge";
+import { KindChip } from "./KindMark";
+import { KIND_META, kindOfLabel } from "./kind";
 
 /**
  * One row of work: an object, its state as a lamp, a detail line and an age.
@@ -82,40 +84,46 @@ export function WorkTable({
           </tr>
         </thead>
         <tbody>
-          {rows.map((row) => (
-            <tr key={row.id}>
-              <td>
-                <div className="work-table__object">
-                  <span className="label-strip">
-                    <span className="label-strip__kind">{row.kind}</span>
-                    <span className="label-strip__name">{row.nameLink ?? row.name}</span>
-                  </span>
-                  {row.namespace !== undefined &&
-                  row.namespace !== null &&
-                  row.namespace.length > 0 ? (
-                    <span className="work-table__namespace mono">{row.namespace}</span>
-                  ) : null}
-                </div>
-              </td>
-              <td>
-                <HealthBadge health={row.health} label={row.stateWord} />
-              </td>
-              <td className="work-table__detail">
-                {row.detail !== undefined && row.detail !== null && row.detail.length > 0
-                  ? row.detail
-                  : EMPTY_CELL}
-              </td>
-              {showAge ? (
-                <td className="num">
-                  {row.at !== undefined && row.at !== null ? (
-                    <time dateTime={row.at}>{humanAge(row.at, now)}</time>
-                  ) : (
-                    EMPTY_CELL
-                  )}
+          {rows.map((row) => {
+            const kind = kindOfLabel(row.kind);
+            return (
+              <tr key={row.id} data-kind={kind !== null ? KIND_META[kind].slug : undefined}>
+                <td className={kind !== null ? "has-stripe" : undefined}>
+                  <div className="table__object">
+                    {kind !== null ? <KindChip kind={kind} size="sm" /> : null}
+                    <div className="work-table__object">
+                      <span className="label-strip">
+                        <span className="label-strip__kind">{row.kind}</span>
+                        <span className="label-strip__name">{row.nameLink ?? row.name}</span>
+                      </span>
+                      {row.namespace !== undefined &&
+                      row.namespace !== null &&
+                      row.namespace.length > 0 ? (
+                        <span className="work-table__namespace mono">{row.namespace}</span>
+                      ) : null}
+                    </div>
+                  </div>
                 </td>
-              ) : null}
-            </tr>
-          ))}
+                <td>
+                  <HealthBadge health={row.health} label={row.stateWord} />
+                </td>
+                <td className="work-table__detail">
+                  {row.detail !== undefined && row.detail !== null && row.detail.length > 0
+                    ? row.detail
+                    : EMPTY_CELL}
+                </td>
+                {showAge ? (
+                  <td className="num">
+                    {row.at !== undefined && row.at !== null ? (
+                      <time dateTime={row.at}>{humanAge(row.at, now)}</time>
+                    ) : (
+                      EMPTY_CELL
+                    )}
+                  </td>
+                ) : null}
+              </tr>
+            );
+          })}
         </tbody>
       </table>
     </div>

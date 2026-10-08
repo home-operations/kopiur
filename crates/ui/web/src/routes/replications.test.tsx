@@ -229,3 +229,13 @@ describe("Replications", () => {
 function nthRepository() {
   return nth(view.repository, 0);
 }
+
+describe("Replications — kind identity", () => {
+  it("stripes each row in its own replication kind", async () => {
+    mockApi({ "/api/v1/replications": jsonResponse(view) });
+    mountApp("/replications");
+    const kinds = bodyRows(await table()).map((r) => r.getAttribute("data-kind"));
+    expect(kinds).toContain("snapshot-replication");
+    expect(kinds).toContain("repository-replication");
+  });
+});

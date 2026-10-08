@@ -84,10 +84,12 @@ describe("Maintenance", () => {
     mockApi({ "/api/v1/maintenance": jsonResponse(rows) });
     mountApp("/maintenance");
     const first = await region("Maintenance media/nas-maintenance");
-    expect(first).toHaveTextContent("Repository/media/nas");
+    expect(first.querySelector('a.ref[data-kind="repository"]')).toHaveTextContent("nas");
     expect(first).toHaveTextContent("media/nas-maintenance");
-    expect(await region("Maintenance kopiur-system/shared-maintenance")).toHaveTextContent(
-      "ClusterRepository/shared",
+    const second = await region("Maintenance kopiur-system/shared-maintenance");
+    expect(second.querySelector('a.ref[data-kind="cluster-repository"]')).toHaveAttribute(
+      "href",
+      "/repositories/cluster-repository/shared",
     );
   });
 
@@ -268,5 +270,20 @@ describe("Maintenance", () => {
     mountApp("/maintenance");
     const section = await region("Maintenance");
     expect(within(section).getByRole("status", { busy: true })).toBeInTheDocument();
+  });
+});
+
+describe("Maintenance — kind identity", () => {
+  it("marks each Maintenance with its kind and names its repository as a reference", async () => {
+    mockApi({ "/api/v1/maintenance": jsonResponse(rows) });
+    mountApp("/maintenance");
+    const first = await region("Maintenance media/nas-maintenance");
+    expect(first).toHaveAttribute("data-kind", "maintenance");
+    expect(first).toHaveClass("has-stripe");
+    expect(first.querySelector(".kind-chip svg")).not.toBeNull();
+    expect(first.querySelector('a.ref[data-kind="repository"]')).toHaveAttribute(
+      "href",
+      "/repositories/repository/nas?namespace=media",
+    );
   });
 });

@@ -1,4 +1,3 @@
-import { Wrench } from "lucide-react";
 import type { ReactNode } from "react";
 
 import type { MaintenanceRow, RunStatusView } from "../api/types";
@@ -7,6 +6,8 @@ import { Facts, type Fact } from "./Facts";
 import { healthLamp, loudLamp } from "./health";
 import { LampBadge } from "./HealthBadge";
 import { NotReported } from "./NotReported";
+import { KindChip, KindName } from "./KindMark";
+import { WireRef } from "./ObjectRef";
 
 /**
  * Every `Maintenance` in scope, one region each: the two run tracks, any
@@ -43,17 +44,21 @@ export function MaintenanceList({ rows, renderAction, now = new Date() }: Mainte
     <>
       {rows.map((row) => (
         <section
-          className="page__section"
+          className="page__section maintenance-card has-stripe"
+          data-kind="maintenance"
           key={`${row.namespace}/${row.name}`}
           aria-label={`Maintenance ${row.namespace}/${row.name}`}
         >
-          <div className="page__section-head">
-            <h2>
-              <Wrench size={16} strokeWidth={2} aria-hidden="true" />
-              {row.repository}
+          <div className="maintenance-card__head">
+            <KindChip kind="maintenance" />
+            <h2 className="maintenance-card__title">
+              <KindName kind="maintenance" />
+              <span className="maintenance__resource mono">
+                {row.namespace}/{row.name}
+              </span>
             </h2>
-            <span className="maintenance__resource mono">
-              {row.namespace}/{row.name}
+            <span className="maintenance-card__for">
+              for <WireRef value={row.repository} contextNamespace={row.namespace} />
             </span>
           </div>
 

@@ -195,3 +195,17 @@ describe("Restores", () => {
     expect(within(region).getByRole("status", { busy: true })).toBeInTheDocument();
   });
 });
+
+describe("Restores — kind identity", () => {
+  it("stripes each restore and names its repository as a reference", async () => {
+    mockApi({ "/api/v1/restores": jsonResponse(rows) });
+    mountApp("/restores");
+    const row = nth(bodyRows(await table()), 0);
+    expect(row).toHaveAttribute("data-kind", "restore");
+    expect(row.querySelector("td.has-stripe .kind-chip svg")).not.toBeNull();
+    expect(row.querySelector('a.ref[data-kind="repository"]')).toHaveAttribute(
+      "href",
+      "/repositories/repository/nas?namespace=media",
+    );
+  });
+});

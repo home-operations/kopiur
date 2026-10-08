@@ -12,6 +12,8 @@ import {
   replicationPhaseLabel,
 } from "./replication";
 import { NotReported } from "./NotReported";
+import { KindChip, KindName } from "./KindMark";
+import { KIND_META } from "./kind";
 import { useCapabilityReason } from "./useCapabilityReason";
 
 /**
@@ -35,6 +37,11 @@ export interface ReplicationTableProps {
   now?: Date | undefined;
 }
 
+/** A merged row as its own replication kind. */
+function replicationKind(row: ReplicationRow): "repositoryReplication" | "snapshotReplication" {
+  return row.kind === "RepositoryReplication" ? "repositoryReplication" : "snapshotReplication";
+}
+
 export function ReplicationTable({ rows, now = new Date() }: ReplicationTableProps) {
   return (
     <div className="ledger-scroll">
@@ -52,14 +59,17 @@ export function ReplicationTable({ rows, now = new Date() }: ReplicationTablePro
         </thead>
         <tbody>
           {rows.map((row) => (
-            <tr key={row.id}>
-              <td>
-                <div className="replication-table__object">
-                  <span className="label-strip">
-                    <span className="label-strip__kind">{row.kind}</span>
-                    <span className="label-strip__name">{row.name}</span>
-                  </span>
-                  <span className="replication-table__namespace mono">{row.namespace}</span>
+            <tr key={row.id} data-kind={KIND_META[replicationKind(row)].slug}>
+              <td className="has-stripe">
+                <div className="table__object">
+                  <KindChip kind={replicationKind(row)} size="sm" />
+                  <div className="replication-table__object">
+                    <span className="label-strip">
+                      <KindName kind={replicationKind(row)} />
+                      <span className="label-strip__name">{row.name}</span>
+                    </span>
+                    <span className="replication-table__namespace mono">{row.namespace}</span>
+                  </div>
                 </div>
               </td>
               <td>
