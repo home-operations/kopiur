@@ -1,6 +1,5 @@
 import { Link } from "@tanstack/react-router";
 import {
-  ArrowLeftRight,
   Database,
   FolderSearch,
   HeartPulse,
@@ -17,11 +16,15 @@ import type {
   CatalogView,
   ConditionView,
   MaintenanceRow,
+  PolicyRow,
+  ReplicationsView,
   RepositoryDetail as RepositoryDetailData,
   RunStatusView,
   SessionInfo,
 } from "../api/types";
 import { EMPTY_CELL, humanBytes, relativeTime } from "../util/format";
+import { DetailHeader } from "./DetailHeader";
+import { FlowLanes, type Lane, type LaneItem } from "./FlowLanes";
 import { Facts, type Fact } from "./Facts";
 import { Finding } from "./Finding";
 import { LastObserved } from "./RepositoryTable";
@@ -51,6 +54,72 @@ export interface RepositoryDetailProps {
   renderSessionAction?: ((session: SessionInfo) => ReactNode) | undefined;
   /** The clock ages are measured against. */
   now?: Date | undefined;
+  /** Policy rows, to show the policies writing here as cards; names alone otherwise. */
+  policyRows?: readonly PolicyRow[] | undefined;
+  /** Replication rows, to show what copies this repository as cards. */
+  replications?: ReplicationsView | undefined;
+}
+
+/**
+ * Fired by → written by → this repository → copies to. Names the server sent
+ * with no row loaded stay references, never dropped and never guessed.
+ */
+function repositoryLanes(
+  detail: RepositoryDetailData,
+  selfKind: "repository" | "clusterRepository",
+  policyRows: readonly PolicyRow[] | undefined,
+  replications: ReplicationsView | undefined,
+): Lane[] {
+  const { summary } = detail;
+  const ns = summary.namespace ?? undefined;
+  const written: LaneItem[] = detail.policies.map((p) => {
+    const row = policyRows?.find((r) => r.namespace === p.namespace && r.name === p.name);
+    return row !== undefined
+      ? { card: { kind: "snapshotPolicy", row } }
+      : { ref: { kind: "snapshotPolicy", name: p.name, namespace: p.namespace } };
+  });
+  for (const name of detail.replicationsIn) {
+    const row = replications?.snapshot.find((r) => r.name === name);
+    written.push(
+      row !== undefined
+        ? { card: { kind: "snapshotReplication", row } }
+        : { ref: { kind: "snapshotReplication", name, namespace: ns } },
+    );
+  }
+  const copies: LaneItem[] = detail.replicationsOut.map((name) => {
+    const snap = replications?.snapshot.find((r) => r.name === name);
+    if (snap !== undefined) return { card: { kind: "snapshotReplication", row: snap } };
+    const repo = replications?.repository.find((r) => r.name === name);
+    if (repo !== undefined) return { card: { kind: "repositoryReplication", row: repo } };
+    return { ref: { kind: "snapshotReplication", name, namespace: ns } };
+  });
+  return [
+    {
+      title: "Fired by",
+      label: "Fired by",
+      items: detail.schedules.map((row) => ({ card: { kind: "snapshotSchedule", row } })),
+      empty: "No schedule fires the policies writing here.",
+    },
+    {
+      title: "Written by",
+      label: "Policies writing here",
+      items: written,
+      empty: "No SnapshotPolicy writes into this repository. Older snapshots may still be here.",
+    },
+    {
+      title: "This repository",
+      label: "This repository",
+      items: [{ card: { kind: selfKind, row: summary } }],
+      empty: "",
+      variant: "stats",
+    },
+    {
+      title: "Copies to",
+      label: "Copies to",
+      items: copies,
+      empty: "Nothing copies this repository.",
+    },
+  ];
 }
 
 export function RepositoryDetail({
@@ -58,35 +127,53 @@ export function RepositoryDetail({
   actions,
   renderSessionAction,
   now = new Date(),
+  policyRows,
+  replications,
 }: RepositoryDetailProps) {
   const { summary } = detail;
   const verdict = repositoryVerdict(summary);
-  const Lamp = verdict.lamp.icon;
+  const selfKind = summary.kind === "ClusterRepository" ? "clusterRepository" : "repository";
+  const lanes = repositoryLanes(detail, selfKind, policyRows, replications);
   const namespaceScope = summary.namespace ?? undefined;
   const replicationSearch = namespaceScope !== undefined ? { namespace: namespaceScope } : {};
 
   return (
     <div className="page">
-      <p className="verdict" role="status" aria-label="Repository verdict">
-        <span className="verdict__lamp" data-health={verdict.lamp.key}>
-          <Lamp size={18} strokeWidth={2} aria-hidden="true" />
-          <span>{verdict.lamp.word}</span>
-        </span>
-        <span className="verdict__text">{verdict.text}</span>
-        <span className="verdict__meta mono">
-          {summary.kind}
-          {summary.namespace !== null && summary.namespace !== undefined
-            ? ` · ${summary.namespace}`
-            : ""}{" "}
-          · {summary.name}
-        </span>
-      </p>
+      <DetailHeader
+        kind={selfKind}
+        name={summary.name}
+        namespace={summary.namespace ?? undefined}
+        lamp={verdict.lamp}
+        verdictLabel="Repository verdict"
+        verdict={verdict.text}
+        actions={actions}
+        stats={[
+          {
+            label: "Snapshots",
+            value:
+              summary.snapshotCount !== null && summary.snapshotCount !== undefined
+                ? summary.snapshotCount.toLocaleString()
+                : { absent: "na" },
+          },
+          { label: "Stored", value: humanBytes(summary.totalSizeBytes) },
+          {
+            label: "Index blobs",
+            value:
+              summary.indexBlobCount !== null && summary.indexBlobCount !== undefined
+                ? summary.indexBlobCount.toLocaleString()
+                : { absent: "na" },
+          },
+          {
+            label: "Last observed",
+            value:
+              summary.lastObservedAt !== null && summary.lastObservedAt !== undefined
+                ? relativeTime(summary.lastObservedAt, now)
+                : { absent: "unreported", field: "repositoryLastObserved" },
+          },
+        ]}
+      />
 
-      {actions !== undefined && actions !== null ? (
-        <section className="page__section" aria-label="Actions">
-          {actions}
-        </section>
-      ) : null}
+      <FlowLanes label="Relationships" lanes={lanes} />
 
       {detail.gates.length > 0 ? (
         <Section title="Gates holding this repository" icon={ShieldAlert}>
@@ -249,41 +336,6 @@ export function RepositoryDetail({
 
         <Section title="Maintenance" icon={Wrench}>
           <MaintenanceCoverage maintenance={detail.maintenance} now={now} />
-        </Section>
-      </div>
-
-      <div className="page__pair">
-        <Section title="Policies writing here" icon={ScrollText}>
-          {detail.policies.length === 0 ? (
-            <p className="page__section-note">
-              No SnapshotPolicy writes into this repository. Older snapshots may still be here.
-            </p>
-          ) : (
-            <ul className="ref-list" aria-label="Policies writing here">
-              {detail.policies.map((policy) => (
-                <li key={`${policy.namespace}/${policy.name}`} className="label-strip">
-                  <span className="label-strip__kind">{policy.namespace}</span>
-                  <span className="label-strip__name">{policy.name}</span>
-                </li>
-              ))}
-            </ul>
-          )}
-        </Section>
-
-        <Section title="Replication" icon={ArrowLeftRight}>
-          <Facts
-            label="Replication"
-            facts={[
-              { term: "Copies out of here", value: refs(detail.replicationsOut) },
-              { term: "Copies into here", value: refs(detail.replicationsIn) },
-            ]}
-          />
-          <p className="page__section-note">
-            <Link to="/replications" search={replicationSearch}>
-              Replications
-            </Link>{" "}
-            shows each one&apos;s schedule, phase and lag.
-          </p>
         </Section>
       </div>
 
@@ -488,12 +540,4 @@ function instant(at: string | null | undefined, now: Date): ReactNode {
     return EMPTY_CELL;
   }
   return <time dateTime={at}>{relativeTime(at, now)}</time>;
-}
-
-/** A list of referenced names, or the empty cell. */
-function refs(names: readonly string[]): ReactNode {
-  if (names.length === 0) {
-    return "none";
-  }
-  return <span className="mono">{names.join(", ")}</span>;
 }

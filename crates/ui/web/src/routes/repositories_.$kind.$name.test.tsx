@@ -362,3 +362,37 @@ describe("Repository detail", () => {
     expect(await screen.findByRole("status", { busy: true })).toBeInTheDocument();
   });
 });
+
+describe("Repository detail — relationships", () => {
+  it("lays out what fires it, what writes it, the repository, and what copies it", async () => {
+    mockApi({
+      "/api/v1/repositories/repository/nas": jsonResponse({
+        ...detail,
+        schedules: [
+          {
+            namespace: "media",
+            name: "nightly-cron",
+            policy: "nightly",
+            cron: "0 2 * * *",
+            suspended: false,
+            consecutiveFailures: 0,
+          },
+        ],
+      }),
+      "/api/v1/policies": jsonResponse([]),
+      "/api/v1/replications": jsonResponse({ repository: [], snapshot: [] }),
+    });
+    mountApp("/repositories/repository/nas?namespace=media");
+    const flow = await screen.findByRole("region", { name: "Relationships" });
+    const fired = within(flow).getByRole("region", { name: "Fired by" });
+    expect(within(fired).getByRole("article")).toHaveAttribute("data-kind", "snapshot-schedule");
+    const written = within(flow).getByRole("region", { name: "Policies writing here" });
+    // No row for "nightly" came back: it is still named, as a reference to its page.
+    expect(within(written).getByRole("link", { name: /nightly/ })).toHaveAttribute(
+      "href",
+      "/policies/media/nightly",
+    );
+    const self = within(flow).getByRole("region", { name: "This repository" });
+    expect(within(self).getByRole("article")).toHaveAttribute("data-kind", "repository");
+  });
+});

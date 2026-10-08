@@ -1,7 +1,7 @@
 import { Link, createFileRoute } from "@tanstack/react-router";
 import { Database, Square } from "lucide-react";
 
-import { useEndRepositorySession, useRepository } from "../api/hooks";
+import { useEndRepositorySession, usePolicies, useReplications, useRepository } from "../api/hooks";
 import type { SessionInfo } from "../api/types";
 import { ActionButton } from "../components/ActionButton";
 import { ErrorState } from "../components/ErrorState";
@@ -40,6 +40,10 @@ function RepositoryDetailRoute() {
   const search: unknown = Route.useSearch();
   const namespace = namespaceFromSearch(search);
   const repository = useRepository(kind, name, namespace);
+  // Cluster-wide, like the server's own join: a ClusterRepository is written
+  // from every namespace it admits. Both are the cached list reads.
+  const policies = usePolicies(undefined);
+  const replications = useReplications(undefined);
 
   if (repository.isPending) {
     return (
@@ -70,6 +74,8 @@ function RepositoryDetailRoute() {
   return (
     <RepositoryDetail
       detail={repository.data}
+      policyRows={policies.data}
+      replications={replications.data}
       actions={<RepositoryActions detail={repository.data} />}
       renderSessionAction={(session) => (
         <StopSession session={session} kindPath={kind} name={name} namespace={namespace} />

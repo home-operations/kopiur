@@ -9,7 +9,7 @@ import type {
   SnapshotReplicationRow,
   SnapshotRow,
 } from "../api/types";
-import { humanAge, humanBytes, humanDuration, relativeTime } from "../util/format";
+import { humanBytes, humanDuration, relativeTime } from "../util/format";
 import { admitsText } from "./admits";
 import { type Lamp, healthLamp, loudLamp } from "./health";
 import { parseRef } from "./kind";
@@ -84,7 +84,9 @@ export function cardFacts(card: CardRow, now: Date): CardFacts {
           { label: "Stored", value: humanBytes(r.totalSizeBytes) },
           {
             label: "Last observed",
-            value: humanAge(r.lastObservedAt, now) + (r.lastObservedAt ? " ago" : ""),
+            value: r.lastObservedAt
+              ? relativeTime(r.lastObservedAt, now)
+              : { absent: "unreported", field: "repositoryLastObserved" },
           },
         ],
         to: `/repositories/${r.kindPath}/${r.name}${

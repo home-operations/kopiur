@@ -114,6 +114,11 @@ describe("cardFacts — each kind carries the three facts that say whether it is
     expect(f.to).toBe("/repositories/repository/nas-offsite?namespace=media");
   });
 
+  it("repository: an observation nothing writes is 'not reported', never a dash", () => {
+    const f = cardFacts({ kind: "repository", row: { ...repo, lastObservedAt: null } }, NOW);
+    expect(f.stats[2].value).toEqual({ absent: "unreported", field: "repositoryLastObserved" });
+  });
+
   it("cluster repository: says which namespaces it admits, never a sentinel", () => {
     const f = cardFacts(
       {
