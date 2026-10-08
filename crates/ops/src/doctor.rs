@@ -1712,6 +1712,7 @@ fn failure_entry(
 }
 
 /// Terminally-`Failed` Snapshots/Restores, windowed by `--failure-lookback`.
+#[cfg(test)]
 fn check_recent_failures(
     work: &Work,
     lookback: std::time::Duration,

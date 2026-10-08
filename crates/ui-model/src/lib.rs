@@ -206,7 +206,7 @@ mod tests {
             .filter(|n| n.ends_with(".ts"))
             .count();
         assert_eq!(
-            exported, 82,
+            exported, 83,
             "expected one .ts file per wire type; add the new type's root to \
              `export_all` and bump this count deliberately. 64 -> 65 when \
              `GateSeverityView` replaced `GateHit.severity`/`GateDescriptor.severity`'s \
@@ -233,7 +233,9 @@ mod tests {
              `KindTally`, `HealthCount` and `ObjectKind`, the overview's \
              fleet-by-kind tiles; 80 -> 82 for `ReplicationRef` and its \
              `ReplicationKind`, so a repository's replications carry their \
-             kind and namespace and the SPA never joins on a bare name"
+             kind and namespace and the SPA never joins on a bare name; \
+             82 -> 83 for `DoctorObjectView`, so a doctor check names each \
+             object it found instead of only one sentence about them all"
         );
     }
 }
