@@ -1118,7 +1118,7 @@ a.object-name:hover {
 .panel {
   background: var(--bg-surface);
   border: 1px solid var(--line);
-  border-radius: var(--radius-md);
+  border-radius: var(--radius-lg);
 }
 
 .panel__header {
@@ -2383,7 +2383,7 @@ a.object-name:hover {
      its track instead of scrolling inside it. */
   min-width: 0;
   border: 1px solid var(--line);
-  border-radius: var(--radius-md);
+  border-radius: var(--radius-lg);
   background: var(--bg-inset);
   overflow: auto;
   max-height: 70vh;
@@ -2435,7 +2435,7 @@ a.object-name:hover {
   min-height: 64px;
   padding: var(--space-2) var(--space-3);
   border: 1px solid var(--line-strong);
-  border-radius: var(--radius-md);
+  border-radius: var(--radius-lg);
   background: var(--bg-surface);
   color: var(--fg);
   text-align: left;
@@ -2447,6 +2447,26 @@ a.object-name:hover {
 
 .topo-node:hover {
   background: var(--bg-hover);
+}
+
+/* A kopiur object's plate wears its kind's stripe, like a summary card. A
+   ghost's dashed outline (below) replaces it: "not a real thing" wins. */
+.topo-node.has-stripe {
+  border-left: var(--stripe) solid var(--kc);
+}
+
+.topo-node__id {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.topo-node__text {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
 }
 
 .topo-node:focus-visible {
@@ -2534,6 +2554,10 @@ a.object-name:hover {
 .topo-drawer {
   position: sticky;
   top: var(--space-2);
+}
+
+.topo-drawer.has-stripe {
+  border-left: var(--stripe) solid var(--kc);
 }
 
 .topo-drawer:focus-visible {
@@ -3071,7 +3095,7 @@ a.object-name:hover {
   max-width: 46rem;
   padding: var(--space-4);
   border: 1px solid var(--line);
-  border-radius: var(--radius-md);
+  border-radius: var(--radius-lg);
   background: var(--bg-surface);
 }
 
@@ -3337,7 +3361,7 @@ a.object-name:hover {
   max-height: 22rem;
   overflow: auto;
   border: 1px solid var(--line);
-  border-radius: var(--radius-md);
+  border-radius: var(--radius-lg);
   background: var(--bg-inset);
   color: var(--fg);
   font-family: var(--font-mono);
@@ -3503,7 +3527,7 @@ a.object-name:hover {
   gap: var(--space-2);
   padding: var(--space-3);
   border: 1px solid var(--line);
-  border-radius: var(--radius-md);
+  border-radius: var(--radius-lg);
   background: var(--bg-surface);
 }
 
@@ -3574,18 +3598,27 @@ a.object-name:hover {
   font-variant-numeric: tabular-nums;
 }
 
-/* One series, so no categorical palette: the body ink the console already
-   uses, at the 2px the mark specs ask for. */
+/* One series, so no categorical palette: the accent, at the 2.2px the chart
+   spec asks for. */
 .chart__line {
   fill: none;
-  stroke: var(--fg-muted);
-  stroke-width: 2;
+  stroke: var(--accent);
+  stroke-width: 2.2;
   stroke-linejoin: round;
   stroke-linecap: round;
 }
 
+/* The fill under the line: the same accent, quiet enough that gridlines
+   still read through it. */
+.chart__area {
+  fill: color-mix(in srgb, var(--accent) 16%, transparent);
+  stroke: none;
+}
+
 .chart__dot {
-  fill: var(--fg-muted);
+  fill: var(--bg-surface);
+  stroke: var(--accent);
+  stroke-width: 1.5;
 }
 
 /* The point under the pointer takes the accent — selection, which is what the

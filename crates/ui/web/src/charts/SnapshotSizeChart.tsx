@@ -3,7 +3,15 @@ import { useState } from "react";
 import type { SnapshotRow } from "../api/types";
 import { NotReported } from "../components/NotReported";
 import { formatTimestamp, humanBytes } from "../util/format";
-import { CHART, type PolicySeries, type SizePoint, linePath, plotArea, sizeSeries } from "./series";
+import {
+  CHART,
+  type PolicySeries,
+  type SizePoint,
+  areaPath,
+  linePath,
+  plotArea,
+  sizeSeries,
+} from "./series";
 
 /**
  * Snapshot size over time, one small multiple per `SnapshotPolicy`.
@@ -155,6 +163,7 @@ function PolicyChart({ series }: PolicyChartProps) {
             </g>
           ))}
 
+          <path className="chart__area" d={areaPath(points, area)} />
           <path className="chart__line" d={linePath(points, area)} />
 
           {points.map((point, index) => (

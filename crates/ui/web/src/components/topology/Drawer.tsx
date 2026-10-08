@@ -2,13 +2,21 @@ import { Link } from "@tanstack/react-router";
 import { X } from "lucide-react";
 import { useEffect, useRef } from "react";
 
+import { KindChip } from "../KindMark";
+import { KIND_META } from "../kind";
 import { ActionButton } from "../ActionButton";
 import { Finding } from "../Finding";
 import { LampBadge } from "../HealthBadge";
 import { gateSeverityLamp } from "../gates";
 import { healthLamp } from "../health";
 import { nodeMeaning, nodeSection } from "./drawer";
-import { type TopologyEdge, type TopologyModel, type TopologyNode, relationships } from "./model";
+import {
+  type TopologyEdge,
+  type TopologyModel,
+  type TopologyNode,
+  nodeObjectKind,
+  relationships,
+} from "./model";
 
 /**
  * The drawer: everything the board could not fit on a 232×64 plate.
@@ -70,15 +78,18 @@ export function Drawer({ model, node, namespace, onClose }: DrawerProps) {
     };
   }, [node.id, onClose]);
 
+  const kind = nodeObjectKind(node.node.kind);
   return (
     <aside
-      className="panel topo-drawer"
+      className={kind !== null ? "panel topo-drawer has-stripe" : "panel topo-drawer"}
+      data-kind={kind !== null ? KIND_META[kind].slug : undefined}
       aria-label={`${node.kindWord} ${node.node.label}`}
       ref={panel}
       tabIndex={-1}
     >
       <div className="panel__header">
         <h3 className="label-strip">
+          {kind !== null ? <KindChip kind={kind} size="sm" /> : null}
           <span className="label-strip__kind">{node.kindWord}</span>
           <span className="label-strip__name">{node.node.label}</span>
         </h3>

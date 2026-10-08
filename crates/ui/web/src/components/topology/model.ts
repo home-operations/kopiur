@@ -18,7 +18,14 @@
 
 import { CircleDashed } from "lucide-react";
 
-import type { EdgeKind, GraphEdge, GraphNode, NodeKind, RepositoryGraph } from "../../api/types";
+import type {
+  EdgeKind,
+  GraphEdge,
+  GraphNode,
+  NodeKind,
+  ObjectKind,
+  RepositoryGraph,
+} from "../../api/types";
 import { unknownVariant } from "../../util/assertNever";
 import { type HealthKey, type Lamp, healthLamp } from "../health";
 
@@ -129,6 +136,28 @@ export function nodeKindWord(kind: NodeKind): string {
       return "Namespace selector";
     default:
       return unknownVariant(kind, "NodeKind");
+  }
+}
+
+/**
+ * The kopiur kind a graph node is, or `null` for what is not a kopiur object —
+ * a bare backend, a namespace, a selector — which gets no stripe and no chip.
+ */
+export function nodeObjectKind(kind: NodeKind): ObjectKind | null {
+  switch (kind) {
+    case "repository":
+      return "repository";
+    case "clusterRepository":
+      return "clusterRepository";
+    case "policy":
+      return "snapshotPolicy";
+    case "backend":
+    case "namespace":
+    case "namespaceSelector":
+      return null;
+    default:
+      unknownVariant(kind, "NodeKind");
+      return null;
   }
 }
 

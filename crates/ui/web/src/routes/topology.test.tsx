@@ -367,3 +367,30 @@ describe("Topology", () => {
     expect(region.querySelector("[data-node-id]")).toBeNull();
   });
 });
+
+describe("Topology — kind identity", () => {
+  it("stripes each plate in its object's kind, and leaves non-kopiur nodes unmarked", async () => {
+    mockApi({ "/api/v1/graph": jsonResponse(FIXTURE_GRAPH) });
+    mountApp("/topology?namespace=media");
+    const region = await drawnBoard();
+    expect(plate(region, "Repository/media/nas")).toHaveAttribute("data-kind", "repository");
+    expect(plate(region, "ClusterRepository/shared")).toHaveAttribute(
+      "data-kind",
+      "cluster-repository",
+    );
+    expect(plate(region, "Policy/media/nightly")).toHaveAttribute("data-kind", "snapshot-policy");
+    expect(plate(region, "Policy/media/nightly").querySelector(".kind-chip svg")).not.toBeNull();
+    expect(plate(region, "Backend/media/blobsync")).not.toHaveAttribute("data-kind");
+    expect(plate(region, "Namespace/prod")).not.toHaveAttribute("data-kind");
+  });
+
+  it("marks the drawer in the same kind as the plate that opened it", async () => {
+    mockApi({ "/api/v1/graph": jsonResponse(FIXTURE_GRAPH) });
+    mountApp("/topology?namespace=media");
+    const region = await drawnBoard();
+    await userEvent.click(plate(region, NAS.id));
+    const drawer = await screen.findByRole("complementary", { name: /media\/nas/ });
+    expect(drawer).toHaveAttribute("data-kind", "repository");
+    expect(drawer.querySelector(".panel__header .kind-chip svg")).not.toBeNull();
+  });
+});

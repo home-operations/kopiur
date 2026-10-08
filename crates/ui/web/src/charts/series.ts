@@ -157,6 +157,18 @@ export function plotArea(points: readonly SizePoint[]): PlotArea {
 }
 
 /** The `d` of a polyline through every point, oldest first. */
+/**
+ * The line's path closed down to the baseline: the fill beneath it. The y
+ * domain is zero-based, so `area.bottom` is zero bytes, not an arbitrary floor.
+ */
+export function areaPath(points: readonly SizePoint[], area: PlotArea): string {
+  const first = points[0];
+  const last = points[points.length - 1];
+  if (first === undefined || last === undefined) return "";
+  const bottom = String(area.bottom);
+  return `${linePath(points, area)} L${String(area.x(last.ms))} ${bottom} L${String(area.x(first.ms))} ${bottom} Z`;
+}
+
 export function linePath(points: readonly SizePoint[], area: PlotArea): string {
   return points
     .map(

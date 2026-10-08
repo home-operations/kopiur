@@ -123,6 +123,24 @@ describe("SnapshotSizeChart", () => {
     expect(container.querySelectorAll(".chart__dot")).toHaveLength(2);
   });
 
+  it("fills the area under the line, drawn beneath it", () => {
+    const { container } = render(
+      <SnapshotSizeChart
+        rows={[
+          row({ name: "a" }),
+          row({ name: "b", endTime: "2026-09-08T01:04:00Z", sizeBytes: 2048 }),
+        ]}
+      />,
+    );
+    const areas = container.querySelectorAll(".chart__area");
+    expect(areas).toHaveLength(1);
+    expect(areas[0]?.getAttribute("d")).toMatch(/Z$/);
+    expect(areas[0]?.getAttribute("d")).not.toMatch(/NaN/);
+    const line = container.querySelector(".chart__line");
+    // Drawn first, so the line sits on top of its fill.
+    expect(areas[0]?.compareDocumentPosition(line as Node)).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
+  });
+
   it("still gives a lone measurement its row in a table", () => {
     render(<SnapshotSizeChart rows={[row({ name: "only" })]} />);
     const table = screen.getByRole("table", { name: /Snapshot sizes for nightly/ });

@@ -1,5 +1,7 @@
 import { LampBadge } from "../HealthBadge";
-import type { TopologyNode } from "./model";
+import { KindChip } from "../KindMark";
+import { KIND_META } from "../kind";
+import { type TopologyNode, nodeObjectKind } from "./model";
 
 /**
  * One plate on the board: what the object is, what it is called, and how it
@@ -24,20 +26,26 @@ export interface NodeCardProps {
 }
 
 export function NodeCard({ node, selected, onSelect }: NodeCardProps) {
+  const kind = nodeObjectKind(node.node.kind);
   return (
     <button
       type="button"
-      className="topo-node"
+      className={kind !== null ? "topo-node has-stripe" : "topo-node"}
       data-node-id={node.id}
-      data-kind={node.node.kind}
+      data-kind={kind !== null ? KIND_META[kind].slug : undefined}
       data-health={node.lamp.key}
       data-missing={node.missing ? "true" : undefined}
       data-selected={selected ? "true" : undefined}
       aria-expanded={selected}
       onClick={onSelect}
     >
-      <span className="topo-node__kind">{node.kindWord}</span>
-      <span className="topo-node__name">{node.node.label}</span>
+      <span className="topo-node__id">
+        {kind !== null ? <KindChip kind={kind} size="sm" /> : null}
+        <span className="topo-node__text">
+          <span className="topo-node__kind">{node.kindWord}</span>
+          <span className="topo-node__name">{node.node.label}</span>
+        </span>
+      </span>
       <span className="topo-node__lamp">
         <LampBadge lamp={node.lamp} />
       </span>
