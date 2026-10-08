@@ -315,7 +315,7 @@ describe("kind colours", () => {
 
   it("are never mixed with a status colour in a kind rule", () => {
     const mixed = rules
-      .filter((r) => /\[data-kind/.test(r.selector) && /--health-/.test(r.body))
+      .filter((r) => r.selector.includes("[data-kind") && r.body.includes("--health-"))
       .map((r) => r.selector);
     expect(mixed).toEqual([]);
   });
