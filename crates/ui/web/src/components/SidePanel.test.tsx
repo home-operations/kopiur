@@ -1,4 +1,5 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { StrictMode } from "react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 
@@ -98,6 +99,35 @@ describe("SidePanel", () => {
     unmount();
     expect(document.activeElement).toBe(trigger);
     trigger.remove();
+  });
+
+  it("stays open through a remount, ignoring the close its first mount queued", async () => {
+    // StrictMode mounts, unmounts and mounts again; the browser delivers the
+    // first unmount's `close` after the second mount has reopened the dialog.
+    const onClose = vi.fn();
+    render(
+      <StrictMode>
+        <SidePanel label="nas" onClose={onClose}>
+          body
+        </SidePanel>
+      </StrictMode>,
+    );
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(onClose).not.toHaveBeenCalled();
+    expect(screen.getByRole("dialog")).toHaveAttribute("open");
+  });
+
+  it("follows the browser when it closes the dialog itself", async () => {
+    const onClose = vi.fn();
+    render(
+      <SidePanel label="nas" onClose={onClose}>
+        body
+      </SidePanel>,
+    );
+    screen.getByRole<HTMLDialogElement>("dialog").close();
+    await waitFor(() => {
+      expect(onClose).toHaveBeenCalledTimes(1);
+    });
   });
 
   it("shows a footer only when given one", () => {

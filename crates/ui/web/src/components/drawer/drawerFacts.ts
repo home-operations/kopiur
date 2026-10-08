@@ -157,7 +157,9 @@ export function drawerFacts(card: CardRow): DrawerFacts {
               "requested",
       );
       b.ref("Repository", m.repository);
-      b.ref("Owner", m.owner);
+      // A projected Maintenance is usually owned by the repository it governs;
+      // naming the same object twice says nothing the first did not.
+      if (m.owner !== m.repository) b.ref("Owner", m.owner);
       return b.done();
     }
     case "repositoryReplication": {

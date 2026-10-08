@@ -1291,6 +1291,9 @@ html:has(dialog.side-panel[open]) {
   border-top: 1px solid var(--line);
   background: var(--bg-canvas);
 }
+.side-panel__foot a.button {
+  text-decoration: none;
+}
 @media (max-width: 560px) {
   .side-panel {
     inset: 0;
@@ -1348,6 +1351,10 @@ html:has(dialog.side-panel[open]) {
 .drawer__related li {
   display: grid;
   gap: var(--space-1);
+}
+.drawer__related .ref {
+  justify-self: start;
+  max-width: 100%;
 }
 .drawer__rel-label {
   color: var(--fg-muted);

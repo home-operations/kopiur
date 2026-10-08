@@ -79,9 +79,12 @@ export function SidePanel({
     };
     // A browser may close the dialog despite the refusal (repeated close
     // requests without user activation). Follow it, so a closed dialog never
-    // sits under a URL that says it is open.
+    // sits under a URL that says it is open. `close` arrives on a later task,
+    // so one queued by an earlier unmount (StrictMode mounts twice) can land
+    // after the dialog reopened — an open dialog was not closed, whatever the
+    // event says.
     const onNativeClose = () => {
-      if (!leaving) close.current();
+      if (!leaving && !node.open) close.current();
     };
 
     document.addEventListener("keydown", onKey);

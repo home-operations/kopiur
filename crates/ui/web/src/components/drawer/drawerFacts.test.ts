@@ -123,6 +123,26 @@ describe("drawerFacts", () => {
     expect(drawerFacts(card).related.map((r) => r.label)).toEqual(["Repository"]);
   });
 
+  it("names the owner only when it is not the repository already named", () => {
+    const row = {
+      namespace: "kopiur-dev",
+      name: "dev-repo",
+      repository: "Repository/kopiur-dev/dev-repo",
+      owner: "Repository/kopiur-dev/dev-repo",
+      managedByRepository: true,
+      quick: { consecutiveFailures: 0 },
+      full: { consecutiveFailures: 0 },
+    };
+    expect(drawerFacts({ kind: "maintenance", row }).related.map((r) => r.label)).toEqual([
+      "Repository",
+    ]);
+    const other = { ...row, owner: "ClusterRepository/shared" };
+    expect(drawerFacts({ kind: "maintenance", row: other }).related.map((r) => r.label)).toEqual([
+      "Repository",
+      "Owner",
+    ]);
+  });
+
   it("relates replications to their ends, and leaves a bare backend as text", () => {
     const blob: CardRow = {
       kind: "repositoryReplication",
