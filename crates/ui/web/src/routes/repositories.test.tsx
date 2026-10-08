@@ -166,3 +166,19 @@ describe("Repositories list", () => {
     expect(within(region).getByRole("status", { busy: true })).toBeInTheDocument();
   });
 });
+
+describe("Repositories — whole-row link", () => {
+  it("makes every row a link to its repository, through the name", async () => {
+    mockApi({ "/api/v1/repositories": jsonResponse(fleet) });
+    mountApp("/repositories");
+    const rows = bodyRows(await list());
+    expect(nth(rows, 0).querySelector("a.row-link")).toHaveAttribute(
+      "href",
+      "/repositories/repository/nas?namespace=media",
+    );
+    expect(nth(rows, 2).querySelector("a.row-link")).toHaveAttribute(
+      "href",
+      "/repositories/cluster-repository/shared",
+    );
+  });
+});

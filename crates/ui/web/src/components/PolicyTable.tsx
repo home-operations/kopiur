@@ -51,6 +51,7 @@ export function PolicyTable({ policies, now = new Date() }: PolicyTableProps) {
                     <span className="label-strip">
                       <span className="label-strip__name">
                         <Link
+                          className="row-link"
                           to="/policies/$namespace/$name"
                           params={{ namespace: policy.namespace, name: policy.name }}
                         >

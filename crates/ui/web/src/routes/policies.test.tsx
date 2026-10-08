@@ -173,3 +173,15 @@ describe("Policies", () => {
     expect(within(region).getByRole("status", { busy: true })).toBeInTheDocument();
   });
 });
+
+describe("Policies — whole-row link", () => {
+  it("makes every row a link to its policy, through the name", async () => {
+    mockApi({ "/api/v1/policies": jsonResponse(rows) });
+    mountApp("/policies");
+    const body = bodyRows(await table());
+    expect(nth(body, 0).querySelector("a.row-link")).toHaveAttribute(
+      "href",
+      "/policies/media/nightly",
+    );
+  });
+});

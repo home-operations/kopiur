@@ -73,6 +73,7 @@ export function RepositoryTable({ repositories, caption = "Repositories" }: Repo
                       <KindName kind={repoKind(repository)} />
                       <span className="label-strip__name">
                         <Link
+                          className="row-link"
                           to="/repositories/$kind/$name"
                           params={{ kind: repository.kindPath, name: repository.name }}
                           search={detailSearch(repository)}

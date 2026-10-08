@@ -242,6 +242,34 @@ td.has-stripe::before {
   background: var(--kc);
 }
 
+/* A whole-row link: the row's name link is stretched over the row, so the
+   row is one target; any other link or button in it sits above the cover and
+   keeps its own click. The stripe cell gives up its own positioning so the
+   cover — and the stripe — measure from the row. */
+tr:has(.row-link) {
+  position: relative;
+  cursor: pointer;
+}
+
+tr:has(.row-link) td.has-stripe {
+  position: static;
+}
+
+.row-link::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+}
+
+tr:has(.row-link) :is(a, button, summary, input, select):not(.row-link) {
+  position: relative;
+  z-index: 1;
+}
+
+tr:has(.row-link):hover > td {
+  background: var(--bg-hover);
+}
+
 /* ---- base ---------------------------------------------------------------- */
 
 *,

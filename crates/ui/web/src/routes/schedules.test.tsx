@@ -73,7 +73,7 @@ describe("Schedules", () => {
     mockApi({ "/api/v1/schedules": jsonResponse(rows) });
     mountApp("/schedules");
     const body = bodyRows(await table());
-    const policy = within(nth(body, 0)).getByRole("link", { name: /nightly/ });
+    const policy = within(nth(body, 0)).getByRole("link", { name: /SnapshotPolicy.*nightly/ });
     expect(policy).toHaveAttribute("href", "/policies/media/nightly");
     expect(policy).toHaveAttribute("data-kind", "snapshot-policy");
     expect(nth(body, 0)).toHaveAttribute("data-kind", "snapshot-schedule");
@@ -263,5 +263,22 @@ describe("Schedules", () => {
     mountApp("/schedules");
     const region = await screen.findByRole("region", { name: "Schedules" });
     expect(within(region).getByRole("status", { busy: true })).toBeInTheDocument();
+  });
+});
+
+describe("Schedules — whole-row link", () => {
+  it("opens the policy a schedule fires — a schedule has no page of its own", async () => {
+    mockApi({ "/api/v1/schedules": jsonResponse(rows) });
+    mountApp("/schedules");
+    const link = nth(bodyRows(await table()), 0).querySelector("a.row-link");
+    expect(link).toHaveAttribute("href", "/policies/media/nightly");
+    expect(link).toHaveTextContent("nightly-cron");
+    expect(link).toHaveAccessibleName(/nightly-cron.*policy nightly/);
+  });
+
+  it("leaves a selector schedule's row unlinked: it fires no single policy", async () => {
+    mockApi({ "/api/v1/schedules": jsonResponse(rows) });
+    mountApp("/schedules");
+    expect(nth(bodyRows(await table()), 1).querySelector("a.row-link")).toBeNull();
   });
 });

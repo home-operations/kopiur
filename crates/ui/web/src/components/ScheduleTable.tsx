@@ -1,3 +1,4 @@
+import { Link } from "@tanstack/react-router";
 import type { ReactNode } from "react";
 
 import type { ScheduleRow } from "../api/types";
@@ -55,7 +56,9 @@ export function ScheduleTable({ schedules, renderAction, now = new Date() }: Sch
                   <KindChip kind="snapshotSchedule" size="sm" />
                   <div className="schedule-table__object">
                     <span className="label-strip">
-                      <span className="label-strip__name">{schedule.name}</span>
+                      <span className="label-strip__name">
+                        <ScheduleName schedule={schedule} />
+                      </span>
                     </span>
                     <span className="schedule-table__namespace mono">{schedule.namespace}</span>
                   </div>
@@ -82,6 +85,29 @@ export function ScheduleTable({ schedules, renderAction, now = new Date() }: Sch
         </tbody>
       </table>
     </div>
+  );
+}
+
+/**
+ * The schedule's name, and the row's link. A schedule has no page of its own,
+ * so the row opens the policy it fires — where the schedule appears in the
+ * "Fired by" lane. One fired by a selector picks no single policy, and its
+ * name stays text rather than a guess.
+ */
+function ScheduleName({ schedule }: { schedule: ScheduleRow }) {
+  const named = schedule.policy;
+  if (named === null || named === undefined || named.length === 0) {
+    return <>{schedule.name}</>;
+  }
+  return (
+    <Link
+      className="row-link"
+      to="/policies/$namespace/$name"
+      params={{ namespace: schedule.namespace, name: named }}
+      aria-label={`${schedule.name} — open the policy ${named} it fires`}
+    >
+      {schedule.name}
+    </Link>
   );
 }
 
