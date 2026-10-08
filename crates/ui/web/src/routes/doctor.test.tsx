@@ -22,15 +22,23 @@ const report: DoctorReportView = {
   ranAt: "2026-09-08T11:59:30Z",
   exitCode: 1,
   checks: [
-    { check: "crds-installed", scope: "installation", title: "CRDs installed", outcome: "Pass" },
+    {
+      check: "crds-installed",
+      scope: "installation",
+      title: "CRDs installed",
+      outcome: "Pass",
+      objects: [],
+    },
     {
       check: "controller-running",
+      objects: [],
       scope: "installation",
       title: "controller running",
       outcome: "Pass",
     },
     {
       check: "credentials-present",
+      objects: [],
       scope: "mixed",
       title: "credential secrets present",
       outcome: "Warn",
@@ -38,6 +46,7 @@ const report: DoctorReportView = {
     },
     {
       check: "no-stuck-work",
+      objects: [],
       scope: "namespace",
       title: "no blocked or stuck work",
       outcome: "Fail",

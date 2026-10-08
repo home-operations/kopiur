@@ -17,6 +17,7 @@ const check = (over: Partial<DoctorCheckView>): DoctorCheckView => ({
   // server now states each check's scope rather than leaving the client to
   // guess it. Spread last so a case can override it.
   scope: "installation",
+  objects: [],
   ...over,
 });
 

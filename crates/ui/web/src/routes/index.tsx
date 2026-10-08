@@ -12,24 +12,14 @@ import {
   useStatus,
 } from "../api/hooks";
 import { type StatusReportView, narrowStatusReport } from "../api/statusReport";
-import type {
-  KindTally,
-  DoctorCheckView,
-  MaintenanceRow,
-  PolicyRow,
-  RepositorySummary,
-  ScheduleRow,
-  StatusOverview,
-} from "../api/types";
+import type { KindTally, DoctorCheckView, RepositorySummary, StatusOverview } from "../api/types";
 import { EmptyState } from "../components/EmptyState";
 import { ErrorState } from "../components/ErrorState";
-import { Finding } from "../components/Finding";
 import { LoadingState } from "../components/LoadingState";
 import { KindTiles } from "../components/KindTiles";
-import { ObjectCard } from "../components/ObjectCard";
-import type { CardRow } from "../components/objectCard";
-import { WorkTable, type WorkRow } from "../components/WorkTable";
-import { OVERVIEW_DOCTOR_CHECKS, doctorOutcomeLamp, summarizeDoctor } from "../components/doctor";
+import { AttentionList } from "../components/AttentionList";
+import { attention } from "../components/attention";
+import { OVERVIEW_DOCTOR_CHECKS, summarizeDoctor } from "../components/doctor";
 import { countByHealth, healthLamp } from "../components/health";
 import { overviewVerdict, tallyPhrases } from "../components/verdict";
 import { relativeTime } from "../util/format";
@@ -38,8 +28,8 @@ import { useCurrentNamespace } from "../util/namespace";
 /**
  * Overview — the screen an operator opens first when they suspect something
  * is wrong. One sentence answers "is my data safe?"; under it, the fleet by
- * health, the work in flight, what is stalled, and what needs fixing with the
- * fix on its plate.
+ * kind, then one list of what needs someone: each object once, whichever read
+ * noticed it, with the fix on its plate (`components/attention.ts`).
  *
  * Three reads, each with its own loading / empty / error / not-permitted
  * state so one refused read does not blank the page:
@@ -72,6 +62,14 @@ function Overview() {
   const report = status.data !== undefined ? narrowStatusReport(status.data.report) : null;
   const now = status.data !== undefined ? new Date(status.data.now) : new Date();
   const search = namespace !== undefined ? { namespace } : {};
+  const needs = attention({
+    repositories: repositories.data,
+    policies: policies.data,
+    schedules: schedules.data,
+    maintenance: maintenance.data,
+    stalled: report?.stalled,
+    checks: doctor.data?.checks,
+  });
 
   return (
     <div className="page">
@@ -124,15 +122,11 @@ function Overview() {
           </Link>
         }
       >
-        <Attention
-          cards={attentionCards({
-            repositories: repositories.data,
-            policies: policies.data,
-            schedules: schedules.data,
-            maintenance: maintenance.data,
-          })}
-          now={now}
-        />
+        {status.isPending || doctor.isPending ? (
+          <LoadingState what="what needs attention" rows={2} />
+        ) : (
+          <AttentionList attention={needs} namespace={namespace} now={now} />
+        )}
         {repositories.isError ? (
           <ErrorState
             problem={repositories.error.problem}
@@ -161,33 +155,20 @@ function Overview() {
             onRetry={() => void maintenance.refetch()}
           />
         ) : null}
-        {status.isPending ? (
-          <LoadingState what="stalled objects" rows={1} />
-        ) : status.isError ? (
+        {status.isError ? (
           <ErrorState
             problem={status.error.problem}
             what="the status report"
             onRetry={() => void status.refetch()}
           />
-        ) : stalledRows(report).length > 0 ? (
-          <WorkTable
-            caption="Stalled objects"
-            rows={stalledRows(report)}
-            now={now}
-            ageLabel="Since"
-          />
         ) : null}
-        {doctor.isPending ? (
-          <LoadingState what="the doctor report" rows={1} />
-        ) : doctor.isError ? (
+        {doctor.isError ? (
           <ErrorState
             problem={doctor.error.problem}
             what="the doctor report"
             onRetry={() => void doctor.refetch()}
           />
-        ) : (
-          <Fixes checks={doctor.data.checks} ranAt={doctor.data.ranAt} now={now} />
-        )}
+        ) : null}
         {nothingNeedsYou({
           // Every read must have answered: an errored read is not pending,
           // and "none" from a refused read is not "none failing".
@@ -200,14 +181,7 @@ function Overview() {
             status.isSuccess &&
             doctor.isSuccess,
           fleetFailing: tallyPhrases(overview.data?.kinds ?? []).failed.length,
-          cards: attentionCards({
-            repositories: repositories.data,
-            policies: policies.data,
-            schedules: schedules.data,
-            maintenance: maintenance.data,
-          }).length,
-          stalled: stalledRows(report).length,
-          failing: doctor.data?.checks.filter((c) => c.outcome === "Fail").length ?? 0,
+          needs: needs.items.length + needs.checks.length,
         }) ? (
           <EmptyState title="Nothing needs you" icon={Stethoscope}>
             No repository, policy, schedule or maintenance is failing, nothing is stalled, and the
@@ -227,87 +201,12 @@ function Overview() {
   );
 }
 
-/** At most this many objects lead "Needs attention"; the lists hold the rest. */
-const ATTENTION_MAX = 6;
-
-interface AttentionInputs {
-  repositories: RepositorySummary[] | undefined;
-  policies: PolicyRow[] | undefined;
-  schedules: ScheduleRow[] | undefined;
-  maintenance: MaintenanceRow[] | undefined;
-}
-
-/**
- * The objects that need someone, worst first: failed or degraded or unknown
- * repositories, maintenance and schedules with failed runs, and policies that
- * have never succeeded or never been verified.
- */
-export function attentionCards({
-  repositories,
-  policies,
-  schedules,
-  maintenance,
-}: AttentionInputs): CardRow[] {
-  const ranked: { rank: number; card: CardRow }[] = [];
-  for (const r of repositories ?? []) {
-    const rank =
-      r.health === "failed" ? 0 : r.health === "degraded" ? 1 : r.health === "unknown" ? 2 : -1;
-    if (rank >= 0) {
-      ranked.push({
-        rank,
-        card: { kind: r.kind === "ClusterRepository" ? "clusterRepository" : "repository", row: r },
-      });
-    }
-  }
-  for (const m of maintenance ?? []) {
-    if (m.quick.consecutiveFailures + m.full.consecutiveFailures > 0) {
-      ranked.push({ rank: 0, card: { kind: "maintenance", row: m } });
-    }
-  }
-  for (const s of schedules ?? []) {
-    if (!s.suspended && s.consecutiveFailures > 0) {
-      ranked.push({ rank: 0, card: { kind: "snapshotSchedule", row: s } });
-    }
-  }
-  for (const p of policies ?? []) {
-    if (p.suspended) continue;
-    if (!p.lastSuccessfulSnapshot)
-      ranked.push({ rank: 1, card: { kind: "snapshotPolicy", row: p } });
-    else if (!p.lastVerified) ranked.push({ rank: 3, card: { kind: "snapshotPolicy", row: p } });
-  }
-  return ranked
-    .sort((a, b) => a.rank - b.rank)
-    .slice(0, ATTENTION_MAX)
-    .map((r) => r.card);
-}
-
-function Attention({ cards, now }: { cards: CardRow[]; now: Date }) {
-  if (cards.length === 0) return null;
-  return (
-    <ul className="attention" aria-label="Objects needing attention">
-      {cards.map((card) => (
-        <li key={`${card.kind}/${card.row.namespace ?? ""}/${card.row.name}`}>
-          <ObjectCard card={card} variant="stats" now={now} />
-        </li>
-      ))}
-    </ul>
-  );
-}
-
 function nothingNeedsYou(state: {
   settled: boolean;
-  cards: number;
-  stalled: number;
-  failing: number;
+  needs: number;
   fleetFailing: number;
 }): boolean {
-  return (
-    state.settled &&
-    state.cards === 0 &&
-    state.stalled === 0 &&
-    state.failing === 0 &&
-    state.fleetFailing === 0
-  );
+  return state.settled && state.needs === 0 && state.fleetFailing === 0;
 }
 
 interface SectionProps {
@@ -395,66 +294,5 @@ function VerdictLine({
         <span className="verdict__meta">as of {relativeTime(at, new Date())}</span>
       ) : null}
     </p>
-  );
-}
-
-/** `namespace/name` → the two halves; a name with no slash is cluster-scoped. */
-function splitObject(object: string): { namespace: string | null; name: string } {
-  const slash = object.indexOf("/");
-  if (slash < 0) {
-    return { namespace: null, name: object };
-  }
-  return { namespace: object.slice(0, slash), name: object.slice(slash + 1) };
-}
-
-function stalledRows(report: StatusReportView | null): WorkRow[] {
-  if (report === null) {
-    return [];
-  }
-  return report.stalled.map((row) => {
-    const { namespace, name } = splitObject(row.object);
-    return {
-      id: `${row.kind}/${row.object}`,
-      kind: row.kind,
-      namespace,
-      name,
-      health: "failed",
-      stateWord: "Stalled",
-      detail: row.message,
-    };
-  });
-}
-
-interface FixesProps {
-  checks: DoctorCheckView[];
-  ranAt: string;
-  now: Date;
-}
-
-/** The failing doctor checks, each with its fix; warnings belong on the doctor page. */
-function Fixes({ checks, ranAt, now }: FixesProps) {
-  const failing = checks.filter((check) => check.outcome === "Fail");
-  if (failing.length === 0) {
-    return null;
-  }
-  return (
-    <ul className="finding-list" aria-label="Failing checks">
-      {failing.map((check) => (
-        <li key={check.check}>
-          <Finding
-            title={check.title}
-            what={check.what ?? "The check failed without saying what it found."}
-            why={check.why}
-            fix={check.fix}
-            lamp={doctorOutcomeLamp(check.outcome)}
-            meta={
-              <>
-                {check.check} · ran {relativeTime(ranAt, now)}
-              </>
-            }
-          />
-        </li>
-      ))}
-    </ul>
   );
 }

@@ -29,10 +29,10 @@ const CSS = readStyles();
  * it needs a `:focus-visible` rule instead.
  */
 const NEVER_FOCUSED = new Set([
-  // Card lifts: a stat strip (`<dl>`) and an object card (`<article>`) are
+  // Card lifts: a stat strip (`<dl>`) and an attention row (`<li>`) are
   // never focusable themselves; the links inside them carry the ring.
   ".stats",
-  ".object-card",
+  ".attention-row",
   // A finding (`<article>`/`<div>`) and a page state are cards, not controls.
   ".finding",
   ".state",

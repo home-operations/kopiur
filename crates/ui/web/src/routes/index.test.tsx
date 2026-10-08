@@ -10,7 +10,6 @@ import type {
   StatusOverview,
 } from "../api/types";
 import {
-  bodyRows,
   calledPaths,
   fetchMock,
   forbiddenProblem,
@@ -78,7 +77,13 @@ const doctor: DoctorReportView = {
   ranAt: NOW,
   exitCode: 1,
   checks: [
-    { check: "crds-installed", scope: "installation", title: "CRDs installed", outcome: "Pass" },
+    {
+      check: "crds-installed",
+      scope: "installation",
+      title: "CRDs installed",
+      outcome: "Pass",
+      objects: [],
+    },
     {
       check: "no-stuck-work",
       scope: "namespace",
@@ -86,10 +91,22 @@ const doctor: DoctorReportView = {
       outcome: "Fail",
       what: "Snapshot media/nightly-1 is parked on MoverPermitted=False",
       why: "namespace media has not opted in to privileged movers",
-      fix: "annotate namespace media with kopiur.home-operations.com/allow-privileged-mover=true",
+      fix: "run the command in the condition message above",
+      objects: [
+        {
+          kind: "snapshot",
+          namespace: "media",
+          name: "nightly-1",
+          failing: true,
+          message:
+            "blocked on MoverPermitted=False: namespace media has not opted in. Fix: annotate namespace media with kopiur.home-operations.com/allow-privileged-mover=true",
+          fix: "run the command in the condition message above",
+        },
+      ],
     },
     {
       check: "recent-warnings",
+      objects: [],
       scope: "namespace",
       title: "recent warning events",
       outcome: "Warn",
@@ -102,7 +119,13 @@ const allGood: DoctorReportView = {
   ranAt: NOW,
   exitCode: 0,
   checks: [
-    { check: "crds-installed", scope: "installation", title: "CRDs installed", outcome: "Pass" },
+    {
+      check: "crds-installed",
+      scope: "installation",
+      title: "CRDs installed",
+      outcome: "Pass",
+      objects: [],
+    },
   ],
 };
 
@@ -210,35 +233,34 @@ describe("Overview", () => {
       "/repositories?health=failed&namespace=media",
     );
 
-    // What needs you: the failing objects as cards, worst first.
+    // What needs you: one row per object, worst first, whichever read
+    // noticed it — the blocked snapshot is stalled AND named by the doctor,
+    // and is shown once, with the doctor's account and the operator's fix.
     const attention = screen.getByRole("region", { name: "Needs attention" });
-    const cards = await within(attention).findAllByRole("article");
-    const kinds = cards.map((c) => c.getAttribute("data-kind")).filter((k) => k !== null);
-    expect(kinds).toContain("repository");
-    expect(kinds).toContain("maintenance");
-    expect(
-      attention
-        .querySelector('article[data-kind="repository"] a.object-name')
-        ?.getAttribute("href"),
-    ).toMatch(/inspect=repository%2Fmedia%2Fcold$/);
-
-    // Stalled objects as work rows.
-    const stalled = within(attention).getByRole("table", { name: "Stalled objects" });
-    const row = nth(bodyRows(stalled), 0);
-    expect(within(row).getByText("Snapshot")).toHaveClass("label-strip__kind");
-    expect(within(row).getByText("nightly-1")).toHaveClass("label-strip__name");
-    expect(row.querySelector(".health")).toHaveAttribute("data-health", "failed");
-    expect(row.querySelector(".health")).toHaveTextContent("Stalled");
-    expect(row).toHaveTextContent("has not opted in");
-
-    // The failing doctor checks, with their fix text, and the way to the full report.
-    const fixes = within(attention).getByRole("list", { name: "Failing checks" });
-    const findings = within(fixes).getAllByRole("article");
-    expect(findings).toHaveLength(1);
-    expect(nth(findings, 0)).toHaveAccessibleName("no blocked or stuck work");
-    expect(nth(findings, 0).querySelector(".finding__fix")).toHaveTextContent(
-      "annotate namespace media",
+    const list = await within(attention).findByRole("list", { name: "Objects needing attention" });
+    const rows = within(list).getAllByRole("listitem");
+    expect(rows.map((r) => r.getAttribute("data-kind"))).toEqual([
+      "snapshot",
+      "repository",
+      "maintenance",
+    ]);
+    const blocked = nth(rows, 0);
+    expect(within(blocked).getByRole("link", { name: "nightly-1" })).toHaveAttribute(
+      "href",
+      expect.stringMatching(/inspect=snapshot%2Fmedia%2Fnightly-1$/),
     );
+    expect(blocked.querySelector(".health")).toHaveTextContent("Stuck");
+    expect(blocked.querySelector(".attention-row__what")).toHaveTextContent(
+      "blocked on MoverPermitted=False",
+    );
+    expect(blocked.querySelector(".finding__fix")).toHaveTextContent("annotate namespace media");
+    expect(within(attention).getAllByText("nightly-1")).toHaveLength(1);
+    expect(nth(rows, 1).querySelector(".health")).toHaveTextContent("Failed");
+    expect(nth(rows, 2)).toHaveTextContent("2 quick maintenance runs in a row failed.");
+
+    // No second and third style beside it: no stalled table, no check cards.
+    expect(within(attention).queryByRole("table")).toBeNull();
+    expect(within(attention).queryByRole("article")).toBeNull();
     expect(within(attention).getByRole("link", { name: /full doctor report/ })).toHaveAttribute(
       "href",
       "/doctor?namespace=media",
@@ -469,18 +491,21 @@ describe("Overview", () => {
         checks: [
           {
             check: "crds-installed",
+            objects: [],
             scope: "installation",
             title: "CRDs installed",
             outcome: "Pass",
           },
           {
             check: "repositories-ready",
+            objects: [],
             scope: "mixed",
             title: "repositories ready",
             outcome: "Pass",
           },
           {
             check: "webhook-admits",
+            objects: [],
             scope: "installation",
             title: "webhook admits",
             outcome: "Warn",
@@ -488,6 +513,7 @@ describe("Overview", () => {
           },
           {
             check: "credentials-present",
+            objects: [],
             scope: "mixed",
             title: "credential secrets present",
             outcome: "Warn",

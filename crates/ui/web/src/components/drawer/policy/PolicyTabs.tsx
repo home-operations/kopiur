@@ -184,8 +184,7 @@ export function SnapshotsTab({ detail, now }: { detail: PolicyDetail; now: Date 
 /**
  * The runs this recipe produced, most recent first.
  *
- * Deliberately not a `WorkTable`: that ledger requires a `Health` per row,
- * and a `Snapshot` has a phase rather than a lamp the operator published.
+ * A `Snapshot` has a phase rather than a lamp the operator published.
  * Rather than derive one here — and derive it a second way from the snapshot
  * screens — the phase is printed as the operator's own word, loud only when
  * it says `Failed`.

@@ -20,6 +20,7 @@ export type { ConditionView } from "./types/ConditionView";
 export type { DirEntryView } from "./types/DirEntryView";
 export type { DirListing } from "./types/DirListing";
 export type { DoctorCheckView } from "./types/DoctorCheckView";
+export type { DoctorObjectView } from "./types/DoctorObjectView";
 export type { DoctorReportView } from "./types/DoctorReportView";
 export type { DoctorScopeView } from "./types/DoctorScopeView";
 export type { EdgeKind } from "./types/EdgeKind";

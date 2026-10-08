@@ -6,9 +6,16 @@ import { bodyRows, nth } from "../test-utils";
 import { DoctorChecks } from "./DoctorChecks";
 
 const checks: DoctorCheckView[] = [
-  { check: "crds-installed", scope: "installation", title: "CRDs installed", outcome: "Pass" },
+  {
+    check: "crds-installed",
+    scope: "installation",
+    title: "CRDs installed",
+    outcome: "Pass",
+    objects: [],
+  },
   {
     check: "credentials-present",
+    objects: [],
     scope: "mixed",
     title: "credential secrets present",
     outcome: "Warn",
@@ -16,6 +23,7 @@ const checks: DoctorCheckView[] = [
   },
   {
     check: "no-stuck-work",
+    objects: [],
     scope: "namespace",
     title: "no blocked or stuck work",
     outcome: "Fail",
@@ -25,6 +33,7 @@ const checks: DoctorCheckView[] = [
   },
   {
     check: "webhook-running",
+    objects: [],
     scope: "installation",
     title: "webhook running",
     outcome: "Warn",
@@ -32,6 +41,7 @@ const checks: DoctorCheckView[] = [
   },
   {
     check: "quantum-parity",
+    objects: [],
     // A scope this bundle has never heard of: `DoctorScopeView` is a closed
     // enum with no fallback variant, so a newer server is the only way this
     // arrives — and it must render as the unread word, never as a guess.

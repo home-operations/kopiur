@@ -91,7 +91,7 @@ that is not a `.health` pill, a loud absence (below) or an icon beside one.
   headers and references (not in table cells, where the column says it).
 
 ```html
-<article class="object-card" data-kind="snapshot-policy">
+<li class="attention-row" data-kind="snapshot-policy">
   <span class="kind-chip" aria-hidden="true"
     ><svg><!-- ScrollText --></svg></span
   >
@@ -333,8 +333,8 @@ One primary per region. Danger is for actions that stop backups or delete data.
 ## Stat strip (facts)
 
 **What:** a handful of named values about one object. One card, cells divided by
-hairlines, label above value. Four per row at the top of the drawer, three inside an
-object card.
+hairlines, label above value. Four per row at the top of the drawer, three in a
+compact card.
 
 ```html
 <dl class="stats">
@@ -421,91 +421,43 @@ tables, the absolute instant is the cell's `title` and a `<time datetime>`.
 
 ---
 
-## Object card
+## Attention row
 
-**What:** the tile for one object anywhere objects appear as cards (overview
-attention list, related objects, lanes, search results).
+**What:** one object that needs someone, wherever objects of mixed kinds are
+listed by what is wrong with them (the overview's "Needs attention"). One row
+per object, however many reads noticed it (`components/attention.ts`).
 
-Anatomy, top to bottom: **head** (chip · kind name / mono name / namespace · status
-pill on the right) → **meta line** (muted, one line, per `kinds.md`) → **stat strip**
-of three (per `kinds.md`). Stripe on the left edge.
+Anatomy: **first line** — chip · kind name / mono name (opens the resource
+drawer) / namespace, and on the right the status pill whose word says what is
+wrong ("Stuck", "Failed", "Never succeeded" — never the object's own phase or
+suspend state) with the relative time it went wrong when known. **Body**, under
+the name — the problem in the operator's own words (`.attention-row__what`) and
+the fix on the finding's FIX plate. The operator's `Fix:` clause is lifted out
+of its message onto the plate. Stripe on the left edge. A failing doctor check
+that is about no object takes the same row with a neutral icon tile, "Doctor
+check" for the kind and the check's title linking to the doctor page.
 
 ```html
-<article class="object-card has-stripe" data-kind="repository">
-  <header class="object-card__head">
-    <span class="kind-chip" aria-hidden="true"><svg /></span>
-    <span class="object-id">
-      <span class="kind-name">Repository</span>
-      <a class="object-name" href="…"><code>nas-offsite</code></a>
-      <span class="object-ns">media</span>
-    </span>
-    <span class="health" data-health="failed"><svg aria-hidden="true" />Failed</span>
-  </header>
-  <p class="object-card__meta">S3 · ReadWrite · bucket unreachable for 3h</p>
-  <dl class="stats stats--card">…three items…</dl>
-</article>
+<li class="attention-row has-stripe" data-kind="snapshot" data-health="failed">
+  <span class="kind-chip" aria-hidden="true"><svg /></span>
+  <span class="object-id">
+    <span class="kind-name">Snapshot</span>
+    <a class="object-name" href="?inspect=snapshot/billing/ledger-manual">ledger-manual</a>
+    <span class="object-ns">billing</span>
+  </span>
+  <span class="attention-row__state">
+    <span class="health" data-health="failed"><svg aria-hidden="true" />Stuck</span>
+  </span>
+  <div class="attention-row__body">
+    <p class="attention-row__what">blocked on MoverPermitted=False …</p>
+    <p class="finding__fix"><span class="finding__fix-label">Fix</span>…</p>
+  </div>
+</li>
 ```
 
-```css
-.object-card {
-  display: grid;
-  gap: 10px;
-  align-content: start;
-  padding: 14px 16px;
-  background: var(--bg-surface);
-  border-radius: var(--radius-lg);
-  box-shadow: var(--shadow-1);
-  border: 1px solid var(--card-border);
-}
-.object-card.has-stripe {
-  border-left: var(--stripe) solid var(--kc);
-}
-.object-card__head {
-  display: grid;
-  grid-template-columns: auto 1fr auto;
-  gap: 10px;
-  align-items: center;
-}
-.object-id {
-  display: grid;
-  min-width: 0;
-  line-height: 1.25;
-}
-.object-name {
-  font-family: var(--font-mono);
-  font-weight: var(--weight-semibold);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.object-ns {
-  font: var(--text-xs) var(--font-mono);
-  color: var(--fg-muted);
-}
-.object-card__meta {
-  margin: 0;
-  color: var(--fg-muted);
-  font-size: var(--text-sm);
-}
-.stats--card {
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  box-shadow: none;
-  border: 0;
-  border-top: 1px solid var(--line);
-  border-radius: 0;
-}
-.stats--card .stats__item {
-  border: 0;
-  padding: 10px 0 0;
-}
-.stats--card dd {
-  font-size: var(--text-md);
-}
-```
-
-Variant **summary** (no stat strip) is used in topology plates.
-The name opens it in the resource drawer; the card itself is not one big link.
-
+Grid `auto minmax(0, 1fr) auto` with areas `"chip id state" ". body body"`;
+below 560px the pill drops under the name. At most `ATTENTION_MAX` rows, then
+"And N more" pointing at the doctor report and the lists.
 ---
 
 ## Table (list pages)
@@ -604,7 +556,7 @@ inside `.table-wrap` rather than starving a column. Long names wrap at `/` and `
 ## Side panel (the resource drawer)
 
 **What:** a resource's details, floating over the right edge of the page. Every
-list row, reference, object card and search result opens one; it is how a
+list row, reference, attention row and search result opens one; it is how a
 resource is looked at without leaving the page you are on.
 
 ```html

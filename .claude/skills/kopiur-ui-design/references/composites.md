@@ -22,9 +22,13 @@ The first screen. Answers "is my data safe?" in this order:
    status bar, and the breakdown in words with icons ("1 failed · 2 ok"). A tile
    with any failure gets a 1.5px inset ring in `--health-failed-fg` at 45%. Each
    tile links to its list page (filtered to the failing state when it has one).
-4. **Needs attention · N** — the objects that need someone, as object cards with
-   their stat strips, three across, worst first. Empty state: "Nothing needs you"
-   with the doctor link.
+4. **Needs attention · N** — one list of attention rows (`primitives.md`), worst
+   first: every object that needs someone exactly once, whether the doctor named
+   it, the status report lists it as stalled, or its kind's list shows it
+   unhealthy — the doctor's account wins, then the stalled message, then what the
+   list row says. Failing doctor checks about no object follow as rows of the same
+   shape. Never a second or third style beside it (no stalled table, no finding
+   cards). Empty state: "Nothing needs you" with the doctor link.
 
 The status bar is decoration over the words beside it: it is `aria-hidden`, and
 the breakdown is the text. Segment colours are the `--health-*-fg` tokens; a zero
