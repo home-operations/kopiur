@@ -17,6 +17,7 @@ import type {
   ConditionView,
   MaintenanceRow,
   PolicyRow,
+  ReplicationRef,
   ReplicationsView,
   RepositoryDetail as RepositoryDetailData,
   RunStatusView,
@@ -61,6 +62,33 @@ export interface RepositoryDetailProps {
 }
 
 /**
+ * A replication the server named, as a card when its row is loaded — matched
+ * on kind, namespace and name, never a same-named one elsewhere — or else a
+ * reference in the kind the server gave.
+ */
+function replicationItem(
+  ref: ReplicationRef,
+  replications: ReplicationsView | undefined,
+): LaneItem {
+  const same = (r: { namespace: string; name: string }) =>
+    r.namespace === ref.namespace && r.name === ref.name;
+  switch (ref.kind) {
+    case "snapshotReplication": {
+      const row = replications?.snapshot.find(same);
+      return row !== undefined
+        ? { card: { kind: "snapshotReplication", row } }
+        : { ref: { kind: "snapshotReplication", name: ref.name, namespace: ref.namespace } };
+    }
+    case "repositoryReplication": {
+      const row = replications?.repository.find(same);
+      return row !== undefined
+        ? { card: { kind: "repositoryReplication", row } }
+        : { ref: { kind: "repositoryReplication", name: ref.name, namespace: ref.namespace } };
+    }
+  }
+}
+
+/**
  * Fired by → written by → this repository → copies to. Names the server sent
  * with no row loaded stay references, never dropped and never guessed.
  */
@@ -71,28 +99,16 @@ function repositoryLanes(
   replications: ReplicationsView | undefined,
 ): Lane[] {
   const { summary } = detail;
-  const ns = summary.namespace ?? undefined;
   const written: LaneItem[] = detail.policies.map((p) => {
     const row = policyRows?.find((r) => r.namespace === p.namespace && r.name === p.name);
     return row !== undefined
       ? { card: { kind: "snapshotPolicy", row } }
       : { ref: { kind: "snapshotPolicy", name: p.name, namespace: p.namespace } };
   });
-  for (const name of detail.replicationsIn) {
-    const row = replications?.snapshot.find((r) => r.name === name);
-    written.push(
-      row !== undefined
-        ? { card: { kind: "snapshotReplication", row } }
-        : { ref: { kind: "snapshotReplication", name, namespace: ns } },
-    );
-  }
-  const copies: LaneItem[] = detail.replicationsOut.map((name) => {
-    const snap = replications?.snapshot.find((r) => r.name === name);
-    if (snap !== undefined) return { card: { kind: "snapshotReplication", row: snap } };
-    const repo = replications?.repository.find((r) => r.name === name);
-    if (repo !== undefined) return { card: { kind: "repositoryReplication", row: repo } };
-    return { ref: { kind: "snapshotReplication", name, namespace: ns } };
-  });
+  for (const ref of detail.replicationsIn) written.push(replicationItem(ref, replications));
+  const copies: LaneItem[] = detail.replicationsOut.map((ref) =>
+    replicationItem(ref, replications),
+  );
   return [
     {
       title: "Fired by",

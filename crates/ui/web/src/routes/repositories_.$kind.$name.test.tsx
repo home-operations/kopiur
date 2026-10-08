@@ -91,7 +91,7 @@ const detail: RepositoryDetail = {
   ],
   policies: [{ namespace: "media", name: "nightly" }],
   schedules: [],
-  replicationsOut: ["offsite"],
+  replicationsOut: [{ kind: "snapshotReplication", namespace: "media", name: "offsite" }],
   replicationsIn: [],
   sessions: [
     {
@@ -394,5 +394,56 @@ describe("Repository detail — relationships", () => {
     );
     const self = within(flow).getByRole("region", { name: "This repository" });
     expect(within(self).getByRole("article")).toHaveAttribute("data-kind", "repository");
+  });
+});
+
+describe("Repository detail — replication lanes", () => {
+  const copy = (namespace: string, phase: "succeeded" | "failed") => ({
+    namespace,
+    name: "offsite",
+    source: `Repository/${namespace}/nas`,
+    destination: "ClusterRepository/shared",
+    cron: "0 3 * * *",
+    suspended: false,
+    phase,
+    lastReplicated: null,
+    identitiesSelected: 1,
+    snapshotsCopied: 1,
+    alreadyPresent: 0,
+    failed: 0,
+    pruned: 0,
+  });
+
+  it("joins a replication on kind, namespace and name — never a same-named one elsewhere", async () => {
+    mockApi({
+      "/api/v1/repositories/repository/nas": jsonResponse(detail),
+      "/api/v1/policies": jsonResponse([]),
+      "/api/v1/replications": jsonResponse({
+        repository: [],
+        snapshot: [copy("prod", "succeeded"), copy("media", "failed")],
+      }),
+    });
+    mountApp("/repositories/repository/nas?namespace=media");
+    const flow = await screen.findByRole("region", { name: "Relationships" });
+    const copies = within(flow).getByRole("region", { name: "Copies to" });
+    const card = await within(copies).findByRole("article");
+    expect(card.querySelector(".health")).toHaveAttribute("data-health", "failed");
+  });
+
+  it("names an unloaded replication in the kind the server gave, not a guessed one", async () => {
+    mockApi({
+      "/api/v1/repositories/repository/nas": jsonResponse({
+        ...detail,
+        replicationsOut: [{ kind: "repositoryReplication", namespace: "media", name: "blobsync" }],
+      }),
+      "/api/v1/policies": jsonResponse([]),
+      "/api/v1/replications": jsonResponse({ repository: [], snapshot: [] }),
+    });
+    mountApp("/repositories/repository/nas?namespace=media");
+    const flow = await screen.findByRole("region", { name: "Relationships" });
+    const copies = within(flow).getByRole("region", { name: "Copies to" });
+    expect(copies.querySelector('.ref[data-kind="repository-replication"]')).toHaveTextContent(
+      "blobsync",
+    );
   });
 });

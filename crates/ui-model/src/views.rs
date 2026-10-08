@@ -273,10 +273,10 @@ pub struct RepositoryDetail {
     /// Schedules that fire any policy writing into this repository, sorted by
     /// namespace then name — the "fired by" end of its relationships.
     pub schedules: Vec<ScheduleRow>,
-    /// Names of replications that read from this repository.
-    pub replications_out: Vec<String>,
-    /// Names of replications that write into this repository.
-    pub replications_in: Vec<String>,
+    /// Replications that read from this repository.
+    pub replications_out: Vec<ReplicationRef>,
+    /// Replications that write into this repository.
+    pub replications_in: Vec<ReplicationRef>,
     /// Browse sessions currently open against this repository.
     pub sessions: Vec<SessionInfo>,
 }
@@ -391,6 +391,31 @@ pub struct ConditionView {
     /// `conditions[].lastTransitionTime` as RFC3339.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_transition_time: Option<String>,
+}
+
+/// Which of the two replication kinds a [`ReplicationRef`] names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum ReplicationKind {
+    /// `RepositoryReplication` — blobs synced to a bare backend.
+    RepositoryReplication,
+    /// `SnapshotReplication` — snapshots copied into another repository.
+    SnapshotReplication,
+}
+
+/// A replication named with its kind and namespace, so a client never joins
+/// on a bare name — two replications may share one across namespaces.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct ReplicationRef {
+    /// Which replication kind this is.
+    pub kind: ReplicationKind,
+    /// `metadata.namespace` of the replication.
+    pub namespace: String,
+    /// `metadata.name` of the replication.
+    pub name: String,
 }
 
 /// A namespaced reference to a `SnapshotPolicy`.

@@ -27,7 +27,8 @@ use kopiur_api::{
 use kopiur_ui_model::graph::GateHit;
 use kopiur_ui_model::views::{
     AdmittedNamespacesView, CatalogCoverageView, CatalogView, HealthProbeView, PolicyRef,
-    RepositoryDetail, RepositorySummary, ScheduleRow, SeedView, ServerView, SessionInfo,
+    ReplicationKind, ReplicationRef, RepositoryDetail, RepositorySummary, ScheduleRow, SeedView,
+    ServerView, SessionInfo,
 };
 
 use crate::AppState;
@@ -272,38 +273,47 @@ fn schedules_firing(
     rows
 }
 
-/// **Pure.** Names of the replications that *read* from `key` — both kinds, since
+/// **Pure.** The replications that *read* from `key` — both kinds, since
 /// a repository is equally drained by a snapshot copy and by a blob sync.
 fn replications_from(
     snapshot: &[Arc<SnapshotReplication>],
     repository: &[Arc<RepositoryReplication>],
     key: &str,
-) -> Vec<String> {
+) -> Vec<ReplicationRef> {
     let from_snapshot = snapshot.iter().filter_map(|r| {
         let owner_ns = r.metadata.namespace.clone().unwrap_or_default();
-        (repo_key(&r.spec.source_ref, &owner_ns) == key)
-            .then(|| r.metadata.name.clone().unwrap_or_default())
+        (repo_key(&r.spec.source_ref, &owner_ns) == key).then(|| ReplicationRef {
+            kind: ReplicationKind::SnapshotReplication,
+            name: r.metadata.name.clone().unwrap_or_default(),
+            namespace: owner_ns,
+        })
     });
     let from_repository = repository.iter().filter_map(|r| {
         let owner_ns = r.metadata.namespace.clone().unwrap_or_default();
-        (repo_key(&r.spec.source_ref, &owner_ns) == key)
-            .then(|| r.metadata.name.clone().unwrap_or_default())
+        (repo_key(&r.spec.source_ref, &owner_ns) == key).then(|| ReplicationRef {
+            kind: ReplicationKind::RepositoryReplication,
+            name: r.metadata.name.clone().unwrap_or_default(),
+            namespace: owner_ns,
+        })
     });
     from_snapshot.chain(from_repository).collect()
 }
 
-/// **Pure.** Names of the replications that *write into* `key`.
+/// **Pure.** The replications that *write into* `key`.
 ///
 /// Only `SnapshotReplication` can: a `RepositoryReplication` writes to a bare
 /// backend, which is not a repository CR and therefore not something that can
 /// name this one as a destination.
-fn replications_into(snapshot: &[Arc<SnapshotReplication>], key: &str) -> Vec<String> {
+fn replications_into(snapshot: &[Arc<SnapshotReplication>], key: &str) -> Vec<ReplicationRef> {
     snapshot
         .iter()
         .filter_map(|r| {
             let owner_ns = r.metadata.namespace.clone().unwrap_or_default();
-            (repo_key(&r.spec.destination_ref, &owner_ns) == key)
-                .then(|| r.metadata.name.clone().unwrap_or_default())
+            (repo_key(&r.spec.destination_ref, &owner_ns) == key).then(|| ReplicationRef {
+                kind: ReplicationKind::SnapshotReplication,
+                name: r.metadata.name.clone().unwrap_or_default(),
+                namespace: owner_ns,
+            })
         })
         .collect()
 }
@@ -962,8 +972,24 @@ spec:
             }],
             "a same-named repository in another namespace is a different repository"
         );
-        assert_eq!(detail.replications_out, vec!["offsite", "blobsync"]);
-        assert_eq!(detail.replications_in, vec!["inbound"]);
+        // Kind and namespace ride with the name: two replications may share a
+        // name across namespaces, and the SPA must not guess which one it is.
+        let r = |kind, name: &str| ReplicationRef {
+            kind,
+            namespace: "media".into(),
+            name: name.into(),
+        };
+        assert_eq!(
+            detail.replications_out,
+            vec![
+                r(ReplicationKind::SnapshotReplication, "offsite"),
+                r(ReplicationKind::RepositoryReplication, "blobsync"),
+            ]
+        );
+        assert_eq!(
+            detail.replications_in,
+            vec![r(ReplicationKind::SnapshotReplication, "inbound")]
+        );
         assert_eq!(detail.identity_cluster.as_deref(), Some("east"));
         assert!(detail.maintenance.is_none());
     }

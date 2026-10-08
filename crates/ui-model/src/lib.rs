@@ -54,6 +54,7 @@
 //! | [`views::OriginView`] | `scheduled`, `manual`, `discovered`, `adopted`, `replicated` | — | **none** — `Origin` is parsed strictly and an unrecognized marker never decodes |
 //! | [`views::DoctorScopeView`] | `namespace`, `installation`, `mixed` | — | **none** |
 //! | [`views::ObjectKind`] | `repository`, `clusterRepository`, `maintenance`, `snapshotPolicy`, `snapshotSchedule`, `snapshot`, `restore`, `repositoryReplication`, `snapshotReplication` | — | **none** — a new kind must be given an identity before it ships |
+//! | [`views::ReplicationKind`] | `repositoryReplication`, `snapshotReplication` | — | **none** — the two replication CRDs |
 //! | [`views::AdmittedNamespacesView`] | `all`, `none` | `{ listed: { count } }`, `{ selector: { selector } }` | **none** — exhaustive over the spec's `AllowedNamespaces` |
 //! | [`views::EntryKind`] | `file`, `dir`, `symlink` | `{ other: { raw: string } }` | **`other`**, not `unknown` |
 //! | [`requests::RestoreSourceBody`] | — | `{ snapshotRef: … }`, `{ fromPolicy: … }`, `{ identity: … }` | none (a request body: the client picks the variant) |
@@ -205,7 +206,7 @@ mod tests {
             .filter(|n| n.ends_with(".ts"))
             .count();
         assert_eq!(
-            exported, 80,
+            exported, 82,
             "expected one .ts file per wire type; add the new type's root to \
              `export_all` and bump this count deliberately. 64 -> 65 when \
              `GateSeverityView` replaced `GateHit.severity`/`GateDescriptor.severity`'s \
@@ -230,7 +231,9 @@ mod tests {
              a count; 75 -> 76 for `NamespaceSummary`, the namespace \
              switcher's list; 76 -> 80 for `OverviewView` and its \
              `KindTally`, `HealthCount` and `ObjectKind`, the overview's \
-             fleet-by-kind tiles"
+             fleet-by-kind tiles; 80 -> 82 for `ReplicationRef` and its \
+             `ReplicationKind`, so a repository's replications carry their \
+             kind and namespace and the SPA never joins on a bare name"
         );
     }
 }

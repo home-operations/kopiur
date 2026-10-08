@@ -45,6 +45,8 @@ export type { OriginView } from "./types/OriginView";
 export type { Page } from "./types/Page";
 export type { PolicyDetail } from "./types/PolicyDetail";
 export type { PolicyRef } from "./types/PolicyRef";
+export type { ReplicationKind } from "./types/ReplicationKind";
+export type { ReplicationRef } from "./types/ReplicationRef";
 export type { PolicyRow } from "./types/PolicyRow";
 export type { Problem } from "./types/Problem";
 export type { ReplicationPhaseView } from "./types/ReplicationPhaseView";
