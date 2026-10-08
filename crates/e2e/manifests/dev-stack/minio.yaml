@@ -1,0 +1,78 @@
+# Dev-stack MinIO — an in-cluster S3 for the console's dev stack.
+#
+# Applied by `mise run //crates/e2e:ui-dev-stack` BEFORE seed.yaml, so the
+# S3-backed repositories and the blob replication in the seed have somewhere to
+# write. A YAML translation of the e2e harness's own MinIO
+# (crates/e2e/src/builders.rs `minio_deployment` / `minio_service` /
+# `mc_bucket_pod`), with the same digest-pinned images as
+# crates/e2e/src/consts.rs `MINIO_IMAGE` / `MC_IMAGE` — keep them in lockstep.
+# It lives in `kopiur-dev`, not the operator namespace, so a test run against
+# this cluster never meets these buckets.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: kopiur-dev
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: minio
+  namespace: kopiur-dev
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: minio }
+  template:
+    metadata:
+      labels: { app: minio }
+    spec:
+      containers:
+        - name: minio
+          image: docker.io/pgsty/minio:RELEASE.2026-08-04T00-00-00Z@sha256:b6bfe7239bfc83fb90d31612d9704d86039dd714f7904b3f1ad68f211e602372
+          imagePullPolicy: IfNotPresent
+          args: ["server", "/data", "--console-address", ":9001"]
+          env:
+            - { name: MINIO_ROOT_USER, value: minioadmin }
+            - { name: MINIO_ROOT_PASSWORD, value: minioadmin123 }
+          ports:
+            - containerPort: 9000
+          readinessProbe:
+            httpGet: { path: /minio/health/ready, port: 9000 }
+            periodSeconds: 3
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: minio
+  namespace: kopiur-dev
+spec:
+  selector: { app: minio }
+  ports:
+    - { name: s3, port: 9000, targetPort: 9000 }
+---
+# The three buckets the seed writes into. A Job, so a re-run of the task (which
+# re-applies this file) is a no-op once it has completed.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: minio-buckets
+  namespace: kopiur-dev
+spec:
+  backoffLimit: 6
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: mc
+          image: docker.io/pgsty/mc:RELEASE.2026-09-13T00-00-00Z@sha256:aa5cc1401b3e1ab482d215d5717e9e69b4f14970a3656f330ed20a549fe19020
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -e
+              until mc alias set local http://minio:9000 minioadmin minioadmin123 >/dev/null 2>&1; do sleep 2; done
+              for bucket in dev-media dev-offsite dev-mirror; do
+                mc mb --ignore-existing "local/$bucket"
+              done

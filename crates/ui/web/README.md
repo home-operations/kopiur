@@ -56,10 +56,26 @@ mise run //crates/e2e:ui-dev-stack   # kind cluster + operator + seeded data
 ```
 
 It builds the `:e2e` images (`KOPIUR_E2E_SKIP_BUILD=1` reuses them), brings up
-the throwaway `kopiur-e2e` kind cluster, installs the operator chart, and applies
-`crates/e2e/manifests/dev-stack/seed.yaml`: a namespaced `Repository` and a
-`ClusterRepository`, two policies, an hourly schedule, succeeded
-snapshots, and a restore. Then it prints the two commands to run. The backend
+the throwaway `kopiur-e2e` kind cluster, installs the operator chart, starts a
+dev-only MinIO (`crates/e2e/manifests/dev-stack/minio.yaml`), and applies
+`crates/e2e/manifests/dev-stack/seed.yaml`. The seed is meant to put every case
+the console renders on screen, across three namespaces (`kopiur-dev`, `media`,
+`billing`):
+
+- filesystem and S3 repositories side by side, and `ClusterRepository`s that
+  admit everyone, a listed set of namespaces, and namespaces by label;
+- an hourly schedule, a schedule firing policies by label selector, a fan-out
+  policy writing into a `Repository` and a `ClusterRepository`, succeeded and
+  pinned snapshots, and a completed restore;
+- a `RepositoryReplication` to a bare S3 backend, a `SnapshotReplication`, and a
+  repository seeded from another;
+- things that are meant to be wrong: a policy naming a repository that does not
+  exist (a ghost on the topology board), a snapshot of a missing claim, a
+  restore of a missing snapshot, a root mover held by the privileged-mover gate,
+  and a suspended policy and schedule.
+
+The task waits only for the happy-path snapshots. Then it prints the two
+commands to run. The backend
 command uses the isolated `target/e2e/kubeconfig`, never your current context.
 It also impersonates `kopiur-dev`, a user the seed binds to `cluster-admin` inside
 that cluster. The backend refuses every `system:` principal, so

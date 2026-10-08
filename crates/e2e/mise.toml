@@ -344,8 +344,9 @@ for bin in docker kind kubectl helm; do
   command -v "$bin" >/dev/null 2>&1 || { echo "error: '$bin' is required" >&2; exit 127; }
 done
 # Same cluster, images and chart as the e2e suite — so what the console shows is
-# what the operator really writes — minus the backend servers and CSI stack,
-# which the seed does not use. The console itself is NOT installed in-cluster:
+# what the operator really writes — minus the CSI stack, which the seed does not
+# use. One backend server comes along: a dev-only MinIO in kopiur-dev, so the
+# console has S3 beside filesystem (crates/e2e/manifests/dev-stack/minio.yaml). The console itself is NOT installed in-cluster:
 # you run kopiur-ui locally (below) so a backend change is one `cargo run` away.
 # KOPIUR_E2E_SKIP_BUILD=1 reuses the :e2e images already in the local daemon.
 if [ "${KOPIUR_E2E_SKIP_BUILD:-0}" != "1" ]; then mise run //crates/e2e:images; fi
@@ -355,6 +356,7 @@ mise run //crates/e2e:images-load
 # controller pod cannot start until node-seed has created it.
 mise run //crates/e2e:node-seed
 mise run //crates/e2e:helm
+mise run //crates/e2e:minio-preload
 
 echo "==> seeding the dev data dirs on the kind node"
 # Kept OUT of /kopiur-e2e and out of REPO_SUBPATHS: these are not e2e fixtures,
@@ -362,6 +364,9 @@ echo "==> seeding the dev data dirs on the kind node"
 docker exec kopiur-e2e-control-plane sh -c '
   set -e
   mkdir -p /kopiur-dev/repo /kopiur-dev/cluster-repo /kopiur-dev/src/config /kopiur-dev/src/data/2026 /kopiur-dev/src/logs
+  mkdir -p /kopiur-dev/media-nas /kopiur-dev/shared-list /kopiur-dev/billing-repo /kopiur-dev/media-src/2026 /kopiur-dev/billing-src
+  for p in beach harbour summit; do head -c 524288 /dev/urandom > "/kopiur-dev/media-src/2026/$p.jpg"; done
+  printf "q3 close\n" > /kopiur-dev/billing-src/ledger.csv
   printf "listen: 0.0.0.0:8080\nlog_level: info\n" > /kopiur-dev/src/config/app.yaml
   printf "{\"feature_flags\": {\"beta\": true}}\n"  > /kopiur-dev/src/config/flags.json
   for m in 01 02 03 04 05 06; do printf "month %s ledger\n" "$m" > "/kopiur-dev/src/data/2026/$m.csv"; done
@@ -370,12 +375,19 @@ docker exec kopiur-e2e-control-plane sh -c '
   chmod -R 0777 /kopiur-dev
 '
 
+echo "==> starting the dev MinIO (crates/e2e/manifests/dev-stack/minio.yaml)"
+kubectl apply -f crates/e2e/manifests/dev-stack/minio.yaml
+kubectl -n kopiur-dev rollout status deployment/minio --timeout=5m
+kubectl -n kopiur-dev wait --for=condition=Complete --timeout=5m job/minio-buckets
+
 echo "==> applying the dev seed (crates/e2e/manifests/dev-stack/seed.yaml)"
 kubectl apply -f crates/e2e/manifests/dev-stack/seed.yaml
 echo "==> waiting for the seeded Snapshots to succeed"
 kubectl -n kopiur-dev wait --for=jsonpath='{.status.phase}'=Succeeded --timeout=10m \
   snapshot/app-data-manual snapshot/app-data-weekly-manual
-kubectl get repositories,snapshotpolicies,snapshotschedules,snapshots,restores -n kopiur-dev
+# Only the happy-path snapshots are waited on: the seed also holds things that
+# are meant to fail, be gated or stay suspended (see its last section).
+kubectl get repositories,snapshotpolicies,snapshotschedules,snapshots,restores,repositoryreplications,snapshotreplications -A
 kubectl get clusterrepositories
 
 KCFG=$(realpath "$KUBECONFIG")
