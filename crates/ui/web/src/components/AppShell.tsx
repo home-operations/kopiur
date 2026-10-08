@@ -1,6 +1,6 @@
 import { useRouterState } from "@tanstack/react-router";
 import { Menu } from "lucide-react";
-import { type ReactNode, useState } from "react";
+import { type ReactNode, useEffect, useRef, useState } from "react";
 
 import { useCurrentNamespace } from "../util/namespace";
 import { sectionFor } from "./nav";
@@ -29,12 +29,28 @@ export function AppShell({ children }: AppShellProps) {
   const setNavOpen = (open: boolean) => {
     setOpenOn(open ? href : null);
   };
+  const menu = useRef<HTMLButtonElement>(null);
+  // Escape closes an open drawer and puts focus back on the button that
+  // opened it, so a keyboard user is never left inside a hidden panel.
+  useEffect(() => {
+    if (!navOpen) return;
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      setOpenOn(null);
+      menu.current?.focus();
+    };
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [navOpen]);
   return (
     <div className="shell" data-nav-open={navOpen ? "true" : undefined}>
       <SkipLink />
       <div className="mobile-bar">
         <button
           type="button"
+          ref={menu}
           className="mobile-bar__menu"
           aria-controls="sidebar"
           aria-expanded={navOpen}

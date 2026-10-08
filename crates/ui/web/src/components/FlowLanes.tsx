@@ -1,5 +1,5 @@
 import { ArrowRight } from "lucide-react";
-import { Fragment } from "react";
+import { type CSSProperties, Fragment } from "react";
 
 import type { ObjectKind } from "../api/types";
 import { detailHref } from "./kind";
@@ -33,9 +33,20 @@ export interface Lane {
  * the lanes are also the page's spoken account of the relationships; the
  * arrows between them are decoration.
  */
+/**
+ * One track per lane with an arrow track between each pair; the object's own
+ * (`stats`) lane gets the extra width its stat strip needs.
+ */
+function laneColumns(lanes: readonly Lane[]): string {
+  return lanes
+    .map((lane) => (lane.variant === "stats" ? "minmax(0, 1.2fr)" : "minmax(0, 1fr)"))
+    .join(" auto ");
+}
+
 export function FlowLanes({ label, lanes }: { label: string; lanes: readonly Lane[] }) {
+  const style = { "--lane-cols": laneColumns(lanes) } as CSSProperties;
   return (
-    <section className="flow-lanes" aria-label={label}>
+    <section className="flow-lanes" aria-label={label} style={style}>
       {lanes.map((lane, index) => (
         <Fragment key={lane.label}>
           {index > 0 ? (

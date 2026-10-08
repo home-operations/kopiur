@@ -87,6 +87,18 @@ afterEach(() => {
 });
 
 describe("AppShell", () => {
+  it("closes the navigation drawer on Escape and hands focus back to its button", async () => {
+    mockShell();
+    mountAt("/snapshots");
+    const user = userEvent.setup();
+    const menu = await screen.findByRole("button", { name: "Navigation" });
+    await user.click(menu);
+    expect(menu).toHaveAttribute("aria-expanded", "true");
+    await user.keyboard("{Escape}");
+    expect(menu).toHaveAttribute("aria-expanded", "false");
+    expect(menu).toHaveFocus();
+  });
+
   it("lists the ten sections, marks the current one, and scopes the header to the namespace", async () => {
     mockShell();
     mountAt("/snapshots?namespace=prod");

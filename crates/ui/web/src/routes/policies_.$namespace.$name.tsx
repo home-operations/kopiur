@@ -75,7 +75,7 @@ function PolicyDetailRoute() {
       detail={policy.data}
       repositoryRows={repositories.data}
       actions={
-        <>
+        <div className="action-bar">
           <SnapshotNowDialog
             namespace={row.namespace}
             policy={row.name}
@@ -96,7 +96,7 @@ function PolicyDetailRoute() {
               setOpen(next ? "suspend" : null);
             }}
           />
-        </>
+        </div>
       }
     />
   );

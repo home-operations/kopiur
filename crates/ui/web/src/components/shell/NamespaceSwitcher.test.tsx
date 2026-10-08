@@ -2,6 +2,8 @@ import { screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it } from "vitest";
 
+import { cssRules, readStyles } from "../../testing/css";
+
 import {
   forbiddenProblem,
   jsonResponse,
@@ -78,5 +80,12 @@ describe("NamespaceSwitcher", () => {
     await user.keyboard("{Escape}");
     expect(screen.queryByRole("dialog", { name: "Choose a namespace" })).toBeNull();
     expect(button).toHaveFocus();
+  });
+});
+
+describe("NamespaceSwitcher — fit", () => {
+  it("keeps the open panel inside the sidebar: its column may shrink below the filter's natural width", () => {
+    const rule = cssRules(readStyles()).find((r) => r.selector === ".ns-switcher__panel");
+    expect(rule?.body).toMatch(/grid-template-columns:\s*minmax\(0,\s*1fr\)/);
   });
 });

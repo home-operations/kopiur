@@ -900,6 +900,28 @@ a.object-name:hover {
   font-size: var(--text-sm);
 }
 
+/* ---- grids step down: tiles 4 → 2 → 1, facts 4 → 2 ------------------------ */
+
+@media (max-width: 1100px) {
+  .kind-tiles,
+  .attention {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 700px) {
+  .stats {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 560px) {
+  .kind-tiles,
+  .attention {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
 /* ---- detail header: trail, hero, verdict, actions, facts ------------------------ */
 
 .detail-header {
@@ -985,12 +1007,10 @@ a.object-name:hover {
 
 /* ---- flow lanes: fired by → written by → this object → copies to --------------- */
 
+/* The track list is set by FlowLanes from its lane count (`--lane-cols`). */
 .flow-lanes {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr) auto minmax(0, 1.2fr) auto minmax(
-      0,
-      1fr
-    );
+  grid-template-columns: var(--lane-cols, minmax(0, 1fr));
   align-items: start;
   gap: var(--space-2);
 }
@@ -1368,6 +1388,9 @@ a.object-name:hover {
   left: 0;
   z-index: 30;
   display: grid;
+  /* An auto track would size to the filter input's natural width, wider than
+     the sidebar; the panel's own width is the limit. */
+  grid-template-columns: minmax(0, 1fr);
   gap: 4px;
   width: 100%;
   padding: 8px;
@@ -2037,42 +2060,6 @@ a.object-name:hover {
 .health-strip__list [data-empty="true"] .health {
   color: var(--fg-muted);
   background: var(--bg-inset);
-}
-
-/* ---- in-flight: two counts with their words --------------------------------- */
-
-.in-flight {
-  display: grid;
-  grid-template-columns: max-content 1fr;
-  gap: var(--space-1) var(--space-3);
-  align-items: baseline;
-  margin: 0;
-}
-
-.in-flight dt {
-  color: var(--fg-muted);
-  font-size: var(--text-xs);
-  letter-spacing: var(--tracking-caps);
-  text-transform: uppercase;
-  padding-top: 0.2em;
-}
-
-.in-flight dd {
-  display: flex;
-  align-items: baseline;
-  gap: var(--space-2);
-  font-size: var(--text-sm);
-}
-
-.in-flight__count {
-  font-size: var(--text-lg);
-  font-weight: var(--weight-semibold);
-  line-height: 1;
-}
-
-.in-flight__count[data-unknown="true"] {
-  color: var(--fg-muted);
-  font-weight: var(--weight-regular);
 }
 
 /* ---- finding: what / why / fix, the fix on its own plate ----------------------
@@ -3372,21 +3359,6 @@ a.object-name:hover {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
   tab-size: 2;
-}
-
-/* A checkbox whose consequence is permanent gets the consequence beside it,
-   not in a hover. */
-.action__switch {
-  display: grid;
-  gap: var(--space-1);
-  margin-top: var(--space-3);
-}
-
-.action__switch label {
-  display: flex;
-  align-items: center;
-  gap: var(--space-2);
-  font-weight: var(--weight-medium);
 }
 
 /* ---- lineage: one hop up, one hop down ----------------------------------- */
