@@ -1,0 +1,254 @@
+# Dev-stack seed — a small, populated kopiur install for working on the web console.
+#
+# Applied by `mise run //crates/e2e:ui-dev-stack` into the throwaway kopiur-e2e
+# kind cluster, AFTER the operator chart is installed. It is NOT part of any e2e
+# scenario: the suite provisions its own fixtures from Rust (crates/e2e `World`),
+# and nothing here is asserted on. Its only job is to give every console screen
+# something real to render — repositories, policies, a schedule that keeps firing,
+# succeeded snapshots, a restore, and the default-managed Maintenance those imply.
+#
+# Everything is filesystem-backed over hostPath dirs under /kopiur-dev on the kind
+# node (created by the task before this is applied), so there is no MinIO to wait
+# for. Nothing here shares a dir with the e2e fixtures under /kopiur-e2e.
+#
+# The `kopiur-dev` user at the bottom is who the locally-run `kopiur-ui` backend
+# impersonates (`--anonymous-user kopiur-dev`). The console refuses every
+# `system:` principal, so it cannot impersonate `system:masters`; this binding is
+# the throwaway-cluster stand-in for a real user's RBAC.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: kopiur-dev
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: dev-kopia-creds
+  namespace: kopiur-dev
+type: Opaque
+stringData:
+  KOPIA_PASSWORD: "kopiur-dev-password"
+---
+# The ClusterRepository's password lives in the operator namespace, where its
+# bootstrap and Maintenance run.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: dev-kopia-creds
+  namespace: kopiur-e2e
+type: Opaque
+stringData:
+  KOPIA_PASSWORD: "kopiur-dev-password"
+# --- storage: statically bound hostPath PVs (storageClassName "", 1:1 PV↔PVC) ---
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: kopiur-dev-repo
+spec:
+  capacity: { storage: 1Gi }
+  accessModes: [ReadWriteOnce]
+  storageClassName: ""
+  hostPath: { path: /kopiur-dev/repo, type: Directory }
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: dev-repo
+  namespace: kopiur-dev
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: ""
+  volumeName: kopiur-dev-repo
+  resources: { requests: { storage: 1Gi } }
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: kopiur-dev-cluster-repo
+spec:
+  capacity: { storage: 1Gi }
+  accessModes: [ReadWriteOnce]
+  storageClassName: ""
+  hostPath: { path: /kopiur-dev/cluster-repo, type: Directory }
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: dev-cluster-repo
+  namespace: kopiur-e2e
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: ""
+  volumeName: kopiur-dev-cluster-repo
+  resources: { requests: { storage: 1Gi } }
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: kopiur-dev-src
+spec:
+  capacity: { storage: 1Gi }
+  accessModes: [ReadWriteOnce]
+  storageClassName: ""
+  hostPath: { path: /kopiur-dev/src, type: Directory }
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: app-data
+  namespace: kopiur-dev
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: ""
+  volumeName: kopiur-dev-src
+  resources: { requests: { storage: 1Gi } }
+# --- kopiur resources -----------------------------------------------------------
+---
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: Repository
+metadata:
+  name: dev-repo
+  namespace: kopiur-dev
+spec:
+  backend:
+    filesystem:
+      path: /repo
+      volume:
+        pvc:
+          name: dev-repo
+  encryption:
+    passwordSecretRef:
+      name: dev-kopia-creds
+      key: KOPIA_PASSWORD
+  create:
+    enabled: true
+---
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: ClusterRepository
+metadata:
+  name: dev-cluster-repo
+spec:
+  backend:
+    filesystem:
+      path: /repo
+      volume:
+        pvc:
+          name: dev-cluster-repo
+  encryption:
+    passwordSecretRef:
+      name: dev-kopia-creds
+      namespace: kopiur-e2e
+      key: KOPIA_PASSWORD
+  create:
+    enabled: true
+  allowedNamespaces:
+    all: true
+---
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: SnapshotPolicy
+metadata:
+  name: app-data
+  namespace: kopiur-dev
+spec:
+  repository:
+    kind: Repository
+    name: dev-repo
+  sources:
+    - pvc:
+        name: app-data
+  # A statically provisioned hostPath PVC has no CSI driver to snapshot it.
+  copyMethod: Direct
+  retention:
+    keepLatest: 10
+    keepHourly: 6
+    keepDaily: 7
+---
+# A second policy over the same data, so policy filters have something to leave out.
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: SnapshotPolicy
+metadata:
+  name: app-data-weekly
+  namespace: kopiur-dev
+spec:
+  repository:
+    kind: Repository
+    name: dev-repo
+  sources:
+    - pvc:
+        name: app-data
+  copyMethod: Direct
+  retention:
+    keepWeekly: 4
+---
+# Keeps producing Snapshots while the stack is up, so list/timeline views move.
+# Hourly, not tighter: the webhook (rightly) warns that a sub-hourly cron piles up
+# Snapshot CRs, and a dev cluster left running overnight should not.
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: SnapshotSchedule
+metadata:
+  name: app-data-frequent
+  namespace: kopiur-dev
+spec:
+  policyRef:
+    name: app-data
+  schedule:
+    cron: "H * * * *"
+    runOnCreate: true
+---
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: Snapshot
+metadata:
+  name: app-data-manual
+  namespace: kopiur-dev
+spec:
+  policyRef:
+    name: app-data
+  description: "seeded by the dev stack"
+  tags:
+    reason: dev-stack
+  pin: true
+  deletionPolicy: Retain
+---
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: Snapshot
+metadata:
+  name: app-data-weekly-manual
+  namespace: kopiur-dev
+spec:
+  policyRef:
+    name: app-data-weekly
+---
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: Restore
+metadata:
+  name: app-data-restore
+  namespace: kopiur-dev
+spec:
+  source:
+    snapshotRef:
+      name: app-data-manual
+      namespace: kopiur-dev
+  target:
+    pvc:
+      name: app-data-restored
+      capacity: 1Gi
+      accessModes: [ReadWriteOnce]
+  policy:
+    # The Snapshot is created in the same apply; give it time to finish.
+    waitTimeout: 10m
+# --- the console's identity ----------------------------------------------------
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kopiur-dev-admin
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-admin
+subjects:
+  - apiGroup: rbac.authorization.k8s.io
+    kind: User
+    name: kopiur-dev

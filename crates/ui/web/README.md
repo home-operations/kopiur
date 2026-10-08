@@ -23,8 +23,10 @@ listen address. So you need the backend running beside it, pointed at a cluster:
 ```bash
 # Terminal 1 — the backend, against whatever kubeconfig is current.
 # --anonymous-user gives you an identity to impersonate without a proxy in
-# front; in a real deployment the identity comes from trusted headers.
-cargo run -p kopiur-ui -- --anonymous-user "$(kubectl config view --minify -o jsonpath='{.contexts[0].context.user}')"
+# front; in a real deployment the identity comes from trusted headers. It must
+# be a username your cluster's RBAC actually binds (not a kubeconfig entry
+# name), and never a `system:` principal, which the backend refuses.
+cargo run -p kopiur-ui -- --anonymous-user <your-rbac-username>
 
 # Terminal 2 — the SPA, with hot reload.
 mise run ui-dev
@@ -46,8 +48,23 @@ Two things about the proxy that will bite if you change them:
   you do not have, not a bug — the identity strip in the header lists every
   capability with a yes or a no.
 
-Against a cluster with nothing in it, most screens are empty states. `crates/e2e`
-is what stands up a populated one.
+Against a cluster with nothing in it, most screens are empty states. For a
+populated one, use the dev stack:
+
+```bash
+mise run //crates/e2e:ui-dev-stack   # kind cluster + operator + seeded data
+```
+
+It builds the `:e2e` images (`KOPIUR_E2E_SKIP_BUILD=1` reuses them), brings up
+the throwaway `kopiur-e2e` kind cluster, installs the operator chart, and applies
+`crates/e2e/manifests/dev-stack/seed.yaml`: a namespaced `Repository` and a
+`ClusterRepository`, two policies, an hourly schedule, succeeded
+snapshots, and a restore. Then it prints the two commands to run. The backend
+command uses the isolated `target/e2e/kubeconfig`, never your current context.
+It also impersonates `kopiur-dev`, a user the seed binds to `cluster-admin` inside
+that cluster. The backend refuses every `system:` principal, so
+`system:masters` is not an option. Tear the cluster down with
+`mise run //crates/e2e:down`.
 
 ## The API types are generated, and that is the rule
 
