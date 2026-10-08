@@ -2600,18 +2600,11 @@ html:has(dialog.side-panel[open]) {
 
 /* ---- topology board ------------------------------------------------------- */
 
-/* The board and its drawer. The drawer is a column beside the board at width
-   and a block under it below 900px (see responsive) — never an overlay: the
-   plate you clicked has to stay on screen while you read about it. */
 .topo-layout {
   display: grid;
   grid-template-columns: minmax(0, 1fr);
   gap: var(--space-4);
   align-items: start;
-}
-
-.topo-layout[data-drawer="open"] {
-  grid-template-columns: minmax(0, 1fr) 22rem;
 }
 
 /* The chassis the graph sits on: the inset, so the plates (surface) read as
@@ -2790,21 +2783,7 @@ html:has(dialog.side-panel[open]) {
   color: var(--fg-muted);
 }
 
-/* ---- topology drawer ------------------------------------------------------ */
-
-.topo-drawer {
-  position: sticky;
-  top: var(--space-2);
-}
-
-.topo-drawer.has-stripe {
-  border-left: var(--stripe) solid var(--kc);
-}
-
-.topo-drawer:focus-visible {
-  outline: none;
-  box-shadow: var(--focus-ring);
-}
+/* ---- topology drawer: the board's side panel body ------------------------- */
 
 .topo-drawer__body {
   display: grid;
@@ -2890,11 +2869,6 @@ html:has(dialog.side-panel[open]) {
   font-size: var(--text-sm);
 }
 
-.topo-drawer__link {
-  margin: 0;
-  font-size: var(--text-sm);
-}
-
 /* ---- responsive: structural, not fluid ------------------------------------ */
 
 @media (max-width: 900px) {
@@ -2956,17 +2930,6 @@ html:has(dialog.side-panel[open]) {
 
   .page__pair {
     grid-template-columns: minmax(0, 1fr);
-  }
-
-  /* The drawer stops being a column and becomes the block under the board;
-     it also stops sticking, since there is no longer a tall neighbour to
-     stick beside. */
-  .topo-layout[data-drawer="open"] {
-    grid-template-columns: minmax(0, 1fr);
-  }
-
-  .topo-drawer {
-    position: static;
   }
 
   .topo-board {

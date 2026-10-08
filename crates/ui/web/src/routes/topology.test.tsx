@@ -238,7 +238,7 @@ describe("Topology", () => {
     const region = await drawnBoard();
 
     await userEvent.click(plate(region, NAS.id));
-    const drawer = await screen.findByRole("complementary", { name: /media\/nas/ });
+    const drawer = await screen.findByRole("dialog", { name: /media\/nas/ });
     expect(router.state.location.search).toMatchObject({ node: NAS.id, namespace: "media" });
 
     // Both directions, named as the CRD names them.
@@ -252,7 +252,7 @@ describe("Topology", () => {
     expect(within(out).getByText("Failed")).toBeInTheDocument();
 
     await userEvent.click(within(drawer).getByRole("button", { name: "Close details" }));
-    expect(screen.queryByRole("complementary", { name: /media\/nas/ })).toBeNull();
+    expect(screen.queryByRole("dialog", { name: /media\/nas/ })).toBeNull();
     expect(router.state.location.search).not.toHaveProperty("node");
   });
 
@@ -262,7 +262,7 @@ describe("Topology", () => {
     const region = await drawnBoard();
 
     await userEvent.click(plate(region, GONE.id));
-    const drawer = await screen.findByRole("complementary", { name: /gone/ });
+    const drawer = await screen.findByRole("dialog", { name: /gone/ });
     expect(drawer).toHaveTextContent("gone is referenced here but does not exist");
     expect(drawer).toHaveTextContent("nowhere to land");
     expect(within(drawer).getByText("Fix")).toBeInTheDocument();
@@ -279,7 +279,7 @@ describe("Topology", () => {
     const region = await drawnBoard();
 
     await userEvent.click(plate(region, SHARED.id));
-    const drawer = await screen.findByRole("complementary", { name: /shared/ });
+    const drawer = await screen.findByRole("dialog", { name: /shared/ });
     expect(drawer).toHaveTextContent("Nothing copies shared anywhere");
     // And the gate the server reported on it, in the server's own words.
     expect(drawer).toHaveTextContent("acknowledge to release");
@@ -384,13 +384,46 @@ describe("Topology — kind identity", () => {
     expect(plate(region, "Namespace/prod")).not.toHaveAttribute("data-kind");
   });
 
+  it("floats the drawer over the board; Escape closes it and hands focus back to the plate", async () => {
+    mockApi({ "/api/v1/graph": jsonResponse(FIXTURE_GRAPH) });
+    const { router } = mountApp("/topology?namespace=media");
+    const region = await drawnBoard();
+    const nas = plate(region, NAS.id);
+    await userEvent.click(nas);
+    const drawer = await screen.findByRole("dialog", { name: /media\/nas/ });
+    expect(drawer).toHaveClass("side-panel");
+    await userEvent.keyboard("{Escape}");
+    await waitFor(() => {
+      expect(screen.queryByRole("dialog")).toBeNull();
+    });
+    expect(router.state.location.search).not.toHaveProperty("node");
+    expect(document.activeElement).toBe(nas);
+  });
+
+  it("opens the plate's resource in the resource drawer, in place of the board's", async () => {
+    mockApi({ "/api/v1/graph": jsonResponse(FIXTURE_GRAPH) });
+    const { router } = mountApp("/topology?namespace=media");
+    const region = await drawnBoard();
+    await userEvent.click(plate(region, NAS.id));
+    const drawer = await screen.findByRole("dialog", { name: /media\/nas/ });
+    await userEvent.click(within(drawer).getByRole("link", { name: "Inspect" }));
+    await waitFor(() => {
+      expect(router.state.location.search).toMatchObject({
+        namespace: "media",
+        inspect: "repository/media/nas",
+      });
+    });
+    expect(router.state.location.search).not.toHaveProperty("node");
+    expect(screen.getAllByRole("dialog")).toHaveLength(1);
+  });
+
   it("marks the drawer in the same kind as the plate that opened it", async () => {
     mockApi({ "/api/v1/graph": jsonResponse(FIXTURE_GRAPH) });
     mountApp("/topology?namespace=media");
     const region = await drawnBoard();
     await userEvent.click(plate(region, NAS.id));
-    const drawer = await screen.findByRole("complementary", { name: /media\/nas/ });
+    const drawer = await screen.findByRole("dialog", { name: /media\/nas/ });
     expect(drawer).toHaveAttribute("data-kind", "repository");
-    expect(drawer.querySelector(".panel__header .kind-chip svg")).not.toBeNull();
+    expect(drawer.querySelector(".side-panel__head .kind-chip svg")).not.toBeNull();
   });
 });

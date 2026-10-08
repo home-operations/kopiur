@@ -1,14 +1,11 @@
 import { Link } from "@tanstack/react-router";
-import { X } from "lucide-react";
-import { useEffect, useRef } from "react";
 
-import { KindChip } from "../KindMark";
-import { KIND_META } from "../kind";
-import { ActionButton } from "../ActionButton";
 import { Finding } from "../Finding";
 import { LampBadge } from "../HealthBadge";
 import { gateSeverityLamp } from "../gates";
 import { healthLamp } from "../health";
+import { inspectToken } from "../inspect";
+import { SidePanel } from "../SidePanel";
 import { nodeMeaning, nodeSection } from "./drawer";
 import {
   type TopologyEdge,
@@ -33,7 +30,11 @@ import {
  * carry it, and inventing one from the display kind is exactly the mapping
  * table that field exists to prevent. So the link goes to the section that
  * lists the object; `drawer.ts` is the one place that changes when the detail
- * routes land.
+ * routes land. A plate that is a resource also offers "Inspect", which swaps
+ * this drawer for the resource drawer — never both at once.
+ *
+ * It floats in the side panel like every other drawer. The plate that opened
+ * it is behind the scrim while it is open, and gets focus back when it closes.
  */
 export interface DrawerProps {
   model: TopologyModel;
@@ -44,61 +45,45 @@ export interface DrawerProps {
 }
 
 export function Drawer({ model, node, namespace, onClose }: DrawerProps) {
-  const panel = useRef<HTMLElement | null>(null);
   const { inbound, outbound } = relationships(model, node.id);
   const section = nodeSection(node.node.kind);
   const search = namespace !== undefined ? { namespace } : {};
-
-  // Opening the drawer moves focus into it, and closing it hands focus back
-  // to the plate that opened it — a keyboard user must not be dropped at the
-  // top of the document every time they inspect a node.
-  useEffect(() => {
-    panel.current?.focus();
-  }, [node.id]);
-
-  const close = () => {
-    onClose();
-    focusPlate(node.id);
-  };
-
-  // Escape closes, from anywhere on the board. On the document rather than on
-  // the panel: the plate that opened the drawer keeps focus in some flows,
-  // and a dismissal that only works while focus is *inside* the thing being
-  // dismissed is the kind that is never found.
-  useEffect(() => {
-    const onKey = (event: KeyboardEvent) => {
-      if (event.key === "Escape") {
-        onClose();
-        focusPlate(node.id);
-      }
-    };
-    document.addEventListener("keydown", onKey);
-    return () => {
-      document.removeEventListener("keydown", onKey);
-    };
-  }, [node.id, onClose]);
-
   const kind = nodeObjectKind(node.node.kind);
-  return (
-    <aside
-      className={kind !== null ? "panel topo-drawer has-stripe" : "panel topo-drawer"}
-      data-kind={kind !== null ? KIND_META[kind].slug : undefined}
-      aria-label={`${node.kindWord} ${node.node.label}`}
-      ref={panel}
-      tabIndex={-1}
-    >
-      <div className="panel__header">
-        <h3 className="label-strip">
-          {kind !== null ? <KindChip kind={kind} size="sm" /> : null}
-          <span className="label-strip__kind">{node.kindWord}</span>
-          <span className="label-strip__name">{node.node.label}</span>
-        </h3>
-        <ActionButton variant="quiet" aria-label="Close details" onClick={close}>
-          <X size={16} strokeWidth={2} aria-hidden="true" />
-        </ActionButton>
-      </div>
+  const nodeNamespace = node.node.namespace ?? undefined;
+  const inspectable = kind !== null && !node.missing;
 
-      <div className="panel__body topo-drawer__body">
+  return (
+    <SidePanel
+      kind={kind ?? undefined}
+      kindWord={node.kindWord}
+      label={node.node.label}
+      onClose={onClose}
+      footer={
+        section !== null || inspectable ? (
+          <>
+            {section !== null ? (
+              <Link className="button button--quiet" to={section.to} search={search}>
+                Find {node.node.name} in {section.section}
+              </Link>
+            ) : null}
+            {inspectable ? (
+              <Link
+                className="button"
+                to="/topology"
+                search={{
+                  ...search,
+                  inspect: inspectToken({ kind, name: node.node.name, namespace: nodeNamespace }),
+                }}
+                replace
+              >
+                Inspect
+              </Link>
+            ) : null}
+          </>
+        ) : undefined
+      }
+    >
+      <div className="topo-drawer__body">
         {/* What the kind *is* — but not for a ghost: this node is a reference,
             not a repository, and describing what a Repository does would be
             describing something that is not there. The finding below is the
@@ -179,22 +164,9 @@ export function Drawer({ model, node, namespace, onClose }: DrawerProps) {
           edges={inbound}
           other={(edge) => edge.from}
         />
-
-        {section !== null ? (
-          <p className="topo-drawer__link">
-            <Link to={section.to} search={search}>
-              Find {node.node.name} in {section.section}
-            </Link>
-          </p>
-        ) : null}
       </div>
-    </aside>
+    </SidePanel>
   );
-}
-
-/** Put focus back on the plate a drawer was opened from. */
-function focusPlate(id: string): void {
-  document.querySelector<HTMLElement>(`[data-node-id="${id}"]`)?.focus();
 }
 
 interface RelationshipsProps {

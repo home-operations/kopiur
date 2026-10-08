@@ -110,7 +110,7 @@ function Topology() {
         ) : laying || layout === null || model === null ? (
           <LoadingState what="the topology layout" rows={6} />
         ) : (
-          <div className="topo-layout" data-drawer={selected !== null ? "open" : undefined}>
+          <div className="topo-layout">
             <Graph model={model} layout={layout} selected={selected?.id ?? null} onSelect={open} />
             {selected !== null ? (
               <Drawer
