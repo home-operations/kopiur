@@ -290,3 +290,37 @@ describe("the failed lamp", () => {
     }
   });
 });
+
+/**
+ * Kind colours mark kinds; status colours mark states — never each other's.
+ *
+ * Rule 2 of the `kopiur-ui-design` skill (`references/rules.md`). Several kind
+ * hues sit near a status hue (orange Snapshot / amber Degraded, pink Restore /
+ * red Failed), which is acceptable only because each family keeps to its own
+ * shapes: a `--kind-*` colour appears on a kind's stripe, chip and small-caps
+ * name and nowhere else, and a `[data-kind]` rule never reaches for a status
+ * colour.
+ */
+describe("kind colours", () => {
+  const rules = cssRules(CSS).filter((r) => !r.selector.includes(":root"));
+  const KIND_TOKEN = /var\(--kind-[a-z-]+\)/;
+  const KIND_SURFACE = /\[data-kind|\.kind-|\.has-stripe/;
+
+  it("appear only on a kind's stripe, chip and name", () => {
+    const strays = rules
+      .filter((r) => KIND_TOKEN.test(r.body) && !KIND_SURFACE.test(r.selector))
+      .map((r) => r.selector);
+    expect(strays).toEqual([]);
+  });
+
+  it("are never mixed with a status colour in a kind rule", () => {
+    const mixed = rules
+      .filter((r) => /\[data-kind/.test(r.selector) && /--health-/.test(r.body))
+      .map((r) => r.selector);
+    expect(mixed).toEqual([]);
+  });
+
+  it("are actually in use, so a rename cannot make this vacuous", () => {
+    expect(rules.filter((r) => KIND_TOKEN.test(r.body)).length).toBeGreaterThanOrEqual(9);
+  });
+});

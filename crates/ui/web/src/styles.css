@@ -145,6 +145,95 @@
   }
 }
 
+/* ---- kind mark ------------------------------------------------------------
+   A kind's identity: --kc / --kc-bg resolve per [data-kind], and the stripe,
+   chip and small-caps name read them. Kind colours appear nowhere else
+   (styles.health.test.ts, "kind colours"). */
+
+[data-kind="repository"] {
+  --kc: var(--kind-repository);
+  --kc-bg: var(--kind-repository-bg);
+}
+[data-kind="cluster-repository"] {
+  --kc: var(--kind-cluster-repository);
+  --kc-bg: var(--kind-cluster-repository-bg);
+}
+[data-kind="maintenance"] {
+  --kc: var(--kind-maintenance);
+  --kc-bg: var(--kind-maintenance-bg);
+}
+[data-kind="snapshot-policy"] {
+  --kc: var(--kind-snapshot-policy);
+  --kc-bg: var(--kind-snapshot-policy-bg);
+}
+[data-kind="snapshot-schedule"] {
+  --kc: var(--kind-snapshot-schedule);
+  --kc-bg: var(--kind-snapshot-schedule-bg);
+}
+[data-kind="snapshot"] {
+  --kc: var(--kind-snapshot);
+  --kc-bg: var(--kind-snapshot-bg);
+}
+[data-kind="restore"] {
+  --kc: var(--kind-restore);
+  --kc-bg: var(--kind-restore-bg);
+}
+[data-kind="repository-replication"] {
+  --kc: var(--kind-repository-replication);
+  --kc-bg: var(--kind-repository-replication-bg);
+}
+[data-kind="snapshot-replication"] {
+  --kc: var(--kind-snapshot-replication);
+  --kc-bg: var(--kind-snapshot-replication-bg);
+}
+
+.kind-chip {
+  display: inline-grid;
+  place-items: center;
+  flex: none;
+  width: 28px;
+  height: 28px;
+  border-radius: var(--radius-md);
+  background: var(--kc-bg);
+  color: var(--kc);
+}
+.kind-chip svg {
+  width: 14px;
+  height: 14px;
+}
+.kind-chip--sm {
+  width: 22px;
+  height: 22px;
+  border-radius: var(--radius-sm);
+}
+.kind-chip--sm svg {
+  width: 12px;
+  height: 12px;
+}
+.kind-chip--lg {
+  width: 40px;
+  height: 40px;
+  border-radius: 12px;
+}
+.kind-chip--lg svg {
+  width: 20px;
+  height: 20px;
+}
+.kind-name {
+  font-size: 0.625rem;
+  font-weight: var(--weight-bold);
+  letter-spacing: var(--tracking-caps);
+  text-transform: uppercase;
+  color: var(--kc);
+}
+.has-stripe {
+  border-left: var(--stripe) solid var(--kc);
+}
+td.has-stripe {
+  border-left: 0;
+  box-shadow: inset var(--stripe) 0 0 var(--kc);
+}
+
 /* ---- base ---------------------------------------------------------------- */
 
 *,
