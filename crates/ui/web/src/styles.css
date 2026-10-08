@@ -1250,12 +1250,12 @@ html:has(dialog.side-panel[open]) {
 /* Past the right edge by the inset and the handle, so neither peeks in. */
 @keyframes side-panel-in {
   from {
-    transform: translateX(calc(100% + 3rem));
+    transform: translateX(calc(100% + 4rem));
   }
 }
 @keyframes side-panel-out {
   to {
-    transform: translateX(calc(100% + 3rem));
+    transform: translateX(calc(100% + 4rem));
   }
 }
 @keyframes side-panel-fade-out {
@@ -1275,9 +1275,9 @@ html:has(dialog.side-panel[open]) {
   position: absolute;
   top: 0;
   bottom: 0;
-  left: calc(-1 * var(--space-6));
+  left: calc(-1 * var(--space-7));
   z-index: 1;
-  width: var(--space-6);
+  width: var(--space-7);
   cursor: ew-resize;
   touch-action: none;
 }
@@ -1286,7 +1286,7 @@ html:has(dialog.side-panel[open]) {
   position: absolute;
   top: 50%;
   right: var(--space-3);
-  width: 16px;
+  width: 22px;
   height: 64px;
   border: 1px solid var(--line-strong);
   border-radius: 5px;
