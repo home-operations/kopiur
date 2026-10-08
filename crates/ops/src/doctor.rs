@@ -142,6 +142,123 @@ pub struct CheckResult {
     pub check: DoctorCheck,
     /// What happened.
     pub outcome: Outcome,
+    /// The objects the outcome is about, one entry each, for a reader that
+    /// wants to point at them rather than re-read the sentence. Only the
+    /// object-scoped checks fill it; the outcome's text stays the report.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub objects: Vec<ObjectFinding>,
+}
+
+impl CheckResult {
+    /// A check whose outcome names no object.
+    pub fn new(check: DoctorCheck, outcome: Outcome) -> Self {
+        Self {
+            check,
+            outcome,
+            objects: Vec::new(),
+        }
+    }
+}
+
+/// The kind of object a finding is about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum FindingKind {
+    /// `Repository`.
+    Repository,
+    /// `ClusterRepository`.
+    ClusterRepository,
+    /// `SnapshotPolicy`.
+    SnapshotPolicy,
+    /// `SnapshotSchedule`.
+    SnapshotSchedule,
+    /// `Snapshot`.
+    Snapshot,
+    /// `Restore`.
+    Restore,
+    /// `SnapshotReplication`.
+    SnapshotReplication,
+}
+
+impl From<RepositoryKind> for FindingKind {
+    fn from(kind: RepositoryKind) -> Self {
+        match kind {
+            RepositoryKind::Repository => Self::Repository,
+            RepositoryKind::ClusterRepository => Self::ClusterRepository,
+        }
+    }
+}
+
+/// How loudly one object's finding counts: the same two levels a check has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum FindingSeverity {
+    /// It is why the check failed.
+    Fail,
+    /// Reported, never counted as red.
+    Warn,
+}
+
+impl From<GateSeverity> for FindingSeverity {
+    fn from(severity: GateSeverity) -> Self {
+        match severity {
+            GateSeverity::Fail => Self::Fail,
+            GateSeverity::Warn => Self::Warn,
+        }
+    }
+}
+
+/// One object a check found something wrong with.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ObjectFinding {
+    /// Its kind.
+    pub kind: FindingKind,
+    /// Its namespace; `None` for a cluster-scoped object.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
+    /// Its name.
+    pub name: String,
+    /// Whether this object is part of why the check failed.
+    pub severity: FindingSeverity,
+    /// What is wrong with it — the same words the outcome uses, without the
+    /// object's name in front.
+    pub message: String,
+    /// What to do, when the check knows something more specific than the
+    /// operator's own message says.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fix: Option<String>,
+    /// When it went wrong, when the check can date it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at: Option<DateTime<Utc>>,
+}
+
+/// Which object a finding names: kind, namespace, name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FindingTarget {
+    kind: FindingKind,
+    namespace: Option<String>,
+    name: String,
+}
+
+impl FindingTarget {
+    fn of(kind: FindingKind, meta: &kube::core::ObjectMeta) -> Self {
+        Self {
+            kind,
+            namespace: meta.namespace.clone(),
+            name: meta.name.clone().unwrap_or_default(),
+        }
+    }
+
+    fn finding(&self, severity: FindingSeverity, message: String) -> ObjectFinding {
+        ObjectFinding {
+            kind: self.kind,
+            namespace: self.namespace.clone(),
+            name: self.name.clone(),
+            severity,
+            message,
+            fix: None,
+            at: None,
+        }
+    }
 }
 
 /// The full report (`-o json|yaml` emits this).
@@ -487,6 +604,14 @@ impl RepoSummary {
     fn label(&self) -> String {
         format!("{:?}/{}", self.kind, self.name)
     }
+
+    fn target(&self) -> FindingTarget {
+        FindingTarget {
+            kind: self.kind.into(),
+            namespace: self.namespace.clone(),
+            name: self.name.clone(),
+        }
+    }
 }
 
 fn ready_message(conditions: &[Condition]) -> Option<String> {
@@ -571,23 +696,34 @@ pub async fn list_repos(ctx: &OpsCtx) -> Result<Vec<RepoSummary>, Outcome> {
 /// perfectly `Ready`, so a phase-only check reports green while a whole
 /// deletion wave is frozen awaiting an acknowledgement.
 pub fn check_repos_ready(repos: &[RepoSummary]) -> Outcome {
+    repos_ready(repos).0
+}
+
+/// [`check_repos_ready`], with one [`ObjectFinding`] per repository it names.
+/// Pure.
+pub fn repos_ready(repos: &[RepoSummary]) -> (Outcome, Vec<ObjectFinding>) {
     let mut fails: Vec<String> = Vec::new();
     let mut warns: Vec<String> = Vec::new();
+    let mut objects: Vec<ObjectFinding> = Vec::new();
     for r in repos {
+        let target = r.target();
         if r.phase.as_deref() != Some("Ready") {
-            fails.push(format!(
-                "{} ({}{})",
-                r.label(),
+            let state = format!(
+                "{}{}",
                 r.phase.as_deref().unwrap_or("no status"),
                 r.ready_message
                     .as_deref()
                     .map(|m| format!(": {m}"))
                     .unwrap_or_default()
-            ));
+            );
+            fails.push(format!("{} ({state})", r.label()));
+            objects.push(target.finding(FindingSeverity::Fail, format!("not Ready ({state})")));
         }
         match first_gate(&r.conditions, GateScope::covers_repository) {
             Some(GateHit::Known(gate, cond)) => {
-                let line = format!("{}: {}", r.label(), describe_gate(gate, cond));
+                let detail = describe_gate(gate, cond);
+                let line = format!("{}: {detail}", r.label());
+                objects.push(target.finding(gate.severity.into(), detail));
                 match gate.severity {
                     GateSeverity::Fail => fails.push(line),
                     GateSeverity::Warn => warns.push(line),
@@ -600,11 +736,13 @@ pub fn check_repos_ready(repos: &[RepoSummary]) -> Outcome {
             // messages). Without it the reader is told about the skew and not
             // what to do about it. The stuck-work path says the same thing in
             // `StuckKind::fix`, so it is not repeated in the shared describer.
-            Some(GateHit::Unregistered(cond)) => warns.push(format!(
-                "{}: {} — {UPGRADE_PLUGIN_FIX}",
-                r.label(),
-                describe_unregistered_gate(cond)
-            )),
+            Some(GateHit::Unregistered(cond)) => {
+                let detail = describe_unregistered_gate(cond);
+                warns.push(format!("{}: {detail} — {UPGRADE_PLUGIN_FIX}", r.label()));
+                let mut finding = target.finding(FindingSeverity::Warn, detail);
+                finding.fix = Some(UPGRADE_PLUGIN_FIX.into());
+                objects.push(finding);
+            }
             None => {}
         }
     }
@@ -612,18 +750,19 @@ pub fn check_repos_ready(repos: &[RepoSummary]) -> Outcome {
         // The warn-level findings are still listed — a Fail elsewhere must not
         // swallow the ReadOnly/unknown-reason lines a reader needs to see.
         fails.extend(warns);
-        return Outcome::Fail {
+        let outcome = Outcome::Fail {
             what: format!("repositories not Ready or blocked: {}", fails.join("; ")),
             why: "backups and restores cannot run against an unready or blocked repository".into(),
             fix: "follow the condition message above; `kubectl describe` the repository for \
                   events"
                 .into(),
         };
+        return (outcome, objects);
     }
     if warns.is_empty() {
-        Outcome::Pass
+        (Outcome::Pass, objects)
     } else {
-        Outcome::Warn(warns.join("; "))
+        (Outcome::Warn(warns.join("; ")), objects)
     }
 }
 
@@ -714,12 +853,28 @@ pub fn evaluate_snapshot_replications(
     repos: Option<&[RepoSummary]>,
     all_namespaces: bool,
 ) -> Outcome {
+    snapshot_replications(items, repos, all_namespaces).0
+}
+
+/// [`evaluate_snapshot_replications`], with one [`ObjectFinding`] per problem
+/// it names. Pure.
+pub fn snapshot_replications(
+    items: &[kopiur_api::SnapshotReplication],
+    repos: Option<&[RepoSummary]>,
+    all_namespaces: bool,
+) -> (Outcome, Vec<ObjectFinding>) {
     use kopiur_api::SnapshotReplicationPhase;
     let mut fails: Vec<String> = Vec::new();
     let mut warns: Vec<String> = Vec::new();
+    let mut objects: Vec<ObjectFinding> = Vec::new();
     for r in items {
         let ns = r.metadata.namespace.clone().unwrap_or_default();
         let label = format!("{ns}/{}", r.name_any());
+        let target = FindingTarget::of(FindingKind::SnapshotReplication, &r.metadata);
+        let mut fail = |line: String, message: String| {
+            fails.push(line);
+            objects.push(target.finding(FindingSeverity::Fail, message));
+        };
         if let Some(repos) = repos {
             for (field, rref) in [
                 ("sourceRef", &r.spec.source_ref),
@@ -732,26 +887,24 @@ pub fn evaluate_snapshot_replications(
                     continue;
                 }
                 let ref_label = format!("{:?} {}", rref.kind, rref.name);
-                match find_replication_repo(repos, rref, &ns) {
-                    None => fails.push(format!(
-                        "{label}: {field} {ref_label} does not resolve to any listed repository"
+                let message = match find_replication_repo(repos, rref, &ns) {
+                    None => Some(format!(
+                        "{field} {ref_label} does not resolve to any listed repository"
                     )),
-                    Some(repo) if repo.phase.as_deref() != Some("Ready") => fails.push(format!(
-                        "{label}: {field} {ref_label} is not Ready ({}{})",
+                    Some(repo) if repo.phase.as_deref() != Some("Ready") => Some(format!(
+                        "{field} {ref_label} is not Ready ({}{})",
                         repo.phase.as_deref().unwrap_or("no status"),
                         repo.ready_message
                             .as_deref()
                             .map(|m| format!(": {m}"))
                             .unwrap_or_default()
                     )),
-                    Some(_) => {}
+                    Some(_) => None,
+                };
+                if let Some(message) = message {
+                    fail(format!("{label}: {message}"), message);
                 }
             }
-        }
-        if r.spec.suspend {
-            warns.push(format!(
-                "{label} is suspended (spec.suspend: true); no replication runs until resumed"
-            ));
         }
         let conditions = r
             .status
@@ -772,24 +925,35 @@ pub fn evaluate_snapshot_replications(
             | None => false,
         };
         if failed {
-            fails.push(format!(
-                "{label} last run Failed: {}",
+            let message = format!(
+                "last run Failed: {}",
                 failure_message(conditions)
                     .unwrap_or_else(|| "(no condition message; kubectl describe it)".into())
-            ));
+            );
+            fail(format!("{label} {message}"), message);
+        }
+        let mut warn = |line: String, message: String| {
+            warns.push(line);
+            objects.push(target.finding(FindingSeverity::Warn, message));
+        };
+        if r.spec.suspend {
+            let message =
+                "is suspended (spec.suspend: true); no replication runs until resumed".to_string();
+            warn(format!("{label} {message}"), message);
         }
         // The runtime identity-overlap backstop: matched by type fragment so a
         // condition-name refinement operator-side surfaces here without a
         // plugin release (the same posture as the unregistered-gate report).
         for c in conditions {
             if c.status == "True" && c.type_.contains("Overlap") {
-                warns.push(format!("{label}: {} — {}", c.type_, c.message));
+                let message = format!("{} — {}", c.type_, c.message);
+                warn(format!("{label}: {message}"), message);
             }
         }
     }
     if !fails.is_empty() {
         fails.extend(warns);
-        return Outcome::Fail {
+        let outcome = Outcome::Fail {
             what: format!(
                 "snapshot replications unhealthy: {}",
                 join_capped(&fails, 5)
@@ -799,28 +963,37 @@ pub fn evaluate_snapshot_replications(
                   <name>` for events"
                 .into(),
         };
+        return (outcome, objects);
     }
     if warns.is_empty() {
-        Outcome::Pass
+        (Outcome::Pass, objects)
     } else {
-        Outcome::Warn(join_capped(&warns, 5))
+        (Outcome::Warn(join_capped(&warns, 5)), objects)
     }
 }
 
 /// List `SnapshotReplication`s in scope and evaluate them. A 404 on the whole
 /// resource (the CRD is newer than this cluster's operator) is a Pass — there
 /// is nothing to check, and a brand-new check must not fail older installs.
-async fn check_snapshot_replications(ctx: &OpsCtx, repos: Option<&[RepoSummary]>) -> Outcome {
+async fn check_snapshot_replications(ctx: &OpsCtx, repos: Option<&[RepoSummary]>) -> CheckResult {
+    let check = DoctorCheck::SnapshotReplications;
     let api: Api<kopiur_api::SnapshotReplication> = match &ctx.scope {
         Scope::All => Api::all(ctx.client.clone()),
         Scope::Namespace(ns) => Api::namespaced(ctx.client.clone(), ns),
     };
     let items = match api.list(&ListParams::default()).await {
         Ok(l) => l.items,
-        Err(kube::Error::Api(ae)) if ae.code == 404 => return Outcome::Pass,
-        Err(e) => return warn_for("list", "snapshotreplications", &e),
+        Err(kube::Error::Api(ae)) if ae.code == 404 => {
+            return CheckResult::new(check, Outcome::Pass);
+        }
+        Err(e) => return CheckResult::new(check, warn_for("list", "snapshotreplications", &e)),
     };
-    evaluate_snapshot_replications(&items, repos, matches!(ctx.scope, Scope::All))
+    let (outcome, objects) = snapshot_replications(&items, repos, matches!(ctx.scope, Scope::All));
+    CheckResult {
+        check,
+        outcome,
+        objects,
+    }
 }
 
 // --- the shared structural-gate core (pure) ---------------------------------
@@ -1153,6 +1326,7 @@ fn policy_stuck(p: &SnapshotPolicy) -> Option<StuckKind> {
 struct StuckEntry {
     /// `snapshot media/nightly-1`.
     object: String,
+    target: FindingTarget,
     kind: StuckKind,
 }
 
@@ -1300,6 +1474,16 @@ fn object_label(kind: &str, meta: &kube::core::ObjectMeta) -> String {
 /// Blocked or stuck work across `Snapshot`, `Restore`, `SnapshotSchedule` and
 /// `SnapshotPolicy`.
 pub fn check_stuck(work: &Work, threshold: std::time::Duration, now: DateTime<Utc>) -> Outcome {
+    stuck(work, threshold, now).0
+}
+
+/// [`check_stuck`], with one [`ObjectFinding`] per blocked or stuck object.
+/// Pure.
+pub fn stuck(
+    work: &Work,
+    threshold: std::time::Duration,
+    now: DateTime<Utc>,
+) -> (Outcome, Vec<ObjectFinding>) {
     let threshold_label = format!("{}s", threshold.as_secs());
     let threshold = chrono::Duration::from_std(threshold).unwrap_or(chrono::Duration::hours(1));
     let mut entries = Vec::new();
@@ -1307,6 +1491,7 @@ pub fn check_stuck(work: &Work, threshold: std::time::Duration, now: DateTime<Ut
         if let Some(kind) = snapshot_stuck(s, now, threshold) {
             entries.push(StuckEntry {
                 object: object_label("snapshot", &s.metadata),
+                target: FindingTarget::of(FindingKind::Snapshot, &s.metadata),
                 kind,
             });
         }
@@ -1315,6 +1500,7 @@ pub fn check_stuck(work: &Work, threshold: std::time::Duration, now: DateTime<Ut
         if let Some(kind) = restore_stuck(r, now, threshold) {
             entries.push(StuckEntry {
                 object: object_label("restore", &r.metadata),
+                target: FindingTarget::of(FindingKind::Restore, &r.metadata),
                 kind,
             });
         }
@@ -1323,6 +1509,7 @@ pub fn check_stuck(work: &Work, threshold: std::time::Duration, now: DateTime<Ut
         if let Some(kind) = schedule_stuck(s) {
             entries.push(StuckEntry {
                 object: object_label("snapshotschedule", &s.metadata),
+                target: FindingTarget::of(FindingKind::SnapshotSchedule, &s.metadata),
                 kind,
             });
         }
@@ -1331,11 +1518,23 @@ pub fn check_stuck(work: &Work, threshold: std::time::Duration, now: DateTime<Ut
         if let Some(kind) = policy_stuck(p) {
             entries.push(StuckEntry {
                 object: object_label("snapshotpolicy", &p.metadata),
+                target: FindingTarget::of(FindingKind::SnapshotPolicy, &p.metadata),
                 kind,
             });
         }
     }
-    stuck_outcome(&mut entries, &threshold_label)
+    let outcome = stuck_outcome(&mut entries, &threshold_label);
+    let objects = entries
+        .iter()
+        .map(|e| {
+            let mut finding = e
+                .target
+                .finding(e.kind.severity().into(), e.kind.detail(&threshold_label));
+            finding.fix = Some(e.kind.fix().to_string());
+            finding
+        })
+        .collect();
+    (outcome, objects)
 }
 
 // --- recent failures --------------------------------------------------------
@@ -1344,6 +1543,7 @@ pub fn check_stuck(work: &Work, threshold: std::time::Duration, now: DateTime<Ut
 struct FailureEntry {
     /// `snapshot media/nightly-1`.
     object: String,
+    target: FindingTarget,
     /// When the failure was recorded; `None` when nothing dates it (treated as
     /// old, so an undatable failure can never flip doctor red forever).
     at: Option<DateTime<Utc>>,
@@ -1489,6 +1689,7 @@ fn failures_outcome(
 /// (and de-escalate) the failure. Pure.
 fn failure_entry(
     object: String,
+    target: FindingTarget,
     conditions: &[Condition],
     meta: &kube::core::ObjectMeta,
     covers: fn(GateScope) -> bool,
@@ -1503,6 +1704,7 @@ fn failure_entry(
     };
     FailureEntry {
         object,
+        target,
         at: failed_at(conditions, meta),
         explained_by_warn_gate: warn_gate.is_some(),
         message: warn_gate.or_else(|| failure_message(conditions)),
@@ -1515,11 +1717,22 @@ fn check_recent_failures(
     lookback: std::time::Duration,
     now: DateTime<Utc>,
 ) -> Outcome {
+    recent_failures(work, lookback, now).0
+}
+
+/// [`check_recent_failures`], with one [`ObjectFinding`] per failed object.
+/// Pure.
+fn recent_failures(
+    work: &Work,
+    lookback: std::time::Duration,
+    now: DateTime<Utc>,
+) -> (Outcome, Vec<ObjectFinding>) {
     let mut entries = Vec::new();
     for s in &work.snapshots {
         if s.status.as_ref().and_then(|st| st.phase.as_ref()) == Some(&SnapshotPhase::Failed) {
             entries.push(failure_entry(
                 object_label("snapshot", &s.metadata),
+                FindingTarget::of(FindingKind::Snapshot, &s.metadata),
                 conditions_of(s.status.as_ref().map(|st| &st.conditions)),
                 &s.metadata,
                 GateScope::covers_snapshot,
@@ -1530,13 +1743,47 @@ fn check_recent_failures(
         if r.status.as_ref().and_then(|st| st.phase.as_ref()) == Some(&RestorePhase::Failed) {
             entries.push(failure_entry(
                 object_label("restore", &r.metadata),
+                FindingTarget::of(FindingKind::Restore, &r.metadata),
                 conditions_of(r.status.as_ref().map(|st| &st.conditions)),
                 &r.metadata,
                 GateScope::covers_restore,
             ));
         }
     }
-    failures_outcome(&entries, now, lookback)
+    let outcome = failures_outcome(&entries, now, lookback);
+    (outcome, failure_findings(&entries, now, lookback))
+}
+
+/// One [`ObjectFinding`] per failed object: a failure inside the window that
+/// no deliberate configuration explains is part of the check's Fail; the rest
+/// are history. Pure — the same partition [`failures_outcome`] makes.
+fn failure_findings(
+    entries: &[FailureEntry],
+    now: DateTime<Utc>,
+    lookback: std::time::Duration,
+) -> Vec<ObjectFinding> {
+    let window =
+        chrono::Duration::from_std(lookback).unwrap_or_else(|_| chrono::Duration::hours(24));
+    let cutoff = now - window;
+    entries
+        .iter()
+        .map(|e| {
+            let recent = !e.explained_by_warn_gate && e.at.is_some_and(|t| t > cutoff);
+            let severity = if recent {
+                FindingSeverity::Fail
+            } else {
+                FindingSeverity::Warn
+            };
+            let mut finding = e.target.finding(
+                severity,
+                e.message
+                    .clone()
+                    .unwrap_or_else(|| "failed; the operator left no message".to_string()),
+            );
+            finding.at = e.at;
+            finding
+        })
+        .collect()
 }
 
 async fn check_warnings(ctx: &OpsCtx, now: DateTime<Utc>) -> Outcome {
@@ -1680,10 +1927,7 @@ impl DoctorParams {
 macro_rules! push_if_wanted {
     ($out:expr, $params:expr, $check:expr, $outcome:expr) => {
         if $params.wants($check) {
-            $out.push(CheckResult {
-                check: $check,
-                outcome: $outcome.await,
-            });
+            $out.push(CheckResult::new($check, $outcome.await));
         }
     };
 }
@@ -1698,20 +1942,14 @@ async fn run_installation_checks(ctx: &OpsCtx, params: &DoctorParams, out: &mut 
     push_if_wanted!(out, params, DoctorCheck::CrdsInstalled, check_crds(ctx));
     if params.wants(DoctorCheck::ControllerRunning) {
         let (controller, _) = check_deployment(ctx, operator_ns, "controller", true).await;
-        out.push(CheckResult {
-            check: DoctorCheck::ControllerRunning,
-            outcome: controller,
-        });
+        out.push(CheckResult::new(DoctorCheck::ControllerRunning, controller));
     }
     if !params.wants(DoctorCheck::WebhookRunning) && !params.wants(DoctorCheck::WebhookAdmits) {
         return;
     }
     let (webhook, webhook_installed) = check_deployment(ctx, operator_ns, "webhook", false).await;
     if params.wants(DoctorCheck::WebhookRunning) {
-        out.push(CheckResult {
-            check: DoctorCheck::WebhookRunning,
-            outcome: webhook,
-        });
+        out.push(CheckResult::new(DoctorCheck::WebhookRunning, webhook));
     }
     // The `dryRun` create: a write verb through the whole admission chain, and
     // an audit entry, on every run that asks for it. Nothing else here reaches
@@ -1735,9 +1973,11 @@ async fn run_repo_checks(ctx: &OpsCtx, params: &DoctorParams, out: &mut Vec<Chec
     match list_repos(ctx).await {
         Ok(repos) => {
             if params.wants(DoctorCheck::RepositoriesReady) {
+                let (outcome, objects) = repos_ready(&repos);
                 out.push(CheckResult {
                     check: DoctorCheck::RepositoriesReady,
-                    outcome: check_repos_ready(&repos),
+                    outcome,
+                    objects,
                 });
             }
             push_if_wanted!(
@@ -1746,34 +1986,25 @@ async fn run_repo_checks(ctx: &OpsCtx, params: &DoctorParams, out: &mut Vec<Chec
                 DoctorCheck::CredentialsPresent,
                 check_credentials(ctx, &repos)
             );
-            push_if_wanted!(
-                out,
-                params,
-                DoctorCheck::SnapshotReplications,
-                check_snapshot_replications(ctx, Some(&repos))
-            );
+            if params.wants(DoctorCheck::SnapshotReplications) {
+                out.push(check_snapshot_replications(ctx, Some(&repos)).await);
+            }
         }
         Err(warn) => {
             if params.wants(DoctorCheck::RepositoriesReady) {
-                out.push(CheckResult {
-                    check: DoctorCheck::RepositoriesReady,
-                    outcome: warn,
-                });
+                out.push(CheckResult::new(DoctorCheck::RepositoriesReady, warn));
             }
             if params.wants(DoctorCheck::CredentialsPresent) {
-                out.push(CheckResult {
-                    check: DoctorCheck::CredentialsPresent,
-                    outcome: Outcome::Warn("skipped (repositories not listable)".into()),
-                });
+                out.push(CheckResult::new(
+                    DoctorCheck::CredentialsPresent,
+                    Outcome::Warn("skipped (repositories not listable)".into()),
+                ));
             }
             // Repos unlistable: the ref-resolution arm is skipped, the
             // suspend/phase/overlap arms still run.
-            push_if_wanted!(
-                out,
-                params,
-                DoctorCheck::SnapshotReplications,
-                check_snapshot_replications(ctx, None)
-            );
+            if params.wants(DoctorCheck::SnapshotReplications) {
+                out.push(check_snapshot_replications(ctx, None).await);
+            }
         }
     }
 }
@@ -1792,21 +2023,19 @@ async fn run_work_checks(
     }
     let work = list_work(ctx).await;
     if params.wants(DoctorCheck::NoStuckWork) {
+        let (outcome, objects) = stuck(&work, params.stuck_threshold, now);
         out.push(CheckResult {
             check: DoctorCheck::NoStuckWork,
-            outcome: merge_degradation(
-                check_stuck(&work, params.stuck_threshold, now),
-                &work.degraded,
-            ),
+            outcome: merge_degradation(outcome, &work.degraded),
+            objects,
         });
     }
     if params.wants(DoctorCheck::RecentFailures) {
+        let (outcome, objects) = recent_failures(&work, params.failure_lookback, now);
         out.push(CheckResult {
             check: DoctorCheck::RecentFailures,
-            outcome: merge_degradation(
-                check_recent_failures(&work, params.failure_lookback, now),
-                &work.degraded,
-            ),
+            outcome: merge_degradation(outcome, &work.degraded),
+            objects,
         });
     }
 }
@@ -1843,10 +2072,7 @@ mod tests {
         DoctorReport {
             checks: outcomes
                 .into_iter()
-                .map(|outcome| CheckResult {
-                    check: DoctorCheck::CrdsInstalled,
-                    outcome,
-                })
+                .map(|outcome| CheckResult::new(DoctorCheck::CrdsInstalled, outcome))
                 .collect(),
         }
     }
@@ -3094,6 +3320,135 @@ mod tests {
         assert!(what.starts_with("1 failed in the last"), "{what}");
         assert!(what.contains("nightly-1"), "{what}");
         assert!(what.contains("ro-1"), "{what}");
+    }
+
+    // --- one finding per object ----------------------------------------------
+
+    #[test]
+    fn a_blocked_snapshot_is_one_failing_finding_with_the_gate_fix() {
+        let w = work(
+            vec![snap_at("Pending", 1, vec![mover_blocked_condition()])],
+            vec![],
+        );
+        let (_, objects) = stuck(&w, std::time::Duration::from_secs(3600), now());
+        assert_eq!(objects.len(), 1, "{objects:?}");
+        let finding = &objects[0];
+        assert_eq!(finding.kind, FindingKind::Snapshot);
+        assert_eq!(finding.namespace.as_deref(), Some("media"));
+        assert_eq!(finding.name, "nightly-1");
+        assert_eq!(finding.severity, FindingSeverity::Fail);
+        assert!(
+            finding.message.contains("PrivilegedMoverNotPermitted"),
+            "{}",
+            finding.message
+        );
+        assert!(
+            !finding.message.contains("snapshot media/nightly-1"),
+            "the object is named by its fields, not repeated in the message: {}",
+            finding.message
+        );
+        assert!(
+            finding
+                .fix
+                .as_deref()
+                .is_some_and(|f| f.contains("operator's own diagnosis")),
+            "{:?}",
+            finding.fix
+        );
+    }
+
+    #[test]
+    fn failures_are_dated_and_only_recent_unexplained_ones_fail() {
+        let at = (now() - chrono::Duration::minutes(5)).to_rfc3339();
+        let readonly = snapshot(
+            serde_json::json!({ "name": "ro-1", "namespace": "media", "creationTimestamp": ago(10) }),
+            serde_json::json!({
+                "phase": "Failed",
+                "conditions": [
+                    { "type": kopiur_api::consts::REPOSITORY_WRITABLE_CONDITION,
+                      "status": "False",
+                      "reason": kopiur_api::consts::REPOSITORY_READ_ONLY_REASON,
+                      "message": "repository nas is ReadOnly", "lastTransitionTime": at },
+                ],
+            }),
+        );
+        let w = work(
+            vec![
+                failed_snapshot("nightly-1", 30),
+                failed_snapshot("nightly-0", 60 * 24 * 7),
+                readonly,
+            ],
+            vec![],
+        );
+        let (_, objects) = recent_failures(&w, std::time::Duration::from_secs(24 * 3600), now());
+        let severity = |name: &str| {
+            objects
+                .iter()
+                .find(|o| o.name == name)
+                .map(|o| o.severity)
+                .unwrap_or_else(|| panic!("{name} missing from {objects:?}"))
+        };
+        assert_eq!(severity("nightly-1"), FindingSeverity::Fail);
+        assert_eq!(severity("nightly-0"), FindingSeverity::Warn, "history");
+        assert_eq!(severity("ro-1"), FindingSeverity::Warn, "explained");
+        let recent = objects.iter().find(|o| o.name == "nightly-1").unwrap();
+        assert_eq!(
+            recent.message,
+            "the mover Job failed: kopia could not connect"
+        );
+        assert_eq!(
+            recent.at,
+            Some(now() - chrono::Duration::minutes(30)),
+            "a failure carries when it happened"
+        );
+    }
+
+    #[test]
+    fn an_unready_repository_is_a_finding_on_that_repository() {
+        let (_, objects) = repos_ready(&[named_repo("nas", "media", "Failed", "bucket gone")]);
+        assert_eq!(
+            objects,
+            vec![ObjectFinding {
+                kind: FindingKind::Repository,
+                namespace: Some("media".into()),
+                name: "nas".into(),
+                severity: FindingSeverity::Fail,
+                message: "not Ready (Failed: bucket gone)".into(),
+                fix: None,
+                at: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn a_replication_names_itself_once_per_problem() {
+        let items = [replication(
+            serde_json::json!({ "suspend": true }),
+            serde_json::json!({ "phase": "Succeeded" }),
+        )];
+        let repos = vec![named_repo("src", "media", "Ready", "")];
+        let (_, objects) = snapshot_replications(&items, Some(&repos), false);
+        let summary: Vec<(FindingKind, &str, FindingSeverity, &str)> = objects
+            .iter()
+            .map(|o| (o.kind, o.name.as_str(), o.severity, o.message.as_str()))
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                (
+                    FindingKind::SnapshotReplication,
+                    "to-offsite",
+                    FindingSeverity::Fail,
+                    "destinationRef Repository dst does not resolve to any listed repository"
+                ),
+                (
+                    FindingKind::SnapshotReplication,
+                    "to-offsite",
+                    FindingSeverity::Warn,
+                    "is suspended (spec.suspend: true); no replication runs until resumed"
+                ),
+            ]
+        );
     }
 
     // --- per-kind list degradation ------------------------------------------

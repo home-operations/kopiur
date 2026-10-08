@@ -1299,6 +1299,39 @@ pub struct DoctorCheckView {
     /// What to do about it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fix: Option<String>,
+    /// The objects the check found something wrong with, one entry each —
+    /// the same findings `what` puts in one sentence. Empty for a check that
+    /// is not about particular objects (the CRDs, the operator's own
+    /// Deployments) and for one that found nothing.
+    #[serde(default)]
+    pub objects: Vec<DoctorObjectView>,
+}
+
+/// One object a doctor check found something wrong with.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct DoctorObjectView {
+    /// Its kind.
+    pub kind: ObjectKind,
+    /// Its namespace; absent for a cluster-scoped object.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
+    /// Its name.
+    pub name: String,
+    /// `true` when this object is part of why the check failed; `false` when
+    /// it is reported but does not count as red (a deliberate configuration,
+    /// a failure older than the window).
+    pub failing: bool,
+    /// What is wrong with it, in the check's words.
+    pub message: String,
+    /// What to do, when the check knows something more specific than the
+    /// message says.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fix: Option<String>,
+    /// RFC3339 instant it went wrong, when the check can date it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at: Option<String>,
 }
 
 /// The full doctor report.

@@ -113,10 +113,7 @@ mod tests {
         DoctorReport {
             checks: outcomes
                 .into_iter()
-                .map(|outcome| CheckResult {
-                    check: DoctorCheck::CrdsInstalled,
-                    outcome,
-                })
+                .map(|outcome| CheckResult::new(DoctorCheck::CrdsInstalled, outcome))
                 .collect(),
         }
     }
