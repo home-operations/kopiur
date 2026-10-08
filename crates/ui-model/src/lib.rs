@@ -114,6 +114,7 @@ pub fn export_all(dir: &Path) -> Result<(), ExportError> {
     views::RepositoryReplicationRow::export_all(&cfg)?;
     views::SnapshotReplicationRow::export_all(&cfg)?;
     views::ReplicationsView::export_all(&cfg)?;
+    views::NamespaceSummary::export_all(&cfg)?;
     views::DoctorReportView::export_all(&cfg)?;
     views::GateDescriptor::export_all(&cfg)?;
     views::EventRow::export_all(&cfg)?;
@@ -202,7 +203,7 @@ mod tests {
             .filter(|n| n.ends_with(".ts"))
             .count();
         assert_eq!(
-            exported, 75,
+            exported, 76,
             "expected one .ts file per wire type; add the new type's root to \
              `export_all` and bump this count deliberately. 64 -> 65 when \
              `GateSeverityView` replaced `GateHit.severity`/`GateDescriptor.severity`'s \
@@ -224,7 +225,8 @@ mod tests {
              74 -> 75 for `AdmittedNamespacesView`, which names a \
              `ClusterRepository`'s admission from its spec instead of passing \
              the controller's `-1` (all) / `0` (selector) sentinels through as \
-             a count"
+             a count; 75 -> 76 for `NamespaceSummary`, the namespace \
+             switcher's list"
         );
     }
 }

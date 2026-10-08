@@ -39,6 +39,7 @@ export type { MaintenanceRow } from "./types/MaintenanceRow";
 export type { MaintenanceRunBody } from "./types/MaintenanceRunBody";
 export type { ManualRunView } from "./types/ManualRunView";
 export type { Me } from "./types/Me";
+export type { NamespaceSummary } from "./types/NamespaceSummary";
 export type { NodeKind } from "./types/NodeKind";
 export type { OriginView } from "./types/OriginView";
 export type { Page } from "./types/Page";

@@ -814,6 +814,17 @@ pub struct RepoVerificationView {
     pub last_verified: Option<String>,
 }
 
+/// A namespace that holds kopiur objects the caller may see.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct NamespaceSummary {
+    /// The namespace.
+    pub name: String,
+    /// How many namespaced kopiur objects in it the caller may see.
+    pub objects: u32,
+}
+
 /// One row of the schedules table.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]

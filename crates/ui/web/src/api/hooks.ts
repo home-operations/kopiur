@@ -51,6 +51,7 @@ import type {
   MaintenanceRow,
   MaintenanceRunBody,
   Me,
+  NamespaceSummary,
   Page,
   PolicyDetail,
   PolicyRow,
@@ -96,6 +97,7 @@ const API = "/api/v1";
 /** Every path the SPA requests, in one place. */
 export const paths = {
   me: `${API}/me`,
+  namespaces: `${API}/namespaces`,
   status: `${API}/status`,
   graph: `${API}/graph`,
   repositories: `${API}/repositories`,
@@ -194,6 +196,7 @@ export interface TreeParams {
  */
 export const queryKeys = {
   me: (namespace: Namespace) => ["me", { namespace: namespace ?? null }] as const,
+  namespaces: () => ["namespaces"] as const,
   status: (namespace: Namespace) => ["status", { namespace: namespace ?? null }] as const,
   graph: (namespace: Namespace) => ["graph", { namespace: namespace ?? null }] as const,
   repositories: (namespace: Namespace) =>
@@ -302,6 +305,14 @@ export function useApiMutation<TData, TVariables>(
 export function useMe(namespace: Namespace, options: ReadOptions = {}) {
   return useApiQuery<Me>(queryKeys.me(namespace), withQuery(paths.me, { namespace }), {
     staleTime: staleTime.me,
+    ...options,
+  });
+}
+
+/** Namespaces holding kopiur objects the caller may see — the switcher's list. */
+export function useNamespaces(options: ReadOptions = {}) {
+  return useApiQuery<NamespaceSummary[]>(queryKeys.namespaces(), paths.namespaces, {
+    staleTime: staleTime.list,
     ...options,
   });
 }
