@@ -60,7 +60,9 @@ Rules that shape the block:
   /* ---- layout ---- */
   --sidebar-width: 240px;
   --content-max: 1440px;
-  --drawer-width: 30rem;
+  --drawer-width: 50vw; /* the side panel; set inline once resized   */
+  --drawer-min: 360px;
+  --drawer-max: 85vw;
 
   /* ---- motion ---- */
   --ease-out: cubic-bezier(0.16, 1, 0.3, 1);

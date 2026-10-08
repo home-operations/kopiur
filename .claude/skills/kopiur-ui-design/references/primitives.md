@@ -648,8 +648,14 @@ resource is looked at without leaving the page you are on.
 
 - A native modal `<dialog>` (`showModal()`): top layer, `::backdrop` on `--scrim`,
   the page behind is inert. No z-index is ever needed to stack it.
-- Inset `--space-3` from the top, right and bottom; `--drawer-width` wide,
-  `--radius-xl`, `--shadow-2`, kind stripe on the left edge. Full-screen below 560px.
+- Inset `--space-3` from the top, right and bottom; `--radius-xl`, `--shadow-2`,
+  kind stripe on the left edge. Full-screen below 560px.
+- **Resizable.** The left edge is a `role="separator"` handle (`.side-panel__grip`,
+  `aria-orientation="vertical"`, `aria-valuenow` in px): drag it, or focus it and
+  use ←/→ (24px), Home/End. It opens at 50% of the window (`--drawer-width`),
+  never wider than 85% (`--drawer-max`) nor narrower than `--drawer-min`, and the
+  chosen width is remembered in `localStorage` (`kopiur-ui.drawer-width`) for every
+  later panel, clamped to the window it reopens in. Hidden on phones.
 - Slides in from the right over `--dur-base`; no exit animation (it unmounts when
   the URL drops it). Reduced motion collapses both.
 - The head (chip, kind name, mono name, pill, close) and the foot stay put; only

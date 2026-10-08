@@ -145,8 +145,70 @@ describe("SidePanel", () => {
     expect(screen.getByRole("link", { name: "Open full page" })).toBeInTheDocument();
   });
 
+  it("opens at half the window, with a resize handle that says so", () => {
+    window.localStorage.clear();
+    render(
+      <SidePanel label="nas" onClose={noop}>
+        body
+      </SidePanel>,
+    );
+    const dialog = screen.getByRole("dialog");
+    const half = Math.round(window.innerWidth / 2);
+    expect(dialog.style.getPropertyValue("--drawer-width")).toBe(`${String(half)}px`);
+    const grip = screen.getByRole("separator", { name: "Resize details" });
+    expect(grip).toHaveAttribute("aria-orientation", "vertical");
+    expect(grip).toHaveAttribute("aria-valuenow", String(half));
+    expect(grip).toHaveAttribute("aria-valuemax", String(Math.floor(window.innerWidth * 0.85)));
+    expect(grip).toHaveAttribute("tabindex", "0");
+  });
+
+  it("resizes from the keyboard and remembers the width", async () => {
+    window.localStorage.clear();
+    render(
+      <SidePanel label="nas" onClose={noop}>
+        body
+      </SidePanel>,
+    );
+    const half = Math.round(window.innerWidth / 2);
+    const grip = screen.getByRole("separator", { name: "Resize details" });
+    grip.focus();
+    await userEvent.keyboard("{ArrowLeft}");
+    expect(grip).toHaveAttribute("aria-valuenow", String(half + 24));
+    await userEvent.keyboard("{ArrowRight}{ArrowRight}");
+    expect(grip).toHaveAttribute("aria-valuenow", String(half - 24));
+    expect(window.localStorage.getItem("kopiur-ui.drawer-width")).toBe(String(half - 24));
+    await userEvent.keyboard("{End}");
+    expect(grip).toHaveAttribute("aria-valuenow", String(Math.floor(window.innerWidth * 0.85)));
+  });
+
+  it("resizes by dragging its left edge, and reopens at the dragged width", () => {
+    window.localStorage.clear();
+    const { unmount } = render(
+      <SidePanel label="nas" onClose={noop}>
+        body
+      </SidePanel>,
+    );
+    const half = Math.round(window.innerWidth / 2);
+    const grip = screen.getByRole("separator", { name: "Resize details" });
+    fireEvent.pointerDown(grip, { clientX: 500, pointerId: 1, button: 0 });
+    fireEvent.pointerMove(grip, { clientX: 400, pointerId: 1 });
+    expect(grip).toHaveAttribute("aria-valuenow", String(half + 100));
+    fireEvent.pointerUp(grip, { clientX: 400, pointerId: 1 });
+    // A drag never reaches the backdrop: the panel stays open.
+    expect(screen.getByRole("dialog")).toHaveAttribute("open");
+    unmount();
+    render(
+      <SidePanel label="nas" onClose={noop}>
+        body
+      </SidePanel>,
+    );
+    expect(screen.getByRole("separator")).toHaveAttribute("aria-valuenow", String(half + 100));
+  });
+
   it("floats at the drawer width over a scrim, and fills a phone", () => {
     expect(rule(".side-panel")).toMatch(/--drawer-width/);
+    expect(rule(".side-panel")).toMatch(/--drawer-max/);
+    expect(rule(".side-panel__grip")).toMatch(/display:\s*none/);
     expect(rule(".side-panel::backdrop")).toMatch(/var\(--scrim\)/);
     expect(rule(".side-panel")).toMatch(/width:\s*100vw/);
   });

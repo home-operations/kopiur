@@ -24,3 +24,10 @@ if (typeof dialog.showModal !== "function") {
     setTimeout(() => this.dispatchEvent(new Event("close")), 0);
   };
 }
+
+// Nor pointer capture, which the side panel's resize handle takes while dragging.
+const element = Element.prototype as Partial<Element>;
+if (typeof element.setPointerCapture !== "function") {
+  element.setPointerCapture = () => undefined;
+  element.releasePointerCapture = () => undefined;
+}

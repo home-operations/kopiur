@@ -1,8 +1,23 @@
 import { X } from "lucide-react";
-import { type ReactNode, useEffect, useId, useLayoutEffect, useRef } from "react";
+import {
+  type CSSProperties,
+  type ReactNode,
+  useEffect,
+  useId,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from "react";
 
 import type { ObjectKind } from "../api/types";
 import { ActionButton } from "./ActionButton";
+import {
+  DRAWER_STEP,
+  clampDrawerWidth,
+  drawerMaxWidth,
+  readDrawerWidth,
+  saveDrawerWidth,
+} from "./drawerWidth";
 import { KindChip, KindName } from "./KindMark";
 import { KIND_META } from "./kind";
 
@@ -23,6 +38,10 @@ import { KIND_META } from "./kind";
  *
  * Focus moves into the panel when it opens and goes back to whatever had it
  * before — the row or reference that opened it — when it goes.
+ *
+ * Its left edge is a resize handle: drag it, or focus it and use the arrow
+ * keys (Home and End for narrowest and widest). The width is remembered for
+ * the next panel, whichever resource it shows (`drawerWidth.ts`).
  */
 export interface SidePanelProps {
   /** The title, which also names the dialog. */
@@ -50,6 +69,9 @@ export function SidePanel({
   const dialog = useRef<HTMLDialogElement | null>(null);
   const titleId = useId();
   const close = useRef(onClose);
+  const grip = useRef<HTMLDivElement | null>(null);
+  const [width, setWidth] = useState(() => readDrawerWidth(window.innerWidth));
+  const widthRef = useRef(width);
 
   useEffect(() => {
     close.current = onClose;
@@ -104,6 +126,69 @@ export function SidePanel({
     };
   }, []);
 
+  // The resize handle. Listeners go on the element directly: a drag moves the
+  // pointer off the 8px handle at once, so it captures the pointer, and the
+  // width is saved once, when the drag ends.
+  useEffect(() => {
+    const node = grip.current;
+    if (node === null) return;
+    // A focusable separator is a widget (it takes the arrow keys), which the
+    // a11y lint's role table does not yet know; the tab stop is set here.
+    node.tabIndex = 0;
+    const resize = (next: number) => {
+      const clamped = clampDrawerWidth(next, window.innerWidth);
+      widthRef.current = clamped;
+      setWidth(clamped);
+      return clamped;
+    };
+    let drag: { x: number; width: number } | null = null;
+    const onDown = (event: PointerEvent) => {
+      if (event.button !== 0) return;
+      event.preventDefault();
+      drag = { x: event.clientX, width: widthRef.current };
+      node.setPointerCapture(event.pointerId);
+    };
+    const onMove = (event: PointerEvent) => {
+      if (drag === null) return;
+      // The panel hangs off the right edge: moving left widens it.
+      resize(drag.width + (drag.x - event.clientX));
+    };
+    const onUp = (event: PointerEvent) => {
+      if (drag === null) return;
+      drag = null;
+      node.releasePointerCapture(event.pointerId);
+      saveDrawerWidth(widthRef.current);
+    };
+    const onKey = (event: KeyboardEvent) => {
+      const current = widthRef.current;
+      const next =
+        event.key === "ArrowLeft"
+          ? current + DRAWER_STEP
+          : event.key === "ArrowRight"
+            ? current - DRAWER_STEP
+            : event.key === "Home"
+              ? 0
+              : event.key === "End"
+                ? Number.POSITIVE_INFINITY
+                : null;
+      if (next === null) return;
+      event.preventDefault();
+      saveDrawerWidth(resize(next));
+    };
+    node.addEventListener("pointerdown", onDown);
+    node.addEventListener("pointermove", onMove);
+    node.addEventListener("pointerup", onUp);
+    node.addEventListener("pointercancel", onUp);
+    node.addEventListener("keydown", onKey);
+    return () => {
+      node.removeEventListener("pointerdown", onDown);
+      node.removeEventListener("pointermove", onMove);
+      node.removeEventListener("pointerup", onUp);
+      node.removeEventListener("pointercancel", onUp);
+      node.removeEventListener("keydown", onKey);
+    };
+  }, []);
+
   // Content swapped under focus (another resource, a section that went away)
   // must not drop focus onto the inert page behind.
   useLayoutEffect(() => {
@@ -122,7 +207,18 @@ export function SidePanel({
       data-kind={kind !== undefined ? KIND_META[kind].slug : undefined}
       aria-labelledby={titleId}
       tabIndex={-1}
+      style={{ "--drawer-width": `${String(width)}px` } as CSSProperties}
     >
+      <div
+        ref={grip}
+        className="side-panel__grip"
+        role="separator"
+        aria-orientation="vertical"
+        aria-label="Resize details"
+        aria-valuemin={clampDrawerWidth(0, window.innerWidth)}
+        aria-valuemax={drawerMaxWidth(window.innerWidth)}
+        aria-valuenow={width}
+      />
       <div className="side-panel__frame">
         <header className="side-panel__head">
           {kind !== undefined ? <KindChip kind={kind} /> : null}

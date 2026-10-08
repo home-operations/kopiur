@@ -53,7 +53,9 @@
   /* ---- layout ---- */
   --sidebar-width: 240px;
   --content-max: 1440px;
-  --drawer-width: 30rem;
+  --drawer-width: 50vw; /* the side panel; set inline once resized   */
+  --drawer-min: 360px;
+  --drawer-max: 85vw;
 
   /* ---- motion ---- */
   --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
@@ -1206,7 +1208,10 @@ html:has(dialog.side-panel[open]) {
 .side-panel {
   position: fixed;
   inset: var(--space-3) var(--space-3) var(--space-3) auto;
-  width: min(var(--drawer-width), calc(100vw - 2 * var(--space-3)));
+  width: min(
+    clamp(min(var(--drawer-min), var(--drawer-max)), var(--drawer-width), var(--drawer-max)),
+    calc(100vw - 2 * var(--space-3))
+  );
   height: auto;
   max-width: none;
   max-height: none;
@@ -1240,6 +1245,38 @@ html:has(dialog.side-panel[open]) {
   from {
     opacity: 0;
   }
+}
+/* The left edge is the resize handle: an 8px strip over the stripe, with a
+   short bar that shows on hover, on focus and while dragging. */
+.side-panel__grip {
+  position: absolute;
+  inset: 0 auto 0 0;
+  z-index: 1;
+  width: 8px;
+  cursor: ew-resize;
+  touch-action: none;
+}
+.side-panel__grip::after {
+  content: "";
+  position: absolute;
+  top: 50%;
+  left: 2px;
+  width: 4px;
+  height: 40px;
+  border-radius: var(--radius-pill);
+  background: var(--line-strong);
+  opacity: 0;
+  transform: translateY(-50%);
+  transition: opacity var(--dur-fast) var(--ease-out);
+}
+.side-panel__grip:hover::after,
+.side-panel__grip:active::after,
+.side-panel__grip:focus-visible::after {
+  opacity: 1;
+}
+.side-panel__grip:focus-visible {
+  outline: none;
+  box-shadow: inset 0 0 0 2px var(--accent);
 }
 .side-panel__frame {
   display: grid;
@@ -1295,6 +1332,9 @@ html:has(dialog.side-panel[open]) {
   text-decoration: none;
 }
 @media (max-width: 560px) {
+  .side-panel__grip {
+    display: none;
+  }
   .side-panel {
     inset: 0;
     width: 100vw;
