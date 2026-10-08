@@ -255,6 +255,11 @@ tr:has(.row-link) td.has-stripe {
   position: static;
 }
 
+/* The row is the link, so its name needs no underline to say so. */
+.row-link {
+  text-decoration: none;
+}
+
 .row-link::after {
   content: "";
   position: absolute;

@@ -22,4 +22,8 @@ describe("whole-row links", () => {
   it("keep the row's other links and buttons above the cover, so they still work", () => {
     expect(body((s) => s.includes(":not(.row-link)"))).toMatch(/z-index:\s*1/);
   });
+
+  it("drop the underline on the row's name — the whole row is the link", () => {
+    expect(body((s) => s === ".row-link")).toMatch(/text-decoration:\s*none/);
+  });
 });
