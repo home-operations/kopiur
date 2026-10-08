@@ -10,7 +10,8 @@ import { namespaceFromSearch } from "../util/namespace";
 export const Route = createFileRoute("/policies_/$namespace/$name")({
   beforeLoad: ({ params, search }) => {
     const scope = namespaceFromSearch(search);
-    throw redirect({
+    redirect({
+      throw: true,
       to: "/policies",
       search: {
         ...(scope !== undefined ? { namespace: scope } : {}),

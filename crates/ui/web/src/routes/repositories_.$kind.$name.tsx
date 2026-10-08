@@ -25,7 +25,8 @@ export const Route = createFileRoute("/repositories_/$kind/$name")({
   beforeLoad: ({ params, search }) => {
     const scope = namespaceFromSearch(search);
     const open = target(params.kind, params.name, scope);
-    throw redirect({
+    redirect({
+      throw: true,
       to: "/repositories",
       search: {
         ...(scope !== undefined ? { namespace: scope } : {}),
