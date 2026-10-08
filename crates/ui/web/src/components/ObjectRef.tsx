@@ -2,6 +2,7 @@ import { Link } from "@tanstack/react-router";
 
 import type { ObjectKind } from "../api/types";
 import { LampBadge } from "./HealthBadge";
+import { InspectLink } from "./InspectLink";
 import type { Lamp } from "./health";
 import { KindChip } from "./KindMark";
 import { KIND_META, detailHref, parseRef } from "./kind";
@@ -16,6 +17,8 @@ export interface ObjectRefProps {
   health?: Lamp | undefined;
   /** The target's detail route. Omitted for a kind with none: then it is not a link. */
   to?: string | undefined;
+  /** Open the target in the resource drawer instead of following `to`. */
+  inspect?: boolean | undefined;
 }
 
 /**
@@ -23,7 +26,15 @@ export interface ObjectRefProps {
  * its live status. A link when the target has a detail route; plain text when
  * it does not, because a link to a route that does not exist is a lie.
  */
-export function ObjectRef({ kind, name, namespace, contextNamespace, health, to }: ObjectRefProps) {
+export function ObjectRef({
+  kind,
+  name,
+  namespace,
+  contextNamespace,
+  health,
+  to,
+  inspect = false,
+}: ObjectRefProps) {
   const meta = KIND_META[kind];
   const showNamespace =
     namespace !== undefined && namespace.length > 0 && namespace !== contextNamespace;
@@ -40,6 +51,13 @@ export function ObjectRef({ kind, name, namespace, contextNamespace, health, to 
       {health !== undefined ? <LampBadge lamp={health} /> : null}
     </>
   );
+  if (inspect) {
+    return (
+      <InspectLink className="ref" data-kind={meta.slug} target={{ kind, name, namespace }}>
+        {body}
+      </InspectLink>
+    );
+  }
   return to !== undefined ? (
     <Link className="ref" data-kind={meta.slug} to={to}>
       {body}

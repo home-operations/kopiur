@@ -3,6 +3,7 @@ import { Menu } from "lucide-react";
 import { type ReactNode, useEffect, useRef, useState } from "react";
 
 import { useCurrentNamespace } from "../util/namespace";
+import { ResourceDrawer } from "./drawer/ResourceDrawer";
 import { sectionFor } from "./nav";
 import { GlobalProblemBanner } from "./ProblemBanner";
 import { Sidebar } from "./shell/Sidebar";
@@ -74,6 +75,7 @@ export function AppShell({ children }: AppShellProps) {
         </div>
         <div className="content">{children}</div>
       </main>
+      <ResourceDrawer />
     </div>
   );
 }

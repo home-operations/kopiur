@@ -7,6 +7,7 @@ export interface InspectLinkProps {
   target: InspectTarget;
   className?: string | undefined;
   "aria-label"?: string | undefined;
+  "data-kind"?: string | undefined;
   onClick?: (() => void) | undefined;
   children: ReactNode;
 }
@@ -24,6 +25,7 @@ export function InspectLink({
   target,
   className,
   "aria-label": ariaLabel,
+  "data-kind": dataKind,
   onClick,
   children,
 }: InspectLinkProps) {
@@ -38,6 +40,7 @@ export function InspectLink({
       replace={drawerOpen}
       className={className}
       aria-label={ariaLabel}
+      data-kind={dataKind}
       onClick={onClick}
     >
       {children}

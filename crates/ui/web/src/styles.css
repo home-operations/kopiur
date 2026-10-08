@@ -1302,6 +1302,58 @@ html:has(dialog.side-panel[open]) {
   }
 }
 
+.side-panel__ns {
+  color: var(--fg-muted);
+  font-weight: 500;
+}
+
+/* ---- resource drawer: what the side panel says about a resource ------------ */
+.drawer__section {
+  display: grid;
+  gap: var(--space-2);
+}
+.drawer__title {
+  margin: 0;
+  color: var(--fg-muted);
+  font-size: var(--text-xs);
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.drawer__facts {
+  display: grid;
+  grid-template-columns: minmax(8rem, max-content) minmax(0, 1fr);
+  gap: var(--space-2) var(--space-4);
+  margin: 0;
+}
+.drawer__fact {
+  display: contents;
+}
+.drawer__fact dt {
+  color: var(--fg-muted);
+  font-size: var(--text-sm);
+}
+.drawer__fact dd {
+  margin: 0;
+  font-size: var(--text-sm);
+  overflow-wrap: anywhere;
+}
+.drawer__related {
+  display: grid;
+  gap: var(--space-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.drawer__related li {
+  display: grid;
+  gap: var(--space-1);
+}
+.drawer__rel-label {
+  color: var(--fg-muted);
+  font-size: var(--text-xs);
+}
+
 /* ---- skip link: the first focusable element, visible only on focus -------- */
 
 .skip-link {
