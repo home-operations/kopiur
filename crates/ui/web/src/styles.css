@@ -719,6 +719,142 @@ a.object-name:hover {
   overflow-wrap: anywhere;
 }
 
+/* ---- kind tiles: the overview's fleet by kind -------------------------------- */
+
+.kind-tiles {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: var(--space-3);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.kind-tile {
+  display: grid;
+  gap: 9px;
+  height: 100%;
+  padding: 12px 14px;
+  border: 1px solid var(--card-border);
+  border-radius: var(--radius-lg);
+  background: var(--bg-surface);
+  box-shadow: var(--shadow-1);
+  color: inherit;
+  text-decoration: none;
+}
+
+.kind-tile.has-stripe {
+  border-left: var(--stripe) solid var(--kc);
+}
+
+.kind-tile:hover {
+  background: var(--bg-hover);
+}
+
+/* A tile is a link: its lift must not eat the focus ring. */
+.kind-tile:focus-visible {
+  box-shadow: var(--focus-ring);
+}
+
+.kind-tile[data-failing="true"] {
+  outline: 1.5px solid color-mix(in srgb, var(--health-failed-fg) 45%, transparent);
+  outline-offset: -1.5px;
+}
+
+.kind-tile__head {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  font-weight: var(--weight-semibold);
+}
+
+.kind-tile__count {
+  margin-left: auto;
+  font-size: var(--text-2xl);
+  font-weight: var(--weight-bold);
+  font-variant-numeric: tabular-nums;
+}
+
+.status-bar {
+  display: flex;
+  gap: 3px;
+  height: 6px;
+}
+
+.status-bar > span {
+  border-radius: 3px;
+  background: var(--health-unknown-fg);
+}
+
+.status-bar > span[data-health="failed"] {
+  background: var(--health-failed-fg);
+}
+
+.status-bar > span[data-health="degraded"] {
+  background: var(--health-degraded-fg);
+}
+
+.status-bar > span[data-health="pending"] {
+  background: var(--health-pending-fg);
+}
+
+.status-bar > span[data-health="healthy"] {
+  background: var(--health-healthy-fg);
+}
+
+.kind-tile__breakdown {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  font-size: var(--text-xs);
+}
+
+.kind-tile__part {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  color: var(--fg-muted);
+}
+
+.kind-tile__part svg {
+  color: var(--health-unknown-fg);
+}
+
+.kind-tile__part[data-health="failed"] svg {
+  color: var(--health-failed-fg);
+}
+
+.kind-tile__part[data-health="degraded"] svg {
+  color: var(--health-degraded-fg);
+}
+
+.kind-tile__part[data-health="pending"] svg {
+  color: var(--health-pending-fg);
+}
+
+.kind-tile__part[data-health="healthy"] svg {
+  color: var(--health-healthy-fg);
+}
+
+.kind-tile__none {
+  color: var(--fg-muted);
+}
+
+/* ---- overview: what needs you --------------------------------------------- */
+
+.attention {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: var(--space-3);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.page__section > * + * {
+  margin-top: var(--space-3);
+}
+
 /* ---- skeleton: a ledger row's silhouette, not a spinner ------------------ */
 
 .skeleton {

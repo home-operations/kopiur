@@ -2,7 +2,13 @@ import { screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { problemBanner } from "../api/problem";
-import type { DoctorReportView, RepositorySummary, StatusOverview } from "../api/types";
+import type {
+  DoctorReportView,
+  MaintenanceRow,
+  OverviewView,
+  RepositorySummary,
+  StatusOverview,
+} from "../api/types";
 import {
   bodyRows,
   calledPaths,
@@ -109,9 +115,77 @@ afterEach(() => {
   vi.useRealTimers();
 });
 
+/** The fleet by kind for {@link repositories}: one failed repository, one failed snapshot. */
+const overview: OverviewView = {
+  snapshotWindowHours: 24,
+  generatedAt: NOW,
+  kinds: [
+    {
+      kind: "repository",
+      total: 4,
+      byHealth: [
+        { health: "failed", count: 1 },
+        { health: "suspended", count: 1 },
+        { health: "healthy", count: 2 },
+      ],
+    },
+    { kind: "clusterRepository", total: 0, byHealth: [] },
+    { kind: "maintenance", total: 1, byHealth: [{ health: "failed", count: 1 }] },
+    { kind: "snapshotPolicy", total: 1, byHealth: [{ health: "healthy", count: 1 }] },
+    { kind: "snapshotSchedule", total: 0, byHealth: [] },
+    {
+      kind: "snapshot",
+      total: 3,
+      byHealth: [
+        { health: "failed", count: 1 },
+        { health: "healthy", count: 2 },
+      ],
+    },
+    { kind: "restore", total: 0, byHealth: [] },
+    { kind: "repositoryReplication", total: 0, byHealth: [] },
+    { kind: "snapshotReplication", total: 0, byHealth: [] },
+  ],
+};
+
+const emptyOverview: OverviewView = {
+  ...overview,
+  kinds: overview.kinds.map((k) => ({ ...k, total: 0, byHealth: [] })),
+};
+
+const failingMaintenance: MaintenanceRow = {
+  namespace: "media",
+  name: "cold",
+  repository: "Repository/media/cold",
+  managedByRepository: true,
+  quick: { lastRunAt: "2026-09-08T06:00:00Z", consecutiveFailures: 2 },
+  full: { lastRunAt: "2026-09-07T03:00:00Z", consecutiveFailures: 0 },
+};
+
+/** The reads the overview makes besides the three each test sets: quiet unless overridden. */
+function calm(over: Record<string, Response | ((url: URL) => Response)> = {}) {
+  return {
+    "/api/v1/overview": jsonResponse(overview),
+    "/api/v1/policies": jsonResponse([
+      {
+        namespace: "media",
+        name: "nightly",
+        repositories: ["Repository/media/nas"],
+        multiRepo: false,
+        suspended: false,
+        lastSuccessfulSnapshot: NOW,
+        lastVerified: NOW,
+      },
+    ]),
+    "/api/v1/schedules": jsonResponse([]),
+    "/api/v1/maintenance": jsonResponse([]),
+    ...over,
+  };
+}
+
 describe("Overview", () => {
-  it("answers whether the data is safe, then shows the lamps, the work and the fixes", async () => {
+  it("answers whether the data is safe, then shows the fleet by kind and what needs you", async () => {
     mockApi({
+      ...calm({ "/api/v1/maintenance": jsonResponse([failingMaintenance]) }),
       "/api/v1/status": jsonResponse(status),
       "/api/v1/repositories": jsonResponse(repositories),
       "/api/v1/doctor": jsonResponse(doctor),
@@ -126,28 +200,29 @@ describe("Overview", () => {
     expect(verdict.querySelector(".verdict__lamp")).toHaveAttribute("data-health", "failed");
     expect(verdict.querySelector("svg")).not.toBeNull();
 
-    // The health strip, from /repositories, filtered links carrying the scope.
-    const strip = screen.getByRole("navigation", { name: "Repositories by health" });
-    expect(within(strip).getByRole("link", { name: "1 failed repository" })).toHaveAttribute(
+    // The fleet by kind, from /overview, each tile a link carrying the scope.
+    const fleet = screen.getByRole("region", { name: "Fleet by kind" });
+    const snapshots = await within(fleet).findByRole("link", { name: /Snapshots/ });
+    expect(snapshots).toHaveTextContent("1 failed");
+    expect(snapshots).toHaveAttribute("data-failing", "true");
+    expect(within(fleet).getByRole("link", { name: /Repositories/ })).toHaveAttribute(
       "href",
-      "/repositories?namespace=media&health=failed",
+      "/repositories?health=failed&namespace=media",
     );
-    expect(within(strip).getByRole("link", { name: "2 healthy repositories" })).toBeInTheDocument();
 
-    // Work in flight, from the status report.
-    const inFlight = screen.getByRole("region", { name: "Work in flight" });
-    expect(within(inFlight).getByText("2")).toBeInTheDocument();
-    expect(within(inFlight).getByRole("link", { name: /snapshots running/ })).toHaveAttribute(
+    // What needs you: the failing objects as cards, worst first.
+    const attention = screen.getByRole("region", { name: "Needs attention" });
+    const cards = await within(attention).findAllByRole("article");
+    const kinds = cards.map((c) => c.getAttribute("data-kind")).filter((k) => k !== null);
+    expect(kinds).toContain("repository");
+    expect(kinds).toContain("maintenance");
+    expect(within(attention).getByRole("link", { name: "cold" })).toHaveAttribute(
       "href",
-      "/snapshots?namespace=media",
-    );
-    expect(within(inFlight).getByRole("link", { name: /restores? running/ })).toHaveAttribute(
-      "href",
-      "/restores?namespace=media",
+      "/repositories/repository/cold?namespace=media",
     );
 
     // Stalled objects as work rows.
-    const stalled = screen.getByRole("table", { name: "Stalled objects" });
+    const stalled = within(attention).getByRole("table", { name: "Stalled objects" });
     const row = nth(bodyRows(stalled), 0);
     expect(within(row).getByText("Snapshot")).toHaveClass("label-strip__kind");
     expect(within(row).getByText("nightly-1")).toHaveClass("label-strip__name");
@@ -155,23 +230,24 @@ describe("Overview", () => {
     expect(row.querySelector(".health")).toHaveTextContent("Stalled");
     expect(row).toHaveTextContent("has not opted in");
 
-    // The fixes: only the failing doctor checks, with their fix text.
-    const fixes = screen.getByRole("region", { name: "What needs fixing" });
+    // The failing doctor checks, with their fix text, and the way to the full report.
+    const fixes = within(attention).getByRole("list", { name: "Failing checks" });
     const findings = within(fixes).getAllByRole("article");
     expect(findings).toHaveLength(1);
     expect(nth(findings, 0)).toHaveAccessibleName("no blocked or stuck work");
     expect(nth(findings, 0).querySelector(".finding__fix")).toHaveTextContent(
       "annotate namespace media",
     );
-    expect(within(fixes).getByRole("link", { name: /full doctor report/ })).toHaveAttribute(
+    expect(within(attention).getByRole("link", { name: /full doctor report/ })).toHaveAttribute(
       "href",
       "/doctor?namespace=media",
     );
 
-    // Every read carried the namespace, and /status took nothing else.
+    // Every read carried the namespace.
     const paths = calledPaths();
     expect(paths).toContain("/api/v1/status?namespace=media");
     expect(paths).toContain("/api/v1/repositories?namespace=media");
+    expect(paths).toContain("/api/v1/overview?namespace=media");
 
     // The landing page asks for a subset, not the whole suite: running it all
     // here meant a dryRun create through the admission chain, a Secret read
@@ -187,14 +263,14 @@ describe("Overview", () => {
     expect(askedFor).toContain("no-stuck-work");
     expect(askedFor).toContain("recent-failures");
     expect(askedFor).toContain("repositories-ready");
-    // The three heaviest reads doctor makes are none of the overview's business.
     expect(askedFor).not.toContain("webhook-admits");
     expect(askedFor).not.toContain("credentials-present");
     expect(askedFor).not.toContain("recent-warnings");
   });
 
-  it("reads as calm when everything is healthy", async () => {
+  it("reads as calm when everything is healthy, and says nothing needs you", async () => {
     mockApi({
+      ...calm({ "/api/v1/overview": jsonResponse(emptyOverview) }),
       "/api/v1/status": jsonResponse({
         now: NOW,
         report: {
@@ -212,15 +288,17 @@ describe("Overview", () => {
       "All 2 repositories healthy, nothing stalled, no failing checks.",
     );
     expect(verdict.querySelector(".verdict__lamp")).toHaveAttribute("data-health", "healthy");
-    const stalled = screen.getByRole("region", { name: "Stalled objects" });
-    expect(within(stalled).getByRole("status")).toHaveTextContent("Nothing is stalled");
-    const fixes = screen.getByRole("region", { name: "What needs fixing" });
-    expect(within(fixes).getByRole("status")).toHaveTextContent("Nothing to fix");
-    expect(calledPaths()).toContain("/api/v1/status");
+    const attention = screen.getByRole("region", { name: "Needs attention" });
+    expect(await within(attention).findByRole("status")).toHaveTextContent("Nothing needs you");
+    expect(within(attention).queryByRole("article")).toBeNull();
   });
 
-  it("renders the empty state when the scope has no repositories, and never calls that healthy", async () => {
+  it("never calls an empty scope healthy", async () => {
     mockApi({
+      ...calm({
+        "/api/v1/overview": jsonResponse(emptyOverview),
+        "/api/v1/policies": jsonResponse([]),
+      }),
       "/api/v1/status": jsonResponse({
         now: NOW,
         report: {
@@ -239,13 +317,38 @@ describe("Overview", () => {
     const verdict = await screen.findByRole("status", { name: "Vault verdict" });
     expect(verdict).toHaveTextContent("No repositories in scope");
     expect(verdict.querySelector(".verdict__lamp")).toHaveAttribute("data-health", "unknown");
-    const region = screen.getByRole("region", { name: "Repositories by health" });
-    expect(within(region).getByRole("status")).toHaveTextContent("No repositories in empty");
-    expect(within(region).getByRole("status")).toHaveTextContent(/Repository|ClusterRepository/);
+    const fleet = screen.getByRole("region", { name: "Fleet by kind" });
+    expect(await within(fleet).findByRole("link", { name: /Repositories/ })).toHaveTextContent(
+      "none in scope",
+    );
   });
 
-  it("renders the not-permitted state for a 403 and says the verdict cannot be given", async () => {
+  it("says once, in its place, that the fleet overview was refused — and the verdict cannot be green", async () => {
     mockApi({
+      ...calm({
+        "/api/v1/overview": problemResponse(
+          forbiddenProblem("Listing kopiur objects was refused.", "/api/v1/overview"),
+        ),
+      }),
+      "/api/v1/status": jsonResponse({
+        ...status,
+        report: { ...(status.report as object), stalled: [] },
+      }),
+      "/api/v1/repositories": jsonResponse([repo("nas", "healthy")]),
+      "/api/v1/doctor": jsonResponse(allGood),
+    });
+    mountApp("/");
+    const verdict = await screen.findByRole("status", { name: "Vault verdict" });
+    expect(verdict).toHaveTextContent("did not load");
+    expect(verdict.querySelector(".verdict__lamp")).not.toHaveAttribute("data-health", "healthy");
+    const fleet = screen.getByRole("region", { name: "Fleet by kind" });
+    expect(fleet.querySelector('[data-state="not-permitted"]')).not.toBeNull();
+    expect(within(fleet).queryByRole("button", { name: "Retry" })).toBeNull();
+  });
+
+  it("renders the status report's refusal where the stalled objects would be", async () => {
+    mockApi({
+      ...calm(),
       "/api/v1/status": problemResponse(
         forbiddenProblem("Listing repositories was refused.", "/api/v1/status"),
       ),
@@ -257,18 +360,16 @@ describe("Overview", () => {
     // What did load still counts — a failed repository outranks a missing report.
     expect(verdict).toHaveTextContent("Needs attention");
     expect(verdict).toHaveTextContent("The status report did not load.");
-    // Both halves of the pair come from the one report: the refusal is said
-    // once, in their place, not twice side by side.
-    const region = screen.getByRole("region", { name: "Status report" });
-    expect(region.querySelector('[data-state="not-permitted"]')).not.toBeNull();
-    expect(within(region).getByRole("alert")).toHaveTextContent("kopiur-ui-viewer");
-    expect(within(region).queryByRole("button", { name: "Retry" })).toBeNull();
-    expect(screen.queryByRole("region", { name: "Stalled objects" })).toBeNull();
+    const attention = screen.getByRole("region", { name: "Needs attention" });
+    expect(attention.querySelector('[data-state="not-permitted"]')).not.toBeNull();
+    expect(within(attention).getByRole("alert")).toHaveTextContent("kopiur-ui-viewer");
+    expect(within(attention).queryByRole("button", { name: "Retry" })).toBeNull();
     expect(screen.getAllByRole("alert")).toHaveLength(1);
   });
 
   it("renders the error state with a retry for any other failure", async () => {
     mockApi({
+      ...calm(),
       "/api/v1/status": jsonResponse(status),
       "/api/v1/repositories": new Response("<html>gateway</html>", {
         status: 502,
@@ -277,9 +378,9 @@ describe("Overview", () => {
       "/api/v1/doctor": jsonResponse(allGood),
     });
     mountApp("/");
-    const region = await screen.findByRole("region", { name: "Repositories by health" });
-    expect(await within(region).findByRole("alert")).toHaveTextContent("answered 502");
-    expect(within(region).getByRole("button", { name: "Retry" })).toBeInTheDocument();
+    const attention = await screen.findByRole("region", { name: "Needs attention" });
+    expect(await within(attention).findByRole("alert")).toHaveTextContent("answered 502");
+    expect(within(attention).getByRole("button", { name: "Retry" })).toBeInTheDocument();
     const verdict = screen.getByRole("status", { name: "Vault verdict" });
     expect(verdict).toHaveTextContent("did not load");
   });
@@ -289,7 +390,7 @@ describe("Overview", () => {
     fetchMock.mockResponse(() => new Promise<Response>(() => undefined));
     mountApp("/");
     const busy = await screen.findAllByRole("status", { busy: true });
-    expect(busy.length).toBeGreaterThanOrEqual(3);
+    expect(busy.length).toBeGreaterThanOrEqual(2);
     expect(document.querySelector(".spinner")).toBeNull();
     expect(screen.getByRole("status", { name: "Vault verdict" })).toHaveTextContent(
       "Checking the vault",
@@ -298,11 +399,9 @@ describe("Overview", () => {
 
   it("tells a read-only viewer their permissions blocked two checks, not that the cluster is degraded", async () => {
     // Every check that could run passed; the two that warned did so because
-    // the console asked the cluster as this user and was refused. The old
-    // sentence read "Mostly healthy: 2 doctor checks warning" on a degraded
-    // lamp, and the overview shows no warning detail — so there was nowhere
-    // on this screen to learn that both were about the viewer's own RBAC.
+    // the console asked the cluster as this user and was refused.
     mockApi({
+      ...calm(),
       "/api/v1/status": jsonResponse({
         now: NOW,
         report: {
@@ -356,6 +455,7 @@ describe("Overview", () => {
 
   it("survives a report this bundle cannot read and says it was incomplete", async () => {
     mockApi({
+      ...calm(),
       "/api/v1/status": jsonResponse({ now: NOW, report: "not-the-report" }),
       "/api/v1/repositories": jsonResponse(repositories),
       "/api/v1/doctor": jsonResponse(allGood),
@@ -363,10 +463,8 @@ describe("Overview", () => {
     mountApp("/");
     await screen.findByRole("status", { name: "Vault verdict" });
     expect(screen.getByText(/could not read part of the status report/)).toBeInTheDocument();
-    // Snapshots, restores, policies, schedules: every count the report did
-    // not carry is "unknown", never 0.
-    const inFlight = screen.getByRole("region", { name: "Work in flight" });
-    expect(within(inFlight).getAllByText("unknown")).toHaveLength(4);
-    expect(within(inFlight).queryByText("0")).toBeNull();
+    // The fleet by kind does not depend on the report.
+    const fleet = screen.getByRole("region", { name: "Fleet by kind" });
+    expect(await within(fleet).findByRole("link", { name: /Snapshots/ })).toBeInTheDocument();
   });
 });
