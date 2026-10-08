@@ -11,6 +11,7 @@ import { type DrawerRelation, drawerFacts } from "./drawerFacts";
 import { DrawerHead } from "./DrawerHead";
 import { FactsList } from "./FactsList";
 import { ListActions } from "./ListActions";
+import { repositoryView } from "./repository/repositoryView";
 
 /**
  * Everything the drawer shows for one resource, in its three bands: the main
@@ -31,6 +32,7 @@ export function drawerView(data: DrawerData, now: Date): DrawerView {
   switch (data.kind) {
     case "repository":
     case "clusterRepository":
+      return repositoryView(data.kind, data.detail, data, now);
     case "snapshotPolicy":
     case "snapshot":
     case "restore": {

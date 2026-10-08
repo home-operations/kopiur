@@ -1458,6 +1458,24 @@ html:has(dialog.side-panel[open]) {
   order: -1;
 }
 
+/* A named region of a tab: a small heading, then its facts or table. */
+.drawer__region {
+  display: grid;
+  gap: var(--space-3);
+  min-width: 0;
+}
+.drawer__region-title {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin: 0;
+  color: var(--fg-muted);
+  font-size: var(--text-xs);
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
 /* ---- chain: where a resource sits, read left to right -------------------- */
 .chain {
   display: flex;

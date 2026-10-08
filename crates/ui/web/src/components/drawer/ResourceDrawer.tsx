@@ -4,6 +4,7 @@ import { useState } from "react";
 import type { ApiProblemError } from "../../api/client";
 import {
   useMaintenance,
+  usePolicies,
   usePolicy,
   useReplications,
   useRepository,
@@ -93,6 +94,10 @@ function useDrawerData(target: InspectTarget): Loaded {
     kind === "clusterRepository" ? undefined : ns,
     { enabled: isRepo },
   );
+  // The rows that give a repository's chain its live pills: cluster-wide,
+  // because what writes into or copies a repository can live anywhere.
+  const policyRows = usePolicies(undefined, { enabled: isRepo });
+  const replicationRows = useReplications(undefined, { enabled: isRepo });
   const policy = usePolicy(ns, name, { enabled: kind === "snapshotPolicy" });
   const snapshot = useSnapshot(ns, name, { enabled: kind === "snapshot" });
   const restore = useRestore(ns, name, { enabled: kind === "restore" });
@@ -103,7 +108,12 @@ function useDrawerData(target: InspectTarget): Loaded {
   switch (kind) {
     case "repository":
     case "clusterRepository":
-      return settle(repository, (detail) => ({ kind, detail }));
+      return settle(repository, (detail) => ({
+        kind,
+        detail,
+        policies: policyRows.data,
+        replications: replicationRows.data,
+      }));
     case "snapshotPolicy":
       return settle(policy, (detail) => ({ kind, detail }));
     case "snapshot":

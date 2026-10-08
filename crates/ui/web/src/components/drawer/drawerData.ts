@@ -1,5 +1,7 @@
 import type {
   PolicyDetail,
+  PolicyRow,
+  ReplicationsView,
   RepositoryDetail,
   RestoreDetail,
   SnapshotDetail,
@@ -18,7 +20,13 @@ export type ListOnlyCard = Extract<
  * are the row their list sent.
  */
 export type DrawerData =
-  | { kind: "repository" | "clusterRepository"; detail: RepositoryDetail }
+  | {
+      kind: "repository" | "clusterRepository";
+      detail: RepositoryDetail;
+      /** Rows that give the chain live pills; absent until (or unless) they load. */
+      policies?: readonly PolicyRow[] | undefined;
+      replications?: ReplicationsView | undefined;
+    }
   | { kind: "snapshotPolicy"; detail: PolicyDetail }
   | { kind: "snapshot"; detail: SnapshotDetail }
   | { kind: "restore"; detail: RestoreDetail }
