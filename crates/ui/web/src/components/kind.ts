@@ -123,3 +123,30 @@ export function parseRef(ref: string): ParsedRef | null {
   }
   return null;
 }
+
+/**
+ * The object's detail page, or `undefined` for a kind that has none
+ * (schedules, maintenance and replications are list rows only). A reference
+ * to such a kind is shown as text, never as a link to a page that does not
+ * exist.
+ */
+export function detailHref(kind: ObjectKind, name: string, namespace?: string): string | undefined {
+  const ns = namespace !== undefined && namespace.length > 0 ? namespace : undefined;
+  switch (kind) {
+    case "repository":
+      return `/repositories/repository/${name}${ns !== undefined ? `?namespace=${encodeURIComponent(ns)}` : ""}`;
+    case "clusterRepository":
+      return `/repositories/cluster-repository/${name}`;
+    case "snapshotPolicy":
+      return ns !== undefined ? `/policies/${ns}/${name}` : undefined;
+    case "snapshot":
+      return ns !== undefined ? `/snapshots/${ns}/${name}` : undefined;
+    case "restore":
+      return ns !== undefined ? `/restores/${ns}/${name}` : undefined;
+    case "snapshotSchedule":
+    case "maintenance":
+    case "repositoryReplication":
+    case "snapshotReplication":
+      return undefined;
+  }
+}

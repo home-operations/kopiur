@@ -118,3 +118,13 @@ describe("RepositoryTable", () => {
     expect(row).toHaveTextContent("0 B");
   });
 });
+
+describe("RepositoryTable — kind identity", () => {
+  it("stripes each row in its own kind, Repository and ClusterRepository apart", async () => {
+    renderWithRouter(<RepositoryTable repositories={[nas, shared]} />);
+    const rows = bodyRows(await table());
+    expect(nth(rows, 0)).toHaveAttribute("data-kind", "repository");
+    expect(nth(rows, 1)).toHaveAttribute("data-kind", "cluster-repository");
+    expect(nth(rows, 0).querySelector("td.has-stripe .kind-chip svg")).not.toBeNull();
+  });
+});

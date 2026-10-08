@@ -6,6 +6,8 @@ import { HealthBadge } from "./HealthBadge";
 import { accessLabel, detailSearch, repositoryPhaseLabel } from "./repository";
 import { NotReported } from "./NotReported";
 import { admitsText } from "./admits";
+import { KindChip, KindName } from "./KindMark";
+import { KIND_META } from "./kind";
 
 /**
  * The fleet as a ledger: one row per `Repository` and `ClusterRepository`,
@@ -23,6 +25,11 @@ import { admitsText } from "./admits";
  * repository shows Degraded or Failed here — the backend folds gates into the
  * health it ships — and the gate itself is named on the detail screen.
  */
+/** The table's mixed rows, each as its own kind. */
+function repoKind(repository: RepositorySummary): "repository" | "clusterRepository" {
+  return repository.kind === "ClusterRepository" ? "clusterRepository" : "repository";
+}
+
 export interface RepositoryTableProps {
   repositories: readonly RepositorySummary[];
   /** The table's accessible name, when the caption should say the filter. */
@@ -54,29 +61,35 @@ export function RepositoryTable({ repositories, caption = "Repositories" }: Repo
         </thead>
         <tbody>
           {repositories.map((repository) => (
-            <tr key={`${repository.kindPath}/${repository.namespace ?? ""}/${repository.name}`}>
-              <td>
-                <div className="repo-table__object">
-                  <span className="label-strip">
-                    <span className="label-strip__kind">{repository.kind}</span>
-                    <span className="label-strip__name">
-                      <Link
-                        to="/repositories/$kind/$name"
-                        params={{ kind: repository.kindPath, name: repository.name }}
-                        search={detailSearch(repository)}
-                      >
-                        {repository.name}
-                      </Link>
+            <tr
+              key={`${repository.kindPath}/${repository.namespace ?? ""}/${repository.name}`}
+              data-kind={KIND_META[repoKind(repository)].slug}
+            >
+              <td className="has-stripe">
+                <div className="table__object">
+                  <KindChip kind={repoKind(repository)} size="sm" />
+                  <div className="repo-table__object">
+                    <span className="label-strip">
+                      <KindName kind={repoKind(repository)} />
+                      <span className="label-strip__name">
+                        <Link
+                          to="/repositories/$kind/$name"
+                          params={{ kind: repository.kindPath, name: repository.name }}
+                          search={detailSearch(repository)}
+                        >
+                          {repository.name}
+                        </Link>
+                      </span>
                     </span>
-                  </span>
-                  {repository.namespace !== null &&
-                  repository.namespace !== undefined &&
-                  repository.namespace.length > 0 ? (
-                    <span className="repo-table__namespace mono">{repository.namespace}</span>
-                  ) : null}
-                  {repository.admits !== null && repository.admits !== undefined ? (
-                    <span className="repo-table__namespace">{admitsText(repository.admits)}</span>
-                  ) : null}
+                    {repository.namespace !== null &&
+                    repository.namespace !== undefined &&
+                    repository.namespace.length > 0 ? (
+                      <span className="repo-table__namespace mono">{repository.namespace}</span>
+                    ) : null}
+                    {repository.admits !== null && repository.admits !== undefined ? (
+                      <span className="repo-table__namespace">{admitsText(repository.admits)}</span>
+                    ) : null}
+                  </div>
                 </div>
               </td>
               <td>

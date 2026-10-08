@@ -1,4 +1,3 @@
-import { Link } from "@tanstack/react-router";
 import type { ReactNode } from "react";
 
 import type { ScheduleRow } from "../api/types";
@@ -6,6 +5,9 @@ import { relativeTime } from "../util/format";
 import { LampBadge } from "./HealthBadge";
 import { healthLamp, loudLamp } from "./health";
 import { firesBySelector, scheduleCron, scheduleFires } from "./schedule";
+import { KindChip } from "./KindMark";
+import { detailHref } from "./kind";
+import { ObjectRef } from "./ObjectRef";
 
 /**
  * Every `SnapshotSchedule` in scope: the cron, what it fires, when it last
@@ -47,14 +49,16 @@ export function ScheduleTable({ schedules, renderAction, now = new Date() }: Sch
         </thead>
         <tbody>
           {schedules.map((schedule) => (
-            <tr key={`${schedule.namespace}/${schedule.name}`}>
-              <td>
-                <div className="schedule-table__object">
-                  <span className="label-strip">
-                    <span className="label-strip__kind">SnapshotSchedule</span>
-                    <span className="label-strip__name">{schedule.name}</span>
-                  </span>
-                  <span className="schedule-table__namespace mono">{schedule.namespace}</span>
+            <tr key={`${schedule.namespace}/${schedule.name}`} data-kind="snapshot-schedule">
+              <td className="has-stripe">
+                <div className="table__object">
+                  <KindChip kind="snapshotSchedule" size="sm" />
+                  <div className="schedule-table__object">
+                    <span className="label-strip">
+                      <span className="label-strip__name">{schedule.name}</span>
+                    </span>
+                    <span className="schedule-table__namespace mono">{schedule.namespace}</span>
+                  </div>
                 </div>
               </td>
               <td className="mono schedule-table__cron">{scheduleCron(schedule)}</td>
@@ -108,17 +112,13 @@ function Fires({ schedule }: { schedule: ScheduleRow }) {
   }
   return (
     <div className="schedule-table__fires">
-      <span className="label-strip">
-        <span className="label-strip__kind">SnapshotPolicy</span>
-        <span className="label-strip__name">
-          <Link
-            to="/policies/$namespace/$name"
-            params={{ namespace: schedule.namespace, name: named }}
-          >
-            {named}
-          </Link>
-        </span>
-      </span>
+      <ObjectRef
+        kind="snapshotPolicy"
+        name={named}
+        namespace={schedule.namespace}
+        contextNamespace={schedule.namespace}
+        to={detailHref("snapshotPolicy", named, schedule.namespace)}
+      />
     </div>
   );
 }

@@ -4,7 +4,7 @@ import type { ObjectKind } from "../api/types";
 import { LampBadge } from "./HealthBadge";
 import type { Lamp } from "./health";
 import { KindChip } from "./KindMark";
-import { KIND_META } from "./kind";
+import { KIND_META, detailHref, parseRef } from "./kind";
 
 export interface ObjectRefProps {
   kind: ObjectKind;
@@ -48,5 +48,35 @@ export function ObjectRef({ kind, name, namespace, contextNamespace, health, to 
     <span className="ref" data-kind={meta.slug}>
       {body}
     </span>
+  );
+}
+
+/**
+ * A wire reference string (`Repository/media/nas`) as an {@link ObjectRef}
+ * linking to its page; anything that is not a kopiur kind stays plain mono
+ * text, exactly as the server sent it.
+ */
+export function WireRef({
+  value,
+  contextNamespace,
+}: {
+  value: string | null | undefined;
+  contextNamespace?: string | undefined;
+}) {
+  if (value === null || value === undefined || value.length === 0) {
+    return <span className="absent">—</span>;
+  }
+  const ref = parseRef(value);
+  if (ref === null) {
+    return <span className="mono">{value}</span>;
+  }
+  return (
+    <ObjectRef
+      kind={ref.kind}
+      name={ref.name}
+      namespace={ref.namespace}
+      contextNamespace={contextNamespace}
+      to={detailHref(ref.kind, ref.name, ref.namespace)}
+    />
   );
 }

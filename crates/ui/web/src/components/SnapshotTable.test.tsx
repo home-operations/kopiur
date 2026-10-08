@@ -111,3 +111,25 @@ describe("SnapshotTable", () => {
     expect([...headers].map((h) => h.textContent)).not.toContain("New bytes");
   });
 });
+
+describe("SnapshotTable — kind identity and references", () => {
+  it("marks every row as a snapshot, striped, with the kind chip in the first cell", async () => {
+    renderWithRouter(<SnapshotTable rows={[nightly]} now={NOW} />);
+    const row = nth(bodyRows(await table()), 0);
+    expect(row).toHaveAttribute("data-kind", "snapshot");
+    const first = row.querySelector("td");
+    expect(first).toHaveClass("has-stripe");
+    expect(first?.querySelector(".kind-chip svg")).not.toBeNull();
+  });
+
+  it("names the policy and repository as references to their pages", async () => {
+    renderWithRouter(
+      <SnapshotTable rows={[{ ...nightly, repository: "Repository/media/nas" }]} now={NOW} />,
+    );
+    const row = nth(bodyRows(await table()), 0);
+    const policy = row.querySelector('a.ref[data-kind="snapshot-policy"]');
+    expect(policy).toHaveAttribute("href", "/policies/media/nightly");
+    const repository = row.querySelector('a.ref[data-kind="repository"]');
+    expect(repository).toHaveAttribute("href", "/repositories/repository/nas?namespace=media");
+  });
+});

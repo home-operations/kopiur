@@ -5,6 +5,8 @@ import { relativeTime } from "../util/format";
 import { LampBadge } from "./HealthBadge";
 import { healthLamp, loudLamp } from "./health";
 import { snapshotCount } from "./policy";
+import { KindChip } from "./KindMark";
+import { WireRef } from "./ObjectRef";
 
 /**
  * Every `SnapshotPolicy` in scope: what it writes into, whether it is
@@ -41,21 +43,23 @@ export function PolicyTable({ policies, now = new Date() }: PolicyTableProps) {
         </thead>
         <tbody>
           {policies.map((policy) => (
-            <tr key={`${policy.namespace}/${policy.name}`}>
-              <td>
-                <div className="policy-table__object">
-                  <span className="label-strip">
-                    <span className="label-strip__kind">SnapshotPolicy</span>
-                    <span className="label-strip__name">
-                      <Link
-                        to="/policies/$namespace/$name"
-                        params={{ namespace: policy.namespace, name: policy.name }}
-                      >
-                        {policy.name}
-                      </Link>
+            <tr key={`${policy.namespace}/${policy.name}`} data-kind="snapshot-policy">
+              <td className="has-stripe">
+                <div className="table__object">
+                  <KindChip kind="snapshotPolicy" size="sm" />
+                  <div className="policy-table__object">
+                    <span className="label-strip">
+                      <span className="label-strip__name">
+                        <Link
+                          to="/policies/$namespace/$name"
+                          params={{ namespace: policy.namespace, name: policy.name }}
+                        >
+                          {policy.name}
+                        </Link>
+                      </span>
                     </span>
-                  </span>
-                  <span className="policy-table__namespace mono">{policy.namespace}</span>
+                    <span className="policy-table__namespace mono">{policy.namespace}</span>
+                  </div>
                 </div>
               </td>
               <td>
@@ -92,8 +96,8 @@ function Repositories({ policy }: { policy: PolicyRow }) {
     <div className="policy-table__repos">
       <ul className="ref-list" aria-label={`Repositories for ${policy.name}`}>
         {policy.repositories.map((repository) => (
-          <li key={repository} className="label-strip">
-            <span className="label-strip__name">{repository}</span>
+          <li key={repository}>
+            <WireRef value={repository} contextNamespace={policy.namespace} />
           </li>
         ))}
       </ul>

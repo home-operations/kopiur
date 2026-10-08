@@ -73,10 +73,10 @@ describe("Schedules", () => {
     mockApi({ "/api/v1/schedules": jsonResponse(rows) });
     mountApp("/schedules");
     const body = bodyRows(await table());
-    expect(within(nth(body, 0)).getByRole("link", { name: "nightly" })).toHaveAttribute(
-      "href",
-      "/policies/media/nightly",
-    );
+    const policy = within(nth(body, 0)).getByRole("link", { name: /nightly/ });
+    expect(policy).toHaveAttribute("href", "/policies/media/nightly");
+    expect(policy).toHaveAttribute("data-kind", "snapshot-policy");
+    expect(nth(body, 0)).toHaveAttribute("data-kind", "snapshot-schedule");
     expect(nth(body, 1)).toHaveTextContent("tier=gold");
     expect(nth(body, 1)).toHaveTextContent("by selector");
   });

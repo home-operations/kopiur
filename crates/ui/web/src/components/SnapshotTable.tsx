@@ -4,6 +4,9 @@ import { Pin } from "lucide-react";
 import type { SnapshotRow } from "../api/types";
 import { EMPTY_CELL, humanAge, humanBytes, humanDuration } from "../util/format";
 import { LampBadge } from "./HealthBadge";
+import { KindChip } from "./KindMark";
+import { detailHref } from "./kind";
+import { ObjectRef, WireRef } from "./ObjectRef";
 import { durationSeconds, originLabel, snapshotPhaseLamp } from "./snapshot";
 
 /**
@@ -71,31 +74,48 @@ export function SnapshotTable({
         </thead>
         <tbody>
           {rows.map((row) => (
-            <tr key={`${row.namespace}/${row.name}`}>
-              <td>
-                <div className="snapshot-table__object">
-                  <Link
-                    className="mono snapshot-table__name"
-                    to="/snapshots/$namespace/$name"
-                    params={{ namespace: row.namespace, name: row.name }}
-                  >
-                    {row.name}
-                  </Link>
-                  <span className="snapshot-table__namespace mono">{row.namespace}</span>
-                  {row.pinned ? (
-                    <span className="snapshot-table__pin">
-                      <Pin size={12} strokeWidth={2} aria-hidden="true" />
-                      pinned
-                    </span>
-                  ) : null}
+            <tr key={`${row.namespace}/${row.name}`} data-kind="snapshot">
+              <td className="has-stripe">
+                <div className="table__object">
+                  <KindChip kind="snapshot" size="sm" />
+                  <div className="snapshot-table__object">
+                    <Link
+                      className="mono snapshot-table__name"
+                      to="/snapshots/$namespace/$name"
+                      params={{ namespace: row.namespace, name: row.name }}
+                    >
+                      {row.name}
+                    </Link>
+                    <span className="snapshot-table__namespace mono">{row.namespace}</span>
+                    {row.pinned ? (
+                      <span className="snapshot-table__pin">
+                        <Pin size={12} strokeWidth={2} aria-hidden="true" />
+                        pinned
+                      </span>
+                    ) : null}
+                  </div>
                 </div>
               </td>
               <td>
                 <LampBadge lamp={snapshotPhaseLamp(row.phase)} />
               </td>
               <td>{originLabel(row.origin)}</td>
-              <td className="mono">{orDash(row.policy)}</td>
-              <td className="mono snapshot-table__repository">{orDash(row.repository)}</td>
+              <td>
+                {row.policy !== null && row.policy !== undefined && row.policy.length > 0 ? (
+                  <ObjectRef
+                    kind="snapshotPolicy"
+                    name={row.policy}
+                    namespace={row.namespace}
+                    contextNamespace={row.namespace}
+                    to={detailHref("snapshotPolicy", row.policy, row.namespace)}
+                  />
+                ) : (
+                  EMPTY_CELL
+                )}
+              </td>
+              <td className="snapshot-table__repository">
+                <WireRef value={row.repository} contextNamespace={row.namespace} />
+              </td>
               <td className="num">{humanBytes(row.sizeBytes)}</td>
               <td className="num">
                 <FilesCell total={row.filesTotal} failed={row.filesFailed} />
@@ -117,10 +137,6 @@ export function SnapshotTable({
 }
 
 /** A nullable string as itself, or the ledger's empty cell. */
-function orDash(value: string | null | undefined): string {
-  return value !== null && value !== undefined && value.length > 0 ? value : EMPTY_CELL;
-}
-
 interface FilesCellProps {
   total: number | null | undefined;
   failed: number | null | undefined;

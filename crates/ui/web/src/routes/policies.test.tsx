@@ -48,8 +48,16 @@ describe("Policies", () => {
     const body = bodyRows(await table());
     expect(body).toHaveLength(2);
     expect(nth(body, 0)).toHaveTextContent("nightly");
-    expect(nth(body, 0)).toHaveTextContent("Repository/media/nas");
-    expect(nth(body, 0)).toHaveTextContent("ClusterRepository/shared");
+    // What it writes into: references to each repository's own page.
+    expect(nth(body, 0).querySelector('a.ref[data-kind="repository"]')).toHaveAttribute(
+      "href",
+      "/repositories/repository/nas?namespace=media",
+    );
+    expect(nth(body, 0).querySelector('a.ref[data-kind="cluster-repository"]')).toHaveAttribute(
+      "href",
+      "/repositories/cluster-repository/shared",
+    );
+    expect(nth(body, 0)).toHaveAttribute("data-kind", "snapshot-policy");
     expect(nth(body, 0)).toHaveTextContent("fans out");
     expect(nth(body, 0)).toHaveTextContent("42");
     expect(nth(body, 1)).toHaveTextContent("hourly");
