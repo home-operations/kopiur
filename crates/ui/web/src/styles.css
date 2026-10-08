@@ -662,6 +662,63 @@ a.ref:hover {
   font-size: var(--text-xs);
 }
 
+/* ---- object card: one object, its kind, its state, its facts ---------------- */
+
+.object-card {
+  display: grid;
+  align-content: start;
+  gap: 10px;
+  min-width: 0;
+  padding: 14px 16px;
+  border: 1px solid var(--card-border);
+  border-radius: var(--radius-lg);
+  background: var(--bg-surface);
+  box-shadow: var(--shadow-1);
+}
+
+.object-card.has-stripe {
+  border-left: var(--stripe) solid var(--kc);
+}
+
+.object-card__head {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+}
+
+.object-id {
+  display: grid;
+  min-width: 0;
+  line-height: 1.25;
+}
+
+.object-name {
+  color: var(--fg);
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-semibold);
+  overflow-wrap: anywhere;
+  text-decoration: none;
+}
+
+a.object-name:hover {
+  text-decoration: underline;
+}
+
+.object-ns {
+  color: var(--fg-muted);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+}
+
+.object-card__meta {
+  margin: 0;
+  color: var(--fg-muted);
+  font-size: var(--text-sm);
+  overflow-wrap: anywhere;
+}
+
 /* ---- skeleton: a ledger row's silhouette, not a spinner ------------------ */
 
 .skeleton {

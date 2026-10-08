@@ -29,8 +29,10 @@ const CSS = readStyles();
  * it needs a `:focus-visible` rule instead.
  */
 const NEVER_FOCUSED = new Set([
-  // A stat strip's card lift: a `<dl>`, never focusable.
+  // Card lifts: a stat strip (`<dl>`) and an object card (`<article>`) are
+  // never focusable themselves; the links inside them carry the ring.
   ".stats",
+  ".object-card",
   // Floating panels and the open drawer: containers, not controls.
   ".identity__panel",
   ".ns-switcher__panel",
