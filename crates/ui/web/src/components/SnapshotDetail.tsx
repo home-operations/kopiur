@@ -22,6 +22,8 @@ import {
 } from "../util/format";
 import { useCurrentNamespace } from "../util/namespace";
 import { ConditionsTable } from "./ConditionsTable";
+import { DetailHeader, type TrailHop } from "./DetailHeader";
+import { detailHref, parseRef } from "./kind";
 import { Facts, type Fact } from "./Facts";
 import { Finding } from "./Finding";
 import { LampBadge } from "./HealthBadge";
@@ -62,6 +64,30 @@ export interface SnapshotDetailProps {
   now?: Date | undefined;
 }
 
+/** Repository › policy — the hops a snapshot was made through, as far as the row names them. */
+function snapshotTrail(row: SnapshotDetailData["row"]): TrailHop[] {
+  const hops: TrailHop[] = [];
+  const repo =
+    row.repository !== null && row.repository !== undefined ? parseRef(row.repository) : null;
+  if (repo !== null) {
+    hops.push({
+      kind: repo.kind,
+      name: repo.name,
+      namespace: repo.namespace,
+      to: detailHref(repo.kind, repo.name, repo.namespace),
+    });
+  }
+  if (row.policy !== null && row.policy !== undefined && row.policy.length > 0) {
+    hops.push({
+      kind: "snapshotPolicy",
+      name: row.policy,
+      namespace: row.namespace,
+      to: detailHref("snapshotPolicy", row.policy, row.namespace),
+    });
+  }
+  return hops;
+}
+
 export function SnapshotDetail({
   detail,
   actions,
@@ -70,7 +96,6 @@ export function SnapshotDetail({
 }: SnapshotDetailProps) {
   const { row } = detail;
   const verdict = snapshotVerdict(row);
-  const Lamp = verdict.lamp.icon;
   // The console's scope, so the browse link lands on a page still narrowed to
   // the namespace the reader came from. Presentation still: this reads the
   // URL the router already has, it issues no request.
@@ -78,22 +103,35 @@ export function SnapshotDetail({
 
   return (
     <div className="page">
-      <p className="verdict" role="status" aria-label="Snapshot verdict">
-        <span className="verdict__lamp" data-health={verdict.lamp.key}>
-          <Lamp size={18} strokeWidth={2} aria-hidden="true" />
-          <span>{verdict.lamp.word}</span>
-        </span>
-        <span className="verdict__text">{verdict.text}</span>
-        <span className="verdict__meta mono">
-          Snapshot · {row.namespace} · {row.name}
-        </span>
-      </p>
-
-      {actions !== undefined && actions !== null ? (
-        <section className="page__section" aria-label="Actions">
-          {actions}
-        </section>
-      ) : null}
+      <DetailHeader
+        kind="snapshot"
+        name={row.name}
+        namespace={row.namespace}
+        lamp={verdict.lamp}
+        verdictLabel="Snapshot verdict"
+        verdict={verdict.text}
+        trail={snapshotTrail(row)}
+        actions={actions}
+        stats={[
+          { label: "Size", value: humanBytes(row.sizeBytes) },
+          {
+            label: "Files",
+            value:
+              row.filesTotal !== null && row.filesTotal !== undefined
+                ? row.filesTotal.toLocaleString()
+                : { absent: "na" },
+          },
+          { label: "Took", value: humanDuration(durationSeconds(row)) },
+          {
+            label: "Started",
+            value:
+              row.startTime !== null && row.startTime !== undefined
+                ? relativeTime(row.startTime, now)
+                : { absent: "na" },
+            abs: row.startTime ?? undefined,
+          },
+        ]}
+      />
 
       {detail.gates.length > 0 ? (
         <Section title="Gates holding this snapshot" icon={ShieldAlert}>

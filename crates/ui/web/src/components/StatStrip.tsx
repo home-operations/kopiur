@@ -1,6 +1,7 @@
 import { OctagonX } from "lucide-react";
 import type { ReactNode } from "react";
 
+import { formatTimestamp } from "../util/format";
 import { NotReported } from "./NotReported";
 import type { UnwiredField } from "./unwired";
 
@@ -69,7 +70,7 @@ export function StatStrip({
             {isAbsence(stat.value) ? <AbsenceText absence={stat.value} /> : stat.value}
             {stat.abs !== undefined ? (
               <time className="stats__abs" dateTime={stat.abs}>
-                {stat.abs.replace("T", " ").replace(/(\.\d+)?Z$/, "")}
+                {formatTimestamp(stat.abs)}
               </time>
             ) : null}
           </dd>

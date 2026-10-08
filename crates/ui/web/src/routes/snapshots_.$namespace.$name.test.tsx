@@ -367,12 +367,20 @@ describe("Snapshot detail route", () => {
     mountApp("/snapshots/media/nightly-29");
     const user = userEvent.setup();
     await user.click(await screen.findByRole("button", { name: /Snapshot now/ }));
-    const pin = screen.getByRole("checkbox", { name: /Pin the new snapshot/ });
-    // Required on the wire and never defaulted on: it starts cleared.
+    // Asked, never defaulted: neither answer starts selected, and the confirm
+    // says what is missing until one is chosen.
+    const pin = screen.getByRole("radio", { name: /Pin it/ });
+    const prune = screen.getByRole("radio", { name: /Prune it/ });
     expect(pin).not.toBeChecked();
+    expect(prune).not.toBeChecked();
+    const confirm = screen.getByRole("button", { name: "Take a snapshot" });
+    expect(confirm).toHaveAttribute("aria-disabled", "true");
+    expect(confirm).toHaveAccessibleDescription("Choose whether to pin it first.");
     expect(screen.getByRole("group", { name: "Snapshot now" })).toHaveTextContent(
       /permanent: retention never removes a pinned snapshot/,
     );
+    await user.click(prune);
+    expect(confirm).not.toHaveAttribute("aria-disabled");
   });
 
   it("sends the pin the reader actually chose, with the policy's namespace", async () => {
@@ -386,7 +394,7 @@ describe("Snapshot detail route", () => {
     mountApp("/snapshots/media/nightly-29");
     const user = userEvent.setup();
     await user.click(await screen.findByRole("button", { name: /Snapshot now/ }));
-    await user.click(screen.getByRole("checkbox", { name: /Pin the new snapshot/ }));
+    await user.click(screen.getByRole("radio", { name: /Pin it/ }));
     await user.click(screen.getByRole("button", { name: "Take a pinned snapshot" }));
     await waitFor(() => {
       expect(snapshotNowBody()).not.toBeUndefined();
@@ -474,5 +482,18 @@ describe("Snapshot detail route", () => {
     const verdict = await screen.findByRole("status", { name: "Snapshot verdict" });
     expect(verdict).toHaveTextContent("Weird");
     expect(verdict.querySelector(".verdict__lamp")).toHaveAttribute("data-health", "unknown");
+  });
+});
+
+describe("Snapshot detail — where it sits", () => {
+  it("leads with a trail to its repository and policy", async () => {
+    mockApi({ [PATH]: jsonResponse(detail()) });
+    mountApp("/snapshots/media/nightly-29");
+    const trail = await screen.findByRole("list", { name: "Where this sits" });
+    expect(within(trail).getByRole("link", { name: /nightly/ })).toHaveAttribute(
+      "href",
+      "/policies/media/nightly",
+    );
+    expect(trail).toHaveTextContent("this snapshot");
   });
 });

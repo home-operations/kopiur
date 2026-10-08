@@ -49,7 +49,9 @@ export function SnapshotActions({ row }: SnapshotActionsProps) {
   const snapshotNow = useSnapshotNow();
   const remove = useDeleteSnapshot();
   const [open, setOpen] = useState<ActionId | null>(null);
-  const [pin, setPin] = useState(false);
+  // Unanswered until the reader chooses: a pin is permanent, so neither
+  // answer is a default (rule 7 of the kopiur-ui-design skill).
+  const [pin, setPin] = useState<"" | "pin" | "prune">("");
   // This bar is hand-rolled rather than built from `ActionPanel` (it predates
   // it), so it borrows the shared focus behaviour directly: opening moves
   // focus into the panel, Escape closes it, and closing returns focus to the
@@ -117,39 +119,62 @@ export function SnapshotActions({ row }: SnapshotActionsProps) {
               </span>
               . It does not touch this snapshot.
             </p>
-            <div className="action__switch">
-              <label htmlFor="snapshot-now-pin">
+            <fieldset className="action__choice">
+              <legend>Retention</legend>
+              <label htmlFor="snapshot-now-prune">
                 <input
-                  id="snapshot-now-pin"
-                  type="checkbox"
-                  checked={pin}
-                  onChange={(event) => {
-                    setPin(event.target.checked);
+                  type="radio"
+                  id="snapshot-now-prune"
+                  name="snapshot-now-pin"
+                  value="prune"
+                  checked={pin === "prune"}
+                  onChange={() => {
+                    setPin("prune");
                   }}
                 />
-                Pin the new snapshot
+                <span>
+                  Prune it under the policy&apos;s retention, like any other snapshot (
+                  <span className="mono">spec.pin</span> unset).
+                </span>
               </label>
-              <p className="controls__hint" id="snapshot-now-pin-hint">
-                A pin is <strong>permanent</strong>: retention never removes a pinned snapshot. Use
-                it for backups to keep indefinitely, such as a pre-upgrade checkpoint.
-              </p>
-            </div>
+              <label htmlFor="snapshot-now-pin" data-danger="true">
+                <input
+                  type="radio"
+                  id="snapshot-now-pin"
+                  name="snapshot-now-pin"
+                  value="pin"
+                  checked={pin === "pin"}
+                  onChange={() => {
+                    setPin("pin");
+                  }}
+                />
+                <span>
+                  Pin it — a pin is <strong>permanent</strong>: retention never removes a pinned
+                  snapshot (<span className="mono">spec.pin: true</span>).
+                </span>
+              </label>
+            </fieldset>
           </div>
           <div className="action__actions">
             <ActionButton
               variant="primary"
-              disabledReason={snapshotNow.isPending ? "The request is in flight." : createReason}
+              disabledReason={
+                snapshotNow.isPending
+                  ? "The request is in flight."
+                  : (createReason ?? (pin === "" ? "Choose whether to pin it first." : undefined))
+              }
+              reasonKind={createReason !== undefined ? "refused" : "blocked"}
               onClick={() => {
                 snapshotNow.mutate({
                   namespace: row.namespace,
                   policy,
                   tags: [],
-                  pin,
+                  pin: pin === "pin",
                 });
                 setOpen(null);
               }}
             >
-              {pin ? "Take a pinned snapshot" : "Take a snapshot"}
+              {pin === "pin" ? "Take a pinned snapshot" : "Take a snapshot"}
             </ActionButton>
             <ActionButton
               variant="quiet"
