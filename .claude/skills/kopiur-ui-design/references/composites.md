@@ -94,8 +94,11 @@ stays a page of its own (a workspace, not a detail); the snapshot drawer's
 
 The cross-cluster **Topology** screen keeps its graph board; its plates are
 summary object cards (232px) and every edge keeps a word label for its kind and,
-when unhealthy, its state. The board stays `aria-hidden` with the edge list as its
-spoken twin.
+when unhealthy, its state. The board has no drawer of its own: a resource plate
+is a link that opens the resource drawer over the board, and a backend,
+namespace or selector plate is inert (it is not a resource; it appears in the
+Relationships tab of whatever points at it). The board stays `aria-hidden`
+behind its links, with the edge list as its spoken twin.
 
 ---
 

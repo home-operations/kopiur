@@ -1,46 +1,14 @@
 /**
- * What the drawer says about one node: where its object is listed, and what
- * the node stands for.
+ * What a topology node stands for, in one clause — said under the verdict of
+ * the resource drawer for the kinds on the board.
  *
- * Both are exhaustive over `NodeKind`, which has no fallback variant
+ * Exhaustive over `NodeKind`, which has no fallback variant
  * (`crates/ui-model/src/lib.rs`): every literal is named so a new kind fails
  * to compile, and the `default` arm still answers at run time rather than
  * rendering a node the server sent as a blank.
- *
- * There is deliberately no kind-to-URL-segment table here. A repository's
- * URL segment is the server's `kindPath` field on `RepositorySummary` /
- * `RepositoryDetail` (addenda item 16), and the graph does not carry it — so
- * a node links to the *section* that lists its object, never to a path this
- * bundle guessed from the display kind. A node whose object is a resource is
- * also opened in the resource drawer, which addresses it by kind, namespace
- * and name.
  */
 
 import type { NodeKind } from "../../api/types";
-import type { NavPath } from "../nav";
-
-/** The route that lists a node's object, and the section's own name. */
-export interface NodeSection {
-  to: NavPath;
-  section: string;
-}
-
-/** Where this node's object is listed, or `null` when it has no object. */
-export function nodeSection(kind: NodeKind): NodeSection | null {
-  switch (kind) {
-    case "repository":
-    case "clusterRepository":
-      return { to: "/repositories", section: "repositories" };
-    case "policy":
-      return { to: "/policies", section: "policies" };
-    case "backend":
-    case "namespace":
-    case "namespaceSelector":
-      return null;
-    default:
-      return null;
-  }
-}
 
 /**
  * One clause saying what the node is, for an operator who has not read the

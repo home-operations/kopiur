@@ -8,6 +8,8 @@ export interface InspectLinkProps {
   className?: string | undefined;
   "aria-label"?: string | undefined;
   "data-kind"?: string | undefined;
+  /** More `data-*` hooks for the anchor (a topology plate's node id, health, …). */
+  data?: Readonly<Record<`data-${string}`, string | undefined>> | undefined;
   onClick?: (() => void) | undefined;
   children: ReactNode;
 }
@@ -26,6 +28,7 @@ export function InspectLink({
   className,
   "aria-label": ariaLabel,
   "data-kind": dataKind,
+  data,
   onClick,
   children,
 }: InspectLinkProps) {
@@ -41,6 +44,7 @@ export function InspectLink({
       className={className}
       aria-label={ariaLabel}
       data-kind={dataKind}
+      {...data}
       onClick={onClick}
     >
       {children}

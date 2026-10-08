@@ -35,6 +35,23 @@ export function graphId(target: InspectTarget): string | null {
   }
 }
 
+/**
+ * A graph node id back into the resource it names — what an old `?node=`
+ * link pointed at — or `null` for a backend, namespace or selector.
+ */
+export function targetFromGraphId(id: string): InspectTarget | null {
+  const parts = id.split("/");
+  const [kind, a, b] = parts;
+  if (kind === "ClusterRepository" && parts.length === 2 && a) {
+    return { kind: "clusterRepository", name: a };
+  }
+  if (parts.length === 3 && a && b) {
+    if (kind === "Repository") return { kind: "repository", namespace: a, name: b };
+    if (kind === "Policy") return { kind: "snapshotPolicy", namespace: a, name: b };
+  }
+  return null;
+}
+
 /** A graph node as the resource it stands for, or `null` for a backend, namespace or selector. */
 export function nodeTarget(node: GraphNode): InspectTarget | null {
   const kind = nodeObjectKind(node.kind);

@@ -659,8 +659,14 @@ resource is looked at without leaving the page you are on.
 - Focus moves into the panel on open and returns to the row or reference that
   opened it. Escape, the close button and a backdrop click close it. An inline
   confirmation inside the panel owns Escape first.
-- Things that are not resources (a topology backend or namespace) use the same
-  panel with a kind word and no stripe.
+- For the kinds on the topology board (Repository, ClusterRepository,
+  SnapshotPolicy) the drawer also carries what the board knows: a
+  **Relationships** tab (every link both ways, with the link's own pill and
+  label; backends, admitted namespaces and selectors named as what they are),
+  loud findings for "nothing copies X anywhere" and for references to things
+  that do not exist, and the kind's one-line meaning. Opened on a ghost (a
+  referenced resource that does not exist), it explains the ghost and names
+  what refers to it.
 
 ---
 
