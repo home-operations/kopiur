@@ -33,7 +33,7 @@ function summary(over: Partial<RepositorySummary> = {}): RepositorySummary {
     indexBlobCount: 17,
     lastObservedAt: null,
     serverEndpoint: null,
-    allowedNamespaceCount: null,
+    admits: null,
     ...over,
   };
 }

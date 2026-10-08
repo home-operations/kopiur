@@ -5,6 +5,7 @@ import { EMPTY_CELL, humanBytes, relativeTime } from "../util/format";
 import { HealthBadge } from "./HealthBadge";
 import { accessLabel, detailSearch, repositoryPhaseLabel } from "./repository";
 import { NotReported } from "./NotReported";
+import { admitsText } from "./admits";
 
 /**
  * The fleet as a ledger: one row per `Repository` and `ClusterRepository`,
@@ -73,12 +74,8 @@ export function RepositoryTable({ repositories, caption = "Repositories" }: Repo
                   repository.namespace.length > 0 ? (
                     <span className="repo-table__namespace mono">{repository.namespace}</span>
                   ) : null}
-                  {repository.allowedNamespaceCount !== null &&
-                  repository.allowedNamespaceCount !== undefined ? (
-                    <span className="repo-table__namespace">
-                      admits {repository.allowedNamespaceCount}{" "}
-                      {repository.allowedNamespaceCount === 1 ? "namespace" : "namespaces"}
-                    </span>
+                  {repository.admits !== null && repository.admits !== undefined ? (
+                    <span className="repo-table__namespace">{admitsText(repository.admits)}</span>
                   ) : null}
                 </div>
               </td>

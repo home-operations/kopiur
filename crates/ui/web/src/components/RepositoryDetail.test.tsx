@@ -23,7 +23,7 @@ const bare: RepositoryDetailData = {
     indexBlobCount: null,
     lastObservedAt: null,
     serverEndpoint: null,
-    allowedNamespaceCount: null,
+    admits: null,
   },
   identityCluster: null,
   catalog: null,

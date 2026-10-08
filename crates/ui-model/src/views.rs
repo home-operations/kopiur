@@ -206,10 +206,35 @@ pub struct RepositorySummary {
     /// `status.server.endpoint`, when running in repository-server mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server_endpoint: Option<String>,
-    /// For `ClusterRepository`: how many namespaces `spec.allowedNamespaces`
-    /// currently admits.
+    /// For `ClusterRepository`: which namespaces `spec.allowedNamespaces`
+    /// admits. Absent for a namespaced `Repository`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub allowed_namespace_count: Option<i64>,
+    pub admits: Option<AdmittedNamespacesView>,
+}
+
+/// Which namespaces a `ClusterRepository` admits, read from its spec.
+///
+/// Named rather than counted: the controller's `status.allowedNamespaceCount`
+/// writes `-1` for "all" and `0` for an unresolved selector, and neither is a
+/// count a person can read. Exhaustive over `AllowedNamespaces`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum AdmittedNamespacesView {
+    /// `allowedNamespaces: { all: true }`.
+    All,
+    /// `allowedNamespaces: { all: false }` — admits none.
+    None,
+    /// An explicit list of this many namespaces.
+    Listed {
+        /// How many namespaces the list names.
+        count: u32,
+    },
+    /// Namespaces matching a label selector, rendered as `k=v,…`.
+    Selector {
+        /// The selector, in `kubectl -l` form.
+        selector: String,
+    },
 }
 
 /// Everything the repository detail screen shows.

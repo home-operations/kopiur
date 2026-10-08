@@ -21,7 +21,7 @@ const nas: RepositorySummary = {
   indexBlobCount: 17,
   lastObservedAt: null,
   serverEndpoint: null,
-  allowedNamespaceCount: null,
+  admits: null,
 };
 
 const shared: RepositorySummary = {
@@ -40,7 +40,7 @@ const shared: RepositorySummary = {
   indexBlobCount: null,
   lastObservedAt: null,
   serverEndpoint: "https://kopia.internal:51515",
-  allowedNamespaceCount: 3,
+  admits: "all",
 };
 
 function table() {
@@ -82,11 +82,12 @@ describe("RepositoryTable", () => {
     expect(within(row).getByText("not reported")).toBeInTheDocument();
   });
 
-  it("says how a server-backed repository is reached and how many namespaces it admits", async () => {
+  it("says how a server-backed repository is reached and which namespaces it admits", async () => {
     renderWithRouter(<RepositoryTable repositories={[shared]} />);
     const row = nth(bodyRows(await table()), 0);
     expect(row).toHaveTextContent("Repository server");
-    expect(row).toHaveTextContent("3 namespaces");
+    expect(row).toHaveTextContent("admits all namespaces");
+    expect(row).not.toHaveTextContent("-1");
   });
 
   it("marks a suspended repository as taking no new backups", async () => {

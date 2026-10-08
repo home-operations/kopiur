@@ -52,6 +52,7 @@ export type { ReplicationsView } from "./types/ReplicationsView";
 export type { RepoVerificationView } from "./types/RepoVerificationView";
 export type { RepositoryDetail } from "./types/RepositoryDetail";
 export type { RepositoryGraph } from "./types/RepositoryGraph";
+export type { AdmittedNamespacesView } from "./types/AdmittedNamespacesView";
 export type { RepositoryPhaseView } from "./types/RepositoryPhaseView";
 export type { RepositoryRefBody } from "./types/RepositoryRefBody";
 export type { RepositoryReplicationRow } from "./types/RepositoryReplicationRow";

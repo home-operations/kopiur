@@ -53,6 +53,7 @@
 //! | [`views::ReplicationPhaseView`] | `pending`, `replicating`, `succeeded`, `failed`, `suspended` | `{ unknown: { raw: string } }` | `unknown` |
 //! | [`views::OriginView`] | `scheduled`, `manual`, `discovered`, `adopted`, `replicated` | — | **none** — `Origin` is parsed strictly and an unrecognized marker never decodes |
 //! | [`views::DoctorScopeView`] | `namespace`, `installation`, `mixed` | — | **none** |
+//! | [`views::AdmittedNamespacesView`] | `all`, `none` | `{ listed: { count } }`, `{ selector: { selector } }` | **none** — exhaustive over the spec's `AllowedNamespaces` |
 //! | [`views::EntryKind`] | `file`, `dir`, `symlink` | `{ other: { raw: string } }` | **`other`**, not `unknown` |
 //! | [`requests::RestoreSourceBody`] | — | `{ snapshotRef: … }`, `{ fromPolicy: … }`, `{ identity: … }` | none (a request body: the client picks the variant) |
 //! | [`requests::RestoreTargetBody`] | — | `{ pvcRef: … }`, `{ pvc: … }` | none (as above) |
@@ -201,7 +202,7 @@ mod tests {
             .filter(|n| n.ends_with(".ts"))
             .count();
         assert_eq!(
-            exported, 74,
+            exported, 75,
             "expected one .ts file per wire type; add the new type's root to \
              `export_all` and bump this count deliberately. 64 -> 65 when \
              `GateSeverityView` replaced `GateHit.severity`/`GateDescriptor.severity`'s \
@@ -219,7 +220,11 @@ mod tests {
              hand-maintained table, and the table said `repositories-ready` \
              was namespace-scoped when `list_repos` lists `ClusterRepository` \
              cluster-wide; 73 -> 74 for `CatalogCoverageView` (#476), so the \
-             discovered-backup count says when it is only the newest window"
+             discovered-backup count says when it is only the newest window; \
+             74 -> 75 for `AdmittedNamespacesView`, which names a \
+             `ClusterRepository`'s admission from its spec instead of passing \
+             the controller's `-1` (all) / `0` (selector) sentinels through as \
+             a count"
         );
     }
 }

@@ -28,6 +28,7 @@ import { LastObserved } from "./RepositoryTable";
 import { gateSeverityLamp } from "./gates";
 import { accessLabel, catalogCoverageNote, repositoryVerdict } from "./repository";
 import { NotReported } from "./NotReported";
+import { admitsText } from "./admits";
 
 /**
  * One repository, in the order an operator needs it when it is unhealthy.
@@ -129,14 +130,8 @@ export function RepositoryDetail({
               { term: "Size", value: humanBytes(summary.totalSizeBytes) },
               { term: "Index blobs", value: count(summary.indexBlobCount) },
               { term: "Last observed", value: <LastObserved at={summary.lastObservedAt} /> },
-              ...(summary.allowedNamespaceCount !== null &&
-              summary.allowedNamespaceCount !== undefined
-                ? [
-                    {
-                      term: "Namespaces admitted",
-                      value: String(summary.allowedNamespaceCount),
-                    },
-                  ]
+              ...(summary.admits !== null && summary.admits !== undefined
+                ? [{ term: "Namespaces", value: admitsText(summary.admits) }]
                 : []),
               ...(detail.identityCluster !== null && detail.identityCluster !== undefined
                 ? [

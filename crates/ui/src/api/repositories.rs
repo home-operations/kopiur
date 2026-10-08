@@ -17,6 +17,7 @@ use k8s_openapi::api::batch::v1::Job;
 
 use kopiur_api::cluster_repository::AllowedNamespaces;
 use kopiur_api::common::{RepositoryKind, RepositoryMode, repo_key};
+use kopiur_api::expand::label_selector_string;
 use kopiur_api::gates::GateScope;
 use kopiur_api::repository::CatalogCoverage;
 use kopiur_api::{
@@ -25,8 +26,8 @@ use kopiur_api::{
 };
 use kopiur_ui_model::graph::GateHit;
 use kopiur_ui_model::views::{
-    CatalogCoverageView, CatalogView, HealthProbeView, PolicyRef, RepositoryDetail,
-    RepositorySummary, SeedView, ServerView, SessionInfo,
+    AdmittedNamespacesView, CatalogCoverageView, CatalogView, HealthProbeView, PolicyRef,
+    RepositoryDetail, RepositorySummary, SeedView, ServerView, SessionInfo,
 };
 
 use crate::AppState;
@@ -65,7 +66,7 @@ struct RepoFacts<'a> {
     index_blob_count: Option<i64>,
     last_observed_at: Option<String>,
     server_endpoint: Option<String>,
-    allowed_namespace_count: Option<i64>,
+    admits: Option<AdmittedNamespacesView>,
 }
 
 /// **Pure.** `spec.mode` as the string every other kopiur front end prints.
@@ -117,7 +118,7 @@ fn summary_from(facts: &RepoFacts<'_>, gates: &[GateHit]) -> RepositorySummary {
         index_blob_count: facts.index_blob_count,
         last_observed_at: facts.last_observed_at.clone(),
         server_endpoint: facts.server_endpoint.clone(),
-        allowed_namespace_count: facts.allowed_namespace_count,
+        admits: facts.admits.clone(),
     }
 }
 
@@ -144,7 +145,7 @@ pub fn view_repository(repo: &Repository) -> RepositorySummary {
         server_endpoint: status
             .and_then(|s| s.server.as_ref())
             .and_then(|s| s.endpoint.clone()),
-        allowed_namespace_count: None,
+        admits: None,
     };
     summary_from(&facts, &gate_hits(conditions, GateScope::covers_repository))
 }
@@ -172,21 +173,23 @@ pub fn view_cluster_repository(repo: &ClusterRepository) -> RepositorySummary {
         server_endpoint: status
             .and_then(|s| s.server.as_ref())
             .and_then(|s| s.endpoint.clone()),
-        allowed_namespace_count: status
-            .and_then(|s| s.allowed_namespace_count)
-            .or_else(|| declared_namespace_count(&repo.spec.allowed_namespaces)),
+        admits: Some(admits(&repo.spec.allowed_namespaces)),
     };
     summary_from(&facts, &gate_hits(conditions, GateScope::covers_repository))
 }
 
-/// **Pure.** How many namespaces the *spec* names, for a repository the
-/// controller has not counted yet. Exhaustive: only a `List` can be counted
-/// without asking the apiserver, and a `Selector`/`All` honestly has no
-/// spec-side answer.
-fn declared_namespace_count(allowed: &AllowedNamespaces) -> Option<i64> {
+/// **Pure.** Which namespaces the spec admits — exact, unlike the status
+/// count, whose `-1`/`0` sentinels are not counts.
+fn admits(allowed: &AllowedNamespaces) -> AdmittedNamespacesView {
     match allowed {
-        AllowedNamespaces::List(names) => Some(names.len() as i64),
-        AllowedNamespaces::Selector(_) | AllowedNamespaces::All(_) => None,
+        AllowedNamespaces::All(true) => AdmittedNamespacesView::All,
+        AllowedNamespaces::All(false) => AdmittedNamespacesView::None,
+        AllowedNamespaces::List(names) => AdmittedNamespacesView::Listed {
+            count: u32::try_from(names.len()).unwrap_or(u32::MAX),
+        },
+        AllowedNamespaces::Selector(selector) => AdmittedNamespacesView::Selector {
+            selector: label_selector_string(selector),
+        },
     }
 }
 
@@ -648,8 +651,8 @@ status:
         assert_eq!(row.total_size_bytes, Some(987_654_321));
         assert_eq!(row.index_blob_count, Some(17));
         assert_eq!(
-            row.allowed_namespace_count, None,
-            "only a cluster repository has one"
+            row.admits, None,
+            "only a cluster repository admits namespaces"
         );
     }
 
@@ -781,57 +784,66 @@ status:
         }
     }
 
-    #[test]
-    fn a_cluster_repository_counts_its_namespaces_from_the_spec_until_the_controller_does() {
-        let listed: ClusterRepository = from_yaml(
+    fn cluster_repo(allowed: &str, status: &str) -> ClusterRepository {
+        from_yaml(&format!(
             r#"
 apiVersion: kopiur.home-operations.com/v1alpha1
 kind: ClusterRepository
-metadata: { name: shared }
+metadata: {{ name: shared }}
 spec:
-  backend: { s3: { bucket: shared } }
-  encryption: { passwordSecretRef: { name: pw, key: password } }
-  allowedNamespaces: { list: [prod, staging, dev] }
-"#,
+  backend: {{ s3: {{ bucket: shared }} }}
+  encryption: {{ passwordSecretRef: {{ name: pw, key: password }} }}
+  allowedNamespaces: {allowed}
+{status}
+"#
+        ))
+    }
+
+    /// The controller writes `allowedNamespaceCount: -1` for "all namespaces"
+    /// (and `0` for a selector it never resolves). Neither is a count, and the
+    /// console used to print "admits -1 namespaces". The view names the
+    /// admission from the spec instead, which is exact.
+    #[test]
+    fn a_cluster_repository_admitting_everyone_says_all_not_minus_one() {
+        let repo = cluster_repo(
+            "{ all: true }",
+            "status: { phase: Ready, allowedNamespaceCount: -1 }",
+        );
+        assert_eq!(
+            view_cluster_repository(&repo).admits,
+            Some(AdmittedNamespacesView::All)
+        );
+        let none = cluster_repo("{ all: false }", "");
+        assert_eq!(
+            view_cluster_repository(&none).admits,
+            Some(AdmittedNamespacesView::None)
+        );
+    }
+
+    #[test]
+    fn listed_and_selector_admission_are_named_not_counted_as_zero() {
+        let listed = cluster_repo(
+            "{ list: [prod, staging, dev] }",
+            "status: { allowedNamespaceCount: 3 }",
         );
         let row = view_cluster_repository(&listed);
         assert_eq!(row.kind, "ClusterRepository");
         assert_eq!(row.namespace, None);
-        assert_eq!(row.allowed_namespace_count, Some(3));
-
-        let selected: ClusterRepository = from_yaml(
-            r#"
-apiVersion: kopiur.home-operations.com/v1alpha1
-kind: ClusterRepository
-metadata: { name: selected }
-spec:
-  backend: { s3: { bucket: shared } }
-  encryption: { passwordSecretRef: { name: pw, key: password } }
-  allowedNamespaces: { selector: { matchLabels: { backup: "yes" } } }
-"#,
-        );
         assert_eq!(
-            view_cluster_repository(&selected).allowed_namespace_count,
-            None,
-            "a selector cannot be counted without asking the apiserver"
+            row.admits,
+            Some(AdmittedNamespacesView::Listed { count: 3 })
         );
 
-        let counted: ClusterRepository = from_yaml(
-            r#"
-apiVersion: kopiur.home-operations.com/v1alpha1
-kind: ClusterRepository
-metadata: { name: counted }
-spec:
-  backend: { s3: { bucket: shared } }
-  encryption: { passwordSecretRef: { name: pw, key: password } }
-  allowedNamespaces: { all: true }
-status: { phase: Ready, allowedNamespaceCount: 12 }
-"#,
+        let selected = cluster_repo(
+            "{ selector: { matchLabels: { backup: \"yes\" } } }",
+            "status: { allowedNamespaceCount: 0 }",
         );
         assert_eq!(
-            view_cluster_repository(&counted).allowed_namespace_count,
-            Some(12),
-            "the controller's count wins wherever it exists"
+            view_cluster_repository(&selected).admits,
+            Some(AdmittedNamespacesView::Selector {
+                selector: "backup=yes".into()
+            }),
+            "a selector is shown as the selector, never as a count of 0"
         );
     }
 

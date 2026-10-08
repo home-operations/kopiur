@@ -32,7 +32,7 @@ const detail: RepositoryDetail = {
     indexBlobCount: 17,
     lastObservedAt: null,
     serverEndpoint: "https://kopia.internal:51515",
-    allowedNamespaceCount: null,
+    admits: null,
   },
   identityCluster: "east",
   catalog: {
@@ -113,7 +113,7 @@ const clusterDetail: RepositoryDetail = {
     kindPath: "cluster-repository",
     name: "shared",
     namespace: null,
-    allowedNamespaceCount: 3,
+    admits: "all",
   },
   maintenance: null,
   gates: [],

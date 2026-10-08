@@ -30,7 +30,7 @@ const nas: RepositorySummary = {
   indexBlobCount: 17,
   lastObservedAt: null,
   serverEndpoint: null,
-  allowedNamespaceCount: null,
+  admits: null,
 };
 
 const cold: RepositorySummary = {
@@ -51,7 +51,7 @@ const shared: RepositorySummary = {
   namespace: null,
   health: "degraded",
   phase: "degraded",
-  allowedNamespaceCount: 3,
+  admits: "all",
 };
 
 const fleet = [nas, cold, shared];
