@@ -1,41 +1,39 @@
 /*
- * kopiur-ui design tokens and base styles — "the vault ledger".
+ * kopiur-ui styles — the "Mission dashboard" design system.
  *
- * An operator's console for backup infrastructure: dense, calm, legible at a
- * glance, read many times a day and sometimes at 3am. Two lights, both
- * first-class: the daylit vault and the 3am vault. Every colour is declared
- * once with `light-dark()`; the theme is chosen by `color-scheme` on `:root`
- * (`light dark` follows the OS, `light`/`dark` is the user's override, set by
- * `data-theme`). One declaration per token means the two themes cannot drift.
+ * The token block below is copied verbatim from the `kopiur-ui-design` skill
+ * (`.claude/skills/kopiur-ui-design/references/tokens.md`), which is the
+ * single source: `styles.tokens.test.ts` fails if the two drift, and the
+ * skill's `scripts/check-contrast.py` (run by `ui-check`) proves every pair
+ * clears WCAG AA in both themes. Change a token there first, then here.
  *
- * Health never rides on hue alone. The six health lamps below are paired with
- * an icon and a word wherever they appear (see components/HealthBadge.tsx);
- * the hues are Okabe–Ito-derived so the pairs stay distinct under the common
- * colour-vision deficiencies, and every fg/bg pair clears WCAG AA (4.5:1).
- *
- * The accent is reserved by law for selection, the current marker and the
- * primary action. It is never a health colour and never decoration.
+ * Every colour is declared once with `light-dark()`; the page follows the OS
+ * until the user picks a theme, which sets `data-theme` on `<html>`. Status is
+ * never colour alone (a tinted pill with an icon and a word), and kind colours
+ * mark kinds only — see the skill's `references/rules.md`.
  */
 
 :root {
   color-scheme: light dark;
 
-  /* ---- type ------------------------------------------------------------ */
+  /* ---- type: the system stack, no web fonts ---- */
   --font-sans: ui-sans-serif, system-ui, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
   --font-mono: ui-monospace, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
-  --text-xs: 0.6875rem; /* 11px — kind strips, column labels */
-  --text-sm: 0.8125rem; /* 13px — ledger rows, dense controls */
-  --text-md: 0.875rem; /* 14px — body */
-  --text-lg: 1.0625rem; /* 17px — section heading */
-  --text-xl: 1.375rem; /* 22px — page title */
-  --leading-dense: 1.35;
-  --leading-prose: 1.5;
-  --tracking-caps: 0.06em;
+  --text-xs: 0.6875rem; /* 11px  label caps, kind name, table heads */
+  --text-sm: 0.8125rem; /* 13px  table cells, controls, meta lines  */
+  --text-md: 0.875rem; /* 14px  body                               */
+  --text-lg: 1rem; /* 16px  verdict sentence, section titles   */
+  --text-xl: 1.375rem; /* 22px  page title                         */
+  --text-2xl: 1.5rem; /* 24px  the number on a kind tile          */
   --weight-regular: 400;
   --weight-medium: 500;
   --weight-semibold: 600;
+  --weight-bold: 700;
+  --leading-dense: 1.35;
+  --leading-prose: 1.5;
+  --tracking-caps: 0.08em;
 
-  /* ---- space (4px base) ------------------------------------------------ */
+  /* ---- space (4px base) ---- */
   --space-1: 0.25rem;
   --space-2: 0.5rem;
   --space-3: 0.75rem;
@@ -44,85 +42,90 @@
   --space-6: 2rem;
   --space-7: 3rem;
 
-  /* ---- shape ----------------------------------------------------------- */
-  --radius-sm: 3px; /* chips, lamps */
-  --radius-md: 6px; /* controls, panels — the chassis chamfer */
+  /* ---- shape ---- */
+  --radius-sm: 7px; /* small kind chip, focus ring on chips      */
+  --radius-md: 10px; /* buttons, inputs, kind chip, nav items     */
+  --radius-lg: 16px; /* cards, tables, panels, popovers           */
+  --radius-pill: 999px; /* status pills only                         */
+  --stripe: 4px; /* the kind stripe on a card / row / header  */
 
-  /* ---- layout ---------------------------------------------------------- */
-  --rail-width: 232px;
-  --header-height: 48px;
+  /* ---- layout ---- */
+  --sidebar-width: 240px;
   --content-max: 1440px;
 
-  /* ---- motion ---------------------------------------------------------- */
+  /* ---- motion ---- */
   --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
   --dur-fast: 120ms;
   --dur-base: 180ms;
 
-  /* ---- surfaces: anodised slate, cool in both lights ------------------- */
-  --bg-canvas: light-dark(#f3f4f6, #131519);
-  --bg-surface: light-dark(#ffffff, #1b1e24);
-  --bg-rail: light-dark(#e9ebef, #0f1114);
-  --bg-inset: light-dark(#edeff2, #22262d);
-  --bg-hover: light-dark(rgba(26, 29, 33, 0.05), rgba(230, 232, 235, 0.06));
-  --bg-active: light-dark(rgba(26, 29, 33, 0.09), rgba(230, 232, 235, 0.1));
+  /* ---- surfaces and ink ---- */
+  --bg-canvas: light-dark(#eef1f7, #0a0e1a);
+  --bg-surface: light-dark(#ffffff, #121829);
+  --bg-inset: light-dark(#f5f7fb, #0f1424);
+  --bg-hover: light-dark(rgb(11 16 32 / 0.04), rgb(232 236 248 / 0.05));
+  --bg-active: light-dark(rgb(11 16 32 / 0.08), rgb(232 236 248 / 0.09));
+  --fg: light-dark(#0b1020, #e8ecf8);
+  --fg-muted: light-dark(#5d6681, #8b93ad);
+  --fg-on-accent: light-dark(#ffffff, #0a0e1a);
+  --line: light-dark(#e1e5ef, #1f2740);
+  --line-strong: light-dark(#c9cfdd, #2c3554);
+  --card-border: light-dark(transparent, #1f2740);
 
-  /* ---- ink ------------------------------------------------------------- */
-  --fg: light-dark(#1a1d21, #e6e8eb);
-  --fg-muted: light-dark(#4f5761, #a7aeb8);
-  --fg-faint: light-dark(#636c78, #858d98);
-  --fg-on-accent: light-dark(#ffffff, #0f1114);
-  /* Ink for a control the user may not use. An explicit colour, not opacity:
-     opacity would dim the control's reason tooltip too, and these controls
-     stay readable on purpose (aria-disabled, focusable) so the reason can be
-     learned. 5.6:1 / 5.5:1 on the surface, 4.8:1 / 5.0:1 on the inset. */
-  --fg-disabled: light-dark(#5f6975, #8d95a0);
+  /* ---- accent: selection, current item, focus, primary action — nothing else ---- */
+  --accent: light-dark(#6c5ce7, #8b7dff);
+  --accent-ink: light-dark(#5a49d6, #a99fff);
+  --accent-soft: light-dark(#ece9fd, #221f45);
+  --selection: light-dark(#d9d4fb, #34306b);
 
-  /* ---- hairlines ------------------------------------------------------- */
-  --line: light-dark(#d5d9df, #2c313a);
-  --line-strong: light-dark(#b8bec7, #3b414c);
-
-  /* ---- the one accent -------------------------------------------------- */
-  --accent: light-dark(#4f55d2, #8b90f0);
-  --accent-soft: light-dark(rgba(79, 85, 210, 0.12), rgba(139, 144, 240, 0.16));
-  --selection: light-dark(#d9dbf8, #34397a);
-
-  /* ---- depth: an offset and a soft blur, or a lighter surface step -----
-     `light-dark()` produces a COLOUR and nothing else. Wrapping a whole
-     shadow list in it — which this file did until a browser was pointed at
-     it — makes the declaration invalid at computed-value time, so `box-shadow`
-     falls back to `none` and every elevation in the console silently
-     disappears: the disabled-control tooltip, the identity panel, the skip
-     link, the selected theme option. The geometry is the same in both themes
-     anyway, so only the ink switches. */
-  --shadow-ink-1: light-dark(rgba(26, 29, 33, 0.08), rgba(0, 0, 0, 0.5));
-  --shadow-ink-2: light-dark(rgba(26, 29, 33, 0.18), rgba(0, 0, 0, 0.7));
-  --shadow-1: 0 1px 2px var(--shadow-ink-1);
-  --shadow-2: 0 6px 16px -4px var(--shadow-ink-2), 0 8px 20px -6px var(--shadow-ink-2);
+  /* ---- depth ---- */
+  --shadow-ink-1: light-dark(rgb(11 16 32 / 0.08), transparent);
+  --shadow-ink-2: light-dark(rgb(11 16 32 / 0.35), rgb(0 0 0 / 0.6));
+  --shadow-1: 0 1px 3px var(--shadow-ink-1);
+  --shadow-2: 0 16px 40px -12px var(--shadow-ink-2);
   --focus-ring: 0 0 0 2px var(--bg-surface), 0 0 0 4px var(--accent);
 
-  /* ---- health lamps: fg on bg, always with an icon and a word ---------- */
-  --health-healthy-fg: light-dark(#0b6e4f, #5fd3a6);
-  --health-healthy-bg: light-dark(#ddf3ea, #10281f);
-  --health-degraded-fg: light-dark(#7a4e00, #f2b84b);
-  --health-degraded-bg: light-dark(#fbefd3, #2e2410);
-  --health-failed-fg: light-dark(#a6320b, #f28b6b);
-  --health-failed-bg: light-dark(#fbe3d9, #331a12);
-  --health-pending-fg: light-dark(#0b5c8f, #6fbbef);
-  --health-pending-bg: light-dark(#dceef8, #10222e);
-  --health-suspended-fg: light-dark(#4f5761, #a7aeb8);
-  --health-suspended-bg: light-dark(#e7e9ed, #23272e);
-  --health-unknown-fg: light-dark(#4f5761, #a7aeb8);
-  --health-unknown-bg: light-dark(#e7e9ed, #23272e);
+  /* ---- status: tinted pill = fg on bg; always with icon + word ---- */
+  --health-healthy-fg: light-dark(#166534, #4ade80);
+  --health-healthy-bg: light-dark(#dcf5e5, #10291c);
+  --health-failed-fg: light-dark(#b91c1c, #fb8a8a);
+  --health-failed-bg: light-dark(#fde2e2, #3a1518);
+  --health-degraded-fg: light-dark(#8a5208, #fbbf24);
+  --health-degraded-bg: light-dark(#fdefcf, #33270b);
+  --health-pending-fg: light-dark(#1d4ed8, #7cb0ff);
+  --health-pending-bg: light-dark(#e0eafd, #13233f);
+  --health-unknown-fg: light-dark(#474f6b, #a3abc4);
+  --health-unknown-bg: light-dark(#e8ebf3, #1e2438);
+  --health-suspended-fg: var(--health-unknown-fg);
+  --health-suspended-bg: var(--health-unknown-bg);
 
-  /* ---- skeleton -------------------------------------------------------- */
-  --skeleton-base: light-dark(#e9ebef, #22262d);
-  --skeleton-sheen: light-dark(#f6f7f9, #2c313a);
+  /* ---- kinds: stripe, chip glyph and small-caps name; -bg is the chip tint ---- */
+  --kind-repository: light-dark(#0e7490, #22d3ee);
+  --kind-repository-bg: light-dark(#ddecef, #164154);
+  --kind-cluster-repository: light-dark(#155e75, #67e8f9);
+  --kind-cluster-repository-bg: light-dark(#dee8ec, #254657);
+  --kind-maintenance: light-dark(#64748b, #94a3b8);
+  --kind-maintenance-bg: light-dark(#e9ecef, #2f3748);
+  --kind-snapshot-policy: light-dark(#c026d3, #e879f9);
+  --kind-snapshot-policy-bg: light-dark(#f6e1f9, #412d57);
+  --kind-snapshot-schedule: light-dark(#9333ea, #c084fc);
+  --kind-snapshot-schedule-bg: light-dark(#f0e2fc, #383057);
+  --kind-snapshot: light-dark(#c2410c, #fb923c);
+  --kind-snapshot-bg: light-dark(#f6e4dd, #45332d);
+  --kind-restore: light-dark(#db2777, #f472b6);
+  --kind-restore-bg: light-dark(#fae1ec, #442c48);
+  --kind-repository-replication: light-dark(#0f766e, #2dd4bf);
+  --kind-repository-replication-bg: light-dark(#ddeceb, #18414a);
+  --kind-snapshot-replication: light-dark(#4f46e5, #818cf8);
+  --kind-snapshot-replication-bg: light-dark(#e6e5fb, #2a3257);
+
+  /* ---- skeleton ---- */
+  --skeleton-base: light-dark(#e1e5ef, #1f2740);
+  --skeleton-sheen: light-dark(#f2f4f9, #2a3352);
 }
 
 :root[data-theme="light"] {
   color-scheme: light;
 }
-
 :root[data-theme="dark"] {
   color-scheme: dark;
 }
@@ -135,10 +138,10 @@
    light-theme values keep keyboard navigation visible on such a browser. */
 @supports not (color: light-dark(#000, #fff)) {
   :root {
-    --fg: #1a1d21;
-    --bg-canvas: #f3f4f6;
+    --fg: #0b1020;
+    --bg-canvas: #eef1f7;
     --bg-surface: #ffffff;
-    --focus-ring: 0 0 0 2px #ffffff, 0 0 0 4px #4f55d2;
+    --focus-ring: 0 0 0 2px #ffffff, 0 0 0 4px #6c5ce7;
   }
 }
 
@@ -298,7 +301,7 @@ svg {
   font-weight: var(--weight-medium);
   letter-spacing: var(--tracking-caps);
   text-transform: uppercase;
-  color: var(--fg-faint);
+  color: var(--fg-muted);
   white-space: nowrap;
 }
 
@@ -414,7 +417,7 @@ svg {
    would dim the reason tooltip below (a pseudo-element inherits it). */
 .button[disabled],
 .button[aria-disabled="true"] {
-  color: var(--fg-disabled);
+  color: var(--fg-muted);
   border-color: var(--line);
   background: var(--bg-inset);
 }
@@ -423,7 +426,7 @@ svg {
 .button--primary[aria-disabled="true"],
 .button--danger[disabled],
 .button--danger[aria-disabled="true"] {
-  color: var(--fg-disabled);
+  color: var(--fg-muted);
   border-color: var(--line);
   background: var(--bg-inset);
 }
@@ -506,7 +509,7 @@ svg {
   font-weight: var(--weight-medium);
   letter-spacing: var(--tracking-caps);
   text-transform: uppercase;
-  color: var(--fg-faint);
+  color: var(--fg-muted);
   white-space: nowrap;
 }
 
@@ -584,8 +587,8 @@ svg {
 
 .shell {
   display: grid;
-  grid-template-columns: var(--rail-width) minmax(0, 1fr);
-  grid-template-rows: var(--header-height) minmax(0, 1fr);
+  grid-template-columns: var(--sidebar-width) minmax(0, 1fr);
+  grid-template-rows: 0px minmax(0, 1fr);
   grid-template-areas:
     "rail header"
     "rail main";
@@ -599,7 +602,7 @@ svg {
   height: 100vh;
   display: flex;
   flex-direction: column;
-  background: var(--bg-rail);
+  background: var(--bg-surface);
   border-right: 1px solid var(--line);
   overflow-y: auto;
 }
@@ -608,7 +611,7 @@ svg {
   display: flex;
   align-items: center;
   gap: var(--space-2);
-  height: var(--header-height);
+  height: 0px;
   padding: 0 var(--space-4);
   border-bottom: 1px solid var(--line);
   color: var(--fg);
@@ -629,7 +632,7 @@ svg {
   font-size: var(--text-xs);
   letter-spacing: var(--tracking-caps);
   text-transform: uppercase;
-  color: var(--fg-faint);
+  color: var(--fg-muted);
 }
 
 .rail__nav {
@@ -687,7 +690,7 @@ svg {
   padding: var(--space-3) var(--space-4);
   border-top: 1px solid var(--line);
   font-size: var(--text-xs);
-  color: var(--fg-faint);
+  color: var(--fg-muted);
 }
 
 .header {
@@ -699,7 +702,7 @@ svg {
   align-items: center;
   justify-content: space-between;
   gap: var(--space-4);
-  height: var(--header-height);
+  height: 0px;
   padding: 0 var(--space-5);
   background: var(--bg-surface);
   border-bottom: 1px solid var(--line);
@@ -808,7 +811,7 @@ svg {
 }
 
 .identity__grid dt {
-  color: var(--fg-faint);
+  color: var(--fg-muted);
   font-size: var(--text-xs);
   letter-spacing: var(--tracking-caps);
   text-transform: uppercase;
@@ -836,7 +839,7 @@ svg {
 }
 
 .cap-list [data-allowed="false"] {
-  color: var(--fg-faint);
+  color: var(--fg-muted);
 }
 
 /* ---- theme switch: a segmented control, icon + label ---------------------- */
@@ -951,7 +954,7 @@ svg {
 .problem__meta {
   font-family: var(--font-mono);
   font-size: var(--text-xs);
-  color: var(--fg-faint);
+  color: var(--fg-muted);
 }
 
 .problem__dismiss {
@@ -1128,7 +1131,7 @@ svg {
 
 .verdict__meta {
   margin-left: auto;
-  color: var(--fg-faint);
+  color: var(--fg-muted);
   font-size: var(--text-xs);
   font-family: var(--font-mono);
 }
@@ -1174,11 +1177,11 @@ svg {
 }
 
 .health-strip__list [data-empty="true"] .health-strip__lamp {
-  color: var(--fg-faint);
+  color: var(--fg-muted);
 }
 
 .health-strip__list [data-empty="true"] .health {
-  color: var(--fg-faint);
+  color: var(--fg-muted);
   background: var(--bg-inset);
 }
 
@@ -1193,7 +1196,7 @@ svg {
 }
 
 .in-flight dt {
-  color: var(--fg-faint);
+  color: var(--fg-muted);
   font-size: var(--text-xs);
   letter-spacing: var(--tracking-caps);
   text-transform: uppercase;
@@ -1214,7 +1217,7 @@ svg {
 }
 
 .in-flight__count[data-unknown="true"] {
-  color: var(--fg-faint);
+  color: var(--fg-muted);
   font-weight: var(--weight-regular);
 }
 
@@ -1288,7 +1291,7 @@ svg {
 .finding__meta {
   font-family: var(--font-mono);
   font-size: var(--text-xs);
-  color: var(--fg-faint);
+  color: var(--fg-muted);
 }
 
 .finding-list {
@@ -1331,7 +1334,7 @@ svg {
 
 .work-table__namespace {
   font-size: var(--text-xs);
-  color: var(--fg-faint);
+  color: var(--fg-muted);
 }
 
 .work-table__detail {
@@ -1363,7 +1366,7 @@ svg {
 }
 
 .controls__field > label {
-  color: var(--fg-faint);
+  color: var(--fg-muted);
   font-size: var(--text-xs);
   font-weight: var(--weight-medium);
   letter-spacing: var(--tracking-caps);
@@ -1383,7 +1386,7 @@ svg {
 }
 
 .controls__input::placeholder {
-  color: var(--fg-faint);
+  color: var(--fg-muted);
   opacity: 1;
 }
 
@@ -1392,7 +1395,7 @@ svg {
 }
 
 .controls__hint {
-  color: var(--fg-faint);
+  color: var(--fg-muted);
   font-size: var(--text-xs);
 }
 
@@ -1417,7 +1420,7 @@ svg {
 
 .doctor-checks__id {
   font-size: var(--text-xs);
-  color: var(--fg-faint);
+  color: var(--fg-muted);
 }
 
 .doctor-checks__scope {
@@ -1426,7 +1429,7 @@ svg {
 }
 
 .doctor-checks__note {
-  color: var(--fg-faint);
+  color: var(--fg-muted);
   white-space: normal;
 }
 
@@ -1462,7 +1465,7 @@ svg {
 /* ---- gates ---------------------------------------------------------------- */
 
 .gate-list__status-eq {
-  color: var(--fg-faint);
+  color: var(--fg-muted);
 }
 
 .gate-list__kinds {
@@ -1591,7 +1594,7 @@ svg {
   font-weight: var(--weight-medium);
   letter-spacing: var(--tracking-caps);
   text-transform: uppercase;
-  color: var(--fg-faint);
+  color: var(--fg-muted);
 }
 
 .topo-node__name {
@@ -1681,7 +1684,7 @@ svg {
   font-weight: var(--weight-medium);
   letter-spacing: var(--tracking-caps);
   text-transform: uppercase;
-  color: var(--fg-faint);
+  color: var(--fg-muted);
 }
 
 .topo-drawer__facts dd {
@@ -1695,7 +1698,7 @@ svg {
   font-weight: var(--weight-medium);
   letter-spacing: var(--tracking-caps);
   text-transform: uppercase;
-  color: var(--fg-faint);
+  color: var(--fg-muted);
 }
 
 .topo-drawer__rel ul {
@@ -1726,18 +1729,18 @@ svg {
   font-weight: var(--weight-medium);
   letter-spacing: var(--tracking-caps);
   text-transform: uppercase;
-  color: var(--fg-faint);
+  color: var(--fg-muted);
   flex-basis: 100%;
 }
 
 .topo-drawer__rel-note {
-  color: var(--fg-faint);
+  color: var(--fg-muted);
   font-size: var(--text-xs);
 }
 
 .topo-drawer__empty {
   margin: 0;
-  color: var(--fg-faint);
+  color: var(--fg-muted);
   font-size: var(--text-sm);
 }
 
@@ -1755,7 +1758,7 @@ svg {
 
   .shell {
     grid-template-columns: minmax(0, 1fr);
-    /* `auto` for the header, not `var(--header-height)`: it wraps to two rows
+    /* `auto` for the header, not `0px`: it wraps to two rows
        at this width (see `.header` below) and a fixed row would clip it. */
     grid-template-rows: auto auto minmax(0, 1fr);
     grid-template-areas:
@@ -1813,7 +1816,7 @@ svg {
   .header {
     position: static;
     height: auto;
-    min-height: var(--header-height);
+    min-height: 0px;
     padding: var(--space-2) var(--space-4);
     flex-wrap: wrap;
     justify-content: flex-start;
@@ -1958,7 +1961,7 @@ svg {
    value rather than as the value — but still a word, never a dash, because
    the absence is the fact (see components/unwired.tsx). */
 .not-reported {
-  color: var(--fg-faint);
+  color: var(--fg-muted);
   font-style: italic;
   white-space: nowrap;
   cursor: help;
@@ -1987,7 +1990,7 @@ svg {
 
 .repo-table__namespace {
   font-size: var(--text-xs);
-  color: var(--fg-faint);
+  color: var(--fg-muted);
 }
 
 .repo-table__access {
@@ -2004,7 +2007,7 @@ svg {
 
 .repo-table__note {
   font-size: var(--text-xs);
-  color: var(--fg-faint);
+  color: var(--fg-muted);
   overflow-wrap: anywhere;
 }
 
@@ -2038,7 +2041,7 @@ svg {
   font-weight: var(--weight-medium);
   letter-spacing: var(--tracking-caps);
   text-transform: uppercase;
-  color: var(--fg-faint);
+  color: var(--fg-muted);
 }
 
 .facts__row dd {
@@ -2182,7 +2185,7 @@ svg {
 .receipt__meta {
   margin: 0;
   font-size: var(--text-xs);
-  color: var(--fg-faint);
+  color: var(--fg-muted);
 }
 
 /* ---- replication ledger --------------------------------------------------- */
@@ -2223,12 +2226,12 @@ svg {
 .replication-table__namespace,
 .replication-table__note {
   font-size: var(--text-xs);
-  color: var(--fg-faint);
+  color: var(--fg-muted);
   overflow-wrap: anywhere;
 }
 
 .replication-table__arrow {
-  color: var(--fg-faint);
+  color: var(--fg-muted);
 }
 
 .replication-table__schedule .mono {
@@ -2328,7 +2331,7 @@ svg {
 /* An absent deadline is not "never" and not "expired": it is a value the
    server did not publish, written the way every other unpublished value is. */
 .browse-session__no-expiry {
-  color: var(--fg-faint);
+  color: var(--fg-muted);
   font-style: italic;
 }
 
@@ -2359,7 +2362,7 @@ svg {
 }
 
 .browse-crumbs__sep {
-  color: var(--fg-faint);
+  color: var(--fg-muted);
   flex: none;
 }
 
@@ -2395,7 +2398,7 @@ svg {
 }
 
 .dir-table__icon {
-  color: var(--fg-faint);
+  color: var(--fg-muted);
   flex: none;
   align-self: center;
 }
@@ -2405,7 +2408,7 @@ svg {
 }
 
 .dir-table__note {
-  color: var(--fg-faint);
+  color: var(--fg-muted);
   font-size: var(--text-xs);
 }
 
@@ -2498,7 +2501,7 @@ svg {
 
 .snapshot-table__namespace {
   font-size: var(--text-xs);
-  color: var(--fg-faint);
+  color: var(--fg-muted);
   overflow-wrap: anywhere;
 }
 
@@ -2533,7 +2536,7 @@ svg {
 /* ---- the detail ---------------------------------------------------------- */
 
 .facts__age {
-  color: var(--fg-faint);
+  color: var(--fg-muted);
 }
 
 /* The mover's own last lines, already redacted server-side. */
@@ -2604,7 +2607,7 @@ svg {
 
 .lineage__meta {
   font-size: var(--text-xs);
-  color: var(--fg-faint);
+  color: var(--fg-muted);
   overflow-wrap: anywhere;
 }
 
@@ -2672,7 +2675,7 @@ svg {
 .retention-table__age {
   display: block;
   font-size: var(--text-xs);
-  color: var(--fg-faint);
+  color: var(--fg-muted);
 }
 
 /* The holding rule is a sentence, not a chip: it is the whole explanation of
@@ -2693,7 +2696,7 @@ svg {
 /* A pruned row is quieter than a kept one but never struck through or hidden:
    it is still a snapshot that exists today. */
 .retention-table tr[data-kept="false"] .retention-table__rule {
-  color: var(--fg-faint);
+  color: var(--fg-muted);
 }
 
 /* ---- the size chart ------------------------------------------------------ */
@@ -2744,7 +2747,7 @@ svg {
 
 .chart__readout-meta {
   font-size: var(--text-xs);
-  color: var(--fg-faint);
+  color: var(--fg-muted);
 }
 
 /* A plot scrolls; it does not shrink. Both charts are drawn in a 560-unit
@@ -2774,7 +2777,7 @@ svg {
 }
 
 .chart__axis {
-  fill: var(--fg-faint);
+  fill: var(--fg-muted);
   font-family: var(--font-sans);
   font-size: 9px;
   font-variant-numeric: tabular-nums;
@@ -2841,7 +2844,7 @@ svg {
 .lag__suspended {
   font-family: var(--font-sans);
   font-size: var(--text-xs);
-  color: var(--fg-faint);
+  color: var(--fg-muted);
 }
 
 /* A lone measurement: the value IS the chart, so it is set as a figure rather
@@ -2924,7 +2927,7 @@ svg {
 
 .action__choice > legend {
   padding: 0;
-  color: var(--fg-faint);
+  color: var(--fg-muted);
   font-size: var(--text-xs);
   font-weight: var(--weight-medium);
   letter-spacing: var(--tracking-caps);
@@ -2956,7 +2959,7 @@ svg {
 
 .action__note {
   margin: 0;
-  color: var(--fg-faint);
+  color: var(--fg-muted);
   font-size: var(--text-sm);
   line-height: var(--leading-prose);
 }
@@ -2997,7 +3000,7 @@ svg {
 .policy-table__namespace,
 .policy-table__note {
   font-size: var(--text-xs);
-  color: var(--fg-faint);
+  color: var(--fg-muted);
   overflow-wrap: anywhere;
 }
 
@@ -3045,7 +3048,7 @@ svg {
 }
 
 .retention-rules__field {
-  color: var(--fg-faint);
+  color: var(--fg-muted);
   font-size: var(--text-xs);
 }
 
@@ -3082,7 +3085,7 @@ svg {
 .schedule-table__namespace,
 .schedule-table__note {
   font-size: var(--text-xs);
-  color: var(--fg-faint);
+  color: var(--fg-muted);
   overflow-wrap: anywhere;
 }
 
@@ -3104,7 +3107,7 @@ svg {
 /* An absence that is merely an absence (no next slot computed) stays quiet:
    it is usually just a suspended schedule. */
 .schedule-table__absent {
-  color: var(--fg-faint);
+  color: var(--fg-muted);
 }
 
 .schedule-table__action {
@@ -3151,14 +3154,14 @@ svg {
 }
 
 .restore-table__arrow {
-  color: var(--fg-faint);
+  color: var(--fg-muted);
 }
 
 .restore-table__namespace,
 .restore-table__note,
 .restore-table__absent {
   font-size: var(--text-xs);
-  color: var(--fg-faint);
+  color: var(--fg-muted);
   overflow-wrap: anywhere;
 }
 
@@ -3168,7 +3171,7 @@ svg {
    by — the two differ whenever a ClusterRepository's maintenance lives in the
    operator's namespace rather than the repository's. */
 .maintenance__resource {
-  color: var(--fg-faint);
+  color: var(--fg-muted);
   font-size: var(--text-xs);
   /* A flex item cannot shrink past its content without this pair, and a
      `kopiur-system/<cluster-repository>-maintenance` name is long enough to
@@ -3183,7 +3186,7 @@ svg {
    mouse user can reach. The full sentence is still on the button's
    aria-describedby sibling and its native title. */
 .action__short {
-  color: var(--fg-faint);
+  color: var(--fg-muted);
   font-size: var(--text-xs);
   overflow-wrap: anywhere;
 }
