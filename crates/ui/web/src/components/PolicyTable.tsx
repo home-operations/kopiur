@@ -1,5 +1,3 @@
-import { Link } from "@tanstack/react-router";
-
 import type { PolicyRow } from "../api/types";
 import { relativeTime } from "../util/format";
 import { LampBadge } from "./HealthBadge";
@@ -7,6 +5,7 @@ import { healthLamp, loudLamp } from "./health";
 import { snapshotCount } from "./policy";
 import { KindChip } from "./KindMark";
 import { WireRef } from "./ObjectRef";
+import { InspectLink } from "./InspectLink";
 
 /**
  * Every `SnapshotPolicy` in scope: what it writes into, whether it is
@@ -50,13 +49,16 @@ export function PolicyTable({ policies, now = new Date() }: PolicyTableProps) {
                   <div className="policy-table__object">
                     <span className="label-strip">
                       <span className="label-strip__name">
-                        <Link
+                        <InspectLink
                           className="row-link"
-                          to="/policies/$namespace/$name"
-                          params={{ namespace: policy.namespace, name: policy.name }}
+                          target={{
+                            kind: "snapshotPolicy",
+                            namespace: policy.namespace,
+                            name: policy.name,
+                          }}
                         >
                           {policy.name}
-                        </Link>
+                        </InspectLink>
                       </span>
                     </span>
                     <span className="policy-table__namespace mono">{policy.namespace}</span>

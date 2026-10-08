@@ -15,6 +15,7 @@ import { NotReported } from "./NotReported";
 import { KindChip, KindName } from "./KindMark";
 import { KIND_META } from "./kind";
 import { useCapabilityReason } from "./useCapabilityReason";
+import { InspectLink } from "./InspectLink";
 
 /**
  * Both replication kinds in one ledger, worst question first: how far behind
@@ -66,7 +67,18 @@ export function ReplicationTable({ rows, now = new Date() }: ReplicationTablePro
                   <div className="replication-table__object">
                     <span className="label-strip">
                       <KindName kind={replicationKind(row)} />
-                      <span className="label-strip__name">{row.name}</span>
+                      <span className="label-strip__name">
+                        <InspectLink
+                          className="row-link"
+                          target={{
+                            kind: replicationKind(row),
+                            namespace: row.namespace,
+                            name: row.name,
+                          }}
+                        >
+                          {row.name}
+                        </InspectLink>
+                      </span>
                     </span>
                     <span className="replication-table__namespace mono">{row.namespace}</span>
                   </div>

@@ -1,11 +1,10 @@
-import { Link } from "@tanstack/react-router";
-
 import type { RestoreRow } from "../api/types";
 import { relativeTime } from "../util/format";
 import { LampBadge } from "./HealthBadge";
 import { restorePhaseLamp, restoreProgress } from "./restore";
 import { KindChip } from "./KindMark";
 import { WireRef } from "./ObjectRef";
+import { InspectLink } from "./InspectLink";
 
 /**
  * Every `Restore` in scope: where it reads, where it writes, how far it got.
@@ -51,12 +50,16 @@ export function RestoreTable({ restores, now = new Date() }: RestoreTableProps) 
                   <div className="restore-table__object">
                     <span className="label-strip">
                       <span className="label-strip__name">
-                        <Link
-                          to="/restores/$namespace/$name"
-                          params={{ namespace: restore.namespace, name: restore.name }}
+                        <InspectLink
+                          className="row-link"
+                          target={{
+                            kind: "restore",
+                            namespace: restore.namespace,
+                            name: restore.name,
+                          }}
                         >
                           {restore.name}
-                        </Link>
+                        </InspectLink>
                       </span>
                     </span>
                     <span className="restore-table__namespace mono">{restore.namespace}</span>

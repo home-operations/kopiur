@@ -1,4 +1,3 @@
-import { Link } from "@tanstack/react-router";
 import { Pin } from "lucide-react";
 
 import type { SnapshotRow } from "../api/types";
@@ -8,6 +7,7 @@ import { KindChip } from "./KindMark";
 import { detailHref } from "./kind";
 import { ObjectRef, WireRef } from "./ObjectRef";
 import { durationSeconds, originLabel, snapshotPhaseLamp } from "./snapshot";
+import { InspectLink } from "./InspectLink";
 
 /**
  * The snapshots ledger: one row per `Snapshot` resource, newest run first.
@@ -79,13 +79,12 @@ export function SnapshotTable({
                 <div className="table__object">
                   <KindChip kind="snapshot" size="sm" />
                   <div className="snapshot-table__object">
-                    <Link
-                      className="mono snapshot-table__name"
-                      to="/snapshots/$namespace/$name"
-                      params={{ namespace: row.namespace, name: row.name }}
+                    <InspectLink
+                      className="row-link mono snapshot-table__name"
+                      target={{ kind: "snapshot", namespace: row.namespace, name: row.name }}
                     >
                       {row.name}
-                    </Link>
+                    </InspectLink>
                     <span className="snapshot-table__namespace mono">{row.namespace}</span>
                     {row.pinned ? (
                       <span className="snapshot-table__pin">

@@ -118,24 +118,6 @@ export function suspendKindToken(summary: RepositorySummary): string {
   return summary.kindPath;
 }
 
-/**
- * The search a link into this repository's detail carries.
- *
- * A namespaced `Repository` needs its own namespace: the handler answers a
- * 400 `namespace-required` without one, and `/me`'s capability review is
- * namespace-scoped (addenda item 17), so the namespace here is what decides
- * whether the suspend and scan buttons are honestly enabled.
- *
- * A `ClusterRepository` carries none — the object is not in a namespace, and
- * a namespaced review of `patchClusterRepositories` would report a
- * RoleBinding grant that cannot authorize the write. The current page's
- * `?namespace=` scope is deliberately dropped for it rather than passed on.
- */
-export function detailSearch(summary: RepositorySummary): { namespace?: string } {
-  const namespace = summary.namespace;
-  return namespace !== null && namespace !== undefined && namespace.length > 0 ? { namespace } : {};
-}
-
 /** The rows whose lamp is `health`; every row when no lamp is asked for. */
 export function filterByHealth(
   rows: readonly RepositorySummary[],

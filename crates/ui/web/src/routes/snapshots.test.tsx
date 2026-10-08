@@ -69,12 +69,11 @@ describe("Snapshots list", () => {
     expect(snapshotRequest()).toContain("namespace=media");
   });
 
-  it("links each row to its detail route, which is NOT nested under the list", async () => {
+  it("opens each row in the resource drawer, on the list itself", async () => {
     mockApi({ "/api/v1/snapshots": jsonResponse(page([row()])) });
     mountApp("/snapshots");
-    expect(await screen.findByRole("link", { name: "nightly-29" })).toHaveAttribute(
-      "href",
-      "/snapshots/media/nightly-29",
+    expect((await screen.findByRole("link", { name: "nightly-29" })).getAttribute("href")).toMatch(
+      /^\/snapshots\?inspect=snapshot%2Fmedia%2Fnightly-29$/,
     );
   });
 

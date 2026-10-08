@@ -93,6 +93,14 @@ describe("Maintenance", () => {
     );
   });
 
+  it("opens a Maintenance object in the resource drawer from its title", async () => {
+    mockApi({ "/api/v1/maintenance": jsonResponse(rows) });
+    mountApp("/maintenance");
+    await userEvent.click(await screen.findByRole("link", { name: "media/nas-maintenance" }));
+    const dialog = await screen.findByRole("dialog", { name: /nas-maintenance/ });
+    expect(dialog).toHaveAttribute("data-kind", "maintenance");
+  });
+
   it("says whether editing this object will stick or be reconciled away", async () => {
     mockApi({ "/api/v1/maintenance": jsonResponse(rows) });
     mountApp("/maintenance");

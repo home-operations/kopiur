@@ -1,4 +1,5 @@
 import { screen, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { describe, expect, it } from "vitest";
 
 import type { PolicyRow } from "../api/types";
@@ -63,17 +64,15 @@ describe("Policies", () => {
     expect(nth(body, 1)).toHaveTextContent("hourly");
   });
 
-  it("links a row into its own detail route, carrying namespace and name in the path", async () => {
+  it("opens a row in the resource drawer, carrying namespace and name", async () => {
     mockApi({ "/api/v1/policies": jsonResponse(rows) });
     mountApp("/policies");
     const body = bodyRows(await table());
-    expect(within(nth(body, 0)).getByRole("link", { name: "nightly" })).toHaveAttribute(
-      "href",
-      "/policies/media/nightly",
-    );
-    expect(within(nth(body, 1)).getByRole("link", { name: "hourly" })).toHaveAttribute(
-      "href",
-      "/policies/prod/hourly",
+    expect(
+      within(nth(body, 0)).getByRole("link", { name: "nightly" }).getAttribute("href"),
+    ).toMatch(/inspect=snapshot-policy%2Fmedia%2Fnightly$/);
+    expect(within(nth(body, 1)).getByRole("link", { name: "hourly" }).getAttribute("href")).toMatch(
+      /inspect=snapshot-policy%2Fprod%2Fhourly$/,
     );
   });
 
@@ -175,13 +174,14 @@ describe("Policies", () => {
 });
 
 describe("Policies — whole-row link", () => {
-  it("makes every row a link to its policy, through the name", async () => {
+  it("makes every row open its policy in the drawer, through the name", async () => {
     mockApi({ "/api/v1/policies": jsonResponse(rows) });
-    mountApp("/policies");
-    const body = bodyRows(await table());
-    expect(nth(body, 0).querySelector("a.row-link")).toHaveAttribute(
-      "href",
-      "/policies/media/nightly",
-    );
+    const { router } = mountApp("/policies");
+    const link = nth(bodyRows(await table()), 0).querySelector<HTMLElement>("a.row-link");
+    expect(link?.getAttribute("href")).toMatch(/inspect=snapshot-policy%2Fmedia%2Fnightly$/);
+    if (link === null) throw new Error("no row link");
+    await userEvent.click(link);
+    expect(await screen.findByRole("dialog", { name: /nightly/ })).toBeInTheDocument();
+    expect(router.state.location.pathname).toBe("/policies");
   });
 });

@@ -267,18 +267,22 @@ describe("Schedules", () => {
 });
 
 describe("Schedules — whole-row link", () => {
-  it("opens the policy a schedule fires — a schedule has no page of its own", async () => {
+  it("opens the schedule itself in the drawer — it has no page of its own", async () => {
     mockApi({ "/api/v1/schedules": jsonResponse(rows) });
     mountApp("/schedules");
-    const link = nth(bodyRows(await table()), 0).querySelector("a.row-link");
-    expect(link).toHaveAttribute("href", "/policies/media/nightly");
-    expect(link).toHaveTextContent("nightly-cron");
-    expect(link).toHaveAccessibleName(/nightly-cron.*policy nightly/);
+    const link = nth(bodyRows(await table()), 0).querySelector<HTMLElement>("a.row-link");
+    expect(link?.getAttribute("href")).toMatch(/inspect=snapshot-schedule%2Fmedia%2Fnightly-cron$/);
+    if (link === null) throw new Error("no row link");
+    await userEvent.click(link);
+    const dialog = await screen.findByRole("dialog", { name: /nightly-cron/ });
+    expect(
+      dialog.querySelector('a.ref[data-kind="snapshot-policy"]')?.getAttribute("href"),
+    ).toMatch(/inspect=snapshot-policy%2Fmedia%2Fnightly$/);
   });
 
-  it("leaves a selector schedule's row unlinked: it fires no single policy", async () => {
+  it("links a selector schedule's row too: the drawer names the selector", async () => {
     mockApi({ "/api/v1/schedules": jsonResponse(rows) });
     mountApp("/schedules");
-    expect(nth(bodyRows(await table()), 1).querySelector("a.row-link")).toBeNull();
+    expect(nth(bodyRows(await table()), 1).querySelector("a.row-link")).not.toBeNull();
   });
 });

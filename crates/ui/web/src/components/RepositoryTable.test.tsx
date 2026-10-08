@@ -62,17 +62,13 @@ describe("RepositoryTable", () => {
     expect(row).toHaveTextContent("17");
   });
 
-  it("links with the summary's kindPath, never a segment derived from the display kind", async () => {
+  it("opens each row in the resource drawer, the cluster-scoped kind without a namespace", async () => {
     renderWithRouter(<RepositoryTable repositories={[nas, shared]} />);
-    expect(await screen.findByRole("link", { name: "nas" })).toHaveAttribute(
-      "href",
-      "/repositories/repository/nas?namespace=media",
+    expect((await screen.findByRole("link", { name: "nas" })).getAttribute("href")).toMatch(
+      /inspect=repository%2Fmedia%2Fnas$/,
     );
-    // "ClusterRepository" would give `/repositories/ClusterRepository/shared`;
-    // the kebab segment is the server's own `kindPath`.
-    expect(await screen.findByRole("link", { name: "shared" })).toHaveAttribute(
-      "href",
-      "/repositories/cluster-repository/shared",
+    expect((await screen.findByRole("link", { name: "shared" })).getAttribute("href")).toMatch(
+      /inspect=cluster-repository%2Fshared$/,
     );
   });
 

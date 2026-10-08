@@ -102,6 +102,18 @@ describe("Replications", () => {
     expect(nth(rows, 1)).toHaveTextContent("ClusterRepository/shared");
   });
 
+  it("opens a row in the resource drawer, as its own kind", async () => {
+    mockApi({ "/api/v1/replications": jsonResponse(view) });
+    mountApp("/replications");
+    const rows = bodyRows(await table());
+    await userEvent.click(within(nth(rows, 1)).getByRole("link", { name: "offsite" }));
+    const dialog = await screen.findByRole("dialog", { name: /offsite/ });
+    expect(dialog).toHaveAttribute("data-kind", "snapshot-replication");
+    expect(within(dialog).getByText("0 3 * * *")).toBeInTheDocument();
+    // Its Run button still sits above the stretched row link.
+    expect(within(nth(rows, 0)).getByRole("button", { name: "Run blobsync now" })).toBeVisible();
+  });
+
   it("shows the lag, and says 'never' for a copy that has not once succeeded", async () => {
     mockApi({ "/api/v1/replications": jsonResponse(view) });
     mountApp("/replications");

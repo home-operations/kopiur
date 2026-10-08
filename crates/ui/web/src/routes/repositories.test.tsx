@@ -70,16 +70,11 @@ describe("Repositories list", () => {
     expect(calledPaths()).toContain("/api/v1/repositories?namespace=media");
   });
 
-  it("links each row with the summary's kindPath, not a segment built from the kind", async () => {
+  it("opens each row in the resource drawer, keeping the list's filter", async () => {
     mockApi({ "/api/v1/repositories": jsonResponse(fleet) });
-    mountApp("/repositories");
-    expect(await screen.findByRole("link", { name: "nas" })).toHaveAttribute(
-      "href",
-      "/repositories/repository/nas?namespace=media",
-    );
-    expect(screen.getByRole("link", { name: "shared" })).toHaveAttribute(
-      "href",
-      "/repositories/cluster-repository/shared",
+    mountApp("/repositories?health=failed");
+    expect((await screen.findByRole("link", { name: "cold" })).getAttribute("href")).toMatch(
+      /health=failed.*inspect=/,
     );
   });
 
@@ -168,17 +163,15 @@ describe("Repositories list", () => {
 });
 
 describe("Repositories — whole-row link", () => {
-  it("makes every row a link to its repository, through the name", async () => {
+  it("makes every row open its repository in the drawer, through the name", async () => {
     mockApi({ "/api/v1/repositories": jsonResponse(fleet) });
     mountApp("/repositories");
     const rows = bodyRows(await list());
-    expect(nth(rows, 0).querySelector("a.row-link")).toHaveAttribute(
-      "href",
-      "/repositories/repository/nas?namespace=media",
+    expect(nth(rows, 0).querySelector("a.row-link")?.getAttribute("href")).toMatch(
+      /inspect=repository%2Fmedia%2Fnas$/,
     );
-    expect(nth(rows, 2).querySelector("a.row-link")).toHaveAttribute(
-      "href",
-      "/repositories/cluster-repository/shared",
+    expect(nth(rows, 2).querySelector("a.row-link")?.getAttribute("href")).toMatch(
+      /inspect=cluster-repository%2Fshared$/,
     );
   });
 });

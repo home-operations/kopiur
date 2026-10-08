@@ -1,13 +1,12 @@
-import { Link } from "@tanstack/react-router";
-
 import type { RepositorySummary } from "../api/types";
 import { EMPTY_CELL, humanBytes, relativeTime } from "../util/format";
 import { HealthBadge } from "./HealthBadge";
-import { accessLabel, detailSearch, repositoryPhaseLabel } from "./repository";
+import { accessLabel, repositoryPhaseLabel } from "./repository";
 import { NotReported } from "./NotReported";
 import { admitsText } from "./admits";
 import { KindChip, KindName } from "./KindMark";
 import { KIND_META } from "./kind";
+import { InspectLink } from "./InspectLink";
 
 /**
  * The fleet as a ledger: one row per `Repository` and `ClusterRepository`,
@@ -72,14 +71,16 @@ export function RepositoryTable({ repositories, caption = "Repositories" }: Repo
                     <span className="label-strip">
                       <KindName kind={repoKind(repository)} />
                       <span className="label-strip__name">
-                        <Link
+                        <InspectLink
                           className="row-link"
-                          to="/repositories/$kind/$name"
-                          params={{ kind: repository.kindPath, name: repository.name }}
-                          search={detailSearch(repository)}
+                          target={{
+                            kind: repoKind(repository),
+                            namespace: repository.namespace ?? undefined,
+                            name: repository.name,
+                          }}
                         >
                           {repository.name}
-                        </Link>
+                        </InspectLink>
                       </span>
                     </span>
                     {repository.namespace !== null &&

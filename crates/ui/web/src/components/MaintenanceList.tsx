@@ -8,6 +8,7 @@ import { LampBadge } from "./HealthBadge";
 import { NotReported } from "./NotReported";
 import { KindChip, KindName } from "./KindMark";
 import { WireRef } from "./ObjectRef";
+import { InspectLink } from "./InspectLink";
 
 /**
  * Every `Maintenance` in scope, one region each: the two run tracks, any
@@ -53,9 +54,12 @@ export function MaintenanceList({ rows, renderAction, now = new Date() }: Mainte
             <KindChip kind="maintenance" />
             <h2 className="maintenance-card__title">
               <KindName kind="maintenance" />
-              <span className="maintenance__resource mono">
+              <InspectLink
+                className="maintenance__resource mono"
+                target={{ kind: "maintenance", namespace: row.namespace, name: row.name }}
+              >
                 {row.namespace}/{row.name}
-              </span>
+              </InspectLink>
             </h2>
             <span className="maintenance-card__for">
               for <WireRef value={row.repository} contextNamespace={row.namespace} />

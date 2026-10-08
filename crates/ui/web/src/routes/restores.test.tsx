@@ -92,14 +92,13 @@ describe("Restores", () => {
     expect(nth(body, 0).querySelector(".health")).toHaveAttribute("data-health", "unknown");
   });
 
-  it("links a row into its own detail route", async () => {
+  it("opens a row in the resource drawer, keeping the scope", async () => {
     mockApi({ "/api/v1/restores": jsonResponse(rows) });
     mountApp("/restores?namespace=media");
     const body = bodyRows(await table());
-    expect(within(nth(body, 0)).getByRole("link", { name: "recover-db" })).toHaveAttribute(
-      "href",
-      "/restores/media/recover-db",
-    );
+    expect(
+      within(nth(body, 0)).getByRole("link", { name: "recover-db" }).getAttribute("href"),
+    ).toMatch(/namespace=media.*inspect=restore%2Fmedia%2Frecover-db$/);
   });
 
   it("creates a restore from the page's namespace, with overwrite said explicitly", async () => {
