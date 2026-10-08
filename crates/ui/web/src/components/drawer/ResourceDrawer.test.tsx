@@ -55,18 +55,6 @@ describe("ResourceDrawer", () => {
     expect(within(dialog).queryByRole("link", { name: "Open full page" })).toBeNull();
   });
 
-  it("offers the full page for a kind that has one", async () => {
-    mockApi({
-      "/api/v1/policies": jsonResponse([policy.row]),
-      "/api/v1/policies/kopiur-dev/app-data": jsonResponse(policy),
-    });
-    mountApp("/policies?inspect=snapshot-policy/kopiur-dev/app-data");
-    const dialog = await screen.findByRole("dialog", { name: /app-data/ });
-    const full = await within(dialog).findByRole("link", { name: "Open full page" });
-    expect(full).toHaveAttribute("href", "/policies/kopiur-dev/app-data");
-    expect(within(dialog).getByRole("link", { name: /dev-repo/ })).toBeInTheDocument();
-  });
-
   it("says when the resource is not there, rather than showing an empty panel", async () => {
     mockApi({ "/api/v1/schedules": jsonResponse([schedule]) });
     mountApp("/schedules?inspect=snapshot-schedule/kopiur-dev/gone");

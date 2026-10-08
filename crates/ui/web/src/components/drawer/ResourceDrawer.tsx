@@ -7,6 +7,7 @@ import {
   usePolicies,
   usePolicy,
   useReplications,
+  useRepositories,
   useRepository,
   useRestore,
   useSchedules,
@@ -98,6 +99,7 @@ function useDrawerData(target: InspectTarget): Loaded {
   // because what writes into or copies a repository can live anywhere.
   const policyRows = usePolicies(undefined, { enabled: isRepo });
   const replicationRows = useReplications(undefined, { enabled: isRepo });
+  const repositoryRows = useRepositories(undefined, { enabled: kind === "snapshotPolicy" });
   const policy = usePolicy(ns, name, { enabled: kind === "snapshotPolicy" });
   const snapshot = useSnapshot(ns, name, { enabled: kind === "snapshot" });
   const restore = useRestore(ns, name, { enabled: kind === "restore" });
@@ -115,7 +117,7 @@ function useDrawerData(target: InspectTarget): Loaded {
         replications: replicationRows.data,
       }));
     case "snapshotPolicy":
-      return settle(policy, (detail) => ({ kind, detail }));
+      return settle(policy, (detail) => ({ kind, detail, repositories: repositoryRows.data }));
     case "snapshot":
       return settle(snapshot, (detail) => ({ kind, detail }));
     case "restore":

@@ -11,6 +11,7 @@ import { type DrawerRelation, drawerFacts } from "./drawerFacts";
 import { DrawerHead } from "./DrawerHead";
 import { FactsList } from "./FactsList";
 import { ListActions } from "./ListActions";
+import { policyView } from "./policy/policyView";
 import { repositoryView } from "./repository/repositoryView";
 
 /**
@@ -34,6 +35,7 @@ export function drawerView(data: DrawerData, now: Date): DrawerView {
     case "clusterRepository":
       return repositoryView(data.kind, data.detail, data, now);
     case "snapshotPolicy":
+      return policyView(data.detail, data.repositories, now);
     case "snapshot":
     case "restore": {
       const card = cardOf(data);

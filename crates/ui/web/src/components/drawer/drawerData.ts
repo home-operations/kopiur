@@ -3,6 +3,7 @@ import type {
   PolicyRow,
   ReplicationsView,
   RepositoryDetail,
+  RepositorySummary,
   RestoreDetail,
   SnapshotDetail,
 } from "../../api/types";
@@ -27,7 +28,12 @@ export type DrawerData =
       policies?: readonly PolicyRow[] | undefined;
       replications?: ReplicationsView | undefined;
     }
-  | { kind: "snapshotPolicy"; detail: PolicyDetail }
+  | {
+      kind: "snapshotPolicy";
+      detail: PolicyDetail;
+      /** Repository rows that give the chain live pills. */
+      repositories?: readonly RepositorySummary[] | undefined;
+    }
   | { kind: "snapshot"; detail: SnapshotDetail }
   | { kind: "restore"; detail: RestoreDetail }
   | ListOnlyCard;
