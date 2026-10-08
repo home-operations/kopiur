@@ -23,5 +23,10 @@ export function admitsText(admits: AdmittedNamespacesView): string {
     const { count } = admits.listed;
     return `admits ${String(count)} namespace${count === 1 ? "" : "s"}`;
   }
-  return `admits namespaces matching ${admits.selector.selector}`;
+  if ("selector" in admits) {
+    const { selector } = admits.selector;
+    return `admits namespaces matching ${selector.length > 0 ? selector : "any labels"}`;
+  }
+  // A shape a newer server invented: named as itself, never a crash.
+  return `admits ${unknownVariant(admits, "AdmittedNamespacesView")}`;
 }

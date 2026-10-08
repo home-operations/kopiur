@@ -409,6 +409,20 @@ describe("Policy detail — header and lanes", () => {
     );
   });
 
+  it("keeps a repository key it cannot read as its text, never claiming there is none", async () => {
+    mockApi({
+      [PATH]: jsonResponse({
+        ...detail,
+        row: { ...detail.row, repositories: ["Vault/media/nas"] },
+      }),
+    });
+    mountApp("/policies/media/nightly");
+    const flow = await screen.findByRole("region", { name: "Relationships" });
+    const writes = within(flow).getByRole("region", { name: "Writes into" });
+    expect(writes).toHaveTextContent("Vault/media/nas");
+    expect(writes).not.toHaveTextContent("names no repository");
+  });
+
   it("shows the four facts, loud when it has never been verified", async () => {
     mockApi({
       [PATH]: jsonResponse({ ...detail, row: { ...detail.row, lastVerified: null } }),

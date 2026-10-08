@@ -75,6 +75,19 @@ export function ObjectSearch() {
     };
   }, []);
 
+  // What has not answered, and what refused to: absence is only claimed when
+  // every read the search spans actually came back.
+  const sources = [
+    ["repositories", repositories],
+    ["policies", policies],
+    ["schedules", schedules],
+    ["restores", restores],
+    ["maintenance", maintenance],
+    ["replications", replications],
+    ["snapshots", snapshots],
+  ] as const;
+  const searching = active && sources.some(([, query]) => query.isPending);
+  const unsearched = sources.filter(([, query]) => query.isError).map(([label]) => label);
   const matches = (name: string) => name.toLowerCase().includes(term);
   const hits: Hit[] = active
     ? [
@@ -152,8 +165,15 @@ export function ObjectSearch() {
       </label>
       {active ? (
         <ul className="search__results" aria-label="Search results">
+          {unsearched.length > 0 ? (
+            <li className="search__empty">{joinWords(unsearched)} could not be searched.</li>
+          ) : null}
           {hits.length === 0 ? (
-            <li className="search__empty">No object named like “{q.trim()}” in this scope.</li>
+            searching ? (
+              <li className="search__empty">Searching…</li>
+            ) : unsearched.length === 0 ? (
+              <li className="search__empty">No object named like “{q.trim()}” in this scope.</li>
+            ) : null
           ) : (
             hits.map((hit) => (
               <li key={`${hit.kind}/${hit.namespace ?? ""}/${hit.name}`}>
@@ -171,4 +191,13 @@ export function ObjectSearch() {
       ) : null}
     </div>
   );
+}
+
+/** "a", "a and b", "a, b and c" — capitalised, as the start of a sentence. */
+function joinWords(words: readonly string[]): string {
+  const text =
+    words.length <= 1
+      ? words.join("")
+      : `${words.slice(0, -1).join(", ")} and ${words[words.length - 1] ?? ""}`;
+  return text.charAt(0).toUpperCase() + text.slice(1);
 }

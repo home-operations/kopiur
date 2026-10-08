@@ -19,4 +19,16 @@ describe("admitsText", () => {
     expect(admitsText(fromTheFuture)).not.toContain("-1");
     expect(admitsText(fromTheFuture)).toContain("everywhere");
   });
+
+  it("does not crash on an admission shape a newer server invented", () => {
+    const newer = { expression: { cel: "true" } } as unknown as AdmittedNamespacesView;
+    expect(() => admitsText(newer)).not.toThrow();
+    expect(admitsText(newer)).toContain("expression");
+  });
+
+  it("says what an empty selector matches rather than trailing off", () => {
+    expect(admitsText({ selector: { selector: "" } })).toBe(
+      "admits namespaces matching any labels",
+    );
+  });
 });

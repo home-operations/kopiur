@@ -13,7 +13,8 @@ import { ObjectRef } from "./ObjectRef";
  */
 export type LaneItem =
   | { card: CardRow }
-  | { ref: { kind: ObjectKind; name: string; namespace?: string | undefined } };
+  | { ref: { kind: ObjectKind; name: string; namespace?: string | undefined } }
+  | { text: string };
 
 export interface Lane {
   /** The visible lane title: "Written by". */
@@ -60,7 +61,12 @@ export function FlowLanes({ label, lanes }: { label: string; lanes: readonly Lan
               <p className="flow-lane__empty">{lane.empty}</p>
             ) : (
               lane.items.map((item) =>
-                "card" in item ? (
+                "text" in item ? (
+                  // A key the console cannot read is still named, as itself.
+                  <span key={`text/${item.text}`} className="flow-lane__text mono">
+                    {item.text}
+                  </span>
+                ) : "card" in item ? (
                   <ObjectCard
                     key={`${item.card.kind}/${item.card.row.namespace ?? ""}/${item.card.row.name}`}
                     card={item.card}

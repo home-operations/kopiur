@@ -97,7 +97,7 @@ function policyLanes(
   const { row } = detail;
   const writes: LaneItem[] = row.repositories.flatMap((key): LaneItem[] => {
     const ref = parseRef(key);
-    if (ref === null) return [];
+    if (ref === null) return [{ text: key }];
     const loaded = repositoryRows?.find(
       (r) =>
         r.name === ref.name &&

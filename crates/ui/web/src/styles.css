@@ -1031,6 +1031,11 @@ a.object-name:hover {
   text-transform: uppercase;
 }
 
+.flow-lane__text {
+  font-size: var(--text-sm);
+  overflow-wrap: anywhere;
+}
+
 .flow-lane__empty {
   margin: 0;
   color: var(--fg-muted);
