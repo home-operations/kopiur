@@ -29,8 +29,8 @@ const CSS = readStyles();
  * it needs a `:focus-visible` rule instead.
  */
 const NEVER_FOCUSED = new Set([
-  // The disabled-control tooltip: a `::after` pseudo-element.
-  ".button[data-reason]::after",
+  // A stat strip's card lift: a `<dl>`, never focusable.
+  ".stats",
   // A floating panel, not a control.
   ".identity__panel",
   // The pressed theme option — covered by its own rule, asserted separately.

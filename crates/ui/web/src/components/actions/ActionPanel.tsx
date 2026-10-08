@@ -143,6 +143,7 @@ export function ActionPanel({
           <ActionButton
             variant={variant}
             disabledReason={disabledReason}
+            reasonShown={shortReason === undefined}
             aria-expanded={isOpen}
             onClick={() => {
               setOpen(!isOpen);
@@ -171,6 +172,9 @@ export function ActionPanel({
             <ActionButton
               variant="primary"
               disabledReason={confirmReason}
+              reasonKind={
+                disabledReason !== undefined && disabledReason.length > 0 ? "refused" : "blocked"
+              }
               onClick={() => {
                 onConfirm();
                 setOpen(false);

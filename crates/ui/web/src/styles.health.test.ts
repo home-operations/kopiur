@@ -102,6 +102,16 @@ interface Exception {
  */
 const INK_ON_TEXT: ReadonlyMap<string, Exception> = new Map<string, Exception>([
   [
+    ".absent--loud",
+    {
+      reason:
+        'A loud absence — "never verified", "never run" — is the fact itself, ' +
+        "worded, and it always carries the failed lamp's OctagonX icon beside " +
+        "the words (StatStrip's AbsenceText), so the colour is never alone.",
+      callSites: 1,
+    },
+  ],
+  [
     ".button--danger",
     {
       reason:

@@ -403,20 +403,29 @@ svg {
   white-space: nowrap;
 }
 
-/* ---- health lamp: icon + word on a tint ---------------------------------- */
+/* ---- status pill: a tinted pill, an icon and a word ----------------------
+   The one way a state is drawn (HealthBadge / LampBadge). Round, where a kind
+   chip is square. Never colour alone: rule 1 of the kopiur-ui-design skill,
+   pinned by styles.health.test.ts. */
 
 .health {
   display: inline-flex;
   align-items: center;
-  gap: 0.35em;
-  padding: 0.1em 0.5em 0.1em 0.4em;
-  border-radius: var(--radius-sm);
+  gap: 4px;
+  padding: 2px 9px 2px 6px;
+  border-radius: var(--radius-pill);
   font-size: var(--text-sm);
-  font-weight: var(--weight-medium);
-  line-height: 1.5;
+  font-weight: var(--weight-semibold);
+  line-height: 1.4;
   white-space: nowrap;
   color: var(--health-unknown-fg);
   background: var(--health-unknown-bg);
+}
+
+.health svg {
+  flex: none;
+  width: 13px;
+  height: 13px;
 }
 
 .health[data-health="healthy"] {
@@ -444,46 +453,40 @@ svg {
   background: var(--health-suspended-bg);
 }
 
-/* ---- controls ------------------------------------------------------------ */
+/* ---- buttons: solid primary, soft everything else -------------------------- */
 
 .button {
-  position: relative;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  gap: var(--space-2);
-  min-height: 2rem;
-  padding: 0 var(--space-3);
-  border: 1px solid var(--line-strong);
+  gap: 7px;
+  min-height: 34px;
+  padding: 0 14px;
+  border: 1px solid transparent;
   border-radius: var(--radius-md);
-  background: var(--bg-surface);
-  color: var(--fg);
+  background: var(--accent-soft);
+  color: var(--accent-ink);
   font-size: var(--text-sm);
-  font-weight: var(--weight-medium);
-  /* A label can name its object — "Run maintenance for <cluster-repository>" —
-     and that name is one unbreakable token. `nowrap` made the button as wide
-     as the name and pushed the page sideways. The button still sizes to its
-     content, so a short label never wraps; only one that cannot fit does.
-     The line height only shows once a label has two lines; a one-line button
-     is unchanged, being taller than its text either way. */
+  font-weight: var(--weight-semibold);
+  /* A label can name its object — one unbreakable token — so a button that
+     cannot fit wraps rather than pushing the page sideways. */
   line-height: var(--leading-dense);
   max-width: 100%;
   overflow-wrap: anywhere;
-  transition:
-    background-color var(--dur-fast) var(--ease-out),
-    border-color var(--dur-fast) var(--ease-out);
+  transition: background-color var(--dur-fast) var(--ease-out);
+}
+
+.button svg {
+  flex: none;
+  width: 14px;
+  height: 14px;
 }
 
 .button:hover:not([disabled]):not([aria-disabled="true"]) {
-  background: var(--bg-hover);
-}
-
-.button:active:not([disabled]):not([aria-disabled="true"]) {
-  background: var(--bg-active);
+  background: color-mix(in srgb, var(--accent-soft) 70%, var(--accent));
 }
 
 .button--primary {
-  border-color: var(--accent);
   background: var(--accent);
   color: var(--fg-on-accent);
 }
@@ -493,68 +496,170 @@ svg {
 }
 
 .button--quiet {
-  border-color: transparent;
   background: transparent;
+}
+
+.button--quiet:hover:not([disabled]):not([aria-disabled="true"]) {
+  background: var(--bg-hover);
 }
 
 .button--danger {
   color: var(--health-failed-fg);
-  border-color: var(--health-failed-fg);
+  background: var(--health-failed-bg);
 }
 
-/* Disabled reads as disabled by ink, border and fill — never by opacity, which
-   would dim the reason tooltip below (a pseudo-element inherits it). */
+.button--danger:hover:not([disabled]):not([aria-disabled="true"]) {
+  background: color-mix(in srgb, var(--health-failed-bg) 80%, var(--health-failed-fg));
+}
+
+/* Refused or blocked: still focusable (aria-disabled), drawn as an outline,
+   and the reason sits beside it in words — never behind a hover. */
 .button[disabled],
-.button[aria-disabled="true"] {
-  color: var(--fg-muted);
-  border-color: var(--line);
-  background: var(--bg-inset);
-}
-
-.button--primary[disabled],
+.button[aria-disabled="true"],
 .button--primary[aria-disabled="true"],
-.button--danger[disabled],
 .button--danger[aria-disabled="true"] {
   color: var(--fg-muted);
-  border-color: var(--line);
-  background: var(--bg-inset);
+  border: 1px dashed var(--line-strong);
+  background: transparent;
+  cursor: not-allowed;
 }
 
-/* The reason a control is disabled: shown on hover and on keyboard focus,
-   so a keyboard user learns the RBAC model too. */
-.button[data-reason]::after {
-  content: attr(data-reason);
-  position: absolute;
-  top: calc(100% + 6px);
-  left: 0;
-  z-index: 20;
-  /* 28rem is the reading measure; the viewport is the hard limit. A control
-     near the right edge of a narrow screen would otherwise open a 448px panel
-     anchored to its own left edge and push the page sideways. */
-  max-width: min(28rem, calc(100vw - 2 * var(--space-4)));
-  width: max-content;
-  padding: var(--space-2) var(--space-3);
-  border: 1px solid var(--line);
-  border-radius: var(--radius-md);
+.button__reason {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  margin-left: var(--space-2);
+  color: var(--fg-muted);
+  font-size: var(--text-sm);
+}
+
+.button__reason svg {
+  flex: none;
+  width: 12px;
+  height: 12px;
+}
+
+/* ---- stat strip: named values, label above value --------------------------- */
+
+.stats {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  margin: 0;
+  overflow: hidden;
+  border: 1px solid var(--card-border);
+  border-radius: var(--radius-lg);
   background: var(--bg-surface);
-  color: var(--fg);
-  box-shadow: var(--shadow-2);
-  font-weight: var(--weight-regular);
-  text-align: left;
-  white-space: normal;
-  line-height: var(--leading-prose);
-  opacity: 0;
-  pointer-events: none;
-  transform: translateY(-4px);
-  transition:
-    opacity var(--dur-base) var(--ease-out),
-    transform var(--dur-base) var(--ease-out);
+  box-shadow: var(--shadow-1);
 }
 
-.button[data-reason]:hover::after,
-.button[data-reason]:focus-visible::after {
-  opacity: 1;
-  transform: translateY(0);
+.stats__item {
+  display: grid;
+  align-content: start;
+  gap: 5px;
+  padding: 12px 16px;
+  border-right: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+}
+
+.stats dt {
+  color: var(--fg-muted);
+  font-size: var(--text-xs);
+  font-weight: var(--weight-semibold);
+  letter-spacing: var(--tracking-caps);
+  text-transform: uppercase;
+}
+
+.stats dd {
+  margin: 0;
+  font-size: var(--text-lg);
+  font-weight: var(--weight-semibold);
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+
+.stats__abs {
+  display: block;
+  color: var(--fg-muted);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  font-weight: var(--weight-regular);
+}
+
+.stats--card {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: var(--space-2);
+  padding-top: 10px;
+  border: 0;
+  border-top: 1px solid var(--line);
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+.stats--card .stats__item {
+  padding: 0;
+  border: 0;
+}
+
+.stats--card dd {
+  font-size: var(--text-md);
+}
+
+/* The three absences: loud (a real problem), unreported, not applicable. */
+.absent {
+  color: var(--fg-muted);
+  font-weight: var(--weight-regular);
+}
+
+.absent--loud {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--health-failed-fg);
+  font-weight: var(--weight-semibold);
+}
+
+/* ---- object reference: a mini card naming another object ------------------- */
+
+.ref {
+  display: inline-grid;
+  grid-template-columns: auto auto auto;
+  align-items: center;
+  gap: var(--space-2);
+  max-width: 100%;
+  padding: 6px 10px 6px 6px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--bg-surface);
+  color: inherit;
+  text-decoration: none;
+  vertical-align: middle;
+}
+
+a.ref:hover {
+  background: var(--bg-hover);
+}
+
+.ref__id {
+  display: grid;
+  min-width: 0;
+  line-height: 1.2;
+}
+
+.ref__name {
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-semibold);
+  overflow-wrap: anywhere;
+}
+
+.ref__ns {
+  color: var(--fg-muted);
+  font-weight: var(--weight-regular);
+}
+
+.ref .health {
+  font-size: var(--text-xs);
 }
 
 /* ---- skeleton: a ledger row's silhouette, not a spinner ------------------ */
@@ -1921,41 +2026,6 @@ svg {
     flex-wrap: wrap;
   }
 
-  /* No hover exists here, so a tooltip is a reason nobody can read — and one
-     anchored to a control's left edge would run off the page besides. The
-     refusal becomes a line under the control instead. A ledger keeps its own
-     answer (the short word in the cell, `actions/reason.ts`), so the sentence
-     stays hidden there rather than doubling up. */
-  .button[data-reason]::after {
-    content: none;
-  }
-
-  .button__reason {
-    position: static;
-    display: block;
-    width: auto;
-    height: auto;
-    margin: var(--space-1) 0 0;
-    overflow: visible;
-    clip: auto;
-    clip-path: none;
-    white-space: normal;
-    max-width: 34rem;
-    color: var(--fg-muted);
-    font-size: var(--text-xs);
-    line-height: var(--leading-prose);
-  }
-
-  .ledger-scroll .button__reason {
-    position: absolute;
-    width: 1px;
-    height: 1px;
-    margin: -1px;
-    overflow: hidden;
-    clip-path: inset(50%);
-    white-space: nowrap;
-  }
-
   .content {
     padding: var(--space-4);
   }
@@ -2028,20 +2098,6 @@ svg {
   .retention-rules__field {
     grid-column: 2;
   }
-}
-
-/* No floating tooltip inside a scrolling ledger. A scroll container clips its
-   descendants, so the reason for the last row's disabled control was cut off
-   mid-sentence — and, worse, the *hidden* tooltip still counted toward the
-   container's scrollable overflow, putting a horizontal and a vertical
-   scrollbar on a table that fits. `content: none` means the pseudo-element is
-   never generated there at all.
-
-   A ledger row says it a better way instead: a short word in the cell (always
-   visible, no hover, no keyboard trap) with the full sentence still on the
-   button's `aria-describedby` sibling and its native `title`. */
-.ledger-scroll .button[data-reason]::after {
-  content: none;
 }
 
 /* ---- not reported: a value nothing ever writes ---------------------------- */
@@ -2508,11 +2564,9 @@ svg {
   justify-content: start;
 }
 
-/* A refused download and its short word. The word is in the cell rather than
-   in a hover tooltip because a ledger scrolls, and a scroll container clips
-   the tooltip a disabled control would carry — see `.ledger-scroll
-   .button[data-reason]::after`. The full sentence is still on the button's
-   `aria-describedby` sibling and its native `title`. */
+/* A refused download and its short word. A table cell has no room for the
+   sentence, so the cell shows the word and the full sentence stays on the
+   button's `aria-describedby` sibling and its native `title`. */
 .dir-table__file {
   display: flex;
   align-items: center;

@@ -27,7 +27,7 @@
 import type { RestorePhaseView, RestoreRow } from "../api/types";
 import { unknownVariant } from "../util/assertNever";
 import { EMPTY_CELL, humanBytes } from "../util/format";
-import { type Lamp, healthLamp } from "./health";
+import { type Lamp, healthLamp, inFlightLamp } from "./health";
 
 /**
  * `status.phase` as a word.
@@ -79,6 +79,7 @@ export function restorePhaseLamp(phase: RestorePhaseView | null | undefined): La
         return { ...healthLamp("failed"), word };
       case "restoring":
       case "resolving":
+        return inFlightLamp(word);
       case "pending":
         return { ...healthLamp("pending"), word };
       default:

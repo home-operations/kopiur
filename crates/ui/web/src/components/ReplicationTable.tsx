@@ -171,6 +171,7 @@ function RunAction({ row }: { row: ReplicationRow }) {
     <div className="replication-table__run">
       <ActionButton
         disabledReason={sentence}
+        reasonShown={false}
         title={sentence}
         onClick={() => {
           run.mutate({ namespace: row.namespace, name: row.name, kind: row.kindToken });

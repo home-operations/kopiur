@@ -68,3 +68,40 @@ describe("ActionButton", () => {
     expect(container.querySelector("button")).toHaveClass("button", "button--primary");
   });
 });
+
+describe("ActionButton — the refusal is on screen, not behind a hover", () => {
+  it("shows a 'not permitted' reason beside the button with a lock", () => {
+    render(
+      <ActionButton disabledReason="You may not delete snapshots in media.">Delete</ActionButton>,
+    );
+    const shown = screen.getByText("You may not delete snapshots in media.");
+    expect(shown).toHaveClass("button__reason");
+    expect(shown).not.toHaveClass("visually-hidden");
+    expect(shown.querySelector("svg")).not.toBeNull();
+  });
+
+  it("shows an 'answer first' reason without the lock: it is not a permission", () => {
+    render(
+      <ActionButton disabledReason="Choose whether to pin it first." reasonKind="blocked">
+        Create snapshot
+      </ActionButton>,
+    );
+    const shown = screen.getByText("Choose whether to pin it first.");
+    expect(shown).not.toHaveClass("visually-hidden");
+    expect(shown.querySelector("svg")).toBeNull();
+  });
+
+  it("keeps the sentence for assistive tech only where the caller shows its own short word", () => {
+    render(
+      <ActionButton disabledReason="You may not run replications in media." reasonShown={false}>
+        Run now
+      </ActionButton>,
+    );
+    expect(screen.getByRole("button", { name: "Run now" })).toHaveAccessibleDescription(
+      "You may not run replications in media.",
+    );
+    expect(screen.getByText("You may not run replications in media.")).toHaveClass(
+      "visually-hidden",
+    );
+  });
+});

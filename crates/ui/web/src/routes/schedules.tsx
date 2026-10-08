@@ -122,6 +122,8 @@ function SuspendTrigger({
       <ActionButton
         variant={schedule.suspended ? "default" : "danger"}
         disabledReason={refusal?.full}
+        reasonShown={false}
+        title={refusal?.full}
         aria-expanded={open}
         onClick={() => {
           onOpen(!open);
