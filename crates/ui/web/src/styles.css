@@ -1430,6 +1430,19 @@ a.object-name:hover {
   outline: none;
 }
 
+/* A text field is focus-visible on a mouse click too, so the global tab ring
+   would light on every click. The field's own border takes the accent
+   instead: quieter, and still a visible focus for the keyboard. */
+.ns-switcher__filter input:focus-visible,
+.search__field input:focus-visible {
+  box-shadow: none;
+}
+
+.ns-switcher__filter:focus-within,
+.search__field:focus-within {
+  border-color: var(--accent);
+}
+
 .ns-switcher__list,
 .search__results {
   display: grid;

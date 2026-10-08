@@ -10,6 +10,7 @@ import {
   mountApp,
   problemResponse,
 } from "../../test-utils";
+import { cssRules, readStyles } from "../../testing/css";
 
 afterEach(() => {
   document.body.innerHTML = "";
@@ -102,5 +103,16 @@ describe("ObjectSearch", () => {
     const results = await screen.findByRole("list", { name: "Search results" });
     expect(within(results).getByText(/Searching/)).toBeInTheDocument();
     expect(results).not.toHaveTextContent("No object named like");
+  });
+});
+
+describe("ObjectSearch — focus", () => {
+  it("marks a focused search field with its border, not the tab-focus ring", () => {
+    const rules = cssRules(readStyles());
+    const input = rules.find((r) => r.selector.includes(".search__field input:focus-visible"));
+    expect(input?.body).toMatch(/box-shadow:\s*none/);
+    const field = rules.find((r) => r.selector.includes(".search__field:focus-within"));
+    expect(field?.body).toMatch(/border-color:\s*var\(--accent\)/);
+    expect(input?.selector).toContain(".ns-switcher__filter input:focus-visible");
   });
 });
