@@ -53,12 +53,14 @@ Rules that shape the block:
   --radius-sm: 7px; /* small kind chip, focus ring on chips      */
   --radius-md: 10px; /* buttons, inputs, kind chip, nav items     */
   --radius-lg: 16px; /* cards, tables, panels, popovers           */
+  --radius-xl: 20px; /* the floating side panel                  */
   --radius-pill: 999px; /* status pills only                         */
   --stripe: 4px; /* the kind stripe on a card / row / header  */
 
   /* ---- layout ---- */
   --sidebar-width: 240px;
   --content-max: 1440px;
+  --drawer-width: 30rem;
 
   /* ---- motion ---- */
   --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
@@ -89,6 +91,7 @@ Rules that shape the block:
   --shadow-ink-2: light-dark(rgb(11 16 32 / 0.35), rgb(0 0 0 / 0.6));
   --shadow-1: 0 1px 3px var(--shadow-ink-1);
   --shadow-2: 0 16px 40px -12px var(--shadow-ink-2);
+  --scrim: light-dark(rgb(15 23 42 / 0.32), rgb(0 0 0 / 0.55));
   --focus-ring: 0 0 0 2px var(--bg-surface), 0 0 0 4px var(--accent);
 
   /* ---- status: tinted pill = fg on bg; always with icon + word ---- */

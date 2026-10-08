@@ -617,3 +617,49 @@ inside `.table-wrap` rather than starving a column. Long names wrap at `/` and `
 
 The verdict is never the healthy state while any read on the page is loading,
 refused or empty — then it says so ("Checking…", "Cannot tell: …").
+
+---
+
+## Side panel (the resource drawer)
+
+**What:** a resource's details, floating over the right edge of the page. Every
+list row, reference, object card and search result opens one; it is how a
+resource is looked at without leaving the page you are on.
+
+```html
+<dialog class="side-panel has-stripe" data-kind="snapshot-policy" aria-labelledby="t">
+  <div class="side-panel__frame">
+    <header class="side-panel__head">
+      <span class="kind-chip kind-chip--md" data-kind="snapshot-policy" aria-hidden="true"
+        ><svg
+      /></span>
+      <div class="side-panel__heading">
+        <span class="kind-name">SnapshotPolicy</span>
+        <h2 class="side-panel__title" id="t">app-data</h2>
+        <div class="side-panel__status"><span class="health" data-health="healthy">…</span></div>
+      </div>
+      <button class="button button--quiet" aria-label="Close details">×</button>
+    </header>
+    <div class="side-panel__body">…stat strip, facts, related references…</div>
+    <footer class="side-panel__foot"><a>Open full page</a></footer>
+  </div>
+</dialog>
+```
+
+- A native modal `<dialog>` (`showModal()`): top layer, `::backdrop` on `--scrim`,
+  the page behind is inert. No z-index is ever needed to stack it.
+- Inset `--space-3` from the top, right and bottom; `--drawer-width` wide,
+  `--radius-xl`, `--shadow-2`, kind stripe on the left edge. Full-screen below 560px.
+- Slides in from the right over `--dur-base`; no exit animation (it unmounts when
+  the URL drops it). Reduced motion collapses both.
+- The head (chip, kind name, mono name, pill, close) and the foot stay put; only
+  the body scrolls. A long name wraps in the title, never widens the panel.
+- **The open resource lives in the URL** — `?inspect=<kind-slug>/<namespace>/<name>`
+  (`cluster-repository/<name>` for the cluster-scoped kind). Opening pushes one
+  history entry, so Back closes it; opening another resource from inside replaces
+  that entry; a deep link opens it.
+- Focus moves into the panel on open and returns to the row or reference that
+  opened it. Escape, the close button and a backdrop click close it. An inline
+  confirmation inside the panel owns Escape first.
+- Things that are not resources (a topology backend or namespace) use the same
+  panel with a kind word and no stripe.
