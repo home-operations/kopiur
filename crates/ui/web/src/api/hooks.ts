@@ -152,6 +152,8 @@ export interface SnapshotListParams {
   policy?: string | undefined;
   origin?: string | undefined;
   phase?: string | undefined;
+  /** Name contains this text (case-insensitive, literal); blank is no filter. */
+  q?: string | undefined;
   offset?: number | undefined;
   limit?: number | undefined;
 }
@@ -352,6 +354,22 @@ export function useSnapshots(params: SnapshotListParams, options: ReadOptions = 
     queryKeys.snapshots(params),
     withQuery(paths.snapshots, { ...params }),
     { staleTime: staleTime.list, ...options },
+  );
+}
+
+/** The shortest query worth sending: one character matches nearly everything. */
+export const SEARCH_MIN_CHARS = 2;
+
+/**
+ * Snapshots whose name contains `q`, for the object search. Ten at most —
+ * the search shows a handful of matches, not a list page — and nothing is
+ * asked until `q` has {@link SEARCH_MIN_CHARS} non-blank characters.
+ */
+export function useSnapshotSearch(q: string, namespace: Namespace, options: ReadOptions = {}) {
+  const term = q.trim();
+  return useSnapshots(
+    { q: term, namespace: namespace ?? undefined, limit: 10 },
+    { ...options, enabled: (options.enabled ?? true) && term.length >= SEARCH_MIN_CHARS },
   );
 }
 

@@ -98,6 +98,10 @@ pub struct SnapshotQuery {
     /// Restrict to this namespace; absent lists cluster-wide.
     #[serde(default)]
     pub namespace: Option<String>,
+    /// Only snapshots whose name contains this text, case-insensitively and
+    /// literally. Empty or whitespace-only is no filter.
+    #[serde(default)]
+    pub q: Option<String>,
     /// Index of the first row to return.
     #[serde(default)]
     pub offset: Option<usize>,
@@ -133,6 +137,17 @@ pub struct ParsedFilter {
     /// The phase to match. Not a label filter either — the phase lives in
     /// status, so the CLI cannot select on it server-side and neither can this.
     pub phase: Option<PhaseFilter>,
+    /// Lowercased name substring, already trimmed; see [`name_filter`].
+    pub name: Option<String>,
+}
+
+/// **Pure.** The `?q=` search as a filter: trimmed and lowercased, `None` when
+/// there is nothing to search for. Matched literally — `%` is a character, not
+/// a wildcard — because a name search should find the name typed.
+pub fn name_filter(q: Option<&str>) -> Option<String> {
+    q.map(str::trim)
+        .filter(|q| !q.is_empty())
+        .map(str::to_lowercase)
 }
 
 /// A phase the caller asked for.
@@ -204,6 +219,14 @@ pub fn filter_rows(snapshots: &[Arc<Snapshot>], filter: &ParsedFilter) -> Vec<Ar
         })
         .filter(|s| matches_filter(s, &filter.labels))
         .filter(|s| filter.phase.as_ref().is_none_or(|p| phase_matches(s, p)))
+        .filter(|s| {
+            filter.name.as_ref().is_none_or(|needle| {
+                s.metadata
+                    .name
+                    .as_deref()
+                    .is_some_and(|name| name.to_lowercase().contains(needle.as_str()))
+            })
+        })
         .cloned()
         .collect();
     // Newest run first, with the CR name as the tiebreaker so two snapshots
@@ -867,6 +890,7 @@ async fn parse_query(
             origin,
         },
         phase,
+        name: name_filter(q.q.as_deref()),
     })
 }
 
@@ -1418,6 +1442,53 @@ status: { phase: Quiescing }
         );
         assert_eq!(succeeded.len(), 1);
         assert_eq!(succeeded[0].metadata.name.as_deref(), Some("nightly-1"));
+    }
+
+    fn names(rows: &[Arc<Snapshot>]) -> Vec<&str> {
+        rows.iter()
+            .filter_map(|s| s.metadata.name.as_deref())
+            .collect()
+    }
+
+    #[test]
+    fn q_matches_names_case_insensitively_and_literally() {
+        let all = vec![
+            nightly_run("app-data-manual", "2026-10-07T01:00:00Z", "Succeeded"),
+            nightly_run("postgres-nightly-1", "2026-10-07T02:00:00Z", "Succeeded"),
+            nightly_run("100%-done", "2026-10-07T03:00:00Z", "Succeeded"),
+        ];
+        let by = |q: &str| ParsedFilter {
+            name: name_filter(Some(q)),
+            ..Default::default()
+        };
+        assert_eq!(names(&filter_rows(&all, &by("APP"))), ["app-data-manual"]);
+        assert_eq!(
+            names(&filter_rows(&all, &by("%"))),
+            ["100%-done"],
+            "matched literally, not as a pattern"
+        );
+        assert_eq!(
+            filter_rows(&all, &by("   ")).len(),
+            3,
+            "a blank q is no filter"
+        );
+        assert_eq!(name_filter(None), None);
+        assert_eq!(name_filter(Some("")), None);
+    }
+
+    /// The list-too-large cap is applied to the *matched* set, so a search can
+    /// bring a cluster with more snapshots than the cap back under it.
+    #[test]
+    fn q_narrows_before_the_cap_is_counted() {
+        let all: Vec<_> = (0..20)
+            .map(|i| nightly_run(&format!("run-{i:02}"), "2026-10-07T01:00:00Z", "Succeeded"))
+            .chain([nightly_run("needle", "2026-10-07T01:00:00Z", "Succeeded")])
+            .collect();
+        let filter = ParsedFilter {
+            name: name_filter(Some("needle")),
+            ..Default::default()
+        };
+        assert_eq!(filter_rows(&all, &filter).len(), 1);
     }
 
     #[test]
