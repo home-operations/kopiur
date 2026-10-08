@@ -205,6 +205,65 @@ describe("SidePanel", () => {
     expect(screen.getByRole("separator")).toHaveAttribute("aria-valuenow", String(half + 100));
   });
 
+  it("slides out before it goes, and says when it has", () => {
+    const onExited = vi.fn();
+    const style = vi.spyOn(window, "getComputedStyle");
+    style.mockImplementation(
+      (el) =>
+        ({
+          animationName: el instanceof HTMLDialogElement ? "side-panel-out" : "none",
+        }) as CSSStyleDeclaration,
+    );
+    const { rerender } = render(
+      <SidePanel label="nas" onClose={noop} onExited={onExited}>
+        body
+      </SidePanel>,
+    );
+    rerender(
+      <SidePanel label="nas" onClose={noop} onExited={onExited} leaving>
+        body
+      </SidePanel>,
+    );
+    const dialog = screen.getByRole("dialog");
+    expect(dialog).toHaveAttribute("data-leaving");
+    expect(onExited).not.toHaveBeenCalled();
+    fireEvent.animationEnd(dialog, { animationName: "side-panel-out" });
+    expect(onExited).toHaveBeenCalledTimes(1);
+    style.mockRestore();
+  });
+
+  it("goes at once when there is no exit animation to wait for (reduced motion)", () => {
+    const onExited = vi.fn();
+    const { rerender } = render(
+      <SidePanel label="nas" onClose={noop} onExited={onExited}>
+        body
+      </SidePanel>,
+    );
+    rerender(
+      <SidePanel label="nas" onClose={noop} onExited={onExited} leaving>
+        body
+      </SidePanel>,
+    );
+    expect(onExited).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not ask to close again while it is already leaving", () => {
+    const onClose = vi.fn();
+    render(
+      <SidePanel label="nas" onClose={onClose} leaving>
+        body
+      </SidePanel>,
+    );
+    fireEvent.keyDown(screen.getByRole("dialog"), { key: "Escape" });
+    expect(onClose).not.toHaveBeenCalled();
+  });
+
+  it("hangs its resize handle outside its left edge, always visible", () => {
+    expect(rule(".side-panel__grip")).toMatch(/left:\s*calc\(-1/);
+    expect(rule(".side-panel__grip::after")).not.toMatch(/opacity:\s*0/);
+    expect(rule(".side-panel[data-leaving]")).toMatch(/side-panel-out/);
+  });
+
   it("floats at the drawer width over a scrim, and fills a phone", () => {
     expect(rule(".side-panel")).toMatch(/--drawer-width/);
     expect(rule(".side-panel")).toMatch(/--drawer-max/);

@@ -39,9 +39,15 @@ import { KIND_META } from "./kind";
  * Focus moves into the panel when it opens and goes back to whatever had it
  * before — the row or reference that opened it — when it goes.
  *
- * Its left edge is a resize handle: drag it, or focus it and use the arrow
- * keys (Home and End for narrowest and widest). The width is remembered for
- * the next panel, whichever resource it shows (`drawerWidth.ts`).
+ * A resize handle hangs just outside its left edge: drag it, or focus it and
+ * use the arrow keys (Home and End for narrowest and widest). The width is
+ * remembered for the next panel, whichever resource it shows
+ * (`drawerWidth.ts`).
+ *
+ * Closing is the caller's to start and the panel's to finish: the caller
+ * passes `leaving` (see `useExiting`), the panel slides out, and `onExited`
+ * says it has gone so the caller can unmount it. With no exit animation to
+ * wait for — reduced motion, or a test — it goes at once.
  */
 export interface SidePanelProps {
   /** The title, which also names the dialog. */
@@ -53,9 +59,18 @@ export interface SidePanelProps {
   /** The status pill, beside the title. */
   status?: ReactNode;
   onClose: () => void;
+  /** It is on its way out: slide away, ignore further close requests. */
+  leaving?: boolean | undefined;
+  /** Called once the exit has finished. */
+  onExited?: (() => void) | undefined;
   footer?: ReactNode;
   children: ReactNode;
 }
+
+/** The longest an exit may take before it is treated as done anyway. */
+const EXIT_TIMEOUT_MS = 400;
+
+const noop = () => undefined;
 
 export function SidePanel({
   label,
@@ -63,6 +78,8 @@ export function SidePanel({
   kindWord,
   status,
   onClose,
+  leaving = false,
+  onExited,
   footer,
   children,
 }: SidePanelProps) {
@@ -73,15 +90,45 @@ export function SidePanel({
   const [width, setWidth] = useState(() => readDrawerWidth(window.innerWidth));
   const widthRef = useRef(width);
 
+  const exited = useRef(onExited);
+
   useEffect(() => {
-    close.current = onClose;
+    close.current = leaving ? noop : onClose;
+    exited.current = onExited;
   });
+
+  // Slide out, then say so. The exit animation is read off the dialog itself:
+  // none (reduced motion collapses it; a test has no stylesheet) means done.
+  useLayoutEffect(() => {
+    const node = dialog.current;
+    if (!leaving || node === null) return;
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      exited.current?.();
+    };
+    const name = window.getComputedStyle(node).animationName;
+    if (name === "" || name === "none") {
+      finish();
+      return;
+    }
+    const onEnd = (event: AnimationEvent) => {
+      if (event.target === node) finish();
+    };
+    node.addEventListener("animationend", onEnd);
+    const timer = window.setTimeout(finish, EXIT_TIMEOUT_MS);
+    return () => {
+      node.removeEventListener("animationend", onEnd);
+      window.clearTimeout(timer);
+    };
+  }, [leaving]);
 
   useLayoutEffect(() => {
     const node = dialog.current;
     if (node === null) return;
     const opener = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-    let leaving = false;
+    let unmounting = false;
 
     // Escape is heard on the document, after the event has bubbled out of the
     // panel: a confirmation inside that answered it stopped it on the way, and
@@ -106,7 +153,7 @@ export function SidePanel({
     // after the dialog reopened — an open dialog was not closed, whatever the
     // event says.
     const onNativeClose = () => {
-      if (!leaving && !node.open) close.current();
+      if (!unmounting && !node.open) close.current();
     };
 
     document.addEventListener("keydown", onKey);
@@ -116,7 +163,7 @@ export function SidePanel({
     if (!node.open) node.showModal();
     node.focus({ preventScroll: true });
     return () => {
-      leaving = true;
+      unmounting = true;
       document.removeEventListener("keydown", onKey);
       node.removeEventListener("click", onClick);
       node.removeEventListener("cancel", onCancel);
@@ -206,6 +253,7 @@ export function SidePanel({
       className={kind !== undefined ? "side-panel has-stripe" : "side-panel"}
       data-kind={kind !== undefined ? KIND_META[kind].slug : undefined}
       aria-labelledby={titleId}
+      data-leaving={leaving ? "" : undefined}
       tabIndex={-1}
       style={{ "--drawer-width": `${String(width)}px` } as CSSProperties}
     >
@@ -235,7 +283,13 @@ export function SidePanel({
               <div className="side-panel__status">{status}</div>
             ) : null}
           </div>
-          <ActionButton variant="quiet" aria-label="Close details" onClick={onClose}>
+          <ActionButton
+            variant="quiet"
+            aria-label="Close details"
+            onClick={() => {
+              close.current();
+            }}
+          >
             <X size={16} strokeWidth={2} aria-hidden="true" />
           </ActionButton>
         </header>

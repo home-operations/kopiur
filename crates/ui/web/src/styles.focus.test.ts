@@ -49,6 +49,9 @@ const NEVER_FOCUSED = new Set([
   '.theme-switch__option[aria-pressed="true"]',
   // The skip link — covered by its own rule, asserted separately.
   ".skip-link",
+  // The side panel's resize tab is a pseudo-element of the handle; the handle
+  // draws its ring on that tab, asserted separately.
+  ".side-panel__grip::after",
 ]);
 
 function setsOuterBoxShadow(body: string): boolean {
@@ -88,6 +91,11 @@ describe("the focus ring", () => {
 
   it("survives on the skip link, which is the first control a keyboard reaches", () => {
     const rule = all.find((r) => r.selector === ".skip-link:focus-visible");
+    expect(rule?.body).toContain("var(--focus-ring)");
+  });
+
+  it("survives on the side panel's resize handle, drawn on its raised tab", () => {
+    const rule = all.find((r) => r.selector === ".side-panel__grip:focus-visible::after");
     expect(rule?.body).toContain("var(--focus-ring)");
   });
 

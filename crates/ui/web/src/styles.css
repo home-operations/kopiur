@@ -1222,12 +1222,23 @@ html:has(dialog.side-panel[open]) {
   background: var(--bg-surface);
   color: var(--fg);
   box-shadow: var(--shadow-2);
-  overflow: hidden;
+  /* Visible, so the resize handle can hang outside the left edge; the frame
+     clips the content to the corners instead. */
+  overflow: visible;
   animation: side-panel-in var(--dur-base) var(--ease-out);
 }
+.side-panel[data-leaving] {
+  animation: side-panel-out var(--dur-base) var(--ease-out) forwards;
+}
+.side-panel[data-leaving]::backdrop {
+  animation: side-panel-fade-out var(--dur-base) var(--ease-out) forwards;
+}
+/* The panel takes focus only as the starting point for Tab; it is a container,
+   not a control, so it keeps its elevation and draws no ring around itself.
+   Every control inside it carries its own. */
 .side-panel:focus-visible {
   outline: none;
-  box-shadow: var(--shadow-2), var(--focus-ring);
+  box-shadow: var(--shadow-2);
 }
 .side-panel.has-stripe {
   border-left: var(--stripe) solid var(--kc);
@@ -1236,9 +1247,20 @@ html:has(dialog.side-panel[open]) {
   background: var(--scrim);
   animation: side-panel-fade var(--dur-base) var(--ease-out);
 }
+/* Past the right edge by the inset and the handle, so neither peeks in. */
 @keyframes side-panel-in {
   from {
-    transform: translateX(100%);
+    transform: translateX(calc(100% + 3rem));
+  }
+}
+@keyframes side-panel-out {
+  to {
+    transform: translateX(calc(100% + 3rem));
+  }
+}
+@keyframes side-panel-fade-out {
+  to {
+    opacity: 0;
   }
 }
 @keyframes side-panel-fade {
@@ -1246,13 +1268,16 @@ html:has(dialog.side-panel[open]) {
     opacity: 0;
   }
 }
-/* The left edge is the resize handle: an 8px strip over the stripe, with a
-   short bar that shows on hover, on focus and while dragging. */
+/* The resize handle hangs outside the left edge, over the scrim: a
+   full-height strip to grab, carrying a raised rectangular tab with three
+   dots, always shown, standing a few pixels clear of the panel. */
 .side-panel__grip {
   position: absolute;
-  inset: 0 auto 0 0;
+  top: 0;
+  bottom: 0;
+  left: calc(-1 * var(--space-6));
   z-index: 1;
-  width: 8px;
+  width: var(--space-6);
   cursor: ew-resize;
   touch-action: none;
 }
@@ -1260,25 +1285,47 @@ html:has(dialog.side-panel[open]) {
   content: "";
   position: absolute;
   top: 50%;
-  left: 2px;
-  width: 4px;
-  height: 40px;
-  border-radius: var(--radius-pill);
-  background: var(--line-strong);
-  opacity: 0;
+  right: var(--space-3);
+  width: 16px;
+  height: 64px;
+  border: 1px solid var(--line-strong);
+  border-radius: 5px;
+  background-color: var(--bg-surface);
+  /* Three dots, stacked: the conventional "grab here". */
+  background-image:
+    radial-gradient(circle, var(--fg-muted) 2px, transparent 2.5px),
+    radial-gradient(circle, var(--fg-muted) 2px, transparent 2.5px),
+    radial-gradient(circle, var(--fg-muted) 2px, transparent 2.5px);
+  background-position:
+    center calc(50% - 10px),
+    center 50%,
+    center calc(50% + 10px);
+  background-repeat: no-repeat;
+  background-size: 8px 8px;
+  box-shadow: var(--shadow-2);
   transform: translateY(-50%);
-  transition: opacity var(--dur-fast) var(--ease-out);
+  transition:
+    background-color var(--dur-fast) var(--ease-out),
+    border-color var(--dur-fast) var(--ease-out);
 }
 .side-panel__grip:hover::after,
-.side-panel__grip:active::after,
-.side-panel__grip:focus-visible::after {
-  opacity: 1;
+.side-panel__grip:active::after {
+  border-color: var(--accent);
+  background-color: var(--accent-soft);
 }
+/* The strip is invisible; its ring is drawn on the tab below, not round the
+   whole strip. */
 .side-panel__grip:focus-visible {
   outline: none;
-  box-shadow: inset 0 0 0 2px var(--accent);
+  box-shadow: none;
+}
+.side-panel__grip:focus-visible::after {
+  border-color: var(--accent);
+  box-shadow: var(--shadow-2), var(--focus-ring);
 }
 .side-panel__frame {
+  border-radius: inherit;
+  overflow: hidden;
   display: grid;
   grid-template-rows: auto minmax(0, 1fr) auto;
   height: 100%;

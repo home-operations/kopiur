@@ -15,13 +15,14 @@ import type { Problem } from "../../api/types";
 import { EmptyState } from "../EmptyState";
 import { ErrorState } from "../ErrorState";
 import { LampBadge } from "../HealthBadge";
-import { type InspectTarget, useInspect } from "../inspect";
+import { type InspectTarget, inspectToken, useInspect } from "../inspect";
 import { KIND_META } from "../kind";
 import { LoadingState } from "../LoadingState";
 import { ObjectRef } from "../ObjectRef";
 import { type CardRow, cardFacts } from "../objectCard";
 import { SidePanel } from "../SidePanel";
 import { AbsenceText, StatStrip } from "../StatStrip";
+import { useExiting } from "../useExiting";
 import { drawerFacts } from "./drawerFacts";
 
 /**
@@ -33,8 +34,15 @@ import { drawerFacts } from "./drawerFacts";
  */
 export function ResourceDrawer() {
   const { target, close } = useInspect();
-  if (target === null) return null;
-  return <Drawer target={target} onClose={close} />;
+  // Once the URL drops `?inspect=`, the last resource stays on screen while
+  // the panel slides away.
+  const { shown, leaving, exited } = useExiting(target, sameTarget);
+  if (shown === null) return null;
+  return <Drawer target={shown} onClose={close} leaving={leaving} onExited={exited} />;
+}
+
+function sameTarget(a: InspectTarget, b: InspectTarget): boolean {
+  return inspectToken(a) === inspectToken(b);
 }
 
 type Loaded =
@@ -126,7 +134,14 @@ function useDrawerRow(target: InspectTarget): Loaded {
   }
 }
 
-function Drawer({ target, onClose }: { target: InspectTarget; onClose: () => void }) {
+interface DrawerProps {
+  target: InspectTarget;
+  onClose: () => void;
+  leaving: boolean;
+  onExited: () => void;
+}
+
+function Drawer({ target, onClose, leaving, onExited }: DrawerProps) {
   const loaded = useDrawerRow(target);
   const meta = KIND_META[target.kind];
   const facts = loaded.state === "ready" ? cardFacts(loaded.card, new Date()) : undefined;
@@ -144,6 +159,8 @@ function Drawer({ target, onClose }: { target: InspectTarget; onClose: () => voi
       }
       status={facts !== undefined ? <LampBadge lamp={facts.lamp} /> : undefined}
       onClose={onClose}
+      leaving={leaving}
+      onExited={onExited}
       footer={
         facts?.to !== undefined ? (
           <Link className="button" to={facts.to}>

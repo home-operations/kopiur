@@ -650,14 +650,17 @@ resource is looked at without leaving the page you are on.
   the page behind is inert. No z-index is ever needed to stack it.
 - Inset `--space-3` from the top, right and bottom; `--radius-xl`, `--shadow-2`,
   kind stripe on the left edge. Full-screen below 560px.
-- **Resizable.** The left edge is a `role="separator"` handle (`.side-panel__grip`,
-  `aria-orientation="vertical"`, `aria-valuenow` in px): drag it, or focus it and
+- **Resizable.** A `role="separator"` handle (`.side-panel__grip`) hangs just outside
+  the left edge: a full-height grab strip carrying a raised rectangular tab with
+  three vertical dots, always shown, standing clear of the panel
+  (`aria-orientation="vertical"`, `aria-valuenow` in px). Drag it, or focus it and
   use ←/→ (24px), Home/End. It opens at 50% of the window (`--drawer-width`),
   never wider than 85% (`--drawer-max`) nor narrower than `--drawer-min`, and the
   chosen width is remembered in `localStorage` (`kopiur-ui.drawer-width`) for every
   later panel, clamped to the window it reopens in. Hidden on phones.
-- Slides in from the right over `--dur-base`; no exit animation (it unmounts when
-  the URL drops it). Reduced motion collapses both.
+- Slides in from the right over `--dur-base`, and back out when it closes: the
+  caller keeps it mounted while `leaving` (`useExiting`) and unmounts on
+  `onExited`. Reduced motion collapses both, and it goes at once.
 - The head (chip, kind name, mono name, pill, close) and the foot stay put; only
   the body scrolls. A long name wraps in the title, never widens the panel.
 - **The open resource lives in the URL** — `?inspect=<kind-slug>/<namespace>/<name>`

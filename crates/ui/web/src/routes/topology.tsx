@@ -11,7 +11,8 @@ import { Drawer } from "../components/topology/Drawer";
 import { EdgeLegend } from "../components/topology/EdgeLegend";
 import { Graph } from "../components/topology/Graph";
 import { useTopologyLayout } from "../components/topology/layout";
-import { topologyModel, topologyVerdict } from "../components/topology/model";
+import { type TopologyNode, topologyModel, topologyVerdict } from "../components/topology/model";
+import { useExiting } from "../components/useExiting";
 import { relativeTime } from "../util/format";
 import { useCurrentNamespace } from "../util/namespace";
 
@@ -54,6 +55,10 @@ export const Route = createFileRoute("/topology")({
   component: Topology,
 });
 
+function sameNode(a: TopologyNode, b: TopologyNode): boolean {
+  return a.id === b.id;
+}
+
 function Topology() {
   const namespace = useCurrentNamespace();
   const { node: openNode } = Route.useSearch();
@@ -71,6 +76,8 @@ function Topology() {
 
   const selected =
     model !== null && openNode !== undefined ? (model.byId.get(openNode) ?? null) : null;
+  // The last node stays in the drawer while it slides away.
+  const drawer = useExiting(selected, sameNode);
   const open = (node: string | undefined) => {
     const search: TopologySearch & { namespace?: string } = {};
     if (namespace !== undefined) {
@@ -112,10 +119,12 @@ function Topology() {
         ) : (
           <div className="topo-layout">
             <Graph model={model} layout={layout} selected={selected?.id ?? null} onSelect={open} />
-            {selected !== null ? (
+            {drawer.shown !== null ? (
               <Drawer
                 model={model}
-                node={selected}
+                node={drawer.shown}
+                leaving={drawer.leaving}
+                onExited={drawer.exited}
                 namespace={namespace}
                 onClose={() => {
                   open(undefined);

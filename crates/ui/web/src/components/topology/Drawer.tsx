@@ -42,9 +42,12 @@ export interface DrawerProps {
   /** The console's current scope, carried into every link. */
   namespace: string | undefined;
   onClose: () => void;
+  /** Sliding away after the URL dropped `?node=` (see `useExiting`). */
+  leaving?: boolean | undefined;
+  onExited?: (() => void) | undefined;
 }
 
-export function Drawer({ model, node, namespace, onClose }: DrawerProps) {
+export function Drawer({ model, node, namespace, onClose, leaving, onExited }: DrawerProps) {
   const { inbound, outbound } = relationships(model, node.id);
   const section = nodeSection(node.node.kind);
   const search = namespace !== undefined ? { namespace } : {};
@@ -58,6 +61,8 @@ export function Drawer({ model, node, namespace, onClose }: DrawerProps) {
       kindWord={node.kindWord}
       label={node.node.label}
       onClose={onClose}
+      leaving={leaving}
+      onExited={onExited}
       footer={
         section !== null || inspectable ? (
           <>
