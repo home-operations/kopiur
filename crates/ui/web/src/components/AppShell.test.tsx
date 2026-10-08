@@ -111,6 +111,31 @@ describe("AppShell", () => {
     expect(heading).toHaveTextContent("prod");
   });
 
+  it("groups the sections by family, and the group names are not links", async () => {
+    mockShell();
+    mountAt("/");
+    const nav = await screen.findByRole("navigation", { name: "Primary" });
+    for (const group of ["Storage", "Protection", "Data"]) {
+      const label = within(nav).getByText(group);
+      expect(label.closest("a")).toBeNull();
+    }
+    // A kind section carries its kind's chip, so the nav already teaches the colours.
+    const repositories = within(nav).getByRole("link", { name: "Repositories" });
+    expect(repositories.querySelector('[data-kind="repository"]')).not.toBeNull();
+  });
+
+  it("has no header bar: the sidebar holds the namespace switcher, search and user", async () => {
+    mockShell();
+    mountAt("/snapshots?namespace=prod");
+    const sidebar = await screen.findByRole("complementary", { name: "Sections" });
+    expect(within(sidebar).getByRole("button", { name: "Namespace: prod" })).toBeInTheDocument();
+    expect(within(sidebar).getByRole("searchbox", { name: "Find an object" })).toBeInTheDocument();
+    expect(
+      await within(sidebar).findByText("alice", { selector: ".identity__user" }),
+    ).toBeInTheDocument();
+    expect(document.querySelector("header.header")).toBeNull();
+  });
+
   it("shows the signed-in identity and re-asks /me for the current namespace", async () => {
     mockShell();
     mountAt("/policies?namespace=prod");

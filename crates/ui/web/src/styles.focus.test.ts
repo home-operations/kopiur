@@ -31,8 +31,11 @@ const CSS = readStyles();
 const NEVER_FOCUSED = new Set([
   // A stat strip's card lift: a `<dl>`, never focusable.
   ".stats",
-  // A floating panel, not a control.
+  // Floating panels and the open drawer: containers, not controls.
   ".identity__panel",
+  ".ns-switcher__panel",
+  ".search__results",
+  '.shell[data-nav-open="true"] .sidebar',
   // The pressed theme option — covered by its own rule, asserted separately.
   '.theme-switch__option[aria-pressed="true"]',
   // The skip link — covered by its own rule, asserted separately.
