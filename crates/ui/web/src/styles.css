@@ -1213,7 +1213,10 @@ a.object-name:hover {
   flex-direction: column;
   gap: 3px;
   height: 100vh;
-  overflow-y: auto;
+  /* No overflow here: the nav scrolls instead, so the user card's panel can
+     open over the page instead of being clipped at the sidebar's edge. The
+     z-index keeps that panel above the page it spills onto. */
+  z-index: 20;
   padding: 14px 12px;
   border-right: 1px solid var(--line);
   background: var(--bg-surface);
@@ -1242,7 +1245,11 @@ a.object-name:hover {
 
 .sidebar__nav {
   display: grid;
+  align-content: start;
   gap: 2px;
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
   margin-top: var(--space-1);
 }
 
@@ -1570,21 +1577,20 @@ a.object-name:hover {
   font-size: var(--text-xs);
 }
 
-/* The panel flies out beside the sidebar rather than inside it: the sidebar
-   scrolls, so anything positioned within it is clipped at its edge. Fixed,
-   anchored to the bottom where the chip sits, and wider than tall — who you
-   are on the left, what you may do on the right. */
+/* The panel opens above the chip from its left edge, wider than the sidebar
+   so it spills out over the page — who you are on the left, what you may do
+   on the right. */
 .identity__panel {
-  position: fixed;
-  bottom: 14px;
-  left: calc(var(--sidebar-width) + 10px);
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 0;
   z-index: 60;
   display: grid;
   grid-template-columns: minmax(0, 15rem) minmax(0, 1fr);
   align-content: start;
   gap: 10px 22px;
-  width: min(44rem, calc(100vw - var(--sidebar-width) - 24px));
-  max-height: calc(100vh - 28px);
+  width: min(44rem, calc(100vw - 24px));
+  max-height: calc(100vh - 90px);
   overflow-y: auto;
   padding: 16px 18px;
   border: 1px solid var(--line);

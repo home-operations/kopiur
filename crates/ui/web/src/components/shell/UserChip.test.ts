@@ -6,10 +6,20 @@ describe("UserChip panel", () => {
   const rule = (selector: string) =>
     cssRules(readStyles()).find((r) => r.selector === selector)?.body ?? "";
 
-  it("flies out of the sidebar — fixed, not clipped by the sidebar's own scroll", () => {
+  it("opens above the chip, from its left edge", () => {
     const panel = rule(".identity__panel");
-    expect(panel).toMatch(/position:\s*fixed/);
-    expect(panel).toMatch(/left:\s*calc\(var\(--sidebar-width\)/);
+    expect(panel).toMatch(/position:\s*absolute/);
+    expect(panel).toMatch(/bottom:\s*calc\(100% \+/);
+    expect(panel).toMatch(/left:\s*0/);
+  });
+
+  it("is wider than the sidebar, so it spills out over the page", () => {
+    expect(rule(".identity__panel")).toMatch(/width:\s*min\(44rem/);
+  });
+
+  it("is not clipped: the sidebar does not scroll, only its nav does", () => {
+    expect(rule(".sidebar")).not.toMatch(/overflow/);
+    expect(rule(".sidebar__nav")).toMatch(/overflow-y:\s*auto/);
   });
 
   it("is a rectangle: identity on the left, capabilities beside it", () => {
