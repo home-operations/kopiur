@@ -3,6 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { problemBanner } from "../api/problem";
+import { cssRules, readStyles } from "../testing/css";
 import type { RepositoryGraph } from "../api/types";
 import type { LaidOut } from "../components/topology/elk";
 import { NODE_HEIGHT, NODE_WIDTH } from "../components/topology/elk";
@@ -268,6 +269,12 @@ describe("Topology", () => {
     expect(within(drawer).getByText("Fix")).toBeInTheDocument();
     const into = within(drawer).getByRole("region", { name: "Pointed at by" });
     expect(within(into).getByRole("link", { name: /orphaned/ })).toBeInTheDocument();
+  });
+
+  it("draws a resource plate as a plate, not as underlined link text", () => {
+    const rule = cssRules(readStyles()).find((r) => r.selector === "a.topo-node");
+    expect(rule?.body).toMatch(/text-decoration:\s*none/);
+    expect(rule?.body).toMatch(/color:\s*inherit/);
   });
 
   it("leaves a backend, a namespace and a selector as plates, not controls", async () => {

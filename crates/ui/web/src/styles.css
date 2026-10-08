@@ -2856,6 +2856,12 @@ html:has(dialog.side-panel[open]) {
     border-color var(--dur-fast) var(--ease-out);
 }
 
+/* A resource plate is a link to its drawer; it still reads as a plate. */
+a.topo-node {
+  color: inherit;
+  text-decoration: none;
+}
+
 .topo-node:hover {
   background: var(--bg-hover);
 }
