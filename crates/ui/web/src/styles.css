@@ -1366,11 +1366,21 @@ html:has(dialog.side-panel[open]) {
   align-content: start;
   gap: var(--space-5);
 }
+.side-panel__body[data-layout="fill"] {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  padding: 0;
+}
+/* The foot holds the actions. A confirmation that opens grows it upwards;
+   past 60% of the panel it scrolls rather than squeezing the body away. */
 .side-panel__foot {
   display: flex;
   justify-content: flex-end;
   flex-wrap: wrap;
   gap: var(--space-2);
+  max-height: 60%;
+  overflow-y: auto;
   padding: var(--space-3) var(--space-5);
   border-top: 1px solid var(--line);
   background: var(--bg-canvas);
@@ -1398,6 +1408,161 @@ html:has(dialog.side-panel[open]) {
 }
 
 /* ---- resource drawer: what the side panel says about a resource ------------ */
+/* The head: the resource's main information, above the tabs. */
+.drawer__head {
+  display: grid;
+  gap: var(--space-4);
+  flex: none;
+  padding: var(--space-4) var(--space-5) var(--space-4);
+}
+.drawer__head .verdict {
+  padding: 0;
+  border-bottom: 0;
+}
+.drawer__findings {
+  display: grid;
+  gap: var(--space-3);
+}
+/* The tabs take the rest of the height; their panel is the scroller. On a
+   short window they keep a usable minimum and the whole body scrolls. */
+.side-panel__body[data-layout="fill"] > .tabs {
+  flex: 1 0 auto;
+  min-height: 16rem;
+}
+.side-panel__body[data-layout="fill"] > .drawer__panel {
+  flex: 1 0 auto;
+  padding: var(--space-4) var(--space-5) var(--space-5);
+  display: grid;
+  align-content: start;
+  gap: var(--space-5);
+}
+
+/* The actions: a row of buttons at the very bottom, with an open
+   confirmation and any receipt stacked above it. */
+.drawer-actions {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  width: 100%;
+}
+.drawer-actions > .action-bar {
+  order: 2;
+}
+
+/* ---- chain: where a resource sits, read left to right -------------------- */
+.chain {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2) var(--space-3);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.chain__step {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  min-width: 0;
+}
+.chain__group {
+  display: grid;
+  gap: var(--space-1);
+  min-width: 0;
+}
+.chain__label {
+  color: var(--fg-muted);
+  font-size: var(--text-xs);
+}
+.chain__items {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.chain__arrow {
+  color: var(--fg-muted);
+}
+.chain__here {
+  padding: var(--space-1) var(--space-3);
+  border: 1px dashed var(--line-strong);
+  border-radius: var(--radius-md);
+  color: var(--fg-muted);
+  font-size: var(--text-sm);
+}
+.chain__text {
+  font-size: var(--text-sm);
+  overflow-wrap: anywhere;
+}
+
+/* ---- tabs: a row of names over one panel ---------------------------------- */
+.tabs {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+/* The hairline is an inset shadow, not a border, so the selected tab's
+   underline sits on it rather than below it. */
+.tabs__list {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  display: flex;
+  gap: var(--space-4);
+  flex: none;
+  padding: 0 var(--space-5);
+  overflow-x: auto;
+  overflow-y: hidden;
+  background: var(--bg-surface);
+  box-shadow: inset 0 -1px 0 var(--line);
+}
+.tabs__tab {
+  flex: none;
+  min-height: 40px;
+  padding: 0;
+  border: 0;
+  border-bottom: 2.5px solid transparent;
+  background: none;
+  color: var(--fg-muted);
+  font: inherit;
+  font-size: var(--text-sm);
+  font-weight: 600;
+  cursor: pointer;
+}
+.tabs__tab:hover {
+  color: var(--fg);
+}
+.tabs__tab[aria-selected="true"] {
+  border-bottom-color: var(--accent);
+  color: var(--fg);
+}
+.tabs__tab:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+  box-shadow: none;
+}
+.tabs__count {
+  padding: 0 var(--space-2);
+  border-radius: var(--radius-pill);
+  background: var(--bg-inset);
+  font-size: var(--text-xs);
+}
+.tabs__panel {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: grid;
+  align-content: start;
+  gap: var(--space-5);
+  padding: var(--space-4) var(--space-5) var(--space-5);
+}
+.tabs__panel:focus-visible {
+  outline: none;
+  box-shadow: inset 0 0 0 2px var(--accent);
+}
+
 .drawer__section {
   display: grid;
   gap: var(--space-2);

@@ -130,6 +130,27 @@ describe("SidePanel", () => {
     });
   });
 
+  it("gives its body to the content to divide when laid out to fill", () => {
+    const { container, rerender } = render(
+      <SidePanel label="nas" onClose={noop}>
+        body
+      </SidePanel>,
+    );
+    expect(container.ownerDocument.querySelector(".side-panel__body")).not.toHaveAttribute(
+      "data-layout",
+    );
+    rerender(
+      <SidePanel label="nas" onClose={noop} layout="fill">
+        body
+      </SidePanel>,
+    );
+    expect(container.ownerDocument.querySelector(".side-panel__body")).toHaveAttribute(
+      "data-layout",
+      "fill",
+    );
+    expect(rule('.side-panel__body[data-layout="fill"]')).toMatch(/padding:\s*0/);
+  });
+
   it("shows a footer only when given one", () => {
     const { container, rerender } = render(
       <SidePanel label="nas" onClose={noop}>

@@ -661,8 +661,14 @@ resource is looked at without leaving the page you are on.
 - Slides in from the right over `--dur-base`, and back out when it closes: the
   caller keeps it mounted while `leaving` (`useExiting`) and unmounts on
   `onExited`. Reduced motion collapses both, and it goes at once.
-- The head (chip, kind name, mono name, pill, close) and the foot stay put; only
-  the body scrolls. A long name wraps in the title, never widens the panel.
+- The head (chip, kind name, mono name, pill, close) and the foot stay put.
+- **Resource drawer anatomy** (`layout="fill"`): under the panel head, the
+  resource's **main information** (`.drawer__head`: the verdict as a lettered
+  lamp and one sentence, then the **chain** — what feeds it → this → what it
+  feeds — then three or four headline stats, then any gate or failure finding);
+  then **tabs** holding everything else, whose panel is the scroller; then the
+  **actions** in the foot — a row of buttons with an open inline confirmation and
+  any receipt stacked above it. A kind with one tab draws no tab list. A long name wraps in the title, never widens the panel.
 - **The open resource lives in the URL** — `?inspect=<kind-slug>/<namespace>/<name>`
   (`cluster-repository/<name>` for the cluster-scoped kind). Opening pushes one
   history entry, so Back closes it; opening another resource from inside replaces
@@ -672,3 +678,35 @@ resource is looked at without leaving the page you are on.
   confirmation inside the panel owns Escape first.
 - Things that are not resources (a topology backend or namespace) use the same
   panel with a kind word and no stripe.
+
+---
+
+## Tabs
+
+**What:** a row of names over one panel — the resource drawer's way of holding
+everything that is not the resource's main information.
+
+```html
+<div class="tabs">
+  <div class="tabs__list" role="tablist" aria-label="About this repository">
+    <button role="tab" id="t-storage" aria-selected="true" aria-controls="p-storage" tabindex="0">
+      Storage
+    </button>
+    <button role="tab" id="t-catalog" aria-selected="false" aria-controls="p-catalog" tabindex="-1">
+      Catalog <span class="tabs__count">3</span>
+    </button>
+  </div>
+  <div class="tabs__panel" role="tabpanel" id="p-storage" aria-labelledby="t-storage" tabindex="0">
+    …
+  </div>
+</div>
+```
+
+- One tab stop: the selected tab is in the tab order; ←/→ move and select
+  (wrapping), Home/End jump. Only the selected panel is mounted, so a tab that
+  reads something reads it when opened, not before.
+- 40px tabs, `--text-sm` semibold in `--fg-muted`; the selected one is `--fg`
+  with a 2.5px `--accent` underline sitting on the list's hairline (an inset
+  shadow, not a border). The list scrolls sideways rather than wrapping.
+- A count sits beside a tab's name as a small inset pill, and is read with it.
+- A tab id the list does not have selects the first tab.

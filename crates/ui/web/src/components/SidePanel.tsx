@@ -63,6 +63,12 @@ export interface SidePanelProps {
   leaving?: boolean | undefined;
   /** Called once the exit has finished. */
   onExited?: (() => void) | undefined;
+  /**
+   * `padded` (the default) pads the body and stacks its children; `fill`
+   * hands the whole body to the content to divide — a head, then tabs whose
+   * panel is the scroller.
+   */
+  layout?: "padded" | "fill" | undefined;
   footer?: ReactNode;
   children: ReactNode;
 }
@@ -80,6 +86,7 @@ export function SidePanel({
   onClose,
   leaving = false,
   onExited,
+  layout = "padded",
   footer,
   children,
 }: SidePanelProps) {
@@ -293,7 +300,9 @@ export function SidePanel({
             <X size={16} strokeWidth={2} aria-hidden="true" />
           </ActionButton>
         </header>
-        <div className="side-panel__body">{children}</div>
+        <div className="side-panel__body" data-layout={layout === "fill" ? "fill" : undefined}>
+          {children}
+        </div>
         {footer !== undefined && footer !== null ? (
           <footer className="side-panel__foot">{footer}</footer>
         ) : null}
