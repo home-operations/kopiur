@@ -1,6 +1,6 @@
 import { screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { problemBanner } from "../../../api/problem";
 import type { ActionReceipt, Capabilities, RepositoryDetail } from "../../../api/types";
@@ -565,6 +565,23 @@ describe("Repository drawer — where it sits", () => {
     await waitFor(() => {
       expect(copies.querySelector(".health")).toHaveAttribute("data-health", "failed");
     });
+  });
+
+  it("keeps a replication it cannot read as text, and the drawer standing", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    mockApi({
+      "/api/v1/repositories/repository/nas": jsonResponse({
+        ...detail,
+        // An older server's bare name, and a kind this bundle does not know.
+        replicationsOut: ["offsite", { kind: "bucketReplication", namespace: "media", name: "b" }],
+      }),
+    });
+    mountApp(NAS);
+    const chain = await within(await drawer()).findByRole("list", { name: "Where this sits" });
+    const copies = within(chain).getByRole("listitem", { name: "Copies to" });
+    expect(copies).toHaveTextContent("offsite");
+    expect(copies).toHaveTextContent("bucketReplication");
+    expect(screen.getByRole("status", { name: "Repository verdict" })).toBeInTheDocument();
   });
 
   it("names an unloaded replication in the kind the server gave, not a guessed one", async () => {

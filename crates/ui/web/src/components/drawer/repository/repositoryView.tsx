@@ -6,6 +6,7 @@ import type {
   ReplicationsView,
   RepositoryDetail,
 } from "../../../api/types";
+import { unknownVariant } from "../../../util/assertNever";
 import { humanBytes, relativeTime } from "../../../util/format";
 import { ConditionsTable } from "../../ConditionsTable";
 import { cardFacts } from "../../objectCard";
@@ -48,6 +49,14 @@ function replicationItem(
     case "repositoryReplication": {
       const row = rows?.repository.find(same);
       return { ref: target, health: row && cardFacts({ kind: ref.kind, row }, now).lamp };
+    }
+    default: {
+      // A kind this bundle does not know, or an older server's bare name: shown
+      // as the server sent it, never dropped and never guessed into a link.
+      const raw: unknown = ref;
+      return {
+        text: typeof raw === "string" ? raw : unknownVariant(ref.kind, "ReplicationKind"),
+      };
     }
   }
 }
