@@ -1,11 +1,14 @@
 import { ShieldOff } from "lucide-react";
+import type { ReactNode } from "react";
 
 import type { DoctorCheckView, DoctorScopeView } from "../api/types";
 import { unknownVariant } from "../util/assertNever";
 import { EMPTY_CELL } from "../util/format";
+import { ColumnLedger } from "./ColumnLedger";
 import { Finding } from "./Finding";
 import { HealthBadge } from "./HealthBadge";
 import { doctorOutcomeLamp, isRbacDegraded } from "./doctor";
+import type { ColumnSpec } from "./tableColumns";
 
 /**
  * The doctor report as a ledger: one row per check, the outcome as a lamp,
@@ -77,57 +80,73 @@ function scopeCell(scope: DoctorScopeView, namespace: string | undefined) {
   }
 }
 
+type DoctorColumn = "outcome" | "check" | "scope" | "finding";
+
+/**
+ * The outcome and the check name the row, so neither can be hidden or moved;
+ * the finding is the prose column and takes the room that is left.
+ */
+const DOCTOR_COLUMNS: readonly ColumnSpec<DoctorColumn>[] = [
+  { id: "outcome", label: "Outcome", width: 130, min: 100, locked: true },
+  { id: "check", label: "Check", width: 240, min: 140, locked: true },
+  { id: "scope", label: "Scope", width: 200, min: 100, className: "doctor-checks__scope" },
+  { id: "finding", label: "Finding", width: "auto", min: 260 },
+];
+
 export function DoctorChecks({ checks, namespace }: DoctorChecksProps) {
   return (
-    <div className="ledger-scroll">
-      <table className="ledger doctor-checks" aria-label="Doctor checks">
-        <thead>
-          <tr>
-            <th scope="col">Outcome</th>
-            <th scope="col">Check</th>
-            <th scope="col">Scope</th>
-            <th scope="col">Finding</th>
-          </tr>
-        </thead>
-        <tbody>
-          {checks.map((check) => {
-            const lamp = doctorOutcomeLamp(check.outcome);
-            const rbac = isRbacDegraded(check);
-            return (
-              <tr key={check.check} data-degraded={rbac ? "rbac" : undefined}>
-                <td>
-                  <HealthBadge health={lamp.key} label={lamp.word} />
-                </td>
-                <td>
-                  <div className="doctor-checks__check">
-                    <span className="doctor-checks__title">{check.title}</span>
-                    <span className="mono doctor-checks__id">{check.check}</span>
-                  </div>
-                </td>
-                <td className="doctor-checks__scope">{scopeCell(check.scope, namespace)}</td>
-                <td>
-                  <div className="doctor-checks__finding">
-                    {check.what !== undefined && check.what !== null && check.what.length > 0 ? (
-                      <Finding what={check.what} why={check.why} fix={check.fix} />
-                    ) : (
-                      EMPTY_CELL
-                    )}
-                    {rbac ? (
-                      <p className="doctor-checks__rbac">
-                        <ShieldOff size={14} strokeWidth={2} aria-hidden="true" />
-                        <span>
-                          You are not permitted to run this check. The grant named above enables it;
-                          the cluster itself may be fine.
-                        </span>
-                      </p>
-                    ) : null}
-                  </div>
-                </td>
-              </tr>
-            );
-          })}
-        </tbody>
-      </table>
-    </div>
+    <ColumnLedger
+      id="doctor"
+      label="Doctor checks"
+      className="doctor-checks"
+      columns={DOCTOR_COLUMNS}
+      rows={checks}
+      rowKey={(check) => check.check}
+      rowProps={(check) => ({ "data-degraded": isRbacDegraded(check) ? "rbac" : undefined })}
+      cell={(check, id) => doctorCell(check, id, namespace)}
+    />
   );
+}
+
+function doctorCell(
+  check: DoctorCheckView,
+  id: DoctorColumn,
+  namespace: string | undefined,
+): ReactNode {
+  switch (id) {
+    case "outcome": {
+      const lamp = doctorOutcomeLamp(check.outcome);
+      return <HealthBadge health={lamp.key} label={lamp.word} />;
+    }
+    case "check":
+      return (
+        <div className="doctor-checks__check">
+          <span className="doctor-checks__title">{check.title}</span>
+          <span className="mono doctor-checks__id">{check.check}</span>
+        </div>
+      );
+    case "scope":
+      return scopeCell(check.scope, namespace);
+    case "finding":
+      return (
+        <div className="doctor-checks__finding">
+          {check.what !== undefined && check.what !== null && check.what.length > 0 ? (
+            <Finding what={check.what} why={check.why} fix={check.fix} />
+          ) : (
+            EMPTY_CELL
+          )}
+          {isRbacDegraded(check) ? (
+            <p className="doctor-checks__rbac">
+              <ShieldOff size={14} strokeWidth={2} aria-hidden="true" />
+              <span>
+                You are not permitted to run this check. The grant named above enables it; the
+                cluster itself may be fine.
+              </span>
+            </p>
+          ) : null}
+        </div>
+      );
+    default:
+      return id satisfies never;
+  }
 }
