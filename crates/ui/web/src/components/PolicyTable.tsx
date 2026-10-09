@@ -1,11 +1,15 @@
+import type { ReactNode } from "react";
+
 import type { PolicyRow } from "../api/types";
 import { relativeTime } from "../util/format";
+import { ColumnLedger } from "./ColumnLedger";
 import { LampBadge } from "./HealthBadge";
 import { healthLamp, loudLamp } from "./health";
 import { snapshotCount } from "./policy";
 import { KindChip } from "./KindMark";
 import { WireRef } from "./ObjectRef";
 import { InspectLink } from "./InspectLink";
+import type { ColumnSpec } from "./tableColumns";
 
 /**
  * Every `SnapshotPolicy` in scope: what it writes into, whether it is
@@ -24,70 +28,80 @@ export interface PolicyTableProps {
   now?: Date | undefined;
 }
 
+type PolicyColumn =
+  | "policy"
+  | "writesInto"
+  | "state"
+  | "lastSnapshot"
+  | "lastVerified"
+  | "snapshots";
+
+const POLICY_COLUMNS: readonly ColumnSpec<PolicyColumn>[] = [
+  { id: "policy", label: "Policy", width: "auto", min: 220, locked: true, stripe: true },
+  { id: "writesInto", label: "Writes into", width: 260, min: 130 },
+  { id: "state", label: "State", width: 130, min: 80 },
+  { id: "lastSnapshot", label: "Last snapshot", width: 170, min: 130 },
+  { id: "lastVerified", label: "Last verified", width: 170, min: 130 },
+  { id: "snapshots", label: "Snapshots", width: 110, min: 110, numeric: true },
+];
+
 export function PolicyTable({ policies, now = new Date() }: PolicyTableProps) {
   return (
-    <div className="ledger-scroll">
-      <table className="ledger policy-table" aria-label="Policies">
-        <thead>
-          <tr>
-            <th scope="col">Policy</th>
-            <th scope="col">Writes into</th>
-            <th scope="col">State</th>
-            <th scope="col">Last snapshot</th>
-            <th scope="col">Last verified</th>
-            <th scope="col" className="num">
-              Snapshots
-            </th>
-          </tr>
-        </thead>
-        <tbody>
-          {policies.map((policy) => (
-            <tr key={`${policy.namespace}/${policy.name}`} data-kind="snapshot-policy">
-              <td className="has-stripe">
-                <div className="table__object">
-                  <KindChip kind="snapshotPolicy" size="sm" />
-                  <div className="policy-table__object">
-                    <span className="label-strip">
-                      <span className="label-strip__name">
-                        <InspectLink
-                          className="row-link"
-                          target={{
-                            kind: "snapshotPolicy",
-                            namespace: policy.namespace,
-                            name: policy.name,
-                          }}
-                        >
-                          {policy.name}
-                        </InspectLink>
-                      </span>
-                    </span>
-                    <span className="policy-table__namespace mono">{policy.namespace}</span>
-                  </div>
-                </div>
-              </td>
-              <td>
-                <Repositories policy={policy} />
-              </td>
-              <td>
-                {policy.suspended ? (
-                  <LampBadge lamp={healthLamp("suspended")} />
-                ) : (
-                  <span className="policy-table__active">Active</span>
-                )}
-              </td>
-              <td>
-                <Instant at={policy.lastSuccessfulSnapshot} now={now} never="never succeeded" />
-              </td>
-              <td>
-                <Instant at={policy.lastVerified} now={now} never="never verified" />
-              </td>
-              <td className="num">{snapshotCount(policy.activeSnapshotCount)}</td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
+    <ColumnLedger
+      id="policies"
+      label="Policies"
+      className="policy-table"
+      columns={POLICY_COLUMNS}
+      rows={policies}
+      rowKey={(p) => `${p.namespace}/${p.name}`}
+      rowProps={() => ({ "data-kind": "snapshot-policy" })}
+      cell={(policy, id) => policyCell(policy, id, now)}
+    />
   );
+}
+
+function policyCell(policy: PolicyRow, id: PolicyColumn, now: Date): ReactNode {
+  switch (id) {
+    case "policy":
+      return (
+        <div className="table__object">
+          <KindChip kind="snapshotPolicy" size="sm" />
+          <div className="policy-table__object">
+            <span className="label-strip">
+              <span className="label-strip__name">
+                <InspectLink
+                  className="row-link"
+                  target={{
+                    kind: "snapshotPolicy",
+                    namespace: policy.namespace,
+                    name: policy.name,
+                  }}
+                >
+                  {policy.name}
+                </InspectLink>
+              </span>
+            </span>
+            <span className="policy-table__namespace mono">{policy.namespace}</span>
+          </div>
+        </div>
+      );
+    case "writesInto":
+      return <Repositories policy={policy} />;
+    case "state":
+      return policy.suspended ? (
+        <LampBadge lamp={healthLamp("suspended")} />
+      ) : (
+        <span className="policy-table__active">Active</span>
+      );
+    case "lastSnapshot":
+      return <Instant at={policy.lastSuccessfulSnapshot} now={now} never="never succeeded" />;
+    case "lastVerified":
+      return <Instant at={policy.lastVerified} now={now} never="never verified" />;
+    case "snapshots":
+      return snapshotCount(policy.activeSnapshotCount);
+    default:
+      return id satisfies never;
+  }
 }
 
 /** The repositories a policy writes into, and whether that is a fan-out. */

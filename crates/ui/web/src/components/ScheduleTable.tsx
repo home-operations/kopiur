@@ -2,12 +2,14 @@ import type { ReactNode } from "react";
 
 import type { ScheduleRow } from "../api/types";
 import { relativeTime } from "../util/format";
+import { ColumnLedger } from "./ColumnLedger";
 import { LampBadge } from "./HealthBadge";
 import { healthLamp, loudLamp } from "./health";
 import { firesBySelector, scheduleCron, scheduleFires } from "./schedule";
 import { KindChip } from "./KindMark";
 import { ObjectRef } from "./ObjectRef";
 import { InspectLink } from "./InspectLink";
+import type { ColumnSpec } from "./tableColumns";
 
 /**
  * Every `SnapshotSchedule` in scope: the cron, what it fires, when it last
@@ -28,72 +30,91 @@ export interface ScheduleTableProps {
   now?: Date | undefined;
 }
 
+type ScheduleColumn = "schedule" | "cron" | "fires" | "state" | "lastFire" | "nextFire" | "action";
+
+const SCHEDULE_COLUMNS: readonly ColumnSpec<ScheduleColumn>[] = [
+  { id: "schedule", label: "Schedule", width: "auto", min: 220, locked: true, stripe: true },
+  { id: "cron", label: "Cron", width: 140, min: 80, className: "mono schedule-table__cron" },
+  { id: "fires", label: "Fires", width: 220, min: 100 },
+  { id: "state", label: "State", width: 150, min: 80 },
+  { id: "lastFire", label: "Last fire", width: 130, min: 100, numeric: true },
+  { id: "nextFire", label: "Next fire", width: 130, min: 100, numeric: true },
+];
+
+/** With the route's suspend control: a column of buttons, kept last. */
+const SCHEDULE_COLUMNS_WITH_ACTION: readonly ColumnSpec<ScheduleColumn>[] = [
+  ...SCHEDULE_COLUMNS,
+  {
+    id: "action",
+    label: "Action",
+    width: 170,
+    min: 120,
+    locked: true,
+    resizable: false,
+    className: "schedule-table__action",
+  },
+];
+
 export function ScheduleTable({ schedules, renderAction, now = new Date() }: ScheduleTableProps) {
   return (
-    <div className="ledger-scroll">
-      <table className="ledger schedule-table" aria-label="Schedules">
-        <thead>
-          <tr>
-            <th scope="col">Schedule</th>
-            <th scope="col">Cron</th>
-            <th scope="col">Fires</th>
-            <th scope="col">State</th>
-            <th scope="col" className="num">
-              Last fire
-            </th>
-            <th scope="col" className="num">
-              Next fire
-            </th>
-            {renderAction !== undefined ? <th scope="col">Action</th> : null}
-          </tr>
-        </thead>
-        <tbody>
-          {schedules.map((schedule) => (
-            <tr key={`${schedule.namespace}/${schedule.name}`} data-kind="snapshot-schedule">
-              <td className="has-stripe">
-                <div className="table__object">
-                  <KindChip kind="snapshotSchedule" size="sm" />
-                  <div className="schedule-table__object">
-                    <span className="label-strip">
-                      <span className="label-strip__name">
-                        <InspectLink
-                          className="row-link"
-                          target={{
-                            kind: "snapshotSchedule",
-                            namespace: schedule.namespace,
-                            name: schedule.name,
-                          }}
-                        >
-                          {schedule.name}
-                        </InspectLink>
-                      </span>
-                    </span>
-                    <span className="schedule-table__namespace mono">{schedule.namespace}</span>
-                  </div>
-                </div>
-              </td>
-              <td className="mono schedule-table__cron">{scheduleCron(schedule)}</td>
-              <td>
-                <Fires schedule={schedule} />
-              </td>
-              <td>
-                <State schedule={schedule} />
-              </td>
-              <td className="num">
-                <Fire at={schedule.lastFire} now={now} never="never fired" />
-              </td>
-              <td className="num">
-                <Fire at={schedule.nextFire} now={now} never="none computed" />
-              </td>
-              {renderAction !== undefined ? (
-                <td className="schedule-table__action">{renderAction(schedule)}</td>
-              ) : null}
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
+    <ColumnLedger
+      id="schedules"
+      label="Schedules"
+      className="schedule-table"
+      columns={renderAction === undefined ? SCHEDULE_COLUMNS : SCHEDULE_COLUMNS_WITH_ACTION}
+      rows={schedules}
+      rowKey={(s) => `${s.namespace}/${s.name}`}
+      rowProps={() => ({ "data-kind": "snapshot-schedule" })}
+      cell={(schedule, id) => scheduleCell(schedule, id, now, renderAction)}
+    />
   );
+}
+
+function scheduleCell(
+  schedule: ScheduleRow,
+  id: ScheduleColumn,
+  now: Date,
+  renderAction: ScheduleTableProps["renderAction"],
+): ReactNode {
+  switch (id) {
+    case "schedule":
+      return (
+        <div className="table__object">
+          <KindChip kind="snapshotSchedule" size="sm" />
+          <div className="schedule-table__object">
+            <span className="label-strip">
+              <span className="label-strip__name">
+                <InspectLink
+                  className="row-link"
+                  target={{
+                    kind: "snapshotSchedule",
+                    namespace: schedule.namespace,
+                    name: schedule.name,
+                  }}
+                >
+                  {schedule.name}
+                </InspectLink>
+              </span>
+            </span>
+            <span className="schedule-table__namespace mono">{schedule.namespace}</span>
+          </div>
+        </div>
+      );
+    case "cron":
+      return scheduleCron(schedule);
+    case "fires":
+      return <Fires schedule={schedule} />;
+    case "state":
+      return <State schedule={schedule} />;
+    case "lastFire":
+      return <Fire at={schedule.lastFire} now={now} never="never fired" />;
+    case "nextFire":
+      return <Fire at={schedule.nextFire} now={now} never="none computed" />;
+    case "action":
+      return renderAction?.(schedule) ?? null;
+    default:
+      return id satisfies never;
+  }
 }
 
 /**

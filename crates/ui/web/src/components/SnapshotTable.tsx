@@ -1,12 +1,15 @@
 import { Pin } from "lucide-react";
+import type { ReactNode } from "react";
 
 import type { SnapshotRow } from "../api/types";
 import { EMPTY_CELL, humanAge, humanBytes, humanDuration } from "../util/format";
+import { ColumnLedger } from "./ColumnLedger";
 import { LampBadge } from "./HealthBadge";
 import { KindChip } from "./KindMark";
 import { ObjectRef, WireRef } from "./ObjectRef";
 import { durationSeconds, originLabel, snapshotPhaseLamp } from "./snapshot";
 import { InspectLink } from "./InspectLink";
+import type { ColumnSpec } from "./tableColumns";
 
 /**
  * The snapshots ledger: one row per `Snapshot` resource, newest run first.
@@ -42,95 +45,109 @@ export interface SnapshotTableProps {
   caption?: string | undefined;
 }
 
+type SnapshotColumn =
+  | "snapshot"
+  | "phase"
+  | "origin"
+  | "policy"
+  | "repository"
+  | "size"
+  | "files"
+  | "started"
+  | "took";
+
+const SNAPSHOT_COLUMNS: readonly ColumnSpec<SnapshotColumn>[] = [
+  { id: "snapshot", label: "Snapshot", width: "auto", min: 220, locked: true, stripe: true },
+  { id: "phase", label: "Phase", width: 140, min: 90 },
+  { id: "origin", label: "Origin", width: 120, min: 80 },
+  { id: "policy", label: "Policy", width: 180, min: 90 },
+  {
+    id: "repository",
+    label: "Repository",
+    width: 200,
+    min: 120,
+    className: "snapshot-table__repository",
+  },
+  { id: "size", label: "Size", width: 100, min: 70, numeric: true },
+  { id: "files", label: "Files", width: 120, min: 70, numeric: true },
+  { id: "started", label: "Started", width: 110, min: 90, numeric: true },
+  { id: "took", label: "Took", width: 90, min: 70, numeric: true },
+];
+
 export function SnapshotTable({
   rows,
   now = new Date(),
   caption = "Snapshots",
 }: SnapshotTableProps) {
   return (
-    <div className="ledger-scroll">
-      <table className="ledger snapshot-table" aria-label={caption}>
-        <thead>
-          <tr>
-            <th scope="col">Snapshot</th>
-            <th scope="col">Phase</th>
-            <th scope="col">Origin</th>
-            <th scope="col">Policy</th>
-            <th scope="col">Repository</th>
-            <th scope="col" className="num">
-              Size
-            </th>
-            <th scope="col" className="num">
-              Files
-            </th>
-            <th scope="col" className="num">
-              Started
-            </th>
-            <th scope="col" className="num">
-              Took
-            </th>
-          </tr>
-        </thead>
-        <tbody>
-          {rows.map((row) => (
-            <tr key={`${row.namespace}/${row.name}`} data-kind="snapshot">
-              <td className="has-stripe">
-                <div className="table__object">
-                  <KindChip kind="snapshot" size="sm" />
-                  <div className="snapshot-table__object">
-                    <InspectLink
-                      className="row-link mono snapshot-table__name"
-                      target={{ kind: "snapshot", namespace: row.namespace, name: row.name }}
-                    >
-                      {row.name}
-                    </InspectLink>
-                    <span className="snapshot-table__namespace mono">{row.namespace}</span>
-                    {row.pinned ? (
-                      <span className="snapshot-table__pin">
-                        <Pin size={12} strokeWidth={2} aria-hidden="true" />
-                        pinned
-                      </span>
-                    ) : null}
-                  </div>
-                </div>
-              </td>
-              <td>
-                <LampBadge lamp={snapshotPhaseLamp(row.phase)} />
-              </td>
-              <td>{originLabel(row.origin)}</td>
-              <td>
-                {row.policy !== null && row.policy !== undefined && row.policy.length > 0 ? (
-                  <ObjectRef
-                    kind="snapshotPolicy"
-                    name={row.policy}
-                    namespace={row.namespace}
-                    contextNamespace={row.namespace}
-                  />
-                ) : (
-                  EMPTY_CELL
-                )}
-              </td>
-              <td className="snapshot-table__repository">
-                <WireRef value={row.repository} contextNamespace={row.namespace} />
-              </td>
-              <td className="num">{humanBytes(row.sizeBytes)}</td>
-              <td className="num">
-                <FilesCell total={row.filesTotal} failed={row.filesFailed} />
-              </td>
-              <td className="num">
-                {row.startTime !== null && row.startTime !== undefined ? (
-                  <time dateTime={row.startTime}>{humanAge(row.startTime, now)}</time>
-                ) : (
-                  EMPTY_CELL
-                )}
-              </td>
-              <td className="num">{humanDuration(durationSeconds(row))}</td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
+    <ColumnLedger
+      id="snapshots"
+      label={caption}
+      className="snapshot-table"
+      columns={SNAPSHOT_COLUMNS}
+      rows={rows}
+      rowKey={(row) => `${row.namespace}/${row.name}`}
+      rowProps={() => ({ "data-kind": "snapshot" })}
+      cell={(row, id) => snapshotCell(row, id, now)}
+    />
   );
+}
+
+function snapshotCell(row: SnapshotRow, id: SnapshotColumn, now: Date): ReactNode {
+  switch (id) {
+    case "snapshot":
+      return (
+        <div className="table__object">
+          <KindChip kind="snapshot" size="sm" />
+          <div className="snapshot-table__object">
+            <InspectLink
+              className="row-link mono snapshot-table__name"
+              target={{ kind: "snapshot", namespace: row.namespace, name: row.name }}
+            >
+              {row.name}
+            </InspectLink>
+            <span className="snapshot-table__namespace mono">{row.namespace}</span>
+            {row.pinned ? (
+              <span className="snapshot-table__pin">
+                <Pin size={12} strokeWidth={2} aria-hidden="true" />
+                pinned
+              </span>
+            ) : null}
+          </div>
+        </div>
+      );
+    case "phase":
+      return <LampBadge lamp={snapshotPhaseLamp(row.phase)} />;
+    case "origin":
+      return originLabel(row.origin);
+    case "policy":
+      return row.policy !== null && row.policy !== undefined && row.policy.length > 0 ? (
+        <ObjectRef
+          kind="snapshotPolicy"
+          name={row.policy}
+          namespace={row.namespace}
+          contextNamespace={row.namespace}
+        />
+      ) : (
+        EMPTY_CELL
+      );
+    case "repository":
+      return <WireRef value={row.repository} contextNamespace={row.namespace} />;
+    case "size":
+      return humanBytes(row.sizeBytes);
+    case "files":
+      return <FilesCell total={row.filesTotal} failed={row.filesFailed} />;
+    case "started":
+      return row.startTime !== null && row.startTime !== undefined ? (
+        <time dateTime={row.startTime}>{humanAge(row.startTime, now)}</time>
+      ) : (
+        EMPTY_CELL
+      );
+    case "took":
+      return humanDuration(durationSeconds(row));
+    default:
+      return id satisfies never;
+  }
 }
 
 /** A nullable string as itself, or the ledger's empty cell. */

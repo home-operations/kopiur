@@ -1,9 +1,11 @@
-import { screen } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import { screen, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { SnapshotRow } from "../api/types";
 import { bodyRows, nth, renderWithRouter } from "../test-utils";
 import { SnapshotTable } from "./SnapshotTable";
+import { forgetColumnPrefs } from "./columnPrefs";
 
 const nightly: SnapshotRow = {
   namespace: "media",
@@ -131,5 +133,42 @@ describe("SnapshotTable — kind identity and references", () => {
     expect(policy?.getAttribute("href")).toMatch(/inspect=snapshot-policy%2Fmedia%2Fnightly$/);
     const repository = row.querySelector('a.ref[data-kind="repository"]');
     expect(repository?.getAttribute("href")).toMatch(/inspect=repository%2Fmedia%2Fnas$/);
+  });
+});
+
+describe("SnapshotTable — its columns", () => {
+  afterEach(() => {
+    window.localStorage.clear();
+    forgetColumnPrefs();
+  });
+
+  const headers = (table: HTMLElement) =>
+    within(table)
+      .getAllByRole("columnheader")
+      .map((th) => th.textContent);
+
+  it("hides a column from its Columns menu, and it stays hidden when the page comes back", async () => {
+    const user = userEvent.setup();
+    const first = renderWithRouter(<SnapshotTable rows={[nightly]} now={NOW} />);
+    await user.click(await screen.findByRole("button", { name: "Columns" }));
+    await user.click(screen.getByRole("checkbox", { name: "Origin" }));
+    expect(headers(await table())).not.toContain("Origin");
+    first.unmount();
+    forgetColumnPrefs();
+
+    renderWithRouter(<SnapshotTable rows={[nightly]} now={NOW} />);
+    const again = await table();
+    expect(headers(again)).toEqual([
+      "Snapshot",
+      "Phase",
+      "Policy",
+      "Repository",
+      "Size",
+      "Files",
+      "Started",
+      "Took",
+    ]);
+    expect(nth(bodyRows(again), 0)).not.toHaveTextContent("Scheduled");
+    expect(screen.getByRole("button", { name: "Columns, 1 hidden" })).toBeInTheDocument();
   });
 });
