@@ -861,18 +861,14 @@ a.object-name:hover {
 /* One list, one row shape: the object (chip, kind, name, namespace) and the
    pill on the first line, the problem and its fix plate under the name. A
    doctor check about no object takes the same row with an icon tile. */
-/* Nothing is held back: a long list scrolls inside itself, so the page under
-   it stays reachable. The padding keeps the rows' shadows and focus rings
-   inside the scroller's clip. */
+/* Nothing is held back and nothing scrolls on its own: the list runs the
+   length of the page. */
 .attention {
   display: grid;
   grid-template-columns: minmax(0, 1fr);
   gap: var(--space-2);
-  max-height: min(70vh, 48rem);
   margin: 0;
-  padding: 2px 4px 4px 2px;
-  overflow-y: auto;
-  overscroll-behavior: contain;
+  padding: 0;
   list-style: none;
 }
 

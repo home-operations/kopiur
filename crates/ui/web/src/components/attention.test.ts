@@ -208,12 +208,12 @@ describe("attention", () => {
     expect(result).not.toHaveProperty("more");
   });
 
-  it("scrolls a long list inside itself rather than cutting it short", () => {
+  it("runs the length of the page: no inner scroller, nothing cut short", () => {
     const list = cssRules(readStyles())
       .filter((r) => r.selector === ".attention")
       .map((r) => r.body)
       .join("\n");
-    expect(list).toMatch(/max-height:/);
-    expect(list).toMatch(/overflow-y:\s*auto/);
+    expect(list).not.toMatch(/max-height:/);
+    expect(list).not.toMatch(/overflow(-y)?:/);
   });
 });
