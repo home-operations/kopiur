@@ -487,8 +487,8 @@ scroller).
 first cell; related objects as references; numbers right-aligned.
 
 ```html
-<div class="table-wrap">
-  <table class="table">
+<div class="ledger-scroll">
+  <table class="ledger">
     <thead>
       <tr>
         <th scope="col">Snapshot</th>
@@ -522,20 +522,21 @@ first cell; related objects as references; numbers right-aligned.
 ```
 
 ```css
-.table-wrap {
+.ledger-scroll {
   overflow-x: auto;
+  position: relative; /* keeps .visually-hidden spans inside the scroll box */
   border-radius: var(--radius-lg);
   box-shadow: var(--shadow-1);
   border: 1px solid var(--card-border);
   background: var(--bg-surface);
 }
-.table {
+.ledger {
   width: 100%;
   border-collapse: separate;
   border-spacing: 0;
   font-size: var(--text-sm);
 }
-.table th {
+.ledger th {
   text-align: left;
   padding: 9px 14px;
   border-bottom: 1px solid var(--line);
@@ -545,18 +546,18 @@ first cell; related objects as references; numbers right-aligned.
   text-transform: uppercase;
   color: var(--fg-muted);
 }
-.table td {
+.ledger td {
   padding: 11px 14px;
   border-bottom: 1px solid var(--line);
   vertical-align: middle;
 }
-.table tbody tr:last-child td {
+.ledger tbody tr:last-child td {
   border-bottom: 0;
 }
-.table tbody tr:hover td {
+.ledger tbody tr:hover td {
   background: var(--bg-hover);
 }
-.table .num {
+.ledger .num {
   text-align: right;
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
@@ -569,8 +570,57 @@ first cell; related objects as references; numbers right-aligned.
 ```
 
 Rows stay in server order unless the page offers sorting. A wide table scrolls
-inside `.table-wrap` rather than starving a column. Long names wrap at `/` and `-`
+inside `.ledger-scroll` rather than starving a column. Long names wrap at `/` and `-`
 (`overflow-wrap: anywhere` on `code`), never ellipsised in a table.
+
+### Columns a person can change
+
+Every list page's table is a `ColumnLedger` (`components/ColumnLedger.tsx`): its
+columns can be resized, hidden and reordered, and the layout is remembered per
+table, per browser, under `kopiur-ui.columns`. Drawer tables and chart twins are
+plain ledgers and stay fixed.
+
+A table declares its columns once, as `ColumnSpec`s (`components/tableColumns.ts`),
+and draws each cell from a `switch` over its column-id union ending in
+`default: return id satisfies never`, so a new column cannot compile undrawn.
+
+```ts
+const SNAPSHOT_COLUMNS: readonly ColumnSpec<SnapshotColumn>[] = [
+  { id: "snapshot", label: "Snapshot", width: "auto", min: 200, locked: true, stripe: true },
+  { id: "phase", label: "Phase", width: 130, min: 90 },
+  { id: "size", label: "Size", width: 90, min: 70, numeric: true },
+  // …
+];
+```
+
+- **The identity column is `locked`** (with `stripe` for the kind stripe): it holds
+  the chip and the `row-link`, so it can never be hidden or moved off the left
+  edge. A column of buttons (Run, Action, File) is locked at the right and not
+  resizable.
+- **One `"auto"` column** takes the room left over, usually the identity column or
+  the prose one (Finding, Reason). Every other column has a default width in px.
+- **`min` is what the column holds**, not just the header word: a reference
+  column's floor fits the widest kind name it can show (`CLUSTERREPOSITORY`), so
+  a reference never wraps inside its chip. The defaults of a table add up to
+  less than a 1600px window with the sidebar.
+- **Layout is fixed** (`.ledger--fixed`, widths in a `colgroup`, the table's
+  `min-width` the sum of its columns), so the browser stops guessing from
+  content, and a layout wider than its card scrolls inside it. Only a header
+  word too long for a narrowed column is cut, with the full word in its title.
+- **Resize** is a focusable `role="separator"` on the header's right edge
+  (`.ledger__resize`, a hairline that turns accent when held or focused), like
+  the drawer grip and the split gutter: drag it, or arrow keys ±16px; Home or a
+  double click puts the declared width back. A drag is stored when it ends.
+- **The Columns menu** (`ColumnPicker`) sits above the card on the right
+  (`.ledger-tools`). It lists the unlocked columns: a checkbox to hide (the
+  last visible one cannot be turned off), a grip to drag or move with ArrowUp
+  and ArrowDown, earlier/later buttons, and **Reset columns** for this table
+  only. Each change is announced in a status line. Its button says how many
+  are hidden ("Columns · 2 hidden"). It closes on Escape or a click outside,
+  like the namespace switcher.
+- Only what someone changed is stored, so adding or removing a column needs no
+  migration: a new column shows in its declared place, a removed one is
+  ignored.
 
 ---
 

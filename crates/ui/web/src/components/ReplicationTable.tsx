@@ -58,8 +58,8 @@ type ReplicationColumn =
 const REPLICATION_COLUMNS: readonly ColumnSpec<ReplicationColumn>[] = [
   { id: "replication", label: "Replication", width: "auto", min: 240, locked: true, stripe: true },
   { id: "state", label: "State", width: 140, min: 80 },
-  { id: "copies", label: "Copies", width: 280, min: 140 },
-  { id: "schedule", label: "Schedule", width: 180, min: 110 },
+  { id: "copies", label: "Copies", width: 260, min: 140 },
+  { id: "schedule", label: "Schedule", width: 170, min: 110 },
   { id: "lastReplicated", label: "Last replicated", width: 160, min: 150 },
   { id: "lastRun", label: "Last run", width: 160, min: 100 },
   { id: "run", label: "Run", width: 150, min: 120, locked: true, resizable: false },

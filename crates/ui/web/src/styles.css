@@ -1188,15 +1188,11 @@ a.object-name:hover {
 
 /* A table whose columns a person sizes (`ColumnLedger`): the colgroup says
    how wide each column is, so the browser stops guessing from the content.
-   Cell text still wraps rather than spilling into the next column; only a
-   header word too long for a narrowed column is cut, with the full word in
-   its title. */
+   Names still wrap at `/` and `-` (`.ledger code`, `.mono`), and each
+   column's floor is wide enough for what it holds; only a header word too
+   long for a narrowed column is cut, with the full word in its title. */
 .ledger--fixed {
   table-layout: fixed;
-}
-
-.ledger--fixed td {
-  overflow-wrap: anywhere;
 }
 
 .ledger--fixed th {
@@ -1237,12 +1233,17 @@ a.object-name:hover {
   background: var(--accent);
 }
 
-/* The table's own tools sit above its card, on the right: the "Columns"
-   menu. */
+/* The table's own tools sit just above its card, on the right: the
+   "Columns" menu. One frame, so a section's gap falls around the pair. */
+.ledger-frame {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: var(--space-2);
+}
+
 .ledger-tools {
   display: flex;
   justify-content: flex-end;
-  margin-bottom: var(--space-2);
 }
 
 .column-picker {
@@ -3831,18 +3832,9 @@ a.topo-node {
 
 /* The directory ledger. Names wrap rather than losing characters to an
    ellipsis, as everywhere else on this console: a filename truncated to
-   nothing is the one thing this screen must not do.
-
-   Six columns need more than `.ledger-scroll > .ledger`'s 30rem floor. Below
-   it the Entry column was squeezed to about two characters and a filename
-   wrapped one letter per line — technically not truncated, and completely
-   unreadable. Same selector shape as the rule it raises (later wins at equal
-   specificity), so the ledger scrolls on a narrow viewport instead, which is
-   the console's documented answer for a wide ledger. */
-.ledger-scroll > .dir-table {
-  min-width: 52rem;
-}
-
+   nothing is the one thing this screen must not do. The Entry column's floor
+   (`DirTable.tsx`) keeps a name from wrapping one letter per line; past it the
+   ledger scrolls. */
 .dir-table__entry {
   display: flex;
   align-items: baseline;

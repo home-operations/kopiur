@@ -46,7 +46,7 @@ export function ColumnLedger<Row, Id extends string>({
   const visible = visibleColumns(columns, prefs);
   const classes = ["ledger", "ledger--fixed", className].filter(Boolean).join(" ");
   return (
-    <>
+    <div className="ledger-frame">
       <div className="ledger-tools">
         <ColumnPicker table={id} label={label} columns={columns} />
       </div>
@@ -87,7 +87,7 @@ export function ColumnLedger<Row, Id extends string>({
           </tbody>
         </table>
       </div>
-    </>
+    </div>
   );
 }
 

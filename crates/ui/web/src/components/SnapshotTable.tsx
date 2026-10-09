@@ -57,21 +57,21 @@ type SnapshotColumn =
   | "took";
 
 const SNAPSHOT_COLUMNS: readonly ColumnSpec<SnapshotColumn>[] = [
-  { id: "snapshot", label: "Snapshot", width: "auto", min: 220, locked: true, stripe: true },
-  { id: "phase", label: "Phase", width: 140, min: 90 },
-  { id: "origin", label: "Origin", width: 120, min: 80 },
-  { id: "policy", label: "Policy", width: 180, min: 90 },
+  { id: "snapshot", label: "Snapshot", width: "auto", min: 200, locked: true, stripe: true },
+  { id: "phase", label: "Phase", width: 130, min: 90 },
+  { id: "origin", label: "Origin", width: 110, min: 80 },
+  { id: "policy", label: "Policy", width: 210, min: 200 },
   {
     id: "repository",
     label: "Repository",
-    width: 200,
-    min: 120,
+    width: 220,
+    min: 210,
     className: "snapshot-table__repository",
   },
-  { id: "size", label: "Size", width: 100, min: 70, numeric: true },
-  { id: "files", label: "Files", width: 120, min: 70, numeric: true },
-  { id: "started", label: "Started", width: 110, min: 90, numeric: true },
-  { id: "took", label: "Took", width: 90, min: 70, numeric: true },
+  { id: "size", label: "Size", width: 90, min: 70, numeric: true },
+  { id: "files", label: "Files", width: 90, min: 70, numeric: true },
+  { id: "started", label: "Started", width: 100, min: 90, numeric: true },
+  { id: "took", label: "Took", width: 80, min: 70, numeric: true },
 ];
 
 export function SnapshotTable({
