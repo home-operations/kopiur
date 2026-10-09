@@ -421,6 +421,26 @@ tables, the absolute instant is the cell's `title` and a `<time datetime>`.
 
 ---
 
+## Split pane
+
+**What:** two cards side by side whose share of the width someone can change —
+the overview's attention and activity (`components/SplitPane.tsx`).
+
+An 8px gutter between the cards is a `role="separator"` (`aria-orientation`
+vertical, `aria-valuenow` the start side's percentage, "Resize the two
+columns"). Its grip is a gutter-wide tab of three dots stacked vertically
+(`::after`, the drawer grip's dot recipe at 8px), sticky at mid-viewport so it
+stays in reach beside tall cards; accent on hover and drag, the focus ring on
+the tab. Drag it (pointer capture), or focus it: arrows move 4%, Home/End go to
+either end, a double click goes back to half. Each side keeps 440px; the share
+is remembered in localStorage under the pane's key.
+
+Too narrow for both sides and the gutter (a `@container split` query, so the
+sidebar counts), the cards stack in DOM order — start first — and the gutter is
+not drawn.
+
+---
+
 ## Attention row
 
 **What:** one object that needs someone, wherever objects of mixed kinds are

@@ -16,56 +16,31 @@ The first screen. Answers "is my data safe?" in this order:
    object and the cause ("1 of 3 repositories is failing — `media/nas-offsite`
    cannot reach its bucket."). `components/verdict.ts` decides it. Never healthy
    while any source is loading or refused, or the scope is empty.
-3. **Fleet by kind** — a grid of kind tiles, four across on desktop:
-   Repositories, Policies, Schedules, Snapshots · 24h, Restores, Replications,
-   Maintenance. Each tile: stripe, chip, label, count (`--text-2xl`), a segmented
-   status bar, and the breakdown in words with icons ("1 failed · 2 ok"). A tile
-   with any failure gets a 1.5px inset ring in `--health-failed-fg` at 45%. Each
-   tile links to its list page (filtered to the failing state when it has one).
-4. **Needs attention · N** — one list of attention rows (`primitives.md`), worst
-   first: every object that needs someone exactly once, whether the doctor named
-   it, the status report lists it as stalled, or its kind's list shows it
-   unhealthy — the doctor's account wins, then the stalled message, then what the
-   list row says. Failing doctor checks about no object follow as rows of the same
-   shape. Never a second or third style beside it (no stalled table, no finding
-   cards). Empty state: "Nothing needs you" with the doctor link.
+3. **Two cards side by side** in a split pane (`primitives.md`), an 8px gutter
+   between them holding a three-dot grip; drag it or use the arrow keys, and the
+   share is remembered. When the pane is too narrow for both (each keeps 440px),
+   they stack, **Needs attention first**, and the grip goes.
+   - **Needs attention · N** (start) — one list of attention rows
+     (`primitives.md`), worst first: every object that needs someone exactly
+     once, whether the doctor named it, the status report lists it as stalled, or
+     its kind's list shows it unhealthy — the doctor's account wins, then the
+     stalled message, then what the list row says. Failing doctor checks about no
+     object follow as rows of the same shape. Never a second or third style beside
+     it (no stalled table, no finding cards). Empty state: "Nothing needs you"
+     with the doctor link.
+   - **Recent activity** (end) — every run, newest first, of every kind: each
+     snapshot and restore, each replication's last pass, each maintenance
+     object's last quick and full run (`components/activity.ts`). A compact row
+     per run: chip, kind, name (the whole row opens the drawer), the outcome pill
+     in the run's own word, when, and what ran ("photos → nas · 2.0 KiB · took
+     30s"). Something that never ran is left out. A refused read is named in
+     place.
 
-The status bar is decoration over the words beside it: it is `aria-hidden`, and
-the breakdown is the text. Segment colours are the `--health-*-fg` tokens; a zero
-segment is not drawn.
+Both lists run the length of the page; nothing is held back behind a count and
+nothing scrolls on its own.
 
-```css
-.kind-tile {
-  display: grid;
-  gap: 9px;
-  padding: 12px 14px;
-  border-radius: var(--radius-lg);
-  background: var(--bg-surface);
-  box-shadow: var(--shadow-1);
-  border: 1px solid var(--card-border);
-  border-left: var(--stripe) solid var(--kc);
-  color: inherit;
-  text-decoration: none;
-}
-.kind-tile[data-failing] {
-  box-shadow:
-    var(--shadow-1),
-    inset 0 0 0 1.5px color-mix(in srgb, var(--health-failed-fg) 45%, transparent);
-}
-.kind-tile__count {
-  margin-left: auto;
-  font-size: var(--text-2xl);
-  font-weight: var(--weight-bold);
-}
-.status-bar {
-  display: flex;
-  gap: 3px;
-  height: 6px;
-}
-.status-bar > span {
-  border-radius: 3px;
-}
-```
+The fleet's counts by kind are not on this page: each sidebar section carries
+its own (`shell.md`).
 
 ---
 

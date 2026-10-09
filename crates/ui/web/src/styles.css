@@ -735,61 +735,7 @@ a.object-name:hover {
   font-size: var(--text-xs);
 }
 
-/* ---- kind tiles: the overview's fleet by kind -------------------------------- */
-
-.kind-tiles {
-  display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: var(--space-3);
-  margin: 0;
-  padding: 0;
-  list-style: none;
-}
-
-.kind-tile {
-  display: grid;
-  gap: 9px;
-  height: 100%;
-  padding: 12px 14px;
-  border: 1px solid var(--card-border);
-  border-radius: var(--radius-lg);
-  background: var(--bg-surface);
-  box-shadow: var(--shadow-1);
-  color: inherit;
-  text-decoration: none;
-}
-
-.kind-tile.has-stripe {
-  border-left: var(--stripe) solid var(--kc);
-}
-
-.kind-tile:hover {
-  background: var(--bg-hover);
-}
-
-/* A tile is a link: its lift must not eat the focus ring. */
-.kind-tile:focus-visible {
-  box-shadow: var(--focus-ring);
-}
-
-.kind-tile[data-failing="true"] {
-  outline: 1.5px solid color-mix(in srgb, var(--health-failed-fg) 45%, transparent);
-  outline-offset: -1.5px;
-}
-
-.kind-tile__head {
-  display: flex;
-  align-items: center;
-  gap: 9px;
-  font-weight: var(--weight-semibold);
-}
-
-.kind-tile__count {
-  margin-left: auto;
-  font-size: var(--text-2xl);
-  font-weight: var(--weight-bold);
-  font-variant-numeric: tabular-nums;
-}
+/* ---- status bar: health buckets as segments, beside their words ---------- */
 
 .status-bar {
   display: flex;
@@ -816,44 +762,6 @@ a.object-name:hover {
 
 .status-bar > span[data-health="healthy"] {
   background: var(--health-healthy-fg);
-}
-
-.kind-tile__breakdown {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 4px 10px;
-  font-size: var(--text-xs);
-}
-
-.kind-tile__part {
-  display: inline-flex;
-  align-items: center;
-  gap: 3px;
-  color: var(--fg-muted);
-}
-
-.kind-tile__part svg {
-  color: var(--health-unknown-fg);
-}
-
-.kind-tile__part[data-health="failed"] svg {
-  color: var(--health-failed-fg);
-}
-
-.kind-tile__part[data-health="degraded"] svg {
-  color: var(--health-degraded-fg);
-}
-
-.kind-tile__part[data-health="pending"] svg {
-  color: var(--health-pending-fg);
-}
-
-.kind-tile__part[data-health="healthy"] svg {
-  color: var(--health-healthy-fg);
-}
-
-.kind-tile__none {
-  color: var(--fg-muted);
 }
 
 /* ---- overview: what needs you --------------------------------------------- */
@@ -988,6 +896,162 @@ a.object-name:hover {
   margin-top: var(--space-3);
 }
 
+/* ---- split: two cards side by side, an 8px handle between ------------------
+   The share sits in --split-start / --split-end (fr), set by SplitPane. Each
+   side keeps 440px; narrower than both and the gutter, the sides stack, start
+   first, and the handle goes. A container query, so the sidebar counts. */
+
+.split {
+  container: split / inline-size;
+}
+
+.split__grid {
+  display: grid;
+  grid-template-columns:
+    minmax(440px, var(--split-start, 1fr))
+    8px
+    minmax(440px, var(--split-end, 1fr));
+  align-items: stretch;
+}
+
+.split__side {
+  min-width: 0;
+}
+
+.split__gutter {
+  position: relative;
+  cursor: col-resize;
+  touch-action: none;
+}
+
+/* The grip: three dots stacked in a tab the gutter's width, kept in view
+   while a tall card scrolls past. */
+.split__gutter::after {
+  content: "";
+  position: sticky;
+  top: calc(50vh - 18px);
+  display: block;
+  width: 8px;
+  height: 36px;
+  margin-top: var(--space-6);
+  border-radius: 4px;
+  background-color: var(--bg-inset);
+  background-image:
+    radial-gradient(circle, var(--fg-muted) 1.5px, transparent 2px),
+    radial-gradient(circle, var(--fg-muted) 1.5px, transparent 2px),
+    radial-gradient(circle, var(--fg-muted) 1.5px, transparent 2px);
+  background-position:
+    center calc(50% - 8px),
+    center 50%,
+    center calc(50% + 8px);
+  background-repeat: no-repeat;
+  background-size: 6px 6px;
+  transition: background-color var(--dur-fast) var(--ease-out);
+}
+
+.split__gutter:hover::after,
+.split__gutter:active::after {
+  background-color: var(--accent-soft);
+}
+
+/* The gutter is invisible; its ring is drawn on the grip. */
+.split__gutter:focus-visible {
+  outline: none;
+  box-shadow: none;
+}
+
+.split__gutter:focus-visible::after {
+  background-color: var(--accent-soft);
+  box-shadow: var(--focus-ring);
+}
+
+@container split (max-width: 887px) {
+  .split__grid {
+    grid-template-columns: minmax(0, 1fr);
+    row-gap: var(--space-4);
+  }
+
+  .split__gutter {
+    display: none;
+  }
+}
+
+/* A region of the overview as a card. */
+.page__card {
+  height: 100%;
+  padding: var(--space-4) var(--space-4) var(--space-5);
+  border: 1px solid var(--card-border);
+  border-radius: var(--radius-lg);
+  background: var(--bg-surface);
+  box-shadow: var(--shadow-1);
+}
+
+/* ---- recent activity: one compact row per run, newest first ---------------- */
+
+.activity {
+  display: grid;
+  gap: var(--space-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.activity-row {
+  position: relative;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  grid-template-areas:
+    "chip id state"
+    ". what what";
+  align-items: center;
+  gap: 4px 10px;
+  padding: 8px 12px;
+  border: 1px solid var(--line);
+  border-left: var(--stripe) solid var(--kc);
+  border-radius: var(--radius-md);
+  font-size: var(--text-sm);
+  cursor: pointer;
+}
+
+.activity-row:hover {
+  background: var(--bg-hover);
+}
+
+.activity-row > .kind-chip {
+  grid-area: chip;
+}
+
+.activity-row > .object-id {
+  grid-area: id;
+}
+
+.activity-row :is(a, button):not(.row-link) {
+  position: relative;
+  z-index: 1;
+}
+
+.activity-row .row-link:focus-visible {
+  box-shadow: none;
+}
+
+.activity-row:has(.row-link:focus-visible) {
+  box-shadow: var(--focus-ring);
+}
+
+.activity-row__state {
+  grid-area: state;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.activity-row__what {
+  grid-area: what;
+  margin: 0;
+  color: var(--fg-muted);
+  overflow-wrap: anywhere;
+}
+
 /* ---- maintenance: one card per object (it has no detail page of its own) ---- */
 
 .maintenance-card {
@@ -1025,13 +1089,7 @@ a.object-name:hover {
   font-size: var(--text-sm);
 }
 
-/* ---- grids step down: tiles 4 → 2 → 1, facts 4 → 2 ------------------------ */
-
-@media (max-width: 1100px) {
-  .kind-tiles {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-}
+/* ---- grids step down: facts 4 → 2 ----------------------------------------- */
 
 @media (max-width: 700px) {
   .stats {
@@ -1040,10 +1098,6 @@ a.object-name:hover {
 }
 
 @media (max-width: 560px) {
-  .kind-tiles {
-    grid-template-columns: minmax(0, 1fr);
-  }
-
   .attention-row {
     grid-template-areas:
       "chip id id"

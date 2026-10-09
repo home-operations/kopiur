@@ -201,6 +201,9 @@ function calm(over: Record<string, Response | ((url: URL) => Response)> = {}) {
     ]),
     "/api/v1/schedules": jsonResponse([]),
     "/api/v1/maintenance": jsonResponse([]),
+    "/api/v1/snapshots": jsonResponse({ items: [], total: 0, offset: 0, limit: 25 }),
+    "/api/v1/restores": jsonResponse([]),
+    "/api/v1/replications": jsonResponse({ repository: [], snapshot: [] }),
     ...over,
   };
 }
@@ -223,15 +226,26 @@ describe("Overview", () => {
     expect(verdict.querySelector(".verdict__lamp")).toHaveAttribute("data-health", "failed");
     expect(verdict.querySelector("svg")).not.toBeNull();
 
-    // The fleet by kind, from /overview, each tile a link carrying the scope.
-    const fleet = screen.getByRole("region", { name: "Fleet by kind" });
-    const snapshots = await within(fleet).findByRole("link", { name: /Snapshots/ });
-    expect(snapshots).toHaveTextContent("1 failed");
-    expect(snapshots).toHaveAttribute("data-failing", "true");
-    expect(within(fleet).getByRole("link", { name: /Repositories/ })).toHaveAttribute(
+    // The fleet by kind lives in the sidebar now: no section of its own here.
+    expect(screen.queryByRole("region", { name: "Fleet by kind" })).toBeNull();
+    const nav = screen.getByRole("navigation", { name: "Primary" });
+    expect(
+      await within(nav).findByRole("link", { name: "Snapshots", description: /1 failed/ }),
+    ).toBeInTheDocument();
+    expect(within(nav).getByRole("link", { name: "Repositories" })).toHaveAttribute(
       "href",
       "/repositories?health=failed&namespace=media",
     );
+
+    // Below the verdict, two cards side by side with a handle between them:
+    // what needs you first, then what has run.
+    const split = screen.getByRole("group", { name: "Needs attention and recent activity" });
+    const [first, second] = within(split).getAllByRole("region");
+    expect(first).toHaveAccessibleName("Needs attention");
+    expect(second).toHaveAccessibleName("Recent activity");
+    expect(
+      within(split).getByRole("separator", { name: "Resize the two columns" }),
+    ).toBeInTheDocument();
 
     // What needs you: one row per object, worst first, whichever read
     // noticed it — the blocked snapshot is stalled AND named by the doctor,
@@ -293,6 +307,54 @@ describe("Overview", () => {
     expect(askedFor).not.toContain("webhook-admits");
     expect(askedFor).not.toContain("credentials-present");
     expect(askedFor).not.toContain("recent-warnings");
+  });
+
+  it("lists every run, newest first, beside what needs you — and names a read it could not make", async () => {
+    mockApi({
+      ...calm({
+        "/api/v1/snapshots": jsonResponse({
+          items: [
+            {
+              namespace: "media",
+              name: "nightly-2",
+              phase: "succeeded",
+              policy: "nightly",
+              repository: "Repository/media/nas",
+              startTime: "2026-09-08T11:00:00Z",
+              endTime: "2026-09-08T11:00:20Z",
+              pinned: false,
+            },
+          ],
+          total: 1,
+          offset: 0,
+          limit: 25,
+        }),
+        "/api/v1/maintenance": jsonResponse([failingMaintenance]),
+        "/api/v1/restores": problemResponse(
+          forbiddenProblem("Listing restores was refused.", "/api/v1/restores"),
+        ),
+      }),
+      "/api/v1/status": jsonResponse(status),
+      "/api/v1/repositories": jsonResponse(repositories),
+      "/api/v1/doctor": jsonResponse(allGood),
+    });
+    mountApp("/?namespace=media");
+    const recent = await screen.findByRole("region", { name: "Recent activity" });
+    const runs = await within(recent).findByRole("list", { name: "Recent runs" });
+    const rows = within(runs).getAllByRole("listitem");
+    expect(rows.map((r) => r.getAttribute("data-kind"))).toEqual([
+      "snapshot",
+      "maintenance",
+      "maintenance",
+    ]);
+    expect(within(nth(rows, 0)).getByRole("link", { name: "nightly-2" })).toHaveAttribute(
+      "href",
+      expect.stringMatching(/inspect=snapshot%2Fmedia%2Fnightly-2/),
+    );
+    expect(nth(rows, 0)).toHaveTextContent("nightly → nas");
+    expect(nth(rows, 1)).toHaveTextContent("Quick maintenance of cold");
+    expect(nth(rows, 1).querySelector(".health")).toHaveTextContent("Failed");
+    expect(recent.querySelector('[data-state="not-permitted"]')).not.toBeNull();
   });
 
   it("reads as calm when everything is healthy, and says nothing needs you", async () => {
@@ -395,10 +457,10 @@ describe("Overview", () => {
     const verdict = await screen.findByRole("status", { name: "Vault verdict" });
     expect(verdict).toHaveTextContent("No repositories in scope");
     expect(verdict.querySelector(".verdict__lamp")).toHaveAttribute("data-health", "unknown");
-    const fleet = screen.getByRole("region", { name: "Fleet by kind" });
-    expect(await within(fleet).findByRole("link", { name: /Repositories/ })).toHaveTextContent(
-      "none in scope",
-    );
+    const nav = screen.getByRole("navigation", { name: "Primary" });
+    expect(
+      await within(nav).findByRole("link", { name: "Repositories", description: "none in scope" }),
+    ).toBeInTheDocument();
   });
 
   it("says once, in its place, that the fleet overview was refused — and the verdict cannot be green", async () => {
@@ -419,9 +481,13 @@ describe("Overview", () => {
     const verdict = await screen.findByRole("status", { name: "Vault verdict" });
     expect(verdict).toHaveTextContent("did not load");
     expect(verdict.querySelector(".verdict__lamp")).not.toHaveAttribute("data-health", "healthy");
-    const fleet = screen.getByRole("region", { name: "Fleet by kind" });
-    expect(fleet.querySelector('[data-state="not-permitted"]')).not.toBeNull();
-    expect(within(fleet).queryByRole("button", { name: "Retry" })).toBeNull();
+    // Said where it matters — under what needs you — and the sidebar draws no
+    // counts it could not read.
+    const attention = screen.getByRole("region", { name: "Needs attention" });
+    expect(attention.querySelector('[data-state="not-permitted"]')).not.toBeNull();
+    expect(within(attention).queryByRole("button", { name: "Retry" })).toBeNull();
+    const nav = screen.getByRole("navigation", { name: "Primary" });
+    expect(nav.querySelector(".nav-item__count")).toBeNull();
   });
 
   it("renders the status report's refusal where the stalled objects would be", async () => {
@@ -545,8 +611,10 @@ describe("Overview", () => {
     mountApp("/");
     await screen.findByRole("status", { name: "Vault verdict" });
     expect(screen.getByText(/could not read part of the status report/)).toBeInTheDocument();
-    // The fleet by kind does not depend on the report.
-    const fleet = screen.getByRole("region", { name: "Fleet by kind" });
-    expect(await within(fleet).findByRole("link", { name: /Snapshots/ })).toBeInTheDocument();
+    // The sidebar's counts do not depend on the report.
+    const nav = screen.getByRole("navigation", { name: "Primary" });
+    expect(
+      await within(nav).findByRole("link", { name: "Snapshots", description: /1 failed/ }),
+    ).toBeInTheDocument();
   });
 });

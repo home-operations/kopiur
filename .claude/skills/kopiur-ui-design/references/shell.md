@@ -48,6 +48,23 @@ height, `padding: 14px 12px`. Top to bottom:
    sections; neutral for Overview/Topology/Doctor) + label, `--radius-md`. The
    current item: `--accent-soft` fill, `--accent-ink` text, `aria-current="page"`.
    Gates stays off-nav (reached from Doctor).
+   - **The fleet by kind lives here.** A section that lists a kind carries the
+     count of that kind in scope, right-aligned in `--text-xs` tabular figures,
+     and a 3px segmented status bar under its label (`--health-*-fg`, worst
+     first, zero segments not drawn). Repositories counts both repository kinds,
+     Replications both replication kinds, Snapshots the overview's window.
+   - **Failures are a lamp, not a colour.** When any are failed, a compact
+     `.health[data-health=failed]` pill with the failed count sits before the
+     total.
+   - **Spoken as a description.** Count, bar and pill are `aria-hidden`. The
+     same breakdown in words ("28 in the last 24h: 2 failed, 14 ok") is the
+     link's `aria-describedby` description, so the section keeps its name.
+   - **Failure filter.** A failing Repositories section links to
+     `?health=failed`.
+   - **Refused overview read.** When `/overview` is refused, no counts are
+     drawn at all.
+   - **No stray second row.** Overview, Topology and Doctor carry nothing, and
+     only items with a bar get the bar's grid row.
 5. **User chip** (pinned to the bottom, `margin-top: auto`) — compact: 28px avatar
    tile (initial on `--accent-soft`), username (semibold) over **role** (the
    identity source — "anonymous", or the trusted-headers group the proxy sent),

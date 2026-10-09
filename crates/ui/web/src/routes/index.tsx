@@ -1,5 +1,5 @@
 import { Link, createFileRoute } from "@tanstack/react-router";
-import { LayoutGrid, Stethoscope, Wrench } from "lucide-react";
+import { Activity, Stethoscope, Wrench } from "lucide-react";
 import type { ReactNode } from "react";
 
 import {
@@ -7,8 +7,11 @@ import {
   useMaintenance,
   useOverview,
   usePolicies,
+  useReplications,
   useRepositories,
+  useRestores,
   useSchedules,
+  useSnapshots,
   useStatus,
 } from "../api/hooks";
 import { type StatusReportView, narrowStatusReport } from "../api/statusReport";
@@ -16,7 +19,9 @@ import type { KindTally, DoctorCheckView, RepositorySummary, StatusOverview } fr
 import { EmptyState } from "../components/EmptyState";
 import { ErrorState } from "../components/ErrorState";
 import { LoadingState } from "../components/LoadingState";
-import { KindTiles } from "../components/KindTiles";
+import { ActivityList } from "../components/ActivityList";
+import { SplitPane } from "../components/SplitPane";
+import { activity } from "../components/activity";
 import { AttentionList } from "../components/AttentionList";
 import { attention } from "../components/attention";
 import { OVERVIEW_DOCTOR_CHECKS, summarizeDoctor } from "../components/doctor";
@@ -58,6 +63,9 @@ function Overview() {
   const maintenance = useMaintenance(namespace);
   const status = useStatus(namespace);
   const doctor = useDoctor({ namespace, checks: OVERVIEW_DOCTOR_CHECKS });
+  const snapshots = useSnapshots({ namespace, limit: RECENT_SNAPSHOTS });
+  const restores = useRestores(namespace);
+  const replications = useReplications(namespace);
 
   const report = status.data !== undefined ? narrowStatusReport(status.data.report) : null;
   const now = status.data !== undefined ? new Date(status.data.now) : new Date();
@@ -99,96 +107,107 @@ function Overview() {
         tallies={overview.data?.kinds}
       />
 
-      <Section title="Fleet by kind" icon={LayoutGrid}>
-        {overview.isPending ? (
-          <LoadingState what="the fleet overview" rows={2} />
-        ) : overview.isError ? (
-          <ErrorState
-            problem={overview.error.problem}
-            what="the fleet overview"
-            onRetry={() => void overview.refetch()}
-          />
-        ) : (
-          <KindTiles overview={overview.data} namespace={namespace} />
-        )}
-      </Section>
-
-      <Section
-        title="Needs attention"
-        icon={Wrench}
-        note={
-          <Link to="/doctor" search={search}>
-            full doctor report
-          </Link>
+      <SplitPane
+        label="Needs attention and recent activity"
+        storageKey="kopiur-ui.overview-split"
+        start={
+          <Section
+            title="Needs attention"
+            icon={Wrench}
+            note={
+              <Link to="/doctor" search={search}>
+                full doctor report
+              </Link>
+            }
+          >
+            {status.isPending || doctor.isPending ? (
+              <LoadingState what="what needs attention" rows={2} />
+            ) : (
+              <AttentionList attention={needs} namespace={namespace} now={now} />
+            )}
+            {repositories.isError ? (
+              <ErrorState
+                problem={repositories.error.problem}
+                what="repositories"
+                onRetry={() => void repositories.refetch()}
+              />
+            ) : null}
+            {policies.isError ? (
+              <ErrorState
+                problem={policies.error.problem}
+                what="policies"
+                onRetry={() => void policies.refetch()}
+              />
+            ) : null}
+            {schedules.isError ? (
+              <ErrorState
+                problem={schedules.error.problem}
+                what="schedules"
+                onRetry={() => void schedules.refetch()}
+              />
+            ) : null}
+            {maintenance.isError ? (
+              <ErrorState
+                problem={maintenance.error.problem}
+                what="maintenance"
+                onRetry={() => void maintenance.refetch()}
+              />
+            ) : null}
+            {status.isError ? (
+              <ErrorState
+                problem={status.error.problem}
+                what="the status report"
+                onRetry={() => void status.refetch()}
+              />
+            ) : null}
+            {doctor.isError ? (
+              <ErrorState
+                problem={doctor.error.problem}
+                what="the doctor report"
+                onRetry={() => void doctor.refetch()}
+              />
+            ) : null}
+            {overview.isError ? (
+              <ErrorState
+                problem={overview.error.problem}
+                what="the fleet overview"
+                onRetry={() => void overview.refetch()}
+              />
+            ) : null}
+            {nothingNeedsYou({
+              // Every read must have answered: an errored read is not pending,
+              // and "none" from a refused read is not "none failing".
+              settled:
+                repositories.isSuccess &&
+                policies.isSuccess &&
+                schedules.isSuccess &&
+                maintenance.isSuccess &&
+                overview.isSuccess &&
+                status.isSuccess &&
+                doctor.isSuccess,
+              fleetFailing: tallyPhrases(overview.data?.kinds ?? []).failed.length,
+              needs: needs.items.length + needs.checks.length,
+            }) ? (
+              <EmptyState title="Nothing needs you" icon={Stethoscope}>
+                No repository, policy, schedule or maintenance is failing, nothing is stalled, and
+                the doctor checks found nothing to fix.
+              </EmptyState>
+            ) : null}
+          </Section>
         }
-      >
-        {status.isPending || doctor.isPending ? (
-          <LoadingState what="what needs attention" rows={2} />
-        ) : (
-          <AttentionList attention={needs} namespace={namespace} now={now} />
-        )}
-        {repositories.isError ? (
-          <ErrorState
-            problem={repositories.error.problem}
-            what="repositories"
-            onRetry={() => void repositories.refetch()}
-          />
-        ) : null}
-        {policies.isError ? (
-          <ErrorState
-            problem={policies.error.problem}
-            what="policies"
-            onRetry={() => void policies.refetch()}
-          />
-        ) : null}
-        {schedules.isError ? (
-          <ErrorState
-            problem={schedules.error.problem}
-            what="schedules"
-            onRetry={() => void schedules.refetch()}
-          />
-        ) : null}
-        {maintenance.isError ? (
-          <ErrorState
-            problem={maintenance.error.problem}
-            what="maintenance"
-            onRetry={() => void maintenance.refetch()}
-          />
-        ) : null}
-        {status.isError ? (
-          <ErrorState
-            problem={status.error.problem}
-            what="the status report"
-            onRetry={() => void status.refetch()}
-          />
-        ) : null}
-        {doctor.isError ? (
-          <ErrorState
-            problem={doctor.error.problem}
-            what="the doctor report"
-            onRetry={() => void doctor.refetch()}
-          />
-        ) : null}
-        {nothingNeedsYou({
-          // Every read must have answered: an errored read is not pending,
-          // and "none" from a refused read is not "none failing".
-          settled:
-            repositories.isSuccess &&
-            policies.isSuccess &&
-            schedules.isSuccess &&
-            maintenance.isSuccess &&
-            overview.isSuccess &&
-            status.isSuccess &&
-            doctor.isSuccess,
-          fleetFailing: tallyPhrases(overview.data?.kinds ?? []).failed.length,
-          needs: needs.items.length + needs.checks.length,
-        }) ? (
-          <EmptyState title="Nothing needs you" icon={Stethoscope}>
-            No repository, policy, schedule or maintenance is failing, nothing is stalled, and the
-            doctor checks found nothing to fix.
-          </EmptyState>
-        ) : null}
-      </Section>
+        end={
+          <Section title="Recent activity" icon={Activity}>
+            <RecentActivity
+              namespace={namespace}
+              now={now}
+              maintenance={maintenance}
+              snapshots={snapshots}
+              restores={restores}
+              replications={replications}
+            />
+          </Section>
+        }
+      />
 
       {report !== null && !report.complete ? (
         <p className="page__prose">
@@ -218,7 +237,7 @@ interface SectionProps {
 
 function Section({ title, icon: Icon, note, children }: SectionProps) {
   return (
-    <section className="page__section" aria-label={title}>
+    <section className="page__section page__card" aria-label={title}>
       <div className="page__section-head">
         <h2>
           <Icon size={16} strokeWidth={1.75} aria-hidden="true" />
@@ -294,5 +313,67 @@ function VerdictLine({
         <span className="verdict__meta">as of {relativeTime(at, new Date())}</span>
       ) : null}
     </p>
+  );
+}
+
+/** The newest snapshots the timeline reads; the snapshot list pages the rest. */
+const RECENT_SNAPSHOTS = 25;
+
+interface RecentActivityProps {
+  namespace: string | undefined;
+  now: Date;
+  snapshots: ReturnType<typeof useSnapshots>;
+  restores: ReturnType<typeof useRestores>;
+  replications: ReturnType<typeof useReplications>;
+  maintenance: ReturnType<typeof useMaintenance>;
+}
+
+/**
+ * Every run, newest first, from four reads. Each read keeps its own state: a
+ * refused one is named where its runs would be, never silently missing from
+ * a timeline that would then look complete.
+ */
+function RecentActivity({
+  now,
+  snapshots,
+  restores,
+  replications,
+  maintenance,
+}: RecentActivityProps) {
+  const reads = [
+    { read: snapshots, what: "snapshots" },
+    { read: restores, what: "restores" },
+    { read: replications, what: "replications" },
+    { read: maintenance, what: "maintenance" },
+  ] as const;
+  if (reads.every(({ read }) => read.isPending)) {
+    return <LoadingState what="recent activity" rows={4} />;
+  }
+  const items = activity({
+    snapshots: snapshots.data?.items,
+    restores: restores.data,
+    replications: replications.data,
+    maintenance: maintenance.data,
+  });
+  const settled = reads.every(({ read }) => read.isSuccess);
+  return (
+    <>
+      {items.length > 0 ? <ActivityList items={items} now={now} /> : null}
+      {reads.map(({ read, what }) =>
+        read.isError ? (
+          <ErrorState
+            key={what}
+            problem={read.error.problem}
+            what={what}
+            onRetry={() => void read.refetch()}
+          />
+        ) : null,
+      )}
+      {settled && items.length === 0 ? (
+        <EmptyState title="No runs yet" icon={Activity}>
+          Nothing in this scope has run yet: no snapshot, restore, replication or maintenance.
+        </EmptyState>
+      ) : null}
+    </>
   );
 }
