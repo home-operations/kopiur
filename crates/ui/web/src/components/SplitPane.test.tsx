@@ -2,7 +2,7 @@ import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it } from "vitest";
 
-import { readStyles, stripComments } from "../testing/css";
+import { cssRules, readStyles, stripComments } from "../testing/css";
 import { SplitPane } from "./SplitPane";
 import { SPLIT_GUTTER, SPLIT_MIN_PANE } from "./splitRatio";
 
@@ -72,5 +72,23 @@ describe("SplitPane", () => {
     const body = query?.[2] ?? "";
     expect(body).toMatch(/\.split__grid \{[^}]*grid-template-columns:\s*minmax\(0, 1fr\)/);
     expect(body).toMatch(/\.split__gutter \{[^}]*display:\s*none/);
+  });
+
+  it("fills the room it is given: the full width, and down to the bottom of the window", () => {
+    const rules = cssRules(readStyles());
+    const body = (selector: string) =>
+      rules
+        .filter((r) => r.selector === selector)
+        .map((r) => r.body)
+        .join("\n");
+    // No cap on the page's width.
+    expect(body(".content")).not.toMatch(/max-width/);
+    expect(body(".page-head")).not.toMatch(/max-width/);
+    // The content area runs to the bottom of the window, and a filling page
+    // gives its last row — the split — whatever height is left.
+    expect(body(".main")).toMatch(/flex-direction:\s*column/);
+    expect(body(".content")).toMatch(/flex:\s*1/);
+    expect(body(".page--fill")).toMatch(/flex:\s*1/);
+    expect(body(".split__grid")).toMatch(/height:\s*100%/);
   });
 });

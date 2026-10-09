@@ -6,7 +6,7 @@ Sidebar only. **There is no top bar**: the page title lives in the content.
 ┌───────────────┬──────────────────────────────────────────────┐
 │ ▣ kopiur      │ Overview  all namespaces · as of now          │
 │ [* all ns   ▾]│                                              │
-│ [⌕ Find… /  ] │  (page content, max --content-max)           │
+│ [⌕ Find… /  ] │  (page content, full width)                  │
 │ ⌂ Overview    │                                              │
 │ ⧉ Topology    │                                              │
 │ STORAGE       │                                              │
@@ -82,7 +82,7 @@ button.
 
 ## Content area
 
-`--bg-canvas`, padded `--space-5`, capped at `--content-max`. Every page starts
+`--bg-canvas`, padded `--space-5`, full width (no cap). Every page starts
 with the **page title** (`--text-xl`, bold) and the scope in mono beside it, then
 the page's own content. A resource's details are never a page: they open in the
 side panel over the page (`composites.md` → Resource drawer).

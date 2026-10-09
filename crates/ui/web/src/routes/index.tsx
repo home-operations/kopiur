@@ -80,7 +80,7 @@ function Overview() {
   });
 
   return (
-    <div className="page">
+    <div className="page page--fill">
       <VerdictLine
         repositories={repositories.data}
         report={report}

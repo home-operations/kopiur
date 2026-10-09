@@ -52,7 +52,6 @@
 
   /* ---- layout ---- */
   --sidebar-width: 240px;
-  --content-max: 1440px;
   --drawer-width: 50vw; /* the side panel; set inline once resized   */
   --drawer-min: 360px;
   --drawer-max: 85vw;
@@ -907,6 +906,7 @@ a.object-name:hover {
 
 .split__grid {
   display: grid;
+  height: 100%;
   grid-template-columns:
     minmax(440px, var(--split-start, 1fr))
     8px
@@ -2319,12 +2319,13 @@ html:has(dialog.side-panel[open]) {
 
 /* The page: the title opens the content. */
 .main {
+  display: flex;
+  flex-direction: column;
   min-width: 0;
   outline: none;
 }
 
 .page-head {
-  max-width: var(--content-max);
   padding: var(--space-5) var(--space-5) 0;
 }
 
@@ -2346,8 +2347,12 @@ html:has(dialog.side-panel[open]) {
   font-weight: var(--weight-regular);
 }
 
+/* Full width, and down to the bottom of the window: a page that fills
+   (`.page--fill`) can hand the room to its last row. */
 .content {
-  max-width: var(--content-max);
+  display: flex;
+  flex-direction: column;
+  flex: 1;
   padding: var(--space-4) var(--space-5) var(--space-6);
 }
 
@@ -2527,6 +2532,12 @@ html:has(dialog.side-panel[open]) {
   display: grid;
   grid-template-columns: minmax(0, 1fr);
   gap: var(--space-6);
+}
+
+/* A page whose last row takes whatever height is left (the overview's split). */
+.page--fill {
+  flex: 1;
+  grid-template-rows: auto minmax(0, 1fr);
 }
 
 .page__section {
