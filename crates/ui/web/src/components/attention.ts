@@ -25,9 +25,6 @@ import { repositoryPhaseLabel } from "./repository";
  * report's condition message, then what the list row alone can say.
  */
 
-/** At most this many rows; the kind lists and the doctor report have the rest. */
-export const ATTENTION_MAX = 8;
-
 /** One thing wrong with an object, and what to do about it when someone said. */
 export interface AttentionProblem {
   what: string;
@@ -53,9 +50,8 @@ export interface AttentionCheck {
 }
 
 export interface Attention {
+  /** Every object that needs someone, worst first — none held back. */
   items: AttentionItem[];
-  /** Rows beyond {@link ATTENTION_MAX}, not shown. */
-  more: number;
   checks: AttentionCheck[];
 }
 
@@ -284,8 +280,7 @@ export function attention(sources: AttentionSources): Attention {
     .sort((a, b) => a.rank - b.rank || a.order - b.order)
     .map((e) => e.item);
   return {
-    items: sorted.slice(0, ATTENTION_MAX),
-    more: Math.max(0, sorted.length - ATTENTION_MAX),
+    items: sorted,
     checks,
   };
 }

@@ -25,7 +25,7 @@ export function AttentionList({
   namespace: string | undefined;
   now: Date;
 }) {
-  const { items, more, checks } = attention;
+  const { items, checks } = attention;
   if (items.length === 0 && checks.length === 0) return null;
   const search = namespace !== undefined ? { namespace } : {};
   return (
@@ -52,15 +52,6 @@ export function AttentionList({
           />
         </li>
       ))}
-      {more > 0 ? (
-        <li className="attention__more">
-          And {more} more — the{" "}
-          <Link to="/doctor" search={search}>
-            doctor report
-          </Link>{" "}
-          and each kind's list have them all.
-        </li>
-      ) : null}
     </ul>
   );
 }

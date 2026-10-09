@@ -456,8 +456,8 @@ check" for the kind and the check's title linking to the doctor page.
 ```
 
 Grid `auto minmax(0, 1fr) auto` with areas `"chip id state" ". body body"`;
-below 560px the pill drops under the name. At most `ATTENTION_MAX` rows, then
-"And N more" pointing at the doctor report and the lists.
+below 560px the pill drops under the name. Every row is shown — nothing is held
+back behind a count; past `min(70vh, 48rem)` the list scrolls inside itself.
 ---
 
 ## Table (list pages)

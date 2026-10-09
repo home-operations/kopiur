@@ -8,7 +8,8 @@ import type {
   RepositorySummary,
   ScheduleRow,
 } from "../api/types";
-import { ATTENTION_MAX, attention, splitFix } from "./attention";
+import { cssRules, readStyles } from "../testing/css";
+import { attention, splitFix } from "./attention";
 
 const NOW = "2026-09-08T12:00:00Z";
 
@@ -200,12 +201,19 @@ describe("attention", () => {
     ]);
   });
 
-  it("shows at most a screenful and counts the rest", () => {
-    const many = Array.from({ length: ATTENTION_MAX + 3 }, (_, i) =>
-      repo(`r${String(i)}`, "failed"),
-    );
+  it("hides nothing: every object that needs someone is a row", () => {
+    const many = Array.from({ length: 30 }, (_, i) => repo(`r${String(i)}`, "failed"));
     const result = attention({ repositories: many });
-    expect(result.items).toHaveLength(ATTENTION_MAX);
-    expect(result.more).toBe(3);
+    expect(result.items).toHaveLength(30);
+    expect(result).not.toHaveProperty("more");
+  });
+
+  it("scrolls a long list inside itself rather than cutting it short", () => {
+    const list = cssRules(readStyles())
+      .filter((r) => r.selector === ".attention")
+      .map((r) => r.body)
+      .join("\n");
+    expect(list).toMatch(/max-height:/);
+    expect(list).toMatch(/overflow-y:\s*auto/);
   });
 });
