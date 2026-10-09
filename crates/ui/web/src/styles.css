@@ -1237,6 +1237,118 @@ a.object-name:hover {
   background: var(--accent);
 }
 
+/* The table's own tools sit above its card, on the right: the "Columns"
+   menu. */
+.ledger-tools {
+  display: flex;
+  justify-content: flex-end;
+  margin-bottom: var(--space-2);
+}
+
+.column-picker {
+  position: relative;
+}
+
+.column-picker__count {
+  color: var(--fg-muted);
+  font-weight: var(--weight-regular);
+}
+
+.column-picker__panel {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 30;
+  display: grid;
+  gap: var(--space-2);
+  width: 18rem;
+  max-width: calc(100vw - 2 * var(--space-4));
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  background: var(--bg-surface);
+  box-shadow: var(--shadow-2);
+}
+
+.column-picker__list {
+  display: grid;
+  gap: 2px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.column-picker__row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: var(--space-1);
+  min-height: 34px;
+  padding: 0 4px;
+  border-radius: var(--radius-md);
+}
+
+.column-picker__row:hover {
+  background: var(--bg-hover);
+}
+
+.column-picker__toggle {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+  font-size: var(--text-sm);
+  overflow-wrap: anywhere;
+  cursor: pointer;
+}
+
+.column-picker__toggle input {
+  accent-color: var(--accent);
+}
+
+.column-picker__grip,
+.column-picker__move {
+  display: inline-grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--fg-muted);
+}
+
+.column-picker__grip {
+  cursor: grab;
+  touch-action: none;
+}
+
+.column-picker__grip:active {
+  cursor: grabbing;
+}
+
+.column-picker__move:hover:not([disabled]),
+.column-picker__grip:hover {
+  background: var(--bg-hover);
+  color: var(--fg);
+}
+
+.column-picker__move[disabled] {
+  opacity: 0.35;
+}
+
+.column-picker__moves {
+  display: inline-flex;
+}
+
+.column-picker__foot {
+  display: flex;
+  justify-content: flex-start;
+  padding-top: var(--space-2);
+  border-top: 1px solid var(--line);
+}
+
 /* ---- panel: one level of enclosure, never nested ------------------------- */
 
 .panel {

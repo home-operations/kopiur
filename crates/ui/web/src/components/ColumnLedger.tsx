@@ -1,6 +1,7 @@
 import type { ReactNode } from "react";
 
 import { ColumnHeader } from "./ColumnHeader";
+import { ColumnPicker } from "./ColumnPicker";
 import { useColumnPrefs } from "./columnPrefs";
 import { type ColumnSpec, columnWidth, tableMinWidth, visibleColumns } from "./tableColumns";
 
@@ -45,43 +46,48 @@ export function ColumnLedger<Row, Id extends string>({
   const visible = visibleColumns(columns, prefs);
   const classes = ["ledger", "ledger--fixed", className].filter(Boolean).join(" ");
   return (
-    <div className="ledger-scroll">
-      <table
-        className={classes}
-        aria-label={label}
-        style={{ minWidth: `${String(tableMinWidth(visible, prefs))}px` }}
-      >
-        <colgroup>
-          {visible.map((spec) => {
-            const width = columnWidth(spec, prefs);
-            return (
-              <col
-                key={spec.id}
-                style={width === null ? undefined : { width: `${String(width)}px` }}
-              />
-            );
-          })}
-        </colgroup>
-        <thead>
-          <tr>
-            {visible.map((spec) => (
-              <ColumnHeader key={spec.id} table={id} spec={spec} prefs={prefs} />
-            ))}
-          </tr>
-        </thead>
-        <tbody>
-          {rows.map((row) => (
-            <tr key={rowKey(row)} {...rowProps?.(row)}>
+    <>
+      <div className="ledger-tools">
+        <ColumnPicker table={id} label={label} columns={columns} />
+      </div>
+      <div className="ledger-scroll">
+        <table
+          className={classes}
+          aria-label={label}
+          style={{ minWidth: `${String(tableMinWidth(visible, prefs))}px` }}
+        >
+          <colgroup>
+            {visible.map((spec) => {
+              const width = columnWidth(spec, prefs);
+              return (
+                <col
+                  key={spec.id}
+                  style={width === null ? undefined : { width: `${String(width)}px` }}
+                />
+              );
+            })}
+          </colgroup>
+          <thead>
+            <tr>
               {visible.map((spec) => (
-                <td key={spec.id} className={cellClass(spec)}>
-                  {cell(row, spec.id)}
-                </td>
+                <ColumnHeader key={spec.id} table={id} spec={spec} prefs={prefs} />
               ))}
             </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
+          </thead>
+          <tbody>
+            {rows.map((row) => (
+              <tr key={rowKey(row)} {...rowProps?.(row)}>
+                {visible.map((spec) => (
+                  <td key={spec.id} className={cellClass(spec)}>
+                    {cell(row, spec.id)}
+                  </td>
+                ))}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </>
   );
 }
 

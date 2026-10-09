@@ -42,6 +42,7 @@ const NEVER_FOCUSED = new Set([
   ".identity__panel",
   ".ns-switcher__panel",
   ".search__results",
+  ".column-picker__panel",
   '.shell[data-nav-open="true"] .sidebar',
   // The pressed theme option — covered by its own rule, asserted separately.
   '.theme-switch__option[aria-pressed="true"]',

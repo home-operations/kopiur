@@ -80,6 +80,12 @@ describe("ColumnLedger", () => {
     expect(nth(cells, 2)).toHaveClass("num");
   });
 
+  it("offers its own Columns menu, above the card", () => {
+    const table = mount();
+    const menu = screen.getByRole("button", { name: "Columns" });
+    expect(menu.compareDocumentPosition(table) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  });
+
   it("sizes each column through a colgroup, leaving the flexible one free", () => {
     const table = mount();
     const cols = Array.from(table.querySelectorAll<HTMLElement>("colgroup col"));
