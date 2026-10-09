@@ -11,7 +11,7 @@ import { KIND_META } from "./kind";
 
 /**
  * The overview's "Needs attention": every object that needs someone as one
- * row of one shape — kind and name (opening the resource drawer), a pill
+ * row of one shape, the whole row its link — kind and name (opening the resource drawer), a pill
  * saying what is wrong, the problem in the operator's words and the fix on
  * its plate — then the failing doctor checks that are about no object in
  * particular, in the same shape.
@@ -40,7 +40,7 @@ export function AttentionList({
           </span>
           <span className="object-id">
             <span className="kind-name attention-row__check-word">Doctor check</span>
-            <Link className="object-name" to="/doctor" search={search}>
+            <Link className="object-name row-link" to="/doctor" search={search}>
               {check.title}
             </Link>
           </span>
@@ -81,7 +81,7 @@ function ObjectRow({ item, now }: { item: AttentionItem; now: Date }) {
       <KindChip kind={target.kind} />
       <span className="object-id">
         <KindName kind={target.kind} />
-        <InspectLink className="object-name" target={target}>
+        <InspectLink className="object-name row-link" target={target}>
           {target.name}
         </InspectLink>
         <span className="object-ns">{target.namespace ?? "cluster-scoped"}</span>

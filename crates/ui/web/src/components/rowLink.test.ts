@@ -26,4 +26,14 @@ describe("whole-row links", () => {
   it("drop the underline on the row's name — the whole row is the link", () => {
     expect(body((s) => s === ".row-link")).toMatch(/text-decoration:\s*none/);
   });
+
+  it("make a whole attention row its object's link, and show the ring on the row", () => {
+    expect(body((s) => s === ".attention-row:has(.row-link)")).toMatch(/position:\s*relative/);
+    expect(
+      body((s) => s.includes(".attention-row:has(.row-link)") && s.includes(":not(.row-link)")),
+    ).toMatch(/z-index:\s*1/);
+    expect(body((s) => s.includes(".attention-row:has(.row-link:focus-visible)"))).toMatch(
+      /box-shadow:\s*var\(--focus-ring\)/,
+    );
+  });
 });

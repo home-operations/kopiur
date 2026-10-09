@@ -887,6 +887,32 @@ a.object-name:hover {
   font-size: var(--text-sm);
 }
 
+/* The whole row opens the object: its name's link is stretched over it
+   (`.row-link`, as in the tables), and the keyboard ring is drawn on the row
+   rather than on the name alone. */
+.attention-row:has(.row-link) {
+  position: relative;
+  cursor: pointer;
+  transition: background-color 120ms ease;
+}
+
+.attention-row:has(.row-link):hover {
+  background: var(--bg-hover);
+}
+
+.attention-row:has(.row-link) :is(a, button):not(.row-link) {
+  position: relative;
+  z-index: 1;
+}
+
+.attention-row .row-link:focus-visible {
+  box-shadow: none;
+}
+
+.attention-row:has(.row-link:focus-visible) {
+  box-shadow: var(--focus-ring);
+}
+
 .attention-row.has-stripe {
   border-left: var(--stripe) solid var(--kc);
 }

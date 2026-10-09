@@ -249,6 +249,10 @@ describe("Overview", () => {
       "href",
       expect.stringMatching(/inspect=snapshot%2Fmedia%2Fnightly-1$/),
     );
+    // The whole row is the link: every row's name is the one stretched over it.
+    for (const row of rows) {
+      expect(row.querySelectorAll("a.row-link")).toHaveLength(1);
+    }
     expect(blocked.querySelector(".health")).toHaveTextContent("Stuck");
     expect(blocked.querySelector(".attention-row__what")).toHaveTextContent(
       "blocked on MoverPermitted=False",
