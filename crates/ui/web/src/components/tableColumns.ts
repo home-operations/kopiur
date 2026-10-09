@@ -37,6 +37,10 @@ export interface ColumnSpec<Id extends string = string> {
   resizable?: boolean;
   /** Off until someone turns it on. */
   defaultHidden?: boolean;
+  /** Carries the row's kind stripe (the identity column). */
+  stripe?: boolean;
+  /** Extra classes on this column's cells. */
+  className?: string;
 }
 
 /** What one person changed about one table. */

@@ -1186,6 +1186,57 @@ a.object-name:hover {
   min-width: 0;
 }
 
+/* A table whose columns a person sizes (`ColumnLedger`): the colgroup says
+   how wide each column is, so the browser stops guessing from the content.
+   Cell text still wraps rather than spilling into the next column; only a
+   header word too long for a narrowed column is cut, with the full word in
+   its title. */
+.ledger--fixed {
+  table-layout: fixed;
+}
+
+.ledger--fixed td {
+  overflow-wrap: anywhere;
+}
+
+.ledger--fixed th {
+  position: relative;
+}
+
+.ledger__label {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* The resize handle: a strip along the header's right edge, wide enough to
+   catch, drawn as a hairline that brightens when it is held or focused. */
+.ledger__resize {
+  position: absolute;
+  inset: 0 0 0 auto;
+  display: flex;
+  justify-content: flex-end;
+  width: 10px;
+  cursor: col-resize;
+  touch-action: none;
+  user-select: none;
+}
+
+.ledger__resize::after {
+  content: "";
+  width: 1px;
+  height: 100%;
+  background: var(--line-strong);
+  transition: background-color var(--dur-fast) var(--ease-out);
+}
+
+.ledger__resize:hover::after,
+.ledger__resize:focus-visible::after,
+.ledger__resize[data-dragging]::after {
+  width: 2px;
+  background: var(--accent);
+}
+
 /* ---- panel: one level of enclosure, never nested ------------------------- */
 
 .panel {
