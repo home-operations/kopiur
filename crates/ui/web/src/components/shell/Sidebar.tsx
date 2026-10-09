@@ -1,7 +1,11 @@
 import { Link } from "@tanstack/react-router";
+import { Fragment } from "react";
 
+import { useOverview } from "../../api/hooks";
 import { KIND_META } from "../kind";
 import { NAV_GROUPS } from "../nav";
+import { navTally } from "../navTally";
+import { NavTallyMarks } from "./NavTally";
 import { NamespaceSwitcher } from "./NamespaceSwitcher";
 import { ObjectSearch } from "./ObjectSearch";
 import { UserChip } from "./UserChip";
@@ -18,9 +22,15 @@ function BrandMark() {
 /**
  * The whole frame: brand, namespace scope, object search, the sections
  * grouped by family, and who you are. There is no header bar.
+ *
+ * A section that lists a kind carries the fleet's count of it in scope and a
+ * bar of their health (`navTally`), from the same overview read the overview
+ * page's verdict uses. The section's name stays its link's name; the count in
+ * words is the link's description, so the bar is never the only account.
  */
 export function Sidebar({ namespace }: { namespace: string | undefined }) {
   const search = namespace !== undefined ? { namespace } : {};
+  const overview = useOverview(namespace);
   return (
     <aside id="sidebar" className="sidebar" aria-label="Sections">
       <Link to="/" className="sidebar__brand" search={search}>
@@ -41,30 +51,44 @@ export function Sidebar({ namespace }: { namespace: string | undefined }) {
             ) : null}
             {group.items.map((item) => {
               const Icon = item.icon;
+              const tally = navTally(overview.data, item.to);
+              const describedBy = tally !== null ? `nav-tally-${item.to.slice(1)}` : undefined;
+              const to =
+                item.to === "/repositories" && tally !== null && tally.failing > 0
+                  ? { health: "failed", ...search }
+                  : search;
               return (
-                <Link
-                  key={item.to}
-                  to={item.to}
-                  search={search}
-                  className="nav-item"
-                  activeOptions={{ exact: item.to === "/", includeSearch: false }}
-                  activeProps={{ "aria-current": "page" }}
-                >
-                  {item.kind !== undefined ? (
-                    <span
-                      className="kind-chip kind-chip--nav"
-                      data-kind={KIND_META[item.kind].slug}
-                      aria-hidden="true"
-                    >
-                      <Icon strokeWidth={2} />
+                <Fragment key={item.to}>
+                  <Link
+                    to={item.to}
+                    search={to}
+                    aria-describedby={describedBy}
+                    className="nav-item"
+                    activeOptions={{ exact: item.to === "/", includeSearch: false }}
+                    activeProps={{ "aria-current": "page" }}
+                  >
+                    {item.kind !== undefined ? (
+                      <span
+                        className="kind-chip kind-chip--nav"
+                        data-kind={KIND_META[item.kind].slug}
+                        aria-hidden="true"
+                      >
+                        <Icon strokeWidth={2} />
+                      </span>
+                    ) : (
+                      <span className="nav-item__chip" aria-hidden="true">
+                        <Icon strokeWidth={2} />
+                      </span>
+                    )}
+                    <span className="nav-item__label">{item.label}</span>
+                    {tally !== null ? <NavTallyMarks tally={tally} /> : null}
+                  </Link>
+                  {describedBy !== undefined && tally !== null ? (
+                    <span id={describedBy} hidden>
+                      {tally.words}
                     </span>
-                  ) : (
-                    <span className="nav-item__chip" aria-hidden="true">
-                      <Icon strokeWidth={2} />
-                    </span>
-                  )}
-                  {item.label}
-                </Link>
+                  ) : null}
+                </Fragment>
               );
             })}
           </div>

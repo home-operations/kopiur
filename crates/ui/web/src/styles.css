@@ -1745,10 +1745,14 @@ html:has(dialog.side-panel[open]) {
   border-top: 1px solid var(--line);
 }
 
+/* A section: chip, name, and — for a kind — its count (with a failed pill
+   when anything fails) and a thin health bar under the name. */
 .nav-item {
-  display: flex;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  grid-template-areas: "chip label tally";
   align-items: center;
-  gap: 10px;
+  column-gap: 10px;
   padding: 6px 8px;
   border-radius: var(--radius-md);
   color: var(--fg-muted);
@@ -1768,8 +1772,63 @@ html:has(dialog.side-panel[open]) {
   color: var(--accent-ink);
 }
 
+.nav-item:has(.status-bar--nav) {
+  grid-template-areas:
+    "chip label tally"
+    "chip bar bar";
+}
+
+.nav-item__label {
+  grid-area: label;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.nav-item__tally {
+  grid-area: tally;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.nav-item__count {
+  color: var(--fg-muted);
+  font-size: var(--text-xs);
+  font-variant-numeric: tabular-nums;
+}
+
+.nav-item[aria-current="page"] .nav-item__count {
+  color: var(--accent-ink);
+}
+
+.health--compact {
+  gap: 2px;
+  padding: 0 6px 0 4px;
+  font-size: var(--text-xs);
+  line-height: 1.5;
+}
+
+.health--compact svg {
+  width: 11px;
+  height: 11px;
+}
+
+.status-bar--nav {
+  grid-area: bar;
+  gap: 2px;
+  height: 3px;
+  margin-top: 4px;
+}
+
+.status-bar--nav > span {
+  border-radius: 2px;
+}
+
 .nav-item__chip,
 .kind-chip--nav {
+  grid-area: chip;
   display: inline-grid;
   place-items: center;
   flex: none;

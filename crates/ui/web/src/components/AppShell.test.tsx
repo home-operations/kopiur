@@ -123,6 +123,77 @@ describe("AppShell", () => {
     expect(heading).toHaveTextContent("prod");
   });
 
+  it("puts each kind's count and health beside its section, the failures first and in words", async () => {
+    fetchMock.resetMocks();
+    fetchMock.mockResponse((request) => {
+      const url = new URL(request.url, "http://localhost");
+      const body =
+        url.pathname === "/api/v1/me"
+          ? alice
+          : url.pathname === "/api/v1/overview"
+            ? {
+                snapshotWindowHours: 24,
+                generatedAt: "2026-10-08T12:00:00Z",
+                kinds: [
+                  {
+                    kind: "repository",
+                    total: 2,
+                    byHealth: [
+                      { health: "failed", count: 1 },
+                      { health: "healthy", count: 1 },
+                    ],
+                  },
+                  {
+                    kind: "clusterRepository",
+                    total: 1,
+                    byHealth: [{ health: "healthy", count: 1 }],
+                  },
+                  { kind: "snapshotSchedule", total: 0, byHealth: [] },
+                  { kind: "snapshotPolicy", total: 2, byHealth: [{ health: "healthy", count: 2 }] },
+                ],
+              }
+            : [];
+      return Promise.resolve(
+        new Response(JSON.stringify(body), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      );
+    });
+    mountAt("/policies?namespace=media");
+    const nav = await screen.findByRole("navigation", { name: "Primary" });
+
+    // The name stays the section's; the count and health are its description.
+    const repositories = await within(nav).findByRole("link", {
+      name: "Repositories",
+      description: "3: 1 failed, 2 ok",
+    });
+    expect(repositories.querySelector(".nav-item__count")).toHaveTextContent("3");
+    expect(repositories.querySelector(".health[data-health='failed']")).toHaveTextContent("1");
+    expect(repositories.querySelector(".status-bar")).toHaveAttribute("aria-hidden", "true");
+    // A failing section links straight to what is failing, keeping the scope.
+    expect(repositories).toHaveAttribute("href", "/repositories?health=failed&namespace=media");
+
+    const policies = within(nav).getByRole("link", { name: "Policies", description: "2: 2 ok" });
+    expect(policies.querySelector(".health")).toBeNull();
+    expect(within(nav).getByRole("link", { name: "Schedules" })).toHaveAccessibleDescription(
+      "none in scope",
+    );
+    for (const name of ["Overview", "Topology", "Doctor"]) {
+      expect(within(nav).getByRole("link", { name }).querySelector(".nav-item__count")).toBeNull();
+    }
+  });
+
+  it("shows no counts when the fleet overview could not be read", async () => {
+    mockShell();
+    mountAt("/doctor");
+    const nav = await screen.findByRole("navigation", { name: "Primary" });
+    expect(
+      within(nav).getByRole("link", { name: "Repositories" }),
+    ).not.toHaveAccessibleDescription();
+    expect(nav.querySelector(".nav-item__count")).toBeNull();
+  });
+
   it("groups the sections by family, and the group names are not links", async () => {
     mockShell();
     mountAt("/");
