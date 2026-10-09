@@ -1343,6 +1343,59 @@ a.object-name:hover {
   display: inline-flex;
 }
 
+/* A drag: the row's slot stays behind as a dashed outline, a lifted copy
+   rides under the pointer (kept inside the list), and the other rows slide
+   out of its way (`ColumnPicker`, a Web Animations slide). */
+.column-picker__stack {
+  position: relative;
+}
+
+.column-picker__row[data-dragging] {
+  outline: 1px dashed var(--line-strong);
+  outline-offset: -1px;
+  background: var(--bg-inset);
+}
+
+.column-picker__row[data-dragging] > * {
+  visibility: hidden;
+}
+
+.column-picker__ghost {
+  position: absolute;
+  inset-inline: 0;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-height: 34px;
+  padding: 0 10px;
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-md);
+  background: var(--bg-surface);
+  box-shadow: var(--shadow-2);
+  color: var(--fg);
+  font-size: var(--text-sm);
+  pointer-events: none;
+  transform: scale(1.02);
+}
+
+.column-picker__ghost svg {
+  color: var(--accent);
+}
+
+.column-picker__panel[data-dragging],
+.column-picker__panel[data-dragging] * {
+  cursor: grabbing;
+}
+
+.column-picker__panel[data-dragging] .column-picker__row:hover {
+  background: transparent;
+}
+
+.column-picker__panel[data-dragging] .column-picker__row[data-dragging]:hover {
+  background: var(--bg-inset);
+}
+
 .column-picker__foot {
   display: flex;
   justify-content: flex-start;

@@ -43,6 +43,8 @@ const NEVER_FOCUSED = new Set([
   ".ns-switcher__panel",
   ".search__results",
   ".column-picker__panel",
+  // The lifted copy of a dragged row: a picture, `aria-hidden`, never focused.
+  ".column-picker__ghost",
   '.shell[data-nav-open="true"] .sidebar',
   // The pressed theme option — covered by its own rule, asserted separately.
   '.theme-switch__option[aria-pressed="true"]',

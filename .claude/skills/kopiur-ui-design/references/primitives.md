@@ -620,7 +620,11 @@ const SNAPSHOT_COLUMNS: readonly ColumnSpec<SnapshotColumn>[] = [
   (`.ledger-tools`). It lists the unlocked columns: a checkbox to hide (the
   last visible one cannot be turned off), a grip to drag or move with ArrowUp
   and ArrowDown, earlier/later buttons, and **Reset columns** for this table
-  only. Each change is announced in a status line. Its button says how many
+  only. A drag lifts the row: a copy (`.column-picker__ghost`, accent border,
+  `--shadow-2`) rides under the pointer, the row's slot stays as a dashed
+  outline, and the other rows slide out of the way (160ms, skipped under
+  reduced motion). The order is saved on release; Escape mid-drag puts it
+  back. Button and key moves slide too. Each change is announced in a status line. Its button says how many
   are hidden ("Columns · 2 hidden"). It closes on Escape or a click outside,
   like the namespace switcher.
 - Only what someone changed is stored, so adding or removing a column needs no

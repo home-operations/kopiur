@@ -1,6 +1,6 @@
 import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { ColumnPicker } from "./ColumnPicker";
 import { COLUMNS_KEY, forgetColumnPrefs, setHidden, tablePrefs } from "./columnPrefs";
@@ -38,9 +38,35 @@ const order = (panel: HTMLElement) =>
     .getAllByRole("checkbox")
     .map((box) => box.closest("label")?.textContent);
 
+/**
+ * jsdom lays nothing out: give each row a 40px slot by its place in the list,
+ * so a drag and a slide have positions to work from.
+ */
+function layOut() {
+  Object.defineProperty(HTMLLIElement.prototype, "offsetTop", {
+    configurable: true,
+    get(this: HTMLLIElement) {
+      return Array.from(this.parentElement?.children ?? []).indexOf(this) * 40;
+    },
+  });
+  Object.defineProperty(HTMLLIElement.prototype, "offsetHeight", {
+    configurable: true,
+    get: () => 40,
+  });
+}
+
 beforeEach(() => {
   window.localStorage.clear();
   forgetColumnPrefs();
+  layOut();
+});
+
+afterEach(() => {
+  // The prototype getters jsdom inherits from HTMLElement come back.
+  Reflect.deleteProperty(HTMLLIElement.prototype, "offsetTop");
+  Reflect.deleteProperty(HTMLLIElement.prototype, "offsetHeight");
+  Reflect.deleteProperty(HTMLElement.prototype, "animate");
+  vi.restoreAllMocks();
 });
 
 describe("ColumnPicker", () => {
@@ -111,31 +137,79 @@ describe("ColumnPicker", () => {
 
   it("reorders by dragging the grip over another row", async () => {
     const { panel } = await open();
-    const rows = within(panel).getAllByRole("listitem");
-    rows.forEach((row, i) => {
-      row.getBoundingClientRect = () => new DOMRect(0, i * 40, 200, 40);
-    });
     const grip = within(panel).getByRole("button", { name: "Reorder Phase" });
-    grip.setPointerCapture = () => undefined;
-    grip.releasePointerCapture = () => undefined;
     fireEvent.pointerDown(grip, { button: 0, clientY: 20, pointerId: 1 });
     fireEvent.pointerMove(grip, { clientY: 105, pointerId: 1, buttons: 1 });
     fireEvent.pointerUp(grip, { clientY: 105, pointerId: 1 });
     expect(order(panel)).toEqual(["Origin", "Size", "Phase", "Notes"]);
+    expect(tablePrefs("test").order).toEqual(["origin", "size", "phase", "notes"]);
+    expect(within(panel).getByRole("status")).toHaveTextContent("Phase moved to position 3 of 4");
+  });
+
+  it("lifts the row while it is dragged, and saves nothing until it is let go", async () => {
+    const { panel } = await open();
+    const grip = within(panel).getByRole("button", { name: "Reorder Phase" });
+    fireEvent.pointerDown(grip, { button: 0, clientY: 20, pointerId: 1 });
+    fireEvent.pointerMove(grip, { clientY: 105, pointerId: 1, buttons: 1 });
+    // The rows already make room…
+    expect(order(panel)).toEqual(["Origin", "Size", "Phase", "Notes"]);
+    // …the row's own slot stays behind as an outline…
+    expect(panel.querySelector('li[data-column="phase"]')).toHaveAttribute("data-dragging", "true");
+    // …and a copy of it rides under the pointer, grabbed where it was grabbed.
+    const ghost = panel.querySelector<HTMLElement>(".column-picker__ghost");
+    expect(ghost).toHaveTextContent("Phase");
+    expect(ghost).toHaveAttribute("aria-hidden", "true");
+    expect(ghost?.style.top).toBe("85px");
+    expect(tablePrefs("test").order).toBeUndefined();
+    fireEvent.pointerUp(grip, { clientY: 105, pointerId: 1 });
+    expect(panel.querySelector(".column-picker__ghost")).toBeNull();
+    expect(panel.querySelector("li[data-dragging]")).toBeNull();
+  });
+
+  it("keeps the copy inside the list, however far the pointer goes", async () => {
+    const { panel } = await open();
+    const grip = within(panel).getByRole("button", { name: "Reorder Phase" });
+    fireEvent.pointerDown(grip, { button: 0, clientY: 20, pointerId: 1 });
+    fireEvent.pointerMove(grip, { clientY: 900, pointerId: 1, buttons: 1 });
+    expect(panel.querySelector<HTMLElement>(".column-picker__ghost")?.style.top).toBe("120px");
+    expect(order(panel)).toEqual(["Origin", "Size", "Notes", "Phase"]);
+  });
+
+  it("puts everything back on Escape mid-drag, and keeps the menu open", async () => {
+    const { user, panel } = await open();
+    const grip = within(panel).getByRole("button", { name: "Reorder Phase" });
+    fireEvent.pointerDown(grip, { button: 0, clientY: 20, pointerId: 1 });
+    fireEvent.pointerMove(grip, { clientY: 105, pointerId: 1, buttons: 1 });
+    await user.keyboard("{Escape}");
+    expect(screen.getByRole("dialog", { name: "Columns of Snapshots" })).toBeInTheDocument();
+    expect(order(panel)).toEqual(["Phase", "Origin", "Size", "Notes"]);
+    expect(panel.querySelector(".column-picker__ghost")).toBeNull();
+    fireEvent.pointerUp(grip, { clientY: 105, pointerId: 1 });
+    expect(tablePrefs("test").order).toBeUndefined();
   });
 
   it("ends a drag released away from the grip, so hovering later moves nothing", async () => {
     const { panel } = await open();
-    const rows = within(panel).getAllByRole("listitem");
-    rows.forEach((row, i) => {
-      row.getBoundingClientRect = () => new DOMRect(0, i * 40, 200, 40);
-    });
     const grip = within(panel).getByRole("button", { name: "Reorder Phase" });
     fireEvent.pointerDown(grip, { button: 0, clientY: 20, pointerId: 1 });
-    // The row moved under the pointer and the release landed on the label.
-    fireEvent.pointerUp(within(panel).getByText("Size"), { clientY: 60, pointerId: 1 });
+    // The release landed on a label, off the grip.
+    fireEvent.pointerUp(within(panel).getByText("Size"), { clientY: 20, pointerId: 1 });
     fireEvent.pointerMove(grip, { clientY: 140, pointerId: 1, buttons: 0 });
     expect(order(panel)).toEqual(["Phase", "Origin", "Size", "Notes"]);
+  });
+
+  it("slides the rows that move to their new places", async () => {
+    const animate = vi.fn(() => ({}) as Animation);
+    HTMLElement.prototype.animate = animate;
+    const { user, panel } = await open();
+    await user.click(within(panel).getByRole("button", { name: "Move Size earlier" }));
+    const slides = animate.mock.calls.map((call) => {
+      const [frames] = call as unknown as [Keyframe[]];
+      return frames[0]?.transform;
+    });
+    // Size came up a slot and Origin went down one; each starts where it was.
+    expect(slides).toEqual(expect.arrayContaining(["translateY(40px)", "translateY(-40px)"]));
+    expect(slides).toHaveLength(2);
   });
 
   it("resets this table's layout and no other", async () => {
