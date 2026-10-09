@@ -118,11 +118,6 @@ function Topology() {
           <EdgeLegend />
         </section>
       ) : null}
-
-      <p className="page__prose">
-        Each line runs from the object that acts to the object it acts on. Select a plate to see its
-        relationships and gates. A dashed plate is referenced but missing from the cluster.
-      </p>
     </div>
   );
 }
