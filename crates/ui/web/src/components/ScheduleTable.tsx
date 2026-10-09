@@ -34,11 +34,11 @@ type ScheduleColumn = "schedule" | "cron" | "fires" | "state" | "lastFire" | "ne
 
 const SCHEDULE_COLUMNS: readonly ColumnSpec<ScheduleColumn>[] = [
   { id: "schedule", label: "Schedule", width: "auto", min: 220, locked: true, stripe: true },
-  { id: "cron", label: "Cron", width: 140, min: 80, className: "mono schedule-table__cron" },
-  { id: "fires", label: "Fires", width: 220, min: 100 },
-  { id: "state", label: "State", width: 150, min: 80 },
-  { id: "lastFire", label: "Last fire", width: 130, min: 100, numeric: true },
-  { id: "nextFire", label: "Next fire", width: 130, min: 100, numeric: true },
+  { id: "cron", label: "Cron", width: 200, min: 200, className: "mono schedule-table__cron" },
+  { id: "fires", label: "Fires", width: 220, min: 160 },
+  { id: "state", label: "State", width: 150, min: 140 },
+  { id: "lastFire", label: "Last fire", width: 150, min: 150, numeric: true },
+  { id: "nextFire", label: "Next fire", width: 170, min: 170, numeric: true },
 ];
 
 /** With the route's suspend control: a column of buttons, kept last. */

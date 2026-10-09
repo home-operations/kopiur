@@ -88,7 +88,11 @@ function onStorage(event: StorageEvent): void {
 }
 
 export function subscribeColumnPrefs(listener: () => void): () => void {
-  if (listeners.size === 0) window.addEventListener("storage", onStorage);
+  if (listeners.size === 0) {
+    // Nothing was listening, so another tab may have written meanwhile.
+    memory = null;
+    window.addEventListener("storage", onStorage);
+  }
   listeners.add(listener);
   return () => {
     listeners.delete(listener);

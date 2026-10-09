@@ -1,9 +1,9 @@
-import type { ReactNode } from "react";
+import { type ReactNode, useEffect, useState } from "react";
 
 import { ColumnHeader } from "./ColumnHeader";
 import { ColumnPicker } from "./ColumnPicker";
 import { useColumnPrefs } from "./columnPrefs";
-import { type ColumnSpec, columnWidth, tableMinWidth, visibleColumns } from "./tableColumns";
+import { type ColumnSpec, fitWidths, tableMinWidth, visibleColumns } from "./tableColumns";
 
 /** Attributes a row may carry: its kind for the stripe, a state for styling. */
 type RowAttributes = Record<`data-${string}`, string | undefined>;
@@ -44,21 +44,32 @@ export function ColumnLedger<Row, Id extends string>({
 }: ColumnLedgerProps<Row, Id>) {
   const prefs = useColumnPrefs(id);
   const visible = visibleColumns(columns, prefs);
+  const [card, setCard] = useState<HTMLDivElement | null>(null);
+  const widths = fitWidths(visible, prefs, useCardWidth(card));
+  const floor = tableMinWidth(visible, widths);
+  // Fixed layout spreads any room the columns leave over across all of them,
+  // so a column would stop following its handle. With a flexible column that
+  // column takes it; with none, the table is exactly as wide as its columns.
+  const flexible = widths.some((w) => w === null);
   const classes = ["ledger", "ledger--fixed", className].filter(Boolean).join(" ");
   return (
     <div className="ledger-frame">
       <div className="ledger-tools">
         <ColumnPicker table={id} label={label} columns={columns} />
       </div>
-      <div className="ledger-scroll">
+      <div ref={setCard} className="ledger-scroll">
         <table
           className={classes}
           aria-label={label}
-          style={{ minWidth: `${String(tableMinWidth(visible, prefs))}px` }}
+          style={
+            flexible
+              ? { width: "100%", minWidth: `${String(floor)}px` }
+              : { width: `${String(floor)}px` }
+          }
         >
           <colgroup>
-            {visible.map((spec) => {
-              const width = columnWidth(spec, prefs);
+            {visible.map((spec, i) => {
+              const width = widths[i] ?? null;
               return (
                 <col
                   key={spec.id}
@@ -69,8 +80,8 @@ export function ColumnLedger<Row, Id extends string>({
           </colgroup>
           <thead>
             <tr>
-              {visible.map((spec) => (
-                <ColumnHeader key={spec.id} table={id} spec={spec} prefs={prefs} />
+              {visible.map((spec, i) => (
+                <ColumnHeader key={spec.id} table={id} spec={spec} width={widths[i] ?? null} />
               ))}
             </tr>
           </thead>
@@ -89,6 +100,27 @@ export function ColumnLedger<Row, Id extends string>({
       </div>
     </div>
   );
+}
+
+/**
+ * How wide the card is inside its border, kept current as the window or the
+ * sidebar changes it; `null` until it is laid out (or where nothing can
+ * measure it, as under test).
+ */
+function useCardWidth(node: HTMLDivElement | null): number | null {
+  const [width, setWidth] = useState<number | null>(null);
+  useEffect(() => {
+    if (node === null || typeof ResizeObserver === "undefined") return undefined;
+    const observer = new ResizeObserver(() => {
+      const next = node.clientWidth;
+      setWidth(next > 0 ? next : null);
+    });
+    observer.observe(node);
+    return () => {
+      observer.disconnect();
+    };
+  }, [node]);
+  return width;
 }
 
 function cellClass(spec: ColumnSpec): string | undefined {

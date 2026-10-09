@@ -127,11 +127,49 @@ export function columnWidth(spec: ColumnSpec, prefs: TablePrefs): number | null 
 }
 
 /**
- * The narrowest the table may be: every visible column at its width (the
- * flexible one at its floor). Wider than its card, it scrolls inside it.
+ * The width each visible column is drawn at in a card `available` pixels
+ * wide (`null` for the flexible column left alone).
+ *
+ * Widths someone chose are kept as chosen. The rest start at their declared
+ * width and, when the card is too narrow for all of them, give up their slack
+ * evenly — each by the same share of the distance to its floor — so a table
+ * reaches the point where it has to scroll as late as it can. With the room
+ * unknown (not laid out yet), the declared widths stand.
  */
-export function tableMinWidth(columns: readonly ColumnSpec[], prefs: TablePrefs): number {
-  return columns.reduce((sum, c) => sum + (columnWidth(c, prefs) ?? c.min), 0);
+export function fitWidths(
+  columns: readonly ColumnSpec[],
+  prefs: TablePrefs,
+  available: number | null,
+): (number | null)[] {
+  const chosen = (c: ColumnSpec) => prefs.width?.[c.id] !== undefined;
+  const sized = columns.filter((c) => !chosen(c) && c.width !== "auto");
+  const declared = sized.reduce((sum, c) => sum + (c.width === "auto" ? 0 : c.width), 0);
+  const floors = sized.reduce((sum, c) => sum + c.min, 0);
+  const taken = columns.reduce(
+    (sum, c) => sum + (chosen(c) ? (columnWidth(c, prefs) ?? 0) : c.width === "auto" ? c.min : 0),
+    0,
+  );
+  const spare = available === null || available <= 0 ? Infinity : available - taken;
+  const share =
+    spare >= declared || declared === floors
+      ? 1
+      : Math.max(0, (spare - floors) / (declared - floors));
+  return columns.map((c) => {
+    if (chosen(c) || c.width === "auto") return columnWidth(c, prefs);
+    return Math.round(c.min + (c.width - c.min) * share);
+  });
+}
+
+/**
+ * The narrowest the table may be: every visible column at the width it is
+ * drawn at, the flexible one at its floor. Wider than its card, it scrolls
+ * inside it.
+ */
+export function tableMinWidth(
+  columns: readonly ColumnSpec[],
+  widths: readonly (number | null)[],
+): number {
+  return columns.reduce((sum, c, i) => sum + (widths[i] ?? c.min), 0);
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {

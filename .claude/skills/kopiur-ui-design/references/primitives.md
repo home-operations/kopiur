@@ -601,12 +601,17 @@ const SNAPSHOT_COLUMNS: readonly ColumnSpec<SnapshotColumn>[] = [
   the prose one (Finding, Reason). Every other column has a default width in px.
 - **`min` is what the column holds**, not just the header word: a reference
   column's floor fits the widest kind name it can show (`CLUSTERREPOSITORY`), so
-  a reference never wraps inside its chip. The defaults of a table add up to
-  less than a 1600px window with the sidebar.
-- **Layout is fixed** (`.ledger--fixed`, widths in a `colgroup`, the table's
-  `min-width` the sum of its columns), so the browser stops guessing from
-  content, and a layout wider than its card scrolls inside it. Only a header
-  word too long for a narrowed column is cut, with the full word in its title.
+  a reference never wraps inside its chip, a status column fits its widest
+  pill, and a "never …" absence fits on one line. The defaults of a table add
+  up to less than a 1600px window with the sidebar.
+- **Layout is fixed** (`.ledger--fixed`, widths in a `colgroup`), so the browser
+  stops guessing from content. The columns nobody resized give up their slack
+  evenly, toward their floors, as the card narrows (`fitWidths`); only past the
+  floors does the table scroll inside its card. Once no visible column is
+  flexible (the `auto` one was resized or hidden), the table is exactly as wide
+  as its columns, so the leftover room is not spread across them and a column
+  keeps following its handle. Only a header word too long for a narrowed
+  column is cut, with the full word in its title.
 - **Resize** is a focusable `role="separator"` on the header's right edge
   (`.ledger__resize`, a hairline that turns accent when held or focused), like
   the drawer grip and the split gutter: drag it, or arrow keys ±16px; Home or a

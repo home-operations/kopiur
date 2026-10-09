@@ -161,6 +161,20 @@ describe("ColumnLedger", () => {
     expect(stored()).toEqual({ test: { width: { phase: 190 } } });
   });
 
+  it("keeps to its columns' widths once none of them is flexible, rather than stretching them", () => {
+    window.localStorage.setItem(COLUMNS_KEY, JSON.stringify({ test: { width: { name: 260 } } }));
+    forgetColumnPrefs();
+    const table = mount();
+    // 260 + 130 + 100 + 90: the card's spare room stays empty.
+    expect(table.style.width).toBe("580px");
+    window.localStorage.clear();
+    forgetColumnPrefs();
+  });
+
+  it("fills the card while a column is flexible", () => {
+    expect(mount().style.width).toBe("100%");
+  });
+
   it("opens with the widths it was left at", () => {
     window.localStorage.setItem(COLUMNS_KEY, JSON.stringify({ test: { width: { size: 150 } } }));
     forgetColumnPrefs();

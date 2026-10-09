@@ -23,7 +23,7 @@ type GateColumn = "severity" | "condition" | "blockedWhen" | "reason" | "applies
 
 /** Severity and condition name the gate, so they stay; the reason takes what is left. */
 const GATE_COLUMNS: readonly ColumnSpec<GateColumn>[] = [
-  { id: "severity", label: "Severity", width: 130, min: 100, locked: true },
+  { id: "severity", label: "Severity", width: 130, min: 130, locked: true },
   { id: "condition", label: "Condition", width: 240, min: 120, locked: true, className: "mono" },
   {
     id: "blockedWhen",
@@ -33,7 +33,7 @@ const GATE_COLUMNS: readonly ColumnSpec<GateColumn>[] = [
     className: "mono gate-list__status",
   },
   { id: "reason", label: "Reason", width: "auto", min: 180, className: "mono" },
-  { id: "appliesTo", label: "Applies to", width: 260, min: 120 },
+  { id: "appliesTo", label: "Applies to", width: 260, min: 150 },
 ];
 
 export function GateList({ gates }: GateListProps) {

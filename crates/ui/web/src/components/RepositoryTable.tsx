@@ -52,12 +52,12 @@ type RepositoryColumn =
 
 const REPOSITORY_COLUMNS: readonly ColumnSpec<RepositoryColumn>[] = [
   { id: "repository", label: "Repository", width: "auto", min: 240, locked: true, stripe: true },
-  { id: "health", label: "Health", width: 130, min: 90 },
+  { id: "health", label: "Health", width: 130, min: 130 },
   { id: "phase", label: "Phase", width: 120, min: 80 },
-  { id: "access", label: "Access", width: 180, min: 100 },
+  { id: "access", label: "Access", width: 180, min: 150 },
   { id: "backend", label: "Backend", width: 110, min: 90 },
   { id: "snapshots", label: "Snapshots", width: 110, min: 110, numeric: true },
-  { id: "size", label: "Size", width: 100, min: 70, numeric: true },
+  { id: "size", label: "Size", width: 100, min: 96, numeric: true },
   { id: "indexBlobs", label: "Index blobs", width: 120, min: 120, numeric: true },
   { id: "lastObserved", label: "Last observed", width: 150, min: 130 },
 ];

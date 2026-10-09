@@ -4,6 +4,7 @@ import {
   type ColumnSpec,
   MAX_COLUMN_WIDTH,
   clampWidth,
+  fitWidths,
   columnWidth,
   hiddenCount,
   isVisible,
@@ -155,8 +156,9 @@ describe("column width", () => {
   it("adds the visible columns up, so a wide layout scrolls instead of squeezing", () => {
     const visible = visibleColumns(SPECS, {});
     // name (floor 200) + phase 130 + origin 120 + size 100 + run 90
-    expect(tableMinWidth(visible, {})).toBe(640);
-    expect(tableMinWidth(visible, { width: { origin: 300 } })).toBe(820);
+    expect(tableMinWidth(visible, fitWidths(visible, {}, null))).toBe(640);
+    const wider = { width: { origin: 300 } };
+    expect(tableMinWidth(visible, fitWidths(visible, wider, null))).toBe(820);
   });
 });
 
@@ -184,5 +186,26 @@ describe("stored preferences", () => {
       a: { hidden: { y: true }, width: { y: 120 }, order: ["x", "y"] },
       c: {},
     });
+  });
+});
+
+describe("fitting the columns to the card", () => {
+  const visible = visibleColumns(SPECS, {});
+  // name (flexible, floor 200), phase 130/90, origin 120/80, size 100/70, run 90/90
+
+  it("draws the declared widths when there is room, or when the room is not known", () => {
+    expect(fitWidths(visible, {}, 2000)).toEqual([null, 130, 120, 100, 90]);
+    expect(fitWidths(visible, {}, null)).toEqual([null, 130, 120, 100, 90]);
+  });
+
+  it("shrinks the columns nobody sized toward their floors before the table scrolls", () => {
+    // Declared: 200 + 130 + 120 + 100 + 90 = 640; floors: 200 + 90 + 80 + 70 + 90 = 530.
+    // 585 is halfway between, so every column gives up half of its slack.
+    expect(fitWidths(visible, {}, 585)).toEqual([null, 110, 100, 85, 90]);
+    expect(fitWidths(visible, {}, 400)).toEqual([null, 90, 80, 70, 90]);
+  });
+
+  it("never shrinks a width someone chose", () => {
+    expect(fitWidths(visible, { width: { origin: 300 } }, 600)).toEqual([null, 90, 300, 70, 90]);
   });
 });

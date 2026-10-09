@@ -87,9 +87,9 @@ type DoctorColumn = "outcome" | "check" | "scope" | "finding";
  * the finding is the prose column and takes the room that is left.
  */
 const DOCTOR_COLUMNS: readonly ColumnSpec<DoctorColumn>[] = [
-  { id: "outcome", label: "Outcome", width: 130, min: 100, locked: true },
+  { id: "outcome", label: "Outcome", width: 130, min: 130, locked: true },
   { id: "check", label: "Check", width: 240, min: 140, locked: true },
-  { id: "scope", label: "Scope", width: 200, min: 100, className: "doctor-checks__scope" },
+  { id: "scope", label: "Scope", width: 200, min: 160, className: "doctor-checks__scope" },
   { id: "finding", label: "Finding", width: "auto", min: 260 },
 ];
 

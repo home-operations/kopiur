@@ -119,9 +119,23 @@ describe("ColumnPicker", () => {
     grip.setPointerCapture = () => undefined;
     grip.releasePointerCapture = () => undefined;
     fireEvent.pointerDown(grip, { button: 0, clientY: 20, pointerId: 1 });
-    fireEvent.pointerMove(grip, { clientY: 105, pointerId: 1 });
+    fireEvent.pointerMove(grip, { clientY: 105, pointerId: 1, buttons: 1 });
     fireEvent.pointerUp(grip, { clientY: 105, pointerId: 1 });
     expect(order(panel)).toEqual(["Origin", "Size", "Phase", "Notes"]);
+  });
+
+  it("ends a drag released away from the grip, so hovering later moves nothing", async () => {
+    const { panel } = await open();
+    const rows = within(panel).getAllByRole("listitem");
+    rows.forEach((row, i) => {
+      row.getBoundingClientRect = () => new DOMRect(0, i * 40, 200, 40);
+    });
+    const grip = within(panel).getByRole("button", { name: "Reorder Phase" });
+    fireEvent.pointerDown(grip, { button: 0, clientY: 20, pointerId: 1 });
+    // The row moved under the pointer and the release landed on the label.
+    fireEvent.pointerUp(within(panel).getByText("Size"), { clientY: 60, pointerId: 1 });
+    fireEvent.pointerMove(grip, { clientY: 140, pointerId: 1, buttons: 0 });
+    expect(order(panel)).toEqual(["Phase", "Origin", "Size", "Notes"]);
   });
 
   it("resets this table's layout and no other", async () => {

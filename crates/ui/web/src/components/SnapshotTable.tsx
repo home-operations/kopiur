@@ -58,7 +58,7 @@ type SnapshotColumn =
 
 const SNAPSHOT_COLUMNS: readonly ColumnSpec<SnapshotColumn>[] = [
   { id: "snapshot", label: "Snapshot", width: "auto", min: 200, locked: true, stripe: true },
-  { id: "phase", label: "Phase", width: 130, min: 90 },
+  { id: "phase", label: "Phase", width: 130, min: 130 },
   { id: "origin", label: "Origin", width: 110, min: 80 },
   { id: "policy", label: "Policy", width: 210, min: 200 },
   {
@@ -68,8 +68,8 @@ const SNAPSHOT_COLUMNS: readonly ColumnSpec<SnapshotColumn>[] = [
     min: 210,
     className: "snapshot-table__repository",
   },
-  { id: "size", label: "Size", width: 90, min: 70, numeric: true },
-  { id: "files", label: "Files", width: 90, min: 70, numeric: true },
+  { id: "size", label: "Size", width: 100, min: 96, numeric: true },
+  { id: "files", label: "Files", width: 110, min: 80, numeric: true },
   { id: "started", label: "Started", width: 100, min: 90, numeric: true },
   { id: "took", label: "Took", width: 80, min: 70, numeric: true },
 ];

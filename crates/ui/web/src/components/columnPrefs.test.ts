@@ -101,6 +101,20 @@ describe("column preferences", () => {
     stop();
   });
 
+  it("rereads storage when a table comes back after none was listening", () => {
+    const stop = subscribeColumnPrefs(() => undefined);
+    setHidden("snapshots", "origin", true);
+    stop();
+    // Another tab, while no table here was on screen to hear it.
+    window.localStorage.setItem(
+      COLUMNS_KEY,
+      JSON.stringify({ snapshots: { hidden: { phase: true } } }),
+    );
+    const again = subscribeColumnPrefs(() => undefined);
+    expect(tablePrefs("snapshots").hidden).toEqual({ phase: true });
+    again();
+  });
+
   it("still works, unremembered, when storage is blocked", () => {
     vi.spyOn(Storage.prototype, "getItem").mockImplementation(() => {
       throw new Error("blocked");

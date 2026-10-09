@@ -31,11 +31,11 @@ type RestoreColumn = "restore" | "phase" | "route" | "repository" | "restored" |
 
 const RESTORE_COLUMNS: readonly ColumnSpec<RestoreColumn>[] = [
   { id: "restore", label: "Restore", width: "auto", min: 220, locked: true, stripe: true },
-  { id: "phase", label: "Phase", width: 140, min: 90 },
+  { id: "phase", label: "Phase", width: 140, min: 130 },
   { id: "route", label: "Reads → writes", width: 220, min: 140 },
   { id: "repository", label: "Repository", width: 240, min: 220 },
   { id: "restored", label: "Restored", width: 140, min: 100, numeric: true },
-  { id: "started", label: "Started", width: 120, min: 90, numeric: true },
+  { id: "started", label: "Started", width: 120, min: 110, numeric: true },
 ];
 
 export function RestoreTable({ restores, now = new Date() }: RestoreTableProps) {

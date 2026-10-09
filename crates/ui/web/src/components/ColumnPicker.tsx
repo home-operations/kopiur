@@ -55,7 +55,7 @@ export function ColumnPicker({
   const button = useRef<HTMLButtonElement | null>(null);
   const panel = useRef<HTMLDivElement | null>(null);
   const list = useRef<HTMLOListElement | null>(null);
-  const drag = useRef<string | null>(null);
+  const stopDrag = useRef<(() => void) | null>(null);
   const panelId = useId();
 
   const close = (refocusButton: boolean) => {
@@ -96,7 +96,6 @@ export function ColumnPicker({
   }, [refocus]);
 
   const order = movableOrder(columns, prefs);
-  if (order.length === 0) return null;
   const byId = new Map(columns.map((c) => [c.id, c]));
   const hidden = hiddenCount(columns, prefs);
   const shown = orderedColumns(columns, prefs).filter((c) => isVisible(c, prefs)).length;
@@ -118,34 +117,58 @@ export function ColumnPicker({
     move(id, order.indexOf(id) + step, "grip");
   };
 
-  const onGripDown = (event: ReactPointerEvent<HTMLButtonElement>, id: string) => {
-    if (event.button !== 0) return;
-    event.preventDefault();
-    drag.current = id;
-    event.currentTarget.setPointerCapture(event.pointerId);
-  };
-
   // Where the pointer is among the other rows: past the middle of a row is
   // past that row.
-  const onGripMove = (event: ReactPointerEvent<HTMLButtonElement>) => {
-    const id = drag.current;
-    if (id === null || list.current === null) return;
+  const dragTo = (id: string, y: number) => {
+    if (list.current === null) return;
     const rows = Array.from(list.current.querySelectorAll<HTMLLIElement>(":scope > li"));
     const to = rows
       .filter((row) => row.dataset.column !== id)
       .filter((row) => {
         const box = row.getBoundingClientRect();
-        return box.top + box.height / 2 < event.clientY;
+        return box.top + box.height / 2 < y;
       }).length;
     move(id, to, "grip");
   };
+  const dragToRef = useRef(dragTo);
+  useLayoutEffect(() => {
+    dragToRef.current = dragTo;
+  });
+  useEffect(
+    () => () => {
+      stopDrag.current?.();
+    },
+    [],
+  );
 
-  const onGripUp = (event: ReactPointerEvent<HTMLButtonElement>) => {
-    if (drag.current === null) return;
-    drag.current = null;
-    event.currentTarget.releasePointerCapture(event.pointerId);
+  // A drag is followed on the window, not the grip: the row it belongs to is
+  // re-inserted as it moves, which drops pointer capture, and the release can
+  // land anywhere. A move with no button held means the release was missed;
+  // that ends the drag too.
+  const onGripDown = (event: ReactPointerEvent<HTMLButtonElement>, id: string) => {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    stopDrag.current?.();
+    const onMove = (e: PointerEvent) => {
+      if ((e.buttons & 1) === 0) {
+        stop();
+        return;
+      }
+      dragToRef.current(id, e.clientY);
+    };
+    const stop = () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", stop);
+      window.removeEventListener("pointercancel", stop);
+      stopDrag.current = null;
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", stop);
+    window.addEventListener("pointercancel", stop);
+    stopDrag.current = stop;
   };
 
+  if (order.length === 0) return null;
   const name = hidden > 0 ? `Columns, ${String(hidden)} hidden` : "Columns";
   return (
     <div className="column-picker">
@@ -192,9 +215,6 @@ export function ColumnPicker({
                     onPointerDown={(event) => {
                       onGripDown(event, id);
                     }}
-                    onPointerMove={onGripMove}
-                    onPointerUp={onGripUp}
-                    onPointerCancel={onGripUp}
                   >
                     <GripVertical size={14} strokeWidth={2} aria-hidden="true" />
                   </button>

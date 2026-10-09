@@ -1,14 +1,7 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 
 import { commitWidths, resetWidth, setWidth } from "./columnPrefs";
-import {
-  COLUMN_STEP,
-  type ColumnSpec,
-  MAX_COLUMN_WIDTH,
-  type TablePrefs,
-  clampWidth,
-  columnWidth,
-} from "./tableColumns";
+import { COLUMN_STEP, type ColumnSpec, MAX_COLUMN_WIDTH, clampWidth } from "./tableColumns";
 
 /**
  * One column's header, with the handle on its right edge that resizes it.
@@ -25,16 +18,17 @@ import {
 export function ColumnHeader({
   table,
   spec,
-  prefs,
+  width: fitted,
 }: {
   table: string;
   spec: ColumnSpec;
-  prefs: TablePrefs;
+  /** What the table draws it at; `null` for the flexible column left alone. */
+  width: number | null;
 }) {
   const header = useRef<HTMLTableCellElement | null>(null);
   const handle = useRef<HTMLDivElement | null>(null);
   const [drawn, setDrawn] = useState<number | null>(null);
-  const width = columnWidth(spec, prefs) ?? drawn ?? spec.min;
+  const width = fitted ?? drawn ?? spec.min;
   const widthRef = useRef(width);
   useLayoutEffect(() => {
     widthRef.current = width;
@@ -44,10 +38,10 @@ export function ColumnHeader({
   // The flexible column's drawn width, so the handle can say what it is.
   useLayoutEffect(() => {
     const node = header.current;
-    if (node === null || columnWidth(spec, prefs) !== null) return;
+    if (node === null || fitted !== null) return;
     const measured = Math.round(node.getBoundingClientRect().width);
     if (measured > 0 && measured !== drawn) setDrawn(measured);
-  }, [spec, prefs, drawn]);
+  }, [fitted, drawn]);
 
   useEffect(() => {
     const node = handle.current;
@@ -58,12 +52,19 @@ export function ColumnHeader({
     const resize = (px: number) => {
       setWidth(table, spec.id, clampWidth(spec, px));
     };
+    // Where a change starts from is the width on screen now — the window or
+    // the sidebar may have moved it since anything was measured — falling
+    // back to what the table asked for where nothing is laid out.
+    const current = () => {
+      const measured = Math.round(header.current?.getBoundingClientRect().width ?? 0);
+      return measured > 0 ? measured : widthRef.current;
+    };
     let start: { x: number; width: number } | null = null;
     const onDown = (event: PointerEvent) => {
       if (event.button !== 0) return;
       event.preventDefault();
       event.stopPropagation();
-      start = { x: event.clientX, width: widthRef.current };
+      start = { x: event.clientX, width: current() };
       node.setPointerCapture(event.pointerId);
       node.dataset.dragging = "true";
     };
@@ -88,7 +89,7 @@ export function ColumnHeader({
         event.key === "ArrowRight" ? COLUMN_STEP : event.key === "ArrowLeft" ? -COLUMN_STEP : 0;
       if (step === 0) return;
       event.preventDefault();
-      resize(widthRef.current + step);
+      resize(current() + step);
       commitWidths();
     };
     const onDouble = () => {
