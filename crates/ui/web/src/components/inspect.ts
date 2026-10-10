@@ -87,6 +87,38 @@ export function pushInspect(
     : { stack: stack.slice(0, at + 1), truncated: true };
 }
 
+/** What a history entry says about the drawers opened onto it. */
+export interface InspectEntry {
+  inspectDepth?: number | undefined;
+  inspectBase?: number | undefined;
+}
+
+/**
+ * The mark for the entry a link pushes when it opens a drawer on top of the
+ * `open` drawers of the current entry. An entry that was itself pushed at
+ * this depth continues its chain, so the new one can be stepped back to its
+ * base; anything else (the page, a deep link) starts a chain here.
+ */
+export function inspectPushEntry(current: InspectEntry, open: number): Required<InspectEntry> {
+  const chained = current.inspectDepth === open;
+  return {
+    inspectDepth: open + 1,
+    inspectBase: chained ? (current.inspectBase ?? open - 1) : open,
+  };
+}
+
+/**
+ * How many entries to step back to go from `open` drawers down to `keep`, or
+ * `null` when the entries for those drawers are not behind this one — then
+ * the URL is replaced instead. Stepping back is what keeps Back from
+ * reopening a drawer that was closed by backing past it.
+ */
+export function inspectStepsBack(current: InspectEntry, open: number, keep: number): number | null {
+  if (current.inspectDepth !== open) return null;
+  const base = current.inspectBase ?? open - 1;
+  return keep >= base ? open - keep : null;
+}
+
 /**
  * The drawers open, the top one, and how to close the top one.
  *

@@ -20,6 +20,7 @@ function Harness() {
         app-data
       </InspectLink>
       <InspectLink target={{ kind: "repository", namespace: "a", name: "nas" }}>nas</InspectLink>
+      <InspectLink target={{ kind: "clusterRepository", name: "shared" }}>shared</InspectLink>
       <output aria-label="open">
         {stack.length === 0 ? "none" : stack.map((t) => `${t.kind}:${t.name}`).join(" > ")}
       </output>
@@ -80,6 +81,50 @@ describe("InspectLink and useInspect", () => {
     expect(link.getAttribute("href")).toMatch(/inspect=snapshot-policy%2Fa%2Fapp-data$/);
     await user.click(link);
     expect(await screen.findByText("snapshotPolicy:app-data")).toBeInTheDocument();
+  });
+
+  it("backs down to an earlier drawer through history, so Back never reopens a closed one", async () => {
+    const { router } = renderHarness("/policies?namespace=a");
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole("link", { name: "app-data" }));
+    await user.click(await screen.findByRole("link", { name: "nas" }));
+    await user.click(await screen.findByRole("link", { name: "shared" }));
+    await screen.findByText("snapshotPolicy:app-data > repository:nas > clusterRepository:shared");
+    await user.click(screen.getByRole("link", { name: "app-data" }));
+    await screen.findByText("snapshotPolicy:app-data");
+    // Back closes the one drawer left, rather than reopening nas.
+    router.history.back();
+    expect(await screen.findByText("none")).toBeInTheDocument();
+    expect(router.state.location.search).toEqual({ namespace: "a" });
+    expect(router.history.canGoBack()).toBe(false);
+  });
+
+  it("closing the drawer backed down to leaves no closed drawer behind it", async () => {
+    const { router } = renderHarness("/policies?namespace=a");
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole("link", { name: "app-data" }));
+    await user.click(await screen.findByRole("link", { name: "nas" }));
+    await user.click(await screen.findByRole("link", { name: "shared" }));
+    await user.click(await screen.findByRole("link", { name: "app-data" }));
+    await screen.findByText("snapshotPolicy:app-data");
+    await user.click(screen.getByRole("button", { name: "close" }));
+    await screen.findByText("none");
+    expect(router.history.canGoBack()).toBe(false);
+  });
+
+  it("replaces in place when the drawers it backs past were not opened here", async () => {
+    // A deep link opened app-data and nas together: there is no entry for
+    // app-data alone to step back to.
+    const { router } = renderHarness(
+      "/policies?inspect=snapshot-policy%2Fa%2Fapp-data%2Crepository%2Fa%2Fnas",
+    );
+    const user = userEvent.setup();
+    await screen.findByText("snapshotPolicy:app-data > repository:nas");
+    await user.click(screen.getByRole("link", { name: "shared" }));
+    await screen.findByText("snapshotPolicy:app-data > repository:nas > clusterRepository:shared");
+    await user.click(screen.getByRole("link", { name: "app-data" }));
+    expect(await screen.findByText("snapshotPolicy:app-data")).toBeInTheDocument();
+    expect(router.state.location.search).toEqual({ inspect: "snapshot-policy/a/app-data" });
   });
 
   it("closes the top of a deep-linked stack in place, then the next", async () => {

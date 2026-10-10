@@ -4,7 +4,9 @@ import type { ObjectKind } from "../api/types";
 import { Route as RootRoute } from "../routes/__root";
 import { KIND_META } from "./kind";
 import {
+  inspectPushEntry,
   inspectStackParam,
+  inspectStepsBack,
   inspectToken,
   parseInspect,
   parseInspectStack,
@@ -104,5 +106,27 @@ describe("inspect stack", () => {
     expect(validate({ inspect: "repository/media/nas,bogus" })).toEqual({
       inspect: "repository/media/nas",
     });
+  });
+});
+
+describe("inspect history entries", () => {
+  it("starts a chain on the page or a deep link, and continues one it was pushed onto", () => {
+    expect(inspectPushEntry({}, 0)).toEqual({ inspectDepth: 1, inspectBase: 0 });
+    // Two drawers from a deep link: nothing behind it to step back to.
+    expect(inspectPushEntry({}, 2)).toEqual({ inspectDepth: 3, inspectBase: 2 });
+    expect(inspectPushEntry({ inspectDepth: 1, inspectBase: 0 }, 1)).toEqual({
+      inspectDepth: 2,
+      inspectBase: 0,
+    });
+  });
+
+  it("steps back as far as the chain reaches, and no further", () => {
+    const three = { inspectDepth: 3, inspectBase: 0 };
+    expect(inspectStepsBack(three, 3, 1)).toBe(2);
+    expect(inspectStepsBack(three, 3, 0)).toBe(3);
+    expect(inspectStepsBack({ inspectDepth: 3, inspectBase: 2 }, 3, 1)).toBeNull();
+    // An entry not pushed at this depth (a deep link, a replaced one).
+    expect(inspectStepsBack({}, 3, 1)).toBeNull();
+    expect(inspectStepsBack({ inspectDepth: 2, inspectBase: 0 }, 3, 1)).toBeNull();
   });
 });
