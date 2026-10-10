@@ -132,7 +132,7 @@ jobs:
         run: mise run cov
 
       - name: Upload coverage artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: coverage-lcov
           path: lcov.info
@@ -433,7 +433,7 @@ jobs:
 
       # Pull every per-image artifact into the workdir.
       - name: Download images
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: e2e-image-*
           merge-multiple: true
@@ -446,7 +446,7 @@ jobs:
       # the shard. Here it still overlaps the cluster boot above, which is the
       # slow thing it would otherwise wait on.
       - name: Download e2e tests
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: nextest-e2e
           path: target/nextest
@@ -602,7 +602,7 @@ jobs:
           for job in $(jobs -p); do wait "$job"; done
 
       - name: Upload controller image
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: e2e-image-controller
           path: image-controller.tar.gz
@@ -610,7 +610,7 @@ jobs:
           compression-level: 0
 
       - name: Upload webhook image
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: e2e-image-webhook
           path: image-webhook.tar.gz
@@ -618,7 +618,7 @@ jobs:
           compression-level: 0
 
       - name: Upload mover image
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: e2e-image-mover
           path: image-mover.tar.gz
@@ -626,7 +626,7 @@ jobs:
           compression-level: 0
 
       - name: Upload ui image
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: e2e-image-ui
           path: image-ui.tar.gz
@@ -667,7 +667,7 @@ jobs:
           - ui
     steps:
       - name: Download image
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: e2e-image-${{ matrix.image }}
 
@@ -931,7 +931,7 @@ jobs:
         run: kind create cluster --name kopiur-it --wait 120s
 
       - name: Download tests
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: nextest-workspace
           path: target/nextest
@@ -1064,7 +1064,7 @@ jobs:
       # also carries the uncompressed debug `kopiur` binary (~140MB), which
       # deflates to a fraction, and every shard downloads it.
       - name: Upload e2e tests
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: nextest-e2e
           path: |
@@ -1074,7 +1074,7 @@ jobs:
           compression-level: 1
 
       - name: Upload workspace tests
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: nextest-workspace
           path: target/nextest/workspace.tar.zst
@@ -1108,7 +1108,7 @@ jobs:
           install_args: aqua:nextest-rs/nextest/cargo-nextest lefthook
 
       - name: Download tests
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: nextest-workspace
           path: target/nextest
