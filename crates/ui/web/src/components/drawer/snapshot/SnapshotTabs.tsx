@@ -1,7 +1,8 @@
-import { Camera, Database, FolderTree, GitBranch, ScrollText, Timer } from "lucide-react";
+import { Camera, Database, FolderTree, GitBranch, ScrollText, Sigma, Timer } from "lucide-react";
 import type { ReactNode } from "react";
 
-import { useSnapshotRetention } from "../../../api/hooks";
+import { useSnapshotRetention, useSnapshots } from "../../../api/hooks";
+import { SnapshotSizeChart } from "../../../charts/SnapshotSizeChart";
 import { isNotPermitted, problemKind } from "../../../api/problem";
 import type { Problem, SnapshotDetail as SnapshotDetailData } from "../../../api/types";
 import {
@@ -59,6 +60,83 @@ export function StorageTab({ detail }: { detail: SnapshotDetailData }) {
           </p>
         )}
       </DrawerSection>
+      <DrawerSection title="Size over time" icon={Sigma}>
+        <SizeHistory detail={detail} />
+      </DrawerSection>
+    </>
+  );
+}
+
+/** "The 13 runs", or "The newest 100 of 240 runs" when the history is cut. */
+function runsText(shown: number, total: number): string {
+  const runs = (n: number) => `${String(n)} run${n === 1 ? "" : "s"}`;
+  return total > shown ? `The newest ${String(shown)} of ${runs(total)}` : `The ${runs(shown)}`;
+}
+
+/** How many runs the size history reads: the newest, which is what a trend is. */
+const HISTORY_RUNS = 100;
+
+/**
+ * This snapshot's size among its policy's other runs into the same
+ * repository, with its own point marked. Read only while the Storage tab is
+ * open — a policy's history is a list call the drawer must not pay for
+ * unopened. A fan-out policy writes one series per repository, so the
+ * repository narrows it: sizes in two repositories are two different trends.
+ */
+function SizeHistory({ detail }: { detail: SnapshotDetailData }) {
+  const { row } = detail;
+  const policy = row.policy ?? "";
+  const history = useSnapshots(
+    {
+      namespace: row.namespace,
+      policy,
+      repository: row.repository ?? undefined,
+      limit: HISTORY_RUNS,
+    },
+    { enabled: policy.length > 0 },
+  );
+  if (policy.length === 0) {
+    return (
+      <p className="page__section-note">
+        No <span className="mono">SnapshotPolicy</span> governs this snapshot, so it has no runs to
+        trend against.
+      </p>
+    );
+  }
+  if (history.isPending) {
+    return <LoadingState what="this policy's earlier runs" rows={3} />;
+  }
+  if (history.isError) {
+    const { problem } = history.error;
+    if (isNotPermitted(problem)) {
+      return <NotPermittedState problem={problem} what="this policy's earlier runs" />;
+    }
+    return (
+      <ErrorState
+        problem={problem}
+        what="this policy's earlier runs"
+        onRetry={() => void history.refetch()}
+      />
+    );
+  }
+  return (
+    <>
+      <p className="page__section-note">
+        {runsText(history.data.items.length, history.data.total)} of{" "}
+        <span className="mono">{policy}</span>
+        {row.repository !== null && row.repository !== undefined ? (
+          <>
+            {" "}
+            into <span className="mono">{row.repository}</span>
+          </>
+        ) : null}
+        ; this snapshot&apos;s point is the one shown.
+      </p>
+      <SnapshotSizeChart
+        rows={history.data.items}
+        maxPolicies={1}
+        focus={{ namespace: row.namespace, name: row.name }}
+      />
     </>
   );
 }

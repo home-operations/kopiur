@@ -195,6 +195,47 @@ describe("Snapshot drawer", () => {
     expect(storage).not.toHaveTextContent("Deletion policyDelete");
   });
 
+  it("charts this snapshot's size among its policy's runs into the same repository, on the Storage tab only", async () => {
+    mockApi({
+      [PATH]: jsonResponse(detail({ row: row({ repository: "Repository/media/nas" }) })),
+      "/api/v1/snapshots": jsonResponse({
+        items: [
+          row({ name: "nightly-30", endTime: "2026-09-10T01:04:00Z", sizeBytes: 1_100_000_000 }),
+          row({ repository: "Repository/media/nas" }),
+          row({ name: "nightly-28", endTime: "2026-09-08T01:04:00Z", sizeBytes: 900_000_000 }),
+        ],
+        total: 3,
+        offset: 0,
+        limit: 100,
+      }),
+    });
+    mountApp(OPEN);
+    await drawer();
+    // Not read until the tab is opened: a policy's history is a list call.
+    expect(calledPaths().filter((p) => p.startsWith("/api/v1/snapshots?"))).toHaveLength(0);
+    const storage = await openTab("Storage");
+    const section = within(storage).getByRole("region", { name: "Size over time" });
+    const figure = await within(section).findByRole("figure");
+    // Its own point is the one the readout shows, not the newest run's.
+    expect(within(figure).getByRole("status")).toHaveTextContent("nightly-29");
+    expect(within(figure).getByRole("status")).toHaveTextContent("(this snapshot)");
+    const asked = calledPaths().find((p) => p.startsWith("/api/v1/snapshots?")) ?? "";
+    expect(section).toHaveTextContent("The 3 runs of nightly");
+    expect(asked).toContain("namespace=media");
+    expect(asked).toContain("policy=nightly");
+    expect(asked).toContain(`repository=${encodeURIComponent("Repository/media/nas")}`);
+  });
+
+  it("says there is no history to chart for a snapshot no policy governs", async () => {
+    mockApi({ [PATH]: jsonResponse(detail({ row: row({ policy: null }) })) });
+    mountApp(OPEN);
+    const storage = await openTab("Storage");
+    expect(within(storage).getByRole("region", { name: "Size over time" })).toHaveTextContent(
+      "no runs to trend against",
+    );
+    expect(calledPaths().filter((p) => p.startsWith("/api/v1/snapshots?"))).toHaveLength(0);
+  });
+
   it("opens the file browser from the action bar, keeping the console's scope", async () => {
     mockApi({
       [PATH]: jsonResponse(detail()),

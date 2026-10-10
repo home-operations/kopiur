@@ -333,7 +333,7 @@ describe("Snapshots list", () => {
     expect(first.querySelector(".health")).toHaveAttribute("data-health", "unknown");
   });
 
-  it("charts the rows on the page and says the chart follows the filter", async () => {
+  it("draws no size chart: that lives in each snapshot's drawer", async () => {
     mockApi({
       "/api/v1/snapshots": jsonResponse(
         page([row(), row({ name: "nightly-28", endTime: "2026-09-08T01:04:00Z" })]),
@@ -341,7 +341,7 @@ describe("Snapshots list", () => {
     });
     mountApp("/snapshots");
     await list();
-    expect(screen.getByRole("figure")).toBeInTheDocument();
-    expect(screen.getByText(/Drawn from the rows on this page only/)).toBeInTheDocument();
+    expect(screen.queryByRole("figure")).toBeNull();
+    expect(screen.queryByRole("region", { name: "Snapshot size over time" })).toBeNull();
   });
 });

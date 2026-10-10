@@ -57,9 +57,14 @@ export interface SnapshotSizeChartProps {
   rows: readonly SnapshotRow[];
   /** How many policies to draw before naming the rest instead. */
   maxPolicies?: number | undefined;
+  /**
+   * The snapshot this chart is about (a drawer's own): its point is the one
+   * the readout shows until the pointer moves, instead of the newest.
+   */
+  focus?: { namespace: string; name: string } | undefined;
 }
 
-export function SnapshotSizeChart({ rows, maxPolicies = 4 }: SnapshotSizeChartProps) {
+export function SnapshotSizeChart({ rows, maxPolicies = 4, focus }: SnapshotSizeChartProps) {
   const series = sizeSeries(rows);
   if (series.length === 0) {
     return (
@@ -74,7 +79,7 @@ export function SnapshotSizeChart({ rows, maxPolicies = 4 }: SnapshotSizeChartPr
   return (
     <div className="charts">
       {drawn.map((policySeries) => (
-        <PolicyChart key={policySeries.policy} series={policySeries} />
+        <PolicyChart key={policySeries.policy} series={policySeries} focus={focus} />
       ))}
       {hidden > 0 ? (
         <p className="page__section-note">
@@ -93,9 +98,10 @@ export function SnapshotSizeChart({ rows, maxPolicies = 4 }: SnapshotSizeChartPr
 
 interface PolicyChartProps {
   series: PolicySeries;
+  focus?: SnapshotSizeChartProps["focus"];
 }
 
-function PolicyChart({ series }: PolicyChartProps) {
+function PolicyChart({ series, focus }: PolicyChartProps) {
   const { points } = series;
   const [hovered, setHovered] = useState<number | null>(null);
   // One point is not a trend, and "over time" needs two. A lone dot in an
@@ -107,7 +113,12 @@ function PolicyChart({ series }: PolicyChartProps) {
   }
   const area = plotArea(points);
   const latestIndex = points.length - 1;
-  const shownIndex = hovered ?? latestIndex;
+  const focusIndex =
+    focus === undefined
+      ? -1
+      : points.findIndex((p) => p.name === focus.name && p.namespace === focus.namespace);
+  const restIndex = focusIndex === -1 ? latestIndex : focusIndex;
+  const shownIndex = hovered ?? restIndex;
   const shown = points[shownIndex];
   const first = points[0];
   const last = points[latestIndex];
@@ -125,7 +136,7 @@ function PolicyChart({ series }: PolicyChartProps) {
               <span className="chart__readout-value">{humanBytes(shown.bytes)}</span>{" "}
               <span className="mono chart__readout-meta">
                 {shown.name} · {formatTimestamp(shown.at)}
-                {hovered === null ? " (latest)" : ""}
+                {hovered === null ? (focusIndex === -1 ? " (latest)" : " (this snapshot)") : ""}
               </span>
             </>
           ) : null}

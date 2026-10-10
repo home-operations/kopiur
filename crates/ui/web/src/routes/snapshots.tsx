@@ -1,9 +1,8 @@
 import { Link, createFileRoute, useNavigate } from "@tanstack/react-router";
-import { Camera, Filter, Sigma } from "lucide-react";
+import { Camera, Filter } from "lucide-react";
 
 import { type SnapshotListParams, useSnapshots } from "../api/hooks";
 import { problemKind } from "../api/problem";
-import { SnapshotSizeChart } from "../charts/SnapshotSizeChart";
 import { EmptyState } from "../components/EmptyState";
 import { ErrorState } from "../components/ErrorState";
 import { Finding } from "../components/Finding";
@@ -305,19 +304,6 @@ function Snapshots() {
           </>
         )}
       </section>
-
-      {items.length > 0 ? (
-        <section className="page__section" aria-label="Snapshot size over time">
-          <div className="page__section-head">
-            <h2>
-              <Sigma size={16} strokeWidth={2} aria-hidden="true" />
-              Size over time
-            </h2>
-          </div>
-          <p className="page__section-note">Drawn from the rows on this page only.</p>
-          <SnapshotSizeChart rows={items} />
-        </section>
-      ) : null}
     </div>
   );
 }
