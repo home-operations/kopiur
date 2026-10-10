@@ -84,7 +84,7 @@ export function refusedNouns(tallies: readonly KindTally[]): string[] {
   const nouns: string[] = [];
   for (const tally of tallies) {
     const noun = tallyNoun(tally.kind);
-    if (tally.refused !== true || noun === null || nouns.includes(noun[1])) continue;
+    if (!tally.refused || noun === null || nouns.includes(noun[1])) continue;
     nouns.push(noun[1]);
   }
   return nouns;

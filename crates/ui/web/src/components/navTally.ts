@@ -57,7 +57,7 @@ export function navTally(overview: OverviewView | undefined, to: NavPath): NavTa
   }
   const all = overview.kinds.filter((k) => counts.includes(k.kind));
   // A refused kind was not read, so its zero is no count at all.
-  const tallies = all.filter((k) => k.refused !== true);
+  const tallies = all.filter((k) => !k.refused);
   if (all.length > 0 && tallies.length === 0) {
     return { total: 0, parts: [], failing: 0, words: "not permitted to list here", refused: true };
   }

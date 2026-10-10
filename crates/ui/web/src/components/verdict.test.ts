@@ -21,6 +21,7 @@ describe("overviewVerdict", () => {
             { health: "failed", count: 1 },
             { health: "healthy", count: 2 },
           ],
+          refused: false,
         },
       ],
     });
@@ -31,8 +32,13 @@ describe("overviewVerdict", () => {
     const verdict = overviewVerdict({
       ...quiet,
       tallies: [
-        { kind: "restore", total: 1, byHealth: [{ health: "unknown", count: 1 }] },
-        { kind: "snapshotPolicy", total: 2, byHealth: [{ health: "degraded", count: 2 }] },
+        { kind: "restore", total: 1, byHealth: [{ health: "unknown", count: 1 }], refused: false },
+        {
+          kind: "snapshotPolicy",
+          total: 2,
+          byHealth: [{ health: "degraded", count: 2 }],
+          refused: false,
+        },
       ],
     });
     expect(verdict.health).toBe("degraded");
@@ -42,7 +48,14 @@ describe("overviewVerdict", () => {
   it("leaves repositories to the repository list, so they are not counted twice", () => {
     const verdict = overviewVerdict({
       ...quiet,
-      tallies: [{ kind: "repository", total: 3, byHealth: [{ health: "failed", count: 3 }] }],
+      tallies: [
+        {
+          kind: "repository",
+          total: 3,
+          byHealth: [{ health: "failed", count: 3 }],
+          refused: false,
+        },
+      ],
     });
     expect(verdict.health).toBe("healthy");
   });
@@ -186,7 +199,7 @@ describe("overviewVerdict", () => {
     const verdict = overviewVerdict({
       ...quiet,
       tallies: [
-        { kind: "snapshot", total: 1, byHealth: [{ health: "failed", count: 1 }] },
+        { kind: "snapshot", total: 1, byHealth: [{ health: "failed", count: 1 }], refused: false },
         { kind: "restore", total: 0, byHealth: [], refused: true },
       ],
     });
