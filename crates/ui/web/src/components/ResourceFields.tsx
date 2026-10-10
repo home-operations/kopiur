@@ -1,6 +1,7 @@
 import { useState } from "react";
 
-import { usePolicies, useRepositories, useSnapshots } from "../api/hooks";
+import { SEARCH_MIN_CHARS, usePolicies, useRepositories, useSnapshots } from "../api/hooks";
+import type { SnapshotRow } from "../api/types";
 import { relativeTime } from "../util/format";
 import { useCurrentNamespace } from "../util/namespace";
 import { KindChip } from "./KindMark";
@@ -135,6 +136,9 @@ const BROWSABLE_PHASES = "succeeded,discovered";
  * One snapshot to browse, picked from the newest in the shell's scope that
  * wrote something. A choice is `namespace/name`, so two snapshots with one
  * name in different namespaces are never confused.
+ *
+ * Only the newest page is loaded on opening; a typed name is also asked of
+ * the server (`q=`), so a backup older than that page can still be found.
  */
 export function SnapshotField({
   id,
@@ -152,13 +156,26 @@ export function SnapshotField({
   strategy?: "absolute" | "fixed" | undefined;
 }) {
   const [opened, onOpen] = useOpened();
+  const [typed, setTyped] = useState("");
   const scope = useCurrentNamespace();
-  const snapshots = useSnapshots(
+  const newest = useSnapshots(
     { namespace: scope, phase: BROWSABLE_PHASES, limit: 200 },
     { enabled: opened },
   );
-  const options: PickerOption[] = (snapshots.isSuccess ? snapshots.data.items : []).map((row) => ({
-    value: `${row.namespace}/${row.name}`,
+  const term = typed.trim();
+  const named = useSnapshots(
+    { namespace: scope, phase: BROWSABLE_PHASES, q: term, limit: 50 },
+    { enabled: opened && term.length >= SEARCH_MIN_CHARS },
+  );
+  const rows = new Map<string, SnapshotRow>();
+  for (const row of [
+    ...(newest.isSuccess ? newest.data.items : []),
+    ...(named.isSuccess ? named.data.items : []),
+  ]) {
+    rows.set(`${row.namespace}/${row.name}`, row);
+  }
+  const options: PickerOption[] = [...rows].map(([key, row]) => ({
+    value: key,
     label: row.name,
     icon: <KindChip kind="snapshot" size="sm" />,
     meta: [
@@ -178,6 +195,7 @@ export function SnapshotField({
       options={options}
       placeholder={placeholder}
       search="snapshots"
+      onSearch={setTyped}
       // Before the list is fetched, the chosen key still reads as the name.
       labelFor={(key) => key.split("/").at(-1) ?? key}
       onOpen={onOpen}

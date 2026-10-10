@@ -37,8 +37,12 @@ export interface PickerOptionsProps {
   emptyChosen?: boolean | undefined;
   /** For `empty`: picked. */
   onEmpty?: (() => void) | undefined;
-  /** A filter field over the list, with what it filters ("namespaces"). */
-  search?: { noun: string } | undefined;
+  /**
+   * A filter field over the list, with what it filters ("namespaces"). The
+   * filter narrows the loaded options; `onChange` hears what is typed, for a
+   * list too long to load whole that asks the server for more.
+   */
+  search?: { noun: string; onChange?: ((text: string) => void) | undefined } | undefined;
   /** With `search`: offer what was typed when nothing listed has that value. */
   freeform?: boolean | undefined;
 }
@@ -172,6 +176,7 @@ export function PickerOptions({
                 spellCheck={false}
                 onChange={(event) => {
                   setFilter(event.target.value);
+                  search.onChange?.(event.target.value);
                 }}
                 onKeyDown={(event) => {
                   if (event.key !== "Enter") return;

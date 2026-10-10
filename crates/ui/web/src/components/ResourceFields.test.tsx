@@ -3,8 +3,8 @@ import userEvent from "@testing-library/user-event";
 import { useState } from "react";
 import { describe, expect, it, vi } from "vitest";
 
-import { jsonResponse, mockApi, renderWithClient } from "../test-utils";
-import { NamespaceField, PolicyField, RepositoryField } from "./ResourceFields";
+import { fetchMock, jsonResponse, mockApi, renderWithClient } from "../test-utils";
+import { NamespaceField, PolicyField, RepositoryField, SnapshotField } from "./ResourceFields";
 
 const NAMESPACES = jsonResponse([
   { name: "billing", objects: 3 },
@@ -201,5 +201,58 @@ describe("RepositoryField", () => {
     mockApi({ "/api/v1/repositories": REPOS });
     renderWithClient(<Repo initial={["Repository/media/nas"]} />);
     expect(await screen.findByRole("button", { name: "Repository: nas" })).toBeInTheDocument();
+  });
+});
+
+describe("SnapshotField", () => {
+  const row = (name: string) => ({
+    namespace: "media",
+    name,
+    phase: "succeeded",
+    policy: "nightly",
+    endTime: "2026-09-09T01:04:00Z",
+    pinned: false,
+  });
+  const page = (names: string[]) =>
+    jsonResponse({ items: names.map(row), total: names.length, offset: 0, limit: 200 });
+
+  function Pick() {
+    const [value, setValue] = useState("");
+    return (
+      <>
+        <SnapshotField
+          id="s"
+          label="Snapshot"
+          value={value}
+          onChange={setValue}
+          placeholder="Choose a snapshot"
+        />
+        <output aria-label="choice">{value}</output>
+      </>
+    );
+  }
+
+  it("asks the server for a typed name, so a snapshot past the newest loaded can be picked", async () => {
+    const asked: string[] = [];
+    fetchMock.resetMocks();
+    fetchMock.mockResponse((request) => {
+      const url = new URL(request.url, "http://localhost");
+      asked.push(url.searchParams.get("q") ?? "");
+      // The newest page holds no old backup; only a name search finds it.
+      return Promise.resolve(
+        url.searchParams.get("q") === "old" ? page(["nightly-old"]) : page(["nightly-new"]),
+      );
+    });
+    renderWithClient(<Pick />);
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole("button", { name: "Snapshot: Choose a snapshot" }));
+    const panel = screen.getByRole("dialog");
+    await within(panel).findByRole("button", { name: /^nightly-new/ });
+    await user.type(within(panel).getByRole("searchbox"), "old");
+    await user.click(await within(panel).findByRole("button", { name: /^nightly-old/ }));
+    expect(screen.getByLabelText("choice")).toHaveTextContent("media/nightly-old");
+    expect(asked).toContain("old");
+    // One character matches nearly everything: nothing is asked for it.
+    expect(asked).not.toContain("o");
   });
 });

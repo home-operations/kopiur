@@ -18,6 +18,8 @@ interface CommonProps {
   placeholder?: string | undefined;
   /** A filter over the options, naming them ("policies"); a short fixed list has none. */
   search?: string | undefined;
+  /** With `search`: told what is typed, so a field can ask the server for more. */
+  onSearch?: ((text: string) => void) | undefined;
   /** With `search`: what is typed may be taken when nothing listed matches. */
   freeform?: boolean | undefined;
   /** What the button says for a value no loaded option labels (options not fetched yet). */
@@ -65,6 +67,7 @@ export function PickerField(props: PickerFieldProps) {
     emptyLabel,
     placeholder,
     search,
+    onSearch,
     freeform = false,
     labelFor,
     onOpen,
@@ -128,7 +131,7 @@ export function PickerField(props: PickerFieldProps) {
             options={options}
             selected={selected}
             multiple={props.multiple}
-            search={search !== undefined ? { noun: search } : undefined}
+            search={search !== undefined ? { noun: search, onChange: onSearch } : undefined}
             freeform={freeform}
             onClear={
               emptyLabel === undefined
