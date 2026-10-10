@@ -122,6 +122,23 @@ describe("Replications", () => {
     expect(within(nth(rows, 1)).getByText("never")).toBeInTheDocument();
   });
 
+  it("draws each copy's age as a bar under it, and none for a copy never made", async () => {
+    mockApi({ "/api/v1/replications": jsonResponse(view) });
+    mountApp("/replications");
+    const rows = bodyRows(await table());
+    // The only copy on record is the stalest, so its bar runs nearly the
+    // whole track (the axis has a little headroom past the stalest copy).
+    const bar = nth(rows, 0).querySelector<HTMLElement>(".lag-bar__fill");
+    expect(bar).not.toBeNull();
+    expect(Number.parseFloat(bar?.style.width ?? "0")).toBeGreaterThan(80);
+    expect(bar?.closest(".lag-bar")).toHaveAttribute("aria-hidden", "true");
+    // "never" stays a word; there is no age to draw.
+    expect(nth(rows, 1).querySelector(".lag-bar")).toBeNull();
+    // And the table is the one place this is said: no separate lag section.
+    expect(screen.queryByRole("region", { name: "Replication lag" })).toBeNull();
+    expect(screen.queryByText("Time since the last copy")).toBeNull();
+  });
+
   it("never reads a failed replication as healthy", async () => {
     mockApi({ "/api/v1/replications": jsonResponse(view) });
     mountApp("/replications");

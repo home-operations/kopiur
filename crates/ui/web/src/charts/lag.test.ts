@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { ReplicationRow } from "../components/replication";
-import { lagSeries } from "./lag";
+import { lagSeries, lagShare } from "./lag";
 
 const NOW = new Date("2026-09-10T12:00:00Z");
 
@@ -80,5 +80,17 @@ describe("lagSeries", () => {
     expect(series.bars).toHaveLength(0);
     expect(series.neverReplicated).toHaveLength(0);
     expect(series.max).toBeGreaterThan(0);
+  });
+});
+
+describe("lagShare", () => {
+  it("is a copy's age as a share of the axis, never past the end", () => {
+    expect(lagShare(30, 60)).toBe(0.5);
+    expect(lagShare(90, 60)).toBe(1);
+  });
+
+  it("keeps a sliver for a copy made just now, which is a fact, not missing data", () => {
+    expect(lagShare(0, 60)).toBe(0.02);
+    expect(lagShare(5, 0)).toBe(0.02);
   });
 });

@@ -2,6 +2,7 @@ import { PlayCircle } from "lucide-react";
 import type { ReactNode } from "react";
 
 import { useReplicationRun } from "../api/hooks";
+import { lagSeries, lagShare } from "../charts/lag";
 import { ActionButton } from "./ActionButton";
 import { ActionResult } from "./ActionResult";
 import { ColumnLedger } from "./ColumnLedger";
@@ -66,6 +67,8 @@ const REPLICATION_COLUMNS: readonly ColumnSpec<ReplicationColumn>[] = [
 ];
 
 export function ReplicationTable({ rows, now = new Date() }: ReplicationTableProps) {
+  // One axis for every row's lag bar, scaled to the stalest copy.
+  const lag = lagSeries(rows, now);
   return (
     <ColumnLedger
       id="replications"
@@ -75,12 +78,17 @@ export function ReplicationTable({ rows, now = new Date() }: ReplicationTablePro
       rows={rows}
       rowKey={(row) => row.id}
       rowProps={(row) => ({ "data-kind": KIND_META[replicationKind(row)].slug })}
-      cell={(row, id) => replicationCell(row, id, now)}
+      cell={(row, id) => replicationCell(row, id, now, lag.max)}
     />
   );
 }
 
-function replicationCell(row: ReplicationRow, id: ReplicationColumn, now: Date): ReactNode {
+function replicationCell(
+  row: ReplicationRow,
+  id: ReplicationColumn,
+  now: Date,
+  lagMax: number,
+): ReactNode {
   switch (id) {
     case "replication":
       return (
@@ -152,7 +160,7 @@ function replicationCell(row: ReplicationRow, id: ReplicationColumn, now: Date):
         </div>
       );
     case "lastReplicated":
-      return <Lag at={row.lastReplicated} now={now} />;
+      return <Lag at={row.lastReplicated} now={now} max={lagMax} />;
     case "lastRun":
       return <LastRun row={row} />;
     case "run":
@@ -162,13 +170,33 @@ function replicationCell(row: ReplicationRow, id: ReplicationColumn, now: Date):
   }
 }
 
-/** How far behind this copy is; "never" is louder than a dash, and truer. */
-function Lag({ at, now }: { at: string | null | undefined; now: Date }) {
+/**
+ * How far behind this copy is: the age in words, and under it a bar on the
+ * same axis as every other row's (`charts/lag.ts`), so the stalest copy
+ * stands out down the column. "Never" is louder than a dash, and truer, and
+ * has no bar — there is no age to draw.
+ */
+function Lag({ at, now, max }: { at: string | null | undefined; now: Date; max: number }) {
   const text = replicationLag(at, now);
   if (at === null || at === undefined || at.length === 0) {
     return <span className="replication-table__never">{text}</span>;
   }
-  return <time dateTime={at}>{text}</time>;
+  const ms = new Date(at).getTime();
+  return (
+    <div className="lag">
+      <time dateTime={at}>{text}</time>
+      {Number.isNaN(ms) ? null : (
+        <span className="lag-bar" aria-hidden="true">
+          <span
+            className="lag-bar__fill"
+            style={{
+              width: `${String(Math.round(lagShare(Math.max(0, now.getTime() - ms), max) * 1000) / 10)}%`,
+            }}
+          />
+        </span>
+      )}
+    </div>
+  );
 }
 
 function LastRun({ row }: { row: ReplicationRow }) {
