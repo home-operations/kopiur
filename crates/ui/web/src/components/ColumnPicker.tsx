@@ -3,12 +3,12 @@ import {
   type PointerEvent as ReactPointerEvent,
   type KeyboardEvent as ReactKeyboardEvent,
   useEffect,
-  useId,
   useLayoutEffect,
   useRef,
   useState,
 } from "react";
 
+import { Popover } from "./Popover";
 import { resetColumns, setHidden, setOrder, useColumnPrefs } from "./columnPrefs";
 import {
   type ColumnSpec,
@@ -53,8 +53,8 @@ interface Refocus {
  * other move (a button, an arrow key, a reset) slides too, so a row is never
  * seen to teleport.
  *
- * It behaves like the namespace switcher: a click outside closes it, Escape
- * closes it and hands focus back to its button.
+ * It is a `Popover`: a click outside closes it, Escape closes it and hands
+ * focus back to its button.
  */
 export function ColumnPicker({
   table,
@@ -70,8 +70,6 @@ export function ColumnPicker({
   const [open, setOpen] = useState(false);
   const [said, setSaid] = useState("");
   const [refocus, setRefocus] = useState<Refocus | null>(null);
-  const button = useRef<HTMLButtonElement | null>(null);
-  const panel = useRef<HTMLDivElement | null>(null);
   const list = useRef<HTMLOListElement | null>(null);
   const stopDrag = useRef<(() => void) | null>(null);
   const [drag, setDrag] = useState<Drag | null>(null);
@@ -80,33 +78,16 @@ export function ColumnPicker({
   // The latest drag handlers, for listeners attached before they existed.
   const dragToRef = useRef<(y: number) => void>(() => undefined);
   const finishRef = useRef<(keep: boolean) => void>(() => undefined);
-  const panelId = useId();
 
-  const close = (refocusButton: boolean) => {
-    setOpen(false);
-    setSaid("");
-    if (refocusButton) button.current?.focus();
+  const setOpenState = (next: boolean) => {
+    setOpen(next);
+    if (!next) {
+      stopDrag.current?.();
+      setDrag(null);
+      setPreview(null);
+      setSaid("");
+    }
   };
-
-  useEffect(() => {
-    if (!open) return undefined;
-    list.current?.querySelector<HTMLInputElement>("input[type=checkbox]")?.focus();
-    const onPointer = (event: MouseEvent) => {
-      const target = event.target as Node;
-      if (!panel.current?.contains(target) && !button.current?.contains(target)) close(false);
-    };
-    const onKey = (event: KeyboardEvent) => {
-      if (event.key !== "Escape") return;
-      if (stopDrag.current !== null) finishRef.current(false);
-      else close(true);
-    };
-    document.addEventListener("mousedown", onPointer);
-    document.addEventListener("keydown", onKey);
-    return () => {
-      document.removeEventListener("mousedown", onPointer);
-      document.removeEventListener("keydown", onKey);
-    };
-  }, [open]);
 
   // A row that moved was re-inserted, which drops focus; put it back on the
   // control that moved it — or on the grip, if that control is now disabled.
@@ -256,133 +237,132 @@ export function ColumnPicker({
   if (order.length === 0) return null;
   const name = hidden > 0 ? `Columns, ${String(hidden)} hidden` : "Columns";
   return (
-    <div className="column-picker">
-      <button
-        ref={button}
-        type="button"
-        className="button button--quiet column-picker__button"
-        aria-label={name}
-        aria-expanded={open}
-        aria-controls={open ? panelId : undefined}
-        onClick={() => {
-          if (open) close(false);
-          else setOpen(true);
-        }}
-      >
-        <Columns3 size={14} strokeWidth={2} aria-hidden="true" />
-        Columns
-        {hidden > 0 ? <span className="column-picker__count"> · {hidden} hidden</span> : null}
-      </button>
-      {open ? (
-        <div
-          id={panelId}
-          ref={panel}
-          className="column-picker__panel"
-          role="dialog"
-          aria-label={`Columns of ${label}`}
-          data-dragging={drag !== null ? "true" : undefined}
+    <Popover
+      label={`Columns of ${label}`}
+      open={open}
+      onOpenChange={setOpenState}
+      align="end"
+      className="column-picker__panel"
+      initialFocus="input[type=checkbox]"
+      panelData={{ "data-dragging": drag !== null ? "true" : undefined }}
+      onEscape={() => {
+        // Escape mid-drag lets go of the row and keeps the menu open.
+        if (stopDrag.current === null) return false;
+        finishRef.current(false);
+        return true;
+      }}
+      trigger={(props) => (
+        <button
+          type="button"
+          className="button button--quiet column-picker__button"
+          {...props}
+          aria-label={name}
         >
-          <div className="column-picker__stack">
-            <ol ref={list} className="column-picker__list" aria-label="Column order">
-              {shownOrder.map((id, index) => {
-                const spec = byId.get(id);
-                if (spec === undefined) return null;
-                const visible = isVisible(spec, prefs);
-                return (
-                  <li
-                    key={id}
-                    className="column-picker__row"
-                    data-column={id}
-                    data-dragging={drag?.id === id ? "true" : undefined}
-                  >
-                    <button
-                      type="button"
-                      className="column-picker__grip"
-                      aria-label={`Reorder ${spec.label}`}
-                      data-column={id}
-                      data-control="grip"
-                      onKeyDown={(event) => {
-                        onGripKey(event, id);
-                      }}
-                      onPointerDown={(event) => {
-                        onGripDown(event, id);
-                      }}
-                    >
-                      <GripVertical size={14} strokeWidth={2} aria-hidden="true" />
-                    </button>
-                    <label className="column-picker__toggle">
-                      <input
-                        type="checkbox"
-                        checked={visible}
-                        disabled={visible && shown <= 1}
-                        onChange={(event) => {
-                          setHidden(table, id, !event.target.checked);
-                          setSaid(`${spec.label} ${event.target.checked ? "shown" : "hidden"}`);
-                        }}
-                      />
-                      {spec.label}
-                    </label>
-                    <span className="column-picker__moves">
-                      <button
-                        type="button"
-                        className="column-picker__move"
-                        aria-label={`Move ${spec.label} earlier`}
-                        data-column={id}
-                        data-control="earlier"
-                        disabled={index === 0}
-                        onClick={() => {
-                          move(id, index - 1, "earlier");
-                        }}
-                      >
-                        <ChevronUp size={14} strokeWidth={2} aria-hidden="true" />
-                      </button>
-                      <button
-                        type="button"
-                        className="column-picker__move"
-                        aria-label={`Move ${spec.label} later`}
-                        data-column={id}
-                        data-control="later"
-                        disabled={index === shownOrder.length - 1}
-                        onClick={() => {
-                          move(id, index + 1, "later");
-                        }}
-                      >
-                        <ChevronDown size={14} strokeWidth={2} aria-hidden="true" />
-                      </button>
-                    </span>
-                  </li>
-                );
-              })}
-            </ol>
-            {drag !== null ? (
-              <div
-                className="column-picker__ghost"
-                aria-hidden="true"
-                style={{ top: `${String(drag.top)}px` }}
+          <Columns3 size={14} strokeWidth={2} aria-hidden="true" />
+          Columns
+          {hidden > 0 ? <span className="column-picker__count"> · {hidden} hidden</span> : null}
+        </button>
+      )}
+    >
+      <div className="column-picker__stack">
+        <ol ref={list} className="column-picker__list" aria-label="Column order">
+          {shownOrder.map((id, index) => {
+            const spec = byId.get(id);
+            if (spec === undefined) return null;
+            const visible = isVisible(spec, prefs);
+            return (
+              <li
+                key={id}
+                className="column-picker__row"
+                data-column={id}
+                data-dragging={drag?.id === id ? "true" : undefined}
               >
-                <GripVertical size={14} strokeWidth={2} />
-                {byId.get(drag.id)?.label ?? drag.id}
-              </div>
-            ) : null}
+                <button
+                  type="button"
+                  className="column-picker__grip"
+                  aria-label={`Reorder ${spec.label}`}
+                  data-column={id}
+                  data-control="grip"
+                  onKeyDown={(event) => {
+                    onGripKey(event, id);
+                  }}
+                  onPointerDown={(event) => {
+                    onGripDown(event, id);
+                  }}
+                >
+                  <GripVertical size={14} strokeWidth={2} aria-hidden="true" />
+                </button>
+                <label className="column-picker__toggle">
+                  <input
+                    type="checkbox"
+                    checked={visible}
+                    disabled={visible && shown <= 1}
+                    onChange={(event) => {
+                      setHidden(table, id, !event.target.checked);
+                      setSaid(`${spec.label} ${event.target.checked ? "shown" : "hidden"}`);
+                    }}
+                  />
+                  {spec.label}
+                </label>
+                <span className="column-picker__moves">
+                  <button
+                    type="button"
+                    className="column-picker__move"
+                    aria-label={`Move ${spec.label} earlier`}
+                    data-column={id}
+                    data-control="earlier"
+                    disabled={index === 0}
+                    onClick={() => {
+                      move(id, index - 1, "earlier");
+                    }}
+                  >
+                    <ChevronUp size={14} strokeWidth={2} aria-hidden="true" />
+                  </button>
+                  <button
+                    type="button"
+                    className="column-picker__move"
+                    aria-label={`Move ${spec.label} later`}
+                    data-column={id}
+                    data-control="later"
+                    disabled={index === shownOrder.length - 1}
+                    onClick={() => {
+                      move(id, index + 1, "later");
+                    }}
+                  >
+                    <ChevronDown size={14} strokeWidth={2} aria-hidden="true" />
+                  </button>
+                </span>
+              </li>
+            );
+          })}
+        </ol>
+        {drag !== null ? (
+          <div
+            className="column-picker__ghost"
+            aria-hidden="true"
+            style={{ top: `${String(drag.top)}px` }}
+          >
+            <GripVertical size={14} strokeWidth={2} />
+            {byId.get(drag.id)?.label ?? drag.id}
           </div>
-          <div className="column-picker__foot">
-            <button
-              type="button"
-              className="button button--quiet"
-              onClick={() => {
-                resetColumns(table);
-                setSaid("Column layout reset");
-              }}
-            >
-              <RotateCcw size={14} strokeWidth={2} aria-hidden="true" />
-              Reset columns
-            </button>
-            <span className="visually-hidden" role="status">
-              {said}
-            </span>
-          </div>
-        </div>
-      ) : null}
-    </div>
+        ) : null}
+      </div>
+      <div className="column-picker__foot">
+        <button
+          type="button"
+          className="button button--quiet"
+          onClick={() => {
+            resetColumns(table);
+            setSaid("Column layout reset");
+          }}
+        >
+          <RotateCcw size={14} strokeWidth={2} aria-hidden="true" />
+          Reset columns
+        </button>
+        <span className="visually-hidden" role="status">
+          {said}
+        </span>
+      </div>
+    </Popover>
   );
 }

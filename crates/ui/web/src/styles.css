@@ -1233,6 +1233,37 @@ a.object-name:hover {
   background: var(--accent);
 }
 
+/* ---- popover: a panel anchored to the button that opened it ------------------
+   Options for an action, a menu of a table's columns: floating just below
+   its trigger, lined up with the trigger's start or end edge, kept inside a
+   phone-width viewport. Not modal; see `Popover.tsx`. */
+.popover {
+  position: relative;
+  display: inline-block;
+}
+
+.popover__panel {
+  position: absolute;
+  top: calc(100% + 6px);
+  z-index: 30;
+  display: grid;
+  gap: var(--space-2);
+  max-width: calc(100vw - 2 * var(--space-4));
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  background: var(--bg-surface);
+  box-shadow: var(--shadow-2);
+}
+
+.popover__panel[data-align="start"] {
+  left: 0;
+}
+
+.popover__panel[data-align="end"] {
+  right: 0;
+}
+
 /* The table's own tools sit just above its card, on the right: the
    "Columns" menu. One frame, so a section's gap falls around the pair. */
 .ledger-frame {
@@ -1246,29 +1277,13 @@ a.object-name:hover {
   justify-content: flex-end;
 }
 
-.column-picker {
-  position: relative;
-}
-
 .column-picker__count {
   color: var(--fg-muted);
   font-weight: var(--weight-regular);
 }
 
 .column-picker__panel {
-  position: absolute;
-  top: calc(100% + 6px);
-  right: 0;
-  z-index: 30;
-  display: grid;
-  gap: var(--space-2);
   width: 18rem;
-  max-width: calc(100vw - 2 * var(--space-4));
-  padding: 8px;
-  border: 1px solid var(--line);
-  border-radius: var(--radius-lg);
-  background: var(--bg-surface);
-  box-shadow: var(--shadow-2);
 }
 
 .column-picker__list {

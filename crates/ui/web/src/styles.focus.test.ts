@@ -42,7 +42,8 @@ const NEVER_FOCUSED = new Set([
   ".identity__panel",
   ".ns-switcher__panel",
   ".search__results",
-  ".column-picker__panel",
+  // An anchored popover's panel is a container; its controls carry the ring.
+  ".popover__panel",
   // The lifted copy of a dragged row: a picture, `aria-hidden`, never focused.
   ".column-picker__ghost",
   '.shell[data-nav-open="true"] .sidebar',
