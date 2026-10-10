@@ -93,7 +93,7 @@ describe("the drawer for a kind with no page of its own", () => {
     await user.click(trigger);
     // Escape answers the open question, not the drawer.
     await user.keyboard("{Escape}");
-    expect(within(foot).queryByRole("group", { name: "Suspend" })).toBeNull();
+    expect(within(foot).queryByRole("dialog", { name: "Suspend" })).toBeNull();
     expect(screen.getByRole("dialog", { name: /nightly-cron/ })).toBeInTheDocument();
     await user.click(trigger);
     await user.click(within(foot).getByRole("button", { name: "Suspend nightly-cron" }));
@@ -136,10 +136,10 @@ describe("the drawer for a kind with no page of its own", () => {
       expect(run).not.toHaveAttribute("aria-disabled");
     });
     await user.click(run);
-    expect(within(panel).getAllByRole("group")).toHaveLength(1);
+    expect(within(panel).getAllByRole("dialog")).toHaveLength(1);
     await user.click(suspend);
-    expect(within(panel).getAllByRole("group")).toHaveLength(1);
-    expect(within(panel).getByRole("group", { name: "Suspend" })).toBeInTheDocument();
+    expect(within(panel).getAllByRole("dialog")).toHaveLength(1);
+    expect(within(panel).getByRole("dialog", { name: "Suspend" })).toBeInTheDocument();
   });
 
   it("never scrolls the action buttons out of view: only a tall question scrolls", () => {

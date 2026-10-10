@@ -13,8 +13,9 @@ import { useConfirmFocus } from "./useConfirmFocus";
  *
  * It is a confirmation *panel*, not a modal. The design system's
  * action pattern (`kopiur-ui-design` skill, `references/composites.md`) opens
- * the confirmation inline, directly under its trigger; a `<dialog>` here
- * would be a second enclosure over the same content. Every dialog in this
+ * the confirmation in a popover anchored to its trigger (or, for a long form,
+ * inline under it); a modal here would be a second enclosure over the same
+ * content. Every dialog in this
  * directory is therefore this shell plus its own fields, which is also why
  * they can be dropped into a ledger row, a detail page or an action bar
  * unchanged.
@@ -96,12 +97,16 @@ export interface ActionPanelProps {
    */
   hideTrigger?: boolean | undefined;
   /**
-   * `inline` (the default) opens the confirmation under its trigger, in the
-   * flow of the page. `popover` floats it over the page, anchored to the
-   * trigger (`Popover`) — for a page of cards, where an inline panel would
-   * push the rest of the card and every card under it down.
+   * `popover` (the default) floats the confirmation over the page, anchored
+   * to its trigger (`Popover`), so asking never shoves the page around it.
+   * `inline` opens it under the trigger, in the flow — for a question too
+   * long to float, such as creating a restore.
    */
   presentation?: "inline" | "popover" | undefined;
+  /** For a popover: which edge of the trigger it lines up with. */
+  align?: "start" | "end" | undefined;
+  /** For a popover: `fixed` inside a box that clips, such as a table. */
+  strategy?: "absolute" | "fixed" | undefined;
 }
 
 export function ActionPanel({
@@ -120,7 +125,9 @@ export function ActionPanel({
   open,
   onOpenChange,
   hideTrigger = false,
-  presentation = "inline",
+  presentation = "popover",
+  align,
+  strategy,
 }: ActionPanelProps) {
   const [ownOpen, setOwnOpen] = useState(false);
   const controlled = open !== undefined;
@@ -200,6 +207,8 @@ export function ActionPanel({
           open={isOpen}
           onOpenChange={setOpen}
           className="action__popover"
+          align={align}
+          strategy={strategy}
           trigger={(props) => trigger(props)}
         >
           {questions}

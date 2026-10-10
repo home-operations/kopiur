@@ -1,7 +1,7 @@
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { useState } from "react";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { Popover } from "./Popover";
 
@@ -129,5 +129,75 @@ describe("Popover", () => {
     render(<Harness align="end" />);
     await user.click(screen.getByRole("button", { name: "Open" }));
     expect(screen.getByRole("dialog")).toHaveAttribute("data-align", "end");
+  });
+
+  it("marks which side it opens on", () => {
+    render(
+      <Popover
+        label="Account"
+        open
+        onOpenChange={() => undefined}
+        side="top"
+        trigger={(props) => (
+          <button type="button" {...props}>
+            Me
+          </button>
+        )}
+      >
+        menu
+      </Popover>,
+    );
+    expect(screen.getByRole("dialog")).toHaveAttribute("data-side", "top");
+  });
+
+  it("escapes a clipping scroll box by pinning itself to the trigger on screen", () => {
+    render(
+      <Popover
+        label="Suspend"
+        open
+        onOpenChange={() => undefined}
+        align="end"
+        strategy="fixed"
+        trigger={(props) => (
+          <button
+            type="button"
+            {...props}
+            ref={(node) => {
+              if (node !== null) {
+                node.getBoundingClientRect = () => new DOMRect(900, 200, 100, 34);
+              }
+              const ref = props.ref;
+              if (typeof ref === "function") ref(node);
+            }}
+          >
+            Suspend
+          </button>
+        )}
+      >
+        question
+      </Popover>,
+    );
+    const panel = screen.getByRole("dialog");
+    expect(panel).toHaveAttribute("data-strategy", "fixed");
+    expect(panel.style.position).toBe("fixed");
+    // Below the trigger (200 + 34 + 6), its end edge on the trigger's end edge.
+    expect(panel.style.top).toBe("240px");
+    expect(panel.style.right).toBe(`${String(window.innerWidth - 1000)}px`);
+  });
+
+  it("takes Escape for itself, so a drawer around it stays open", async () => {
+    const user = userEvent.setup();
+    const outer = vi.fn();
+    // A drawer hears Escape on the document and ignores one already handled.
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !event.defaultPrevented) outer();
+    };
+    document.addEventListener("keydown", onKey);
+    render(<Harness />);
+    await user.click(screen.getByRole("button", { name: "Open" }));
+    await user.keyboard("{Escape}");
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(outer).not.toHaveBeenCalled();
+    document.removeEventListener("keydown", onKey);
   });
 });

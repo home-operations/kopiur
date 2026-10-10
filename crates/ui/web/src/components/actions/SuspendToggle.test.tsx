@@ -91,7 +91,7 @@ describe("SuspendToggle", () => {
     );
     const user = userEvent.setup();
     await user.click(await screen.findByRole("button", { name: "Suspend" }));
-    const panel = await screen.findByRole("group", { name: "Suspend" });
+    const panel = await screen.findByRole("dialog", { name: "Suspend" });
     expect(panel).toHaveTextContent("spec.schedule.suspend");
     expect(panel).not.toHaveTextContent("spec.suspend to");
   });

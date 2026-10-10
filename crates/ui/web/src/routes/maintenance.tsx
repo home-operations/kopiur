@@ -100,7 +100,6 @@ function Maintenance() {
                   // A close from one card must not undo another card opening.
                   setOpen((current) => (next ? id : current === id ? null : current));
                 }}
-                presentation="popover"
               />
             );
           }}

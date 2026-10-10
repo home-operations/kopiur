@@ -1264,6 +1264,27 @@ a.object-name:hover {
   right: 0;
 }
 
+.popover__panel[data-side="top"] {
+  top: auto;
+  bottom: calc(100% + 6px);
+}
+
+/* Pinned to the trigger on screen (`strategy="fixed"`): the inline style
+   places it, so the flow offsets above must not. */
+.popover__panel[data-strategy="fixed"] {
+  inset: auto;
+}
+
+/* In a drawer's foot the buttons sit at the bottom of the panel: a question
+   opens upward, over the content it is about, and a tall one scrolls inside
+   itself. */
+.side-panel__foot .popover__panel {
+  top: auto;
+  bottom: calc(100% + 6px);
+  max-height: 60vh;
+  overflow-y: auto;
+}
+
 /* The table's own tools sit just above its card, on the right: the
    "Columns" menu. One frame, so a section's gap falls around the pair. */
 .ledger-frame {

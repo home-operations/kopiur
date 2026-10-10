@@ -211,7 +211,7 @@ describe("RunDialog", () => {
       />,
     );
     const user = await open("Run maintenance");
-    expect(screen.getByRole("group", { name: "Run maintenance" })).toHaveTextContent(
+    expect(screen.getByRole("dialog", { name: "Run maintenance" })).toHaveTextContent(
       "watch the object's status for the outcome",
     );
     await user.click(screen.getByRole("button", { name: "Request the run" }));

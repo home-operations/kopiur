@@ -313,10 +313,10 @@ describe("Policy drawer", () => {
       expect(snapshot).not.toHaveAttribute("aria-disabled");
     });
     await user.click(snapshot);
-    expect(within(bar).getByRole("group", { name: "Snapshot now" })).toBeInTheDocument();
+    expect(within(bar).getByRole("dialog", { name: "Snapshot now" })).toBeInTheDocument();
     await user.click(within(bar).getByRole("button", { name: "Suspend" }));
-    expect(within(bar).queryByRole("group", { name: "Snapshot now" })).toBeNull();
-    expect(within(bar).getByRole("group", { name: "Suspend" })).toBeInTheDocument();
+    expect(within(bar).queryByRole("dialog", { name: "Snapshot now" })).toBeNull();
+    expect(within(bar).getByRole("dialog", { name: "Suspend" })).toBeInTheDocument();
   });
 
   it("keeps both controls visible and explained when the user may do neither", async () => {

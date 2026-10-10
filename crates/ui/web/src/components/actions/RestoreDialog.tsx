@@ -133,6 +133,8 @@ export function RestoreDialog({ namespace, snapshot, open, onOpenChange }: Resto
     <ActionPanel
       label="Restore"
       icon={ArchiveRestore}
+      // A long form: it opens in the page, where it can be read at length.
+      presentation="inline"
       variant="danger"
       disabledReason={reason}
       confirmLabel="Create the restore"
