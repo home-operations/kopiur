@@ -69,9 +69,12 @@ in three bands:
 Old detail addresses (`/policies/<ns>/<name>` and the like) redirect to the
 kind's list with the drawer open on the same object. The snapshot file browser
 is a section of its own, **Browse** (a workspace, not a detail), with the
-snapshot in its address (`/browse?snapshot=<ns>/<name>`). Its head is a panel
-naming the snapshot being browsed: a snapshot picker field, a Details button
-that opens the drawer over the page, and the snapshot's facts. The snapshot
+snapshot in its address (`/browse?snapshot=<ns>/<name>`). One card heads it:
+a snapshot picker field, a Details button that opens the drawer over the page,
+the snapshot's facts, and under a rule the browse session (or why there is
+none), with the listing beneath the card. Its sidebar item draws a one-segment
+line in the health colours: grey with no session, green while one runs, red
+when the last start failed. The snapshot
 drawer's "Browse files" opens Browse with that snapshot chosen; the tab
 remembers the last one, so Browse from the sidebar returns to it. The old
 `/snapshots/<ns>/<name>/browse` address redirects.
