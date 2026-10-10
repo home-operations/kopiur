@@ -49,32 +49,77 @@ export function parseInspect(raw: unknown): InspectTarget | null {
 }
 
 /**
- * The resource the drawer is showing, and how to close it.
- *
- * Closing undoes the opening: when the drawer was opened onto this history
- * entry (a link marked it), close steps back over it, so the entry is gone and
- * Back afterwards leaves the page as it would have before. A deep link has no
- * such entry to step over, so it drops the parameter in place. Neither moves
- * the page: stepping back restores where it was (the router's scroll
- * restoration, `main.tsx`), and dropping the parameter does not scroll.
+ * The drawers open, bottom first: `?inspect=` is their tokens joined by
+ * commas (a token is slugs and DNS labels, so it never holds one). One token
+ * is a stack of one. Reading stops at the first part that does not name a
+ * resource, so a damaged link opens the drawers under the damage and no more.
  */
-export function useInspect(): { target: InspectTarget | null; close: () => void } {
+export function parseInspectStack(raw: unknown): InspectTarget[] {
+  if (typeof raw !== "string") return [];
+  const stack: InspectTarget[] = [];
+  for (const part of raw.split(",")) {
+    const target = parseInspect(part);
+    if (target === null) break;
+    stack.push(target);
+  }
+  return stack;
+}
+
+export function inspectStackParam(stack: readonly InspectTarget[]): string {
+  return stack.map(inspectToken).join(",");
+}
+
+/**
+ * The stack after opening `target` from its top drawer: on top of it — or,
+ * when `target` is already open lower down, back down to that drawer, so
+ * walking a loop (policy → repository → the same policy) never piles up
+ * copies. `truncated` says which, since a step back down is not a new entry
+ * in history.
+ */
+export function pushInspect(
+  stack: readonly InspectTarget[],
+  target: InspectTarget,
+): { stack: InspectTarget[]; truncated: boolean } {
+  const token = inspectToken(target);
+  const at = stack.findIndex((open) => inspectToken(open) === token);
+  return at === -1
+    ? { stack: [...stack, target], truncated: false }
+    : { stack: stack.slice(0, at + 1), truncated: true };
+}
+
+/**
+ * The drawers open, the top one, and how to close the top one.
+ *
+ * Closing undoes the opening, one drawer at a time: when the top drawer was
+ * opened onto this history entry (a link marked it with its depth), close
+ * steps back over it, so the entry is gone and Back afterwards leaves the page
+ * as it would have before. A deep link has no such entry to step over, so the
+ * top token is dropped in place. Neither moves the page: stepping back
+ * restores where it was (the router's scroll restoration, `main.tsx`), and
+ * dropping a token does not scroll.
+ */
+export function useInspect(): {
+  stack: InspectTarget[];
+  target: InspectTarget | null;
+  close: () => void;
+} {
   const router = useRouter();
   const location = useRouterState({ select: (s) => s.location });
   const search = location.search as Record<string, unknown>;
-  const target = parseInspect(search.inspect);
+  const stack = parseInspectStack(search.inspect);
   const close = () => {
-    if (location.state.inspect === true && router.history.canGoBack()) {
+    if (location.state.inspectDepth === stack.length && router.history.canGoBack()) {
       router.history.back();
       return;
     }
+    const below = stack.slice(0, -1);
     const rest = Object.fromEntries(Object.entries(search).filter(([key]) => key !== "inspect"));
     void router.navigate({
       to: location.pathname,
-      search: rest as never,
+      search: (below.length > 0 ? { ...rest, inspect: inspectStackParam(below) } : rest) as never,
       replace: true,
       resetScroll: false,
     });
   };
-  return { target, close };
+  return { stack, target: stack.at(-1) ?? null, close };
 }

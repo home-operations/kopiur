@@ -13,7 +13,7 @@ import { InspectLink } from "./InspectLink";
 import { useInspect } from "./inspect";
 
 function Harness() {
-  const { target, close } = useInspect();
+  const { stack, close } = useInspect();
   return (
     <div>
       <InspectLink target={{ kind: "snapshotPolicy", namespace: "a", name: "app-data" }}>
@@ -21,7 +21,7 @@ function Harness() {
       </InspectLink>
       <InspectLink target={{ kind: "repository", namespace: "a", name: "nas" }}>nas</InspectLink>
       <output aria-label="open">
-        {target === null ? "none" : `${target.kind}:${target.name}`}
+        {stack.length === 0 ? "none" : stack.map((t) => `${t.kind}:${t.name}`).join(" > ")}
       </output>
       <button type="button" onClick={close}>
         close
@@ -41,20 +41,58 @@ describe("InspectLink and useInspect", () => {
     expect(await screen.findByText("snapshotPolicy:app-data")).toBeInTheDocument();
   });
 
-  it("closing goes back to where it opened from, so Back does not reopen it", async () => {
+  it("opens another resource on top, and closing backs up one drawer at a time", async () => {
     const { router } = renderHarness("/policies?namespace=a");
     const user = userEvent.setup();
     await user.click(await screen.findByRole("link", { name: "app-data" }));
     await screen.findByText("snapshotPolicy:app-data");
-    // Another resource from inside replaces, it does not stack.
+    expect(screen.getByRole("link", { name: "nas" }).getAttribute("href")).toMatch(
+      /inspect=snapshot-policy%2Fa%2Fapp-data%2Crepository%2Fa%2Fnas/,
+    );
     await user.click(screen.getByRole("link", { name: "nas" }));
-    await screen.findByText("repository:nas");
+    await screen.findByText("snapshotPolicy:app-data > repository:nas");
+    await user.click(screen.getByRole("button", { name: "close" }));
+    await screen.findByText("snapshotPolicy:app-data");
     await user.click(screen.getByRole("button", { name: "close" }));
     await screen.findByText("none");
     await waitFor(() => {
       expect(router.state.location.search).toEqual({ namespace: "a" });
     });
+    // Each close stepped back over the entry its opening pushed.
     expect(router.history.canGoBack()).toBe(false);
+  });
+
+  it("Back closes the top drawer, like clicking out of it", async () => {
+    const { router } = renderHarness("/policies?namespace=a");
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole("link", { name: "app-data" }));
+    await user.click(await screen.findByRole("link", { name: "nas" }));
+    await screen.findByText("snapshotPolicy:app-data > repository:nas");
+    router.history.back();
+    expect(await screen.findByText("snapshotPolicy:app-data")).toBeInTheDocument();
+  });
+
+  it("backs down to a resource already open rather than opening it twice", async () => {
+    renderHarness("/policies?inspect=snapshot-policy%2Fa%2Fapp-data%2Crepository%2Fa%2Fnas");
+    const user = userEvent.setup();
+    await screen.findByText("snapshotPolicy:app-data > repository:nas");
+    const link = screen.getByRole("link", { name: "app-data" });
+    expect(link.getAttribute("href")).toMatch(/inspect=snapshot-policy%2Fa%2Fapp-data$/);
+    await user.click(link);
+    expect(await screen.findByText("snapshotPolicy:app-data")).toBeInTheDocument();
+  });
+
+  it("closes the top of a deep-linked stack in place, then the next", async () => {
+    const { router } = renderHarness(
+      "/policies?inspect=snapshot-policy%2Fa%2Fapp-data%2Crepository%2Fa%2Fnas",
+    );
+    const user = userEvent.setup();
+    await screen.findByText("snapshotPolicy:app-data > repository:nas");
+    await user.click(screen.getByRole("button", { name: "close" }));
+    await screen.findByText("snapshotPolicy:app-data");
+    expect(router.state.location.search).toEqual({ inspect: "snapshot-policy/a/app-data" });
+    await user.click(screen.getByRole("button", { name: "close" }));
+    await screen.findByText("none");
   });
 
   it("closes a deep link in place, without leaving the page", async () => {
@@ -75,7 +113,7 @@ describe("opening and closing the drawer leaves the page where it was", () => {
       ([arg]) => typeof arg === "object" && (arg as { top?: number }).top === 0,
     );
 
-  it("does not scroll to the top when a drawer opens, or when another replaces it", async () => {
+  it("does not scroll to the top when a drawer opens, or when another opens on top", async () => {
     const scroll = vi.spyOn(window, "scrollTo").mockImplementation(() => undefined);
     renderHarness("/policies?namespace=a");
     const user = userEvent.setup();
@@ -85,7 +123,7 @@ describe("opening and closing the drawer leaves the page where it was", () => {
     await user.click(link);
     await screen.findByText("snapshotPolicy:app-data");
     await user.click(screen.getByRole("link", { name: "nas" }));
-    await screen.findByText("repository:nas");
+    await screen.findByText("snapshotPolicy:app-data > repository:nas");
     expect(toTop(scroll)).toEqual([]);
     scroll.mockRestore();
   });

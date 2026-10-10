@@ -550,7 +550,7 @@ describe("Repository drawer — where it sits", () => {
       within(chain)
         .getByRole("link", { name: /SnapshotPolicy.*nightly/ })
         .getAttribute("href"),
-    ).toMatch(/inspect=snapshot-policy%2Fmedia%2Fnightly$/);
+    ).toMatch(/inspect=[^&]+%2Csnapshot-policy%2Fmedia%2Fnightly$/);
   });
 
   it("joins a replication on kind, namespace and name — never a same-named one elsewhere", async () => {

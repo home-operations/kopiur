@@ -41,6 +41,34 @@ describe("SidePanel", () => {
     expect(dialog).toHaveTextContent("Backend");
   });
 
+  it("stacks: only the top panel answers Escape, and a lower one re-rendering leaves focus where it is", async () => {
+    const lower = vi.fn();
+    const upper = vi.fn();
+    function Stack({ tick }: { tick: number }) {
+      return (
+        <>
+          <SidePanel label="nas" onClose={lower} depth={0} panelsAbove={1}>
+            lower body {tick}
+          </SidePanel>
+          <SidePanel label="app-data" onClose={upper} depth={1}>
+            <button type="button">inside the top</button>
+          </SidePanel>
+        </>
+      );
+    }
+    const { rerender } = render(<Stack tick={0} />);
+    const inside = screen.getByRole("button", { name: "inside the top" });
+    inside.focus();
+    rerender(<Stack tick={1} />);
+    expect(inside).toHaveFocus();
+    await userEvent.keyboard("{Escape}");
+    expect(upper).toHaveBeenCalledTimes(1);
+    expect(lower).not.toHaveBeenCalled();
+    const bottom = screen.getByRole("dialog", { name: "nas" });
+    expect(bottom.style.getPropertyValue("--panels-above")).toBe("1");
+    expect(bottom).toHaveAttribute("data-depth", "0");
+  });
+
   it("closes on Escape and on its close button", async () => {
     const onClose = vi.fn();
     render(

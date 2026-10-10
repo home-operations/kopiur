@@ -212,9 +212,9 @@ describe("Restore drawer — head", () => {
       within(chain)
         .getByRole("link", { name: /nightly-1/ })
         .getAttribute("href"),
-    ).toMatch(/inspect=snapshot%2Fmedia%2Fnightly-1$/);
+    ).toMatch(/inspect=[^&]+%2Csnapshot%2Fmedia%2Fnightly-1$/);
     expect(within(chain).getByRole("link", { name: /nas/ }).getAttribute("href")).toMatch(
-      /inspect=repository%2Fmedia%2Fnas$/,
+      /inspect=[^&]+%2Crepository%2Fmedia%2Fnas$/,
     );
     expect(chain).toHaveTextContent("this restore");
     expect(within(chain).getByRole("listitem", { name: "Writes into" })).toHaveTextContent("data");

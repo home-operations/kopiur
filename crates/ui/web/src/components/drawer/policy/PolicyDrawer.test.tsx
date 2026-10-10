@@ -243,7 +243,7 @@ describe("Policy drawer", () => {
     expect(row.querySelector("td.has-stripe .kind-chip svg")).not.toBeNull();
     expect(
       within(row).getByRole("link", { name: "nightly-20260909" }).getAttribute("href"),
-    ).toMatch(/inspect=snapshot%2Fmedia%2Fnightly-20260909$/);
+    ).toMatch(/inspect=[^&]+%2Csnapshot%2Fmedia%2Fnightly-20260909$/);
   });
 
   it("takes a snapshot under this policy, with pin answered explicitly", async () => {
@@ -413,13 +413,13 @@ describe("Policy drawer — head", () => {
     const chain = await within(await drawer()).findByRole("list", { name: "Where this sits" });
     const writes = within(chain).getByRole("listitem", { name: "Writes into" });
     expect(within(writes).getByRole("link", { name: /nas/ }).getAttribute("href")).toMatch(
-      /inspect=repository%2Fmedia%2Fnas$/,
+      /inspect=[^&]+%2Crepository%2Fmedia%2Fnas$/,
     );
     expect(
       within(writes)
         .getByRole("link", { name: /shared/ })
         .getAttribute("href"),
-    ).toMatch(/inspect=cluster-repository%2Fshared$/);
+    ).toMatch(/inspect=[^&]+%2Ccluster-repository%2Fshared$/);
     expect(chain).toHaveTextContent("this policy");
   });
 

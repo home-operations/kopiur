@@ -1455,9 +1455,13 @@ html:has(dialog.side-panel[open]) {
     clamp(min(var(--drawer-min), var(--drawer-max)), var(--drawer-width), var(--drawer-max)),
     calc(100vw - 2 * var(--space-3))
   );
+  /* Stacked: a panel sits a step further left per panel over it, so its edge
+     shows past the one covering it. */
+  --panel-peek: calc(var(--panels-above, 0) * var(--space-4));
   position: fixed;
-  inset: var(--space-3) var(--space-3) var(--space-3) auto;
+  inset: var(--space-3) calc(var(--space-3) + var(--panel-peek)) var(--space-3) auto;
   width: var(--panel-w);
+  transition: right var(--dur-base) var(--ease-out);
   height: auto;
   max-width: none;
   max-height: none;
@@ -1492,6 +1496,12 @@ html:has(dialog.side-panel[open]) {
 .side-panel::backdrop {
   background: var(--scrim);
   animation: side-panel-fade var(--dur-base) var(--ease-out);
+}
+/* A panel opened over another sets that one back without darkening the page
+   a second time: its scrim is clear, and the edge of the one beneath, in
+   shadow, is what says there is one. */
+.side-panel:not([data-depth="0"])::backdrop {
+  background: transparent;
 }
 /* Past the right edge by the inset and the handle, so neither peeks in.
    The slide moves the right edge, not a transform: a transformed dialog would
@@ -1556,6 +1566,17 @@ html:has(dialog.side-panel[open]) {
   transition:
     background-color var(--dur-fast) var(--ease-out),
     border-color var(--dur-fast) var(--ease-out);
+}
+/* Stacked, the strip left of a panel is the edge of the one beneath, and a
+   click there backs up one drawer. The handle keeps only its tab there, and
+   a covered panel has none: it cannot be resized until it is on top. */
+.side-panel:not([data-depth="0"]) .side-panel__grip {
+  top: calc(50% - 40px);
+  bottom: auto;
+  height: 80px;
+}
+.side-panel[data-covered] .side-panel__grip {
+  display: none;
 }
 .side-panel__grip:hover::after,
 .side-panel__grip:active::after {

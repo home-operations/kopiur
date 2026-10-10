@@ -323,7 +323,7 @@ describe("Schedules — whole-row link", () => {
     const dialog = await screen.findByRole("dialog", { name: /nightly-cron/ });
     expect(
       dialog.querySelector('a.ref[data-kind="snapshot-policy"]')?.getAttribute("href"),
-    ).toMatch(/inspect=snapshot-policy%2Fmedia%2Fnightly$/);
+    ).toMatch(/inspect=[^&]+%2Csnapshot-policy%2Fmedia%2Fnightly$/);
   });
 
   it("links a selector schedule's row too: the drawer names the selector", async () => {

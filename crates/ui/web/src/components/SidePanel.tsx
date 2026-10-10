@@ -35,7 +35,13 @@ import { toastHost } from "./toast/toastHost";
  * it, and a stopped Escape must not also close the panel. The browser's own
  * close request would ignore that, so the key is taken (`preventDefault`) and
  * routed through `onClose` — the caller owns whether the panel exists, usually
- * by clearing a URL parameter. Only one panel is ever open.
+ * by clearing a URL parameter.
+ *
+ * Panels stack: a resource opened from a panel opens its own on top. Each is
+ * its own modal dialog, so the browser makes every lower one inert and a
+ * click outside lands on the top one's backdrop, closing only it. Only the top
+ * panel answers Escape and keeps focus at home; a lower one sits a little
+ * further left (`panelsAbove`), so its edge shows past the one covering it.
  *
  * Focus moves into the panel when it opens and goes back to whatever had it
  * before — the row or reference that opened it — when it goes.
@@ -70,6 +76,10 @@ export interface SidePanelProps {
    * panel is the scroller.
    */
   layout?: "padded" | "fill" | undefined;
+  /** How many panels are stacked on top of this one; 0 for the top. */
+  panelsAbove?: number | undefined;
+  /** Its place in the stack, 0 for the bottom panel. */
+  depth?: number | undefined;
   footer?: ReactNode;
   children: ReactNode;
 }
@@ -78,6 +88,13 @@ export interface SidePanelProps {
 const EXIT_TIMEOUT_MS = 400;
 
 const noop = () => undefined;
+
+/** The open panels, bottom first: only the last one answers Escape and holds focus. */
+const openPanels: HTMLDialogElement[] = [];
+
+function isTop(node: HTMLDialogElement): boolean {
+  return openPanels.at(-1) === node;
+}
 
 export function SidePanel({
   label,
@@ -88,6 +105,8 @@ export function SidePanel({
   leaving = false,
   onExited,
   layout = "padded",
+  panelsAbove = 0,
+  depth = 0,
   footer,
   children,
 }: SidePanelProps) {
@@ -142,7 +161,7 @@ export function SidePanel({
     // panel: a confirmation inside that answered it stopped it on the way, and
     // never gets here. Taking the key also stops the browser's own close.
     const onKey = (event: KeyboardEvent) => {
-      if (event.key !== "Escape" || event.defaultPrevented) return;
+      if (event.key !== "Escape" || event.defaultPrevented || !isTop(node)) return;
       event.preventDefault();
       close.current();
     };
@@ -169,7 +188,8 @@ export function SidePanel({
     node.addEventListener("cancel", onCancel);
     node.addEventListener("close", onNativeClose);
     if (!node.open) node.showModal();
-    // Toasts render inside the open dialog; outside it they would be inert.
+    openPanels.push(node);
+    // Toasts render inside the top dialog; outside it they would be inert.
     toastHost.set(node);
     node.focus({ preventScroll: true });
     return () => {
@@ -178,6 +198,8 @@ export function SidePanel({
       node.removeEventListener("click", onClick);
       node.removeEventListener("cancel", onCancel);
       node.removeEventListener("close", onNativeClose);
+      const at = openPanels.indexOf(node);
+      if (at !== -1) openPanels.splice(at, 1);
       toastHost.release(node);
       if (node.open) node.close();
       if (opener?.isConnected) opener.focus({ preventScroll: true });
@@ -248,10 +270,11 @@ export function SidePanel({
   }, []);
 
   // Content swapped under focus (another resource, a section that went away)
-  // must not drop focus onto the inert page behind.
+  // must not drop focus onto the inert page behind. Only the top panel: a
+  // lower one re-rendering must not pull focus out of the panel over it.
   useLayoutEffect(() => {
     const node = dialog.current;
-    if (node === null) return;
+    if (node === null || !isTop(node)) return;
     const active = document.activeElement;
     if (active === null || active === document.body || !node.contains(active)) {
       node.focus({ preventScroll: true });
@@ -265,8 +288,15 @@ export function SidePanel({
       data-kind={kind !== undefined ? KIND_META[kind].slug : undefined}
       aria-labelledby={titleId}
       data-leaving={leaving ? "" : undefined}
+      data-depth={depth}
+      data-covered={panelsAbove > 0 ? "" : undefined}
       tabIndex={-1}
-      style={{ "--drawer-width": `${String(width)}px` } as CSSProperties}
+      style={
+        {
+          "--drawer-width": `${String(width)}px`,
+          "--panels-above": String(panelsAbove),
+        } as CSSProperties
+      }
     >
       <div
         ref={grip}

@@ -152,6 +152,34 @@ describe("Toaster", () => {
     expect(screen.queryByRole("status")).toBeNull();
   });
 
+  it("renders in the top drawer of a stack, and in the one beneath once it closes", async () => {
+    await mount();
+    act(() => {
+      toasts.push({ kind: "problem", label: "Suspend", problem });
+    });
+    const lower = document.createElement("dialog");
+    const upper = document.createElement("dialog");
+    document.body.append(lower, upper);
+    lower.showModal();
+    upper.showModal();
+    act(() => {
+      toastHost.set(lower);
+      toastHost.set(upper);
+    });
+    expect(within(upper).getByRole("alert")).toBeInTheDocument();
+    expect(within(lower).queryByRole("alert")).toBeNull();
+    act(() => {
+      toastHost.release(upper);
+    });
+    upper.remove();
+    expect(within(lower).getByRole("alert")).toBeInTheDocument();
+    act(() => {
+      toastHost.release(lower);
+    });
+    lower.remove();
+    expect(screen.getByRole("alert")).toBeInTheDocument();
+  });
+
   it("slides the drawer without a transform, so a toast inside it stays in its corner", () => {
     // A transformed ancestor becomes the box a fixed element is placed in: the
     // toasts inside the drawer would ride along as it slides in and out.

@@ -32,19 +32,63 @@ import { graphContext } from "./graphFacts";
 import { drawerView } from "./views";
 
 /**
- * The resource drawer: whatever `?inspect=` names, over whatever page is open.
+ * The resource drawers: whatever `?inspect=` names, bottom first, over
+ * whatever page is open.
  *
- * Mounted once, by the shell. The panel stays mounted while the resource
- * changes — walking from a schedule to the policy it fires swaps the body,
- * not the panel, so focus still goes home to the row that first opened it.
+ * Mounted once, by the shell. A resource opened from a drawer opens its own
+ * drawer on top; closing the top one — clicking out, Escape, Back — uncovers
+ * the one beneath. Each level is mounted for good once used and shows
+ * whatever the stack holds at its place: a level the stack no longer reaches
+ * slides away and then renders nothing, and a level whose resource changes
+ * swaps the body, not the panel, so focus still goes home to whatever opened
+ * it.
  */
 export function ResourceDrawer() {
-  const { target, close } = useInspect();
-  // Once the URL drops `?inspect=`, the last resource stays on screen while
-  // the panel slides away.
+  const { stack, close } = useInspect();
+  const [levels, setLevels] = useState(stack.length);
+  if (stack.length > levels) {
+    // Adopted during render, so a new drawer never misses its first frame.
+    setLevels(stack.length);
+  }
+  return (
+    <>
+      {Array.from({ length: Math.max(levels, stack.length) }, (_, index) => (
+        <DrawerLevel
+          // A level is a place in the stack, whatever it shows.
+          key={index}
+          index={index}
+          target={stack[index] ?? null}
+          panelsAbove={Math.max(0, stack.length - 1 - index)}
+          onClose={close}
+        />
+      ))}
+    </>
+  );
+}
+
+interface DrawerLevelProps {
+  index: number;
+  target: InspectTarget | null;
+  panelsAbove: number;
+  onClose: () => void;
+}
+
+/** One place in the stack: its drawer, lingering while it slides away. */
+function DrawerLevel({ index, target, panelsAbove, onClose }: DrawerLevelProps) {
+  // Once the stack stops reaching this level, its last resource stays on
+  // screen while the panel slides away.
   const { shown, leaving, exited } = useExiting(target, sameTarget);
   if (shown === null) return null;
-  return <Drawer target={shown} onClose={close} leaving={leaving} onExited={exited} />;
+  return (
+    <Drawer
+      target={shown}
+      onClose={onClose}
+      leaving={leaving}
+      onExited={exited}
+      depth={index}
+      panelsAbove={panelsAbove}
+    />
+  );
 }
 
 function sameTarget(a: InspectTarget, b: InspectTarget): boolean {
@@ -180,9 +224,11 @@ interface DrawerProps {
   onClose: () => void;
   leaving: boolean;
   onExited: () => void;
+  depth: number;
+  panelsAbove: number;
 }
 
-function Drawer({ target, onClose, leaving, onExited }: DrawerProps) {
+function Drawer({ target, onClose, leaving, onExited, depth, panelsAbove }: DrawerProps) {
   const loaded = useDrawerData(target);
   const meta = KIND_META[target.kind];
   const token = inspectToken(target);
@@ -206,6 +252,8 @@ function Drawer({ target, onClose, leaving, onExited }: DrawerProps) {
       onClose={onClose}
       leaving={leaving}
       onExited={onExited}
+      depth={depth}
+      panelsAbove={panelsAbove}
       layout="fill"
       footer={view?.actions}
     >

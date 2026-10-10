@@ -3,7 +3,13 @@ import { describe, expect, it } from "vitest";
 import type { ObjectKind } from "../api/types";
 import { Route as RootRoute } from "../routes/__root";
 import { KIND_META } from "./kind";
-import { inspectToken, parseInspect } from "./inspect";
+import {
+  inspectStackParam,
+  inspectToken,
+  parseInspect,
+  parseInspectStack,
+  pushInspect,
+} from "./inspect";
 
 const KINDS = Object.keys(KIND_META) as ObjectKind[];
 
@@ -50,5 +56,53 @@ describe("inspect token", () => {
       inspect: "snapshot/kopiur-dev/a",
     });
     expect(validate({ inspect: "nonsense", namespace: "media" })).toEqual({ namespace: "media" });
+  });
+});
+
+describe("inspect stack", () => {
+  const nas = { kind: "repository" as const, namespace: "media", name: "nas" };
+  const photos = { kind: "snapshotPolicy" as const, namespace: "media", name: "photos" };
+  const shared = { kind: "clusterRepository" as const, name: "shared" };
+
+  it("reads the drawers bottom first, and writes them back the same", () => {
+    const raw = "repository/media/nas,snapshot-policy/media/photos,cluster-repository/shared";
+    expect(parseInspectStack(raw)).toEqual([nas, photos, shared]);
+    expect(inspectStackParam([nas, photos, shared])).toBe(raw);
+  });
+
+  it("reads one token as a stack of one", () => {
+    expect(parseInspectStack("repository/media/nas")).toEqual([nas]);
+  });
+
+  it("stops at the first part it cannot name, keeping the drawers under it", () => {
+    expect(parseInspectStack("repository/media/nas,bogus/x,snapshot-policy/media/photos")).toEqual([
+      nas,
+    ]);
+    expect(parseInspectStack("nonsense,repository/media/nas")).toEqual([]);
+    for (const raw of ["", 42, null, undefined]) {
+      expect(parseInspectStack(raw), String(raw)).toEqual([]);
+    }
+  });
+
+  it("opens a new object on top", () => {
+    expect(pushInspect([nas], photos)).toEqual({ stack: [nas, photos], truncated: false });
+    expect(pushInspect([], nas)).toEqual({ stack: [nas], truncated: false });
+  });
+
+  it("backs up to an object already open lower down, rather than opening it twice", () => {
+    expect(pushInspect([nas, photos, shared], { ...photos })).toEqual({
+      stack: [nas, photos],
+      truncated: true,
+    });
+  });
+
+  it("is kept by the root route as the stack it parses to", () => {
+    const validate = RootRoute.options.validateSearch as (s: Record<string, unknown>) => unknown;
+    expect(validate({ inspect: "repository/media/nas,snapshot-policy/media/photos" })).toEqual({
+      inspect: "repository/media/nas,snapshot-policy/media/photos",
+    });
+    expect(validate({ inspect: "repository/media/nas,bogus" })).toEqual({
+      inspect: "repository/media/nas",
+    });
   });
 });

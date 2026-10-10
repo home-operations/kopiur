@@ -172,7 +172,7 @@ describe("Snapshot drawer", () => {
       within(chain)
         .getByRole("link", { name: /SnapshotPolicy.*nightly/ })
         .getAttribute("href"),
-    ).toMatch(/inspect=snapshot-policy%2Fmedia%2Fnightly$/);
+    ).toMatch(/inspect=[^&]+%2Csnapshot-policy%2Fmedia%2Fnightly$/);
     expect(within(chain).getByRole("link", { name: /Repository.*nas/ })).toBeInTheDocument();
     expect(chain).toHaveTextContent("this snapshot");
   });
