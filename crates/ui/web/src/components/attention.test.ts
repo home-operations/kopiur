@@ -5,8 +5,10 @@ import type {
   DoctorObjectView,
   MaintenanceRow,
   PolicyRow,
+  RepositoryReplicationRow,
   RepositorySummary,
   ScheduleRow,
+  SnapshotReplicationRow,
 } from "../api/types";
 import { cssRules, readStyles } from "../testing/css";
 import { attention, splitFix } from "./attention";
@@ -215,5 +217,80 @@ describe("attention", () => {
       .join("\n");
     expect(list).not.toMatch(/max-height:/);
     expect(list).not.toMatch(/overflow(-y)?:/);
+  });
+});
+
+describe("attention: replications", () => {
+  const blobCopy = (over: Partial<RepositoryReplicationRow> = {}): RepositoryReplicationRow => ({
+    namespace: "media",
+    name: "blobsync",
+    source: "nas",
+    destinationBackend: "s3 dr-bucket/nas/",
+    cron: "0 5 * * *",
+    suspended: false,
+    phase: "failed",
+    ...over,
+  });
+  const copy = (over: Partial<SnapshotReplicationRow> = {}): SnapshotReplicationRow => ({
+    namespace: "media",
+    name: "offsite",
+    source: "nas",
+    destination: "shared",
+    cron: "0 6 * * *",
+    suspended: false,
+    phase: "failed",
+    ...over,
+  });
+
+  it("lists a failed copy of either kind, so a red verdict always has its object", () => {
+    const { items } = attention({
+      replications: { repository: [blobCopy()], snapshot: [copy()] },
+    });
+    expect(items.map((i) => [i.target, i.state])).toEqual([
+      [{ kind: "repositoryReplication", namespace: "media", name: "blobsync" }, "Failed"],
+      [{ kind: "snapshotReplication", namespace: "media", name: "offsite" }, "Failed"],
+    ]);
+    expect(items[0]?.problems[0]?.what).toBe("The last copy from nas to s3 dr-bucket/nas/ failed.");
+  });
+
+  it("leaves out a copy that is running, healthy or suspended", () => {
+    const { items } = attention({
+      replications: {
+        repository: [blobCopy({ phase: "succeeded" }), blobCopy({ name: "b", suspended: true })],
+        snapshot: [copy({ phase: "replicating" })],
+      },
+    });
+    expect(items).toEqual([]);
+  });
+
+  it("gives a copy the doctor already named the doctor's account", () => {
+    const { items } = attention({
+      replications: { repository: [], snapshot: [copy()] },
+      checks: [
+        {
+          check: "recent-failures",
+          title: "Recent failures",
+          outcome: "Fail",
+          what: null,
+          fix: null,
+          objects: [
+            {
+              kind: "snapshotReplication",
+              namespace: "media",
+              name: "offsite",
+              failing: true,
+              message: "copy failed: bucket refused. Fix: check the bucket's credentials",
+              fix: null,
+              at: null,
+            },
+          ],
+        } as unknown as DoctorCheckView,
+      ],
+    });
+    expect(items).toHaveLength(1);
+    expect(items[0]?.problems[0]).toEqual({
+      what: "copy failed: bucket refused.",
+      fix: "check the bucket's credentials",
+    });
   });
 });

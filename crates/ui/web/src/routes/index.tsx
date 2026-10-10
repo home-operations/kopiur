@@ -75,6 +75,7 @@ function Overview() {
     policies: policies.data,
     schedules: schedules.data,
     maintenance: maintenance.data,
+    replications: replications.data,
     stalled: report?.stalled,
     checks: doctor.data?.checks,
   });

@@ -4,12 +4,14 @@ import type {
   Health,
   MaintenanceRow,
   PolicyRow,
+  ReplicationsView,
   RepositorySummary,
   ScheduleRow,
 } from "../api/types";
 import type { StalledRowView } from "../api/statusReport";
 import type { InspectTarget } from "./inspect";
 import { kindOfLabel } from "./kind";
+import { replicationHealth } from "./replication";
 import { repositoryPhaseLabel } from "./repository";
 
 /**
@@ -60,6 +62,8 @@ export interface AttentionSources {
   policies?: readonly PolicyRow[] | undefined;
   schedules?: readonly ScheduleRow[] | undefined;
   maintenance?: readonly MaintenanceRow[] | undefined;
+  /** Both replication kinds: a failed copy turns the verdict red, so it needs a row. */
+  replications?: ReplicationsView | undefined;
   stalled?: readonly StalledRowView[] | undefined;
   checks?: readonly DoctorCheckView[] | undefined;
 }
@@ -255,6 +259,29 @@ export function attention(sources: AttentionSources): Attention {
       "failed",
       "Failing",
       { what },
+    );
+  }
+  for (const r of sources.replications?.repository ?? []) {
+    if (replicationHealth(r.phase, r.suspended) !== "failed") continue;
+    const to = r.destinationBackend ?? "its destination";
+    add(
+      Source.List,
+      { kind: "repositoryReplication", namespace: r.namespace, name: r.name },
+      "failed",
+      "Failed",
+      { what: `The last copy from ${r.source} to ${to} failed.` },
+      { at: r.lastReplicated },
+    );
+  }
+  for (const r of sources.replications?.snapshot ?? []) {
+    if (replicationHealth(r.phase, r.suspended) !== "failed") continue;
+    add(
+      Source.List,
+      { kind: "snapshotReplication", namespace: r.namespace, name: r.name },
+      "failed",
+      "Failed",
+      { what: `The last copy from ${r.source} to ${r.destination} failed.` },
+      { at: r.lastReplicated },
     );
   }
   for (const p of sources.policies ?? []) {
