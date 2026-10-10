@@ -233,6 +233,14 @@ function ActiveSnapshot({ target, value, scope, children }: ActiveSnapshotProps)
         ) : null}
       </div>
       {facts.length > 0 ? <Facts label="About this snapshot" facts={facts} /> : null}
+      {target !== null && detail.isError ? (
+        // Browsing goes on without the facts, but never silently without them.
+        <ErrorState
+          problem={detail.error.problem}
+          what={`the details of ${target.name}`}
+          onRetry={() => void detail.refetch()}
+        />
+      ) : null}
       <div className="browse-head__body">{children}</div>
     </section>
   );

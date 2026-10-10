@@ -628,6 +628,33 @@ describe("Browse — the snapshot being browsed", () => {
     ).toBe("/browse?snapshot=media%2Fnightly-1&inspect=snapshot%2Fmedia%2Fnightly-1");
   });
 
+  it("says when the snapshot's details could not be read, with a retry, and still browses", async () => {
+    let fail = true;
+    mockBrowse({
+      detail: () =>
+        fail
+          ? problemResponse(kopiurProblem("upstream", 502, "The API server did not answer."))
+          : jsonResponse(detail()),
+    });
+    mountApp(ROUTE);
+    const head = await screen.findByRole("region", { name: "Snapshot being browsed" });
+    expect(
+      await within(head).findByText("Could not load the details of nightly-1"),
+    ).toBeInTheDocument();
+    // The failed read does not hold the session up.
+    expect(
+      await screen.findByRole("button", { name: /Start a browse session/ }),
+    ).toBeInTheDocument();
+    fail = false;
+    await userEvent.click(within(head).getByRole("button", { name: "Retry" }));
+    await waitFor(() => {
+      expect(head.querySelector('dl[aria-label="About this snapshot"]')).toHaveTextContent(
+        "Policynightly",
+      );
+    });
+    expect(within(head).queryByText("Could not load the details of nightly-1")).toBeNull();
+  });
+
   it("names an address that is not a snapshot rather than dropping it", async () => {
     mockBrowse({});
     mountApp("/browse?snapshot=nightly-1");
