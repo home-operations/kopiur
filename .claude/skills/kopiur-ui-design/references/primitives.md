@@ -714,6 +714,11 @@ value in mono, the empty meaning muted, a chevron) that opens a popover onto
   one match (or the typed text) and never submits the surrounding form.
 - A list filter goes on the wire comma-separated and matches any of its values
   (`?phase=failed,running`).
+- **A filter bar applies each change at once**: no Apply button. The fields read
+  their values from the URL and a pick navigates, so the bar and the list never
+  disagree. Do not key the bar on the URL: it would remount on every pick and
+  close a list still open for the next one. "Clear all" appears only when a
+  filter is set, and keeps the shell's namespace.
 - Inside another popover or a drawer foot, pass `strategy="fixed"` so the list
   is not clipped by the panel's own scroll.
 - A field that would repeat the shell's scope (`?namespace=`) is left out; the

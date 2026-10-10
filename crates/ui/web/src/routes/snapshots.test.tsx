@@ -135,7 +135,10 @@ describe("Snapshots list", () => {
     await pickOption(user, "Phase", "Running", filters);
     await pickOption(user, "Repository", "nas", filters);
     await pickOption(user, "Repository", "shared", filters);
-    await user.click(within(filters).getByRole("button", { name: /Apply filters/ }));
+    // Applied as picked: no Apply button, and the open list survived each
+    // change (the helper reuses it), so the bar was not rebuilt under it.
+    expect(within(filters).queryByRole("button", { name: /Apply/ })).toBeNull();
+    expect(screen.getByRole("dialog", { name: "Choose the repository" })).toBeInTheDocument();
     expect(router.state.location.search).toMatchObject({
       namespace: "media",
       phase: "failed,running",
@@ -155,9 +158,15 @@ describe("Snapshots list", () => {
     await list();
     const filters = screen.getByRole("form", { name: "Snapshot filters" });
     expect(within(filters).getByRole("button", { name: "Repository: nas" })).toBeInTheDocument();
+    // The link is sent as it is until something changes…
+    expect(snapshotRequest()).toContain("repositoryNamespace=infra");
     const user = userEvent.setup();
-    await user.click(within(filters).getByRole("button", { name: /Apply filters/ }));
-    expect(router.state.location.search).toMatchObject({ repository: "Repository/infra/nas" });
+    await pickOption(user, "Phase", "Failed", filters);
+    // …and then it is written back in the qualified form.
+    expect(router.state.location.search).toMatchObject({
+      repository: "Repository/infra/nas",
+      phase: "failed",
+    });
     expect(router.state.location.search).not.toHaveProperty("repositoryNamespace");
   });
 
@@ -170,18 +179,29 @@ describe("Snapshots list", () => {
     expect(screen.getAllByText(/bogus/).length).toBeGreaterThan(0);
   });
 
-  it("round-trips a filter through the address bar when the form is submitted", async () => {
+  it("puts each filter in the address bar the moment it is chosen", async () => {
     mockApi({ "/api/v1/snapshots": jsonResponse(page([row()])) });
     const { router } = mountApp("/snapshots");
     await list();
     const user = userEvent.setup();
     await pickOption(user, "Phase", "Failed");
     await typeOption(user, "Policy", "nightly");
-    await user.click(screen.getByRole("button", { name: /Apply filters/ }));
     // The URL is the state: the filter is in the address bar, so the view is a
     // link a colleague can open.
     expect(router.state.location.search).toMatchObject({ phase: "failed", policy: "nightly" });
     expect(snapshotRequest()).toContain("phase=failed");
+  });
+
+  it("offers Clear all only when a filter is set, and it keeps the shell's namespace", async () => {
+    mockApi({ "/api/v1/snapshots": jsonResponse(page([row()])) });
+    const { router } = mountApp("/snapshots?namespace=media");
+    await list();
+    expect(screen.queryByRole("link", { name: "Clear all" })).toBeNull();
+    const user = userEvent.setup();
+    await pickOption(user, "Origin", "Manual");
+    await user.click(await screen.findByRole("link", { name: "Clear all" }));
+    expect(router.state.location.search).toEqual({ namespace: "media" });
+    expect(screen.getByRole("button", { name: "Origin: any origin" })).toBeInTheDocument();
   });
 
   it("keeps a filter value the server would refuse, says so, and does not send it", async () => {

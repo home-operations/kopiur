@@ -1,11 +1,9 @@
 import { Link, createFileRoute, useNavigate } from "@tanstack/react-router";
 import { Camera, Filter, Sigma } from "lucide-react";
-import { type SubmitEvent, useState } from "react";
 
 import { type SnapshotListParams, useSnapshots } from "../api/hooks";
 import { problemKind } from "../api/problem";
 import { SnapshotSizeChart } from "../charts/SnapshotSizeChart";
-import { ActionButton } from "../components/ActionButton";
 import { EmptyState } from "../components/EmptyState";
 import { ErrorState } from "../components/ErrorState";
 import { Finding } from "../components/Finding";
@@ -241,7 +239,7 @@ function Snapshots() {
       </p>
 
       <section className="page__section" aria-label="Filters">
-        <Filters search={asked} namespace={namespace} limit={limit} key={JSON.stringify(search)} />
+        <Filters search={asked} namespace={namespace} limit={limit} />
       </section>
 
       {ignored.map((filter) => (
@@ -400,67 +398,79 @@ interface FiltersProps {
 }
 
 /**
- * The four filters, submitted into the URL beside the shell's namespace. Each
- * takes any number of values (sent comma-separated, matching any of them);
- * choosing none is the Clear button in its list.
+ * The four filters, applied to the URL as they change, beside the shell's
+ * namespace. Each takes any number of values (sent comma-separated, matching
+ * any of them); choosing none is the Clear button in its list.
  *
  * A repository is chosen with its kind and namespace in one key, so the bar
  * has no separate kind or namespace field to keep in step with it.
  *
- * Submitting always resets `offset`: a page-3 window over the old filter is
+ * A change always resets `offset`: a page-3 window over the old filter is
  * meaningless under a new one, and leaving it would show an empty page that
  * looks like "no such snapshots".
  */
 function Filters({ search, namespace, limit }: FiltersProps) {
   const navigate = useNavigate();
-  const [repositories, setRepositories] = useState(() => repositoryEntries(search, namespace));
-  const [policies, setPolicies] = useState(() => listParam(search.policy));
-  const [origins, setOrigins] = useState(() => listParam(search.origin));
-  const [phases, setPhases] = useState(() => listParam(search.phase));
-
-  const submit = (event: SubmitEvent<HTMLFormElement>) => {
-    event.preventDefault();
+  // The URL is the state: each field reads it, and a change is applied at
+  // once by navigating. Nothing is held locally, so the bar never disagrees
+  // with the list under it — and it is not remounted per change, so a list
+  // still open for another pick stays open.
+  const current = {
+    repository: repositoryEntries(search, namespace),
+    policy: listParam(search.policy),
+    origin: listParam(search.origin),
+    phase: listParam(search.phase),
+  };
+  const apply = (key: keyof typeof current, values: readonly string[]) => {
+    const chosen = { ...current, [key]: values };
     const next: Record<string, string | number> = {};
-    const put = (key: string, values: readonly string[]) => {
-      if (values.length > 0) {
-        next[key] = values.join(",");
-      }
-    };
     // The namespace is the shell's scope, chosen in the sidebar's switcher;
     // the filters keep it.
     if (namespace !== undefined) next.namespace = namespace;
-    put("repository", repositories);
-    put("policy", policies);
-    put("origin", origins);
-    put("phase", phases);
+    for (const [name, list] of Object.entries(chosen)) {
+      if (list.length > 0) next[name] = list.join(",");
+    }
     if (limit !== DEFAULT_LIMIT) {
       next.limit = limit;
     }
     void navigate({ to: "/snapshots", search: next });
   };
+  const anyChosen = Object.values(current).some((list) => list.length > 0);
 
   return (
-    <form className="controls snapshot-filters" onSubmit={submit} aria-label="Snapshot filters">
+    <form
+      className="controls snapshot-filters"
+      aria-label="Snapshot filters"
+      onSubmit={(event) => {
+        event.preventDefault();
+      }}
+    >
       <PolicyField
         id="snapshots-policy"
         label="Policy"
-        value={policies}
-        onChange={setPolicies}
+        value={current.policy}
+        onChange={(values) => {
+          apply("policy", values);
+        }}
         emptyLabel="any policy"
       />
       <RepositoryField
         id="snapshots-repository"
         label="Repository"
-        value={repositories}
-        onChange={setRepositories}
+        value={current.repository}
+        onChange={(values) => {
+          apply("repository", values);
+        }}
         emptyLabel="any repository"
       />
       <PickerField
         id="snapshots-origin"
         label="Origin"
         multiple
-        value={origins}
-        onChange={setOrigins}
+        value={current.origin}
+        onChange={(values) => {
+          apply("origin", values);
+        }}
         options={ORIGIN_FILTERS}
         emptyLabel="any origin"
       />
@@ -468,24 +478,24 @@ function Filters({ search, namespace, limit }: FiltersProps) {
         id="snapshots-phase"
         label="Phase"
         multiple
-        value={phases}
-        onChange={setPhases}
+        value={current.phase}
+        onChange={(values) => {
+          apply("phase", values);
+        }}
         options={PHASE_FILTERS}
         emptyLabel="any phase"
       />
-      <div className="controls__actions">
-        <ActionButton variant="primary" type="submit">
-          <Filter size={14} strokeWidth={2} aria-hidden="true" />
-          Apply filters
-        </ActionButton>
-        <Link
-          className="button button--quiet"
-          to="/snapshots"
-          search={namespace === undefined ? {} : { namespace }}
-        >
-          Clear
-        </Link>
-      </div>
+      {anyChosen ? (
+        <div className="controls__actions">
+          <Link
+            className="button button--quiet"
+            to="/snapshots"
+            search={namespace === undefined ? {} : { namespace }}
+          >
+            Clear all
+          </Link>
+        </div>
+      ) : null}
     </form>
   );
 }
