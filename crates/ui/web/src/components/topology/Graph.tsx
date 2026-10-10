@@ -17,24 +17,22 @@ import type { TopologyModel } from "./model";
  * mouse and without colour vision.
  *
  * The SVG is therefore `aria-hidden`: it is a picture of relationships that
- * are also stated in words. Each plate is a button; each relationship is in
- * the drawer for either of its ends; and the whole edge set is listed for
- * assistive technology beneath the board, so the graph can be read straight
- * through without ever selecting a node.
+ * are also stated in words. Each resource plate is a link to its resource
+ * drawer, where every relationship at either end is listed; and the whole
+ * edge set is listed for assistive technology beneath the board, so the
+ * graph can be read straight through without opening anything.
  *
  * A dangling edge — an endpoint the server did not send a node for — is not
  * drawn, because there is nothing to draw it to. It is in the spoken list and
- * in the drawer, saying exactly that, rather than being quietly dropped.
+ * in the resource drawer, saying exactly that, rather than being quietly
+ * dropped.
  */
 export interface GraphProps {
   model: TopologyModel;
   layout: LaidOut;
-  /** The node whose drawer is open, or `null`. */
-  selected: string | null;
-  onSelect: (id: string) => void;
 }
 
-export function Graph({ model, layout, selected, onSelect }: GraphProps) {
+export function Graph({ model, layout }: GraphProps) {
   // Marker ids are document-global; scope them to this instance so two boards
   // on one page cannot steal each other's arrowheads.
   const markers = useId().replaceAll(":", "");
@@ -132,13 +130,7 @@ export function Graph({ model, layout, selected, onSelect }: GraphProps) {
                 key={node.id}
                 style={{ left: `${box.x}px`, top: `${box.y}px`, width: `${box.width}px` }}
               >
-                <NodeCard
-                  node={node}
-                  selected={selected === node.id}
-                  onSelect={() => {
-                    onSelect(node.id);
-                  }}
-                />
+                <NodeCard node={node} />
               </li>
             );
           })}

@@ -9,6 +9,8 @@ import type {
   RestoreTargetBody,
 } from "../../api/types";
 import { assertNever } from "../../util/assertNever";
+import { PickerField } from "../PickerField";
+import { NamespaceField } from "../ResourceFields";
 import { useCapabilityReason } from "../useCapabilityReason";
 import { ActionPanel } from "./ActionPanel";
 
@@ -133,6 +135,8 @@ export function RestoreDialog({ namespace, snapshot, open, onOpenChange }: Resto
     <ActionPanel
       label="Restore"
       icon={ArchiveRestore}
+      // A long form: it opens in the page, where it can be read at length.
+      presentation="inline"
       variant="danger"
       disabledReason={reason}
       confirmLabel="Create the restore"
@@ -143,8 +147,6 @@ export function RestoreDialog({ namespace, snapshot, open, onOpenChange }: Resto
           restore.mutate(body);
         }
       }}
-      receipt={restore.data}
-      problem={restore.error?.problem}
       open={open}
       onOpenChange={onOpenChange}
     >
@@ -198,12 +200,12 @@ export function RestoreDialog({ namespace, snapshot, open, onOpenChange }: Resto
             value={snapshotName}
             set={setSnapshotName}
           />
-          <Field
+          <NamespaceField
             id={`${fieldId}-snap-ns`}
-            label="Snapshot namespace (optional)"
+            label="Snapshot namespace"
             value={snapshotNamespace}
-            set={setSnapshotNamespace}
-            placeholder={namespace}
+            onChange={setSnapshotNamespace}
+            emptyLabel={`${namespace} (the restore's)`}
           />
         </>
       ) : null}
@@ -211,12 +213,12 @@ export function RestoreDialog({ namespace, snapshot, open, onOpenChange }: Resto
       {sourceKind === "fromPolicy" ? (
         <>
           <Field id={`${fieldId}-pol`} label="Policy name" value={policyName} set={setPolicyName} />
-          <Field
+          <NamespaceField
             id={`${fieldId}-pol-ns`}
-            label="Policy namespace (optional)"
+            label="Policy namespace"
             value={policyNamespace}
-            set={setPolicyNamespace}
-            placeholder={namespace}
+            onChange={setPolicyNamespace}
+            emptyLabel={`${namespace} (the restore's)`}
           />
           <Field
             id={`${fieldId}-asof`}
@@ -309,7 +311,7 @@ export function RestoreDialog({ namespace, snapshot, open, onOpenChange }: Resto
         </>
       )}
 
-      <fieldset className="action__choice" data-danger="true">
+      <fieldset className="action__choice">
         <legend>Overwrite existing files</legend>
         <p className="action__note">
           This is <span className="mono">overwrite</span>, which becomes{" "}
@@ -330,6 +332,7 @@ export function RestoreDialog({ namespace, snapshot, open, onOpenChange }: Resto
         <Radio
           id={`${fieldId}-ow-yes`}
           group={`${fieldId}-ow`}
+          danger
           checked={overwrite === "yes"}
           onPick={() => {
             setOverwrite("yes");
@@ -355,21 +358,18 @@ export function RestoreDialog({ namespace, snapshot, open, onOpenChange }: Resto
         />
       )}
 
-      <div className="controls__field">
-        <label htmlFor={`${fieldId}-repo-kind`}>Repository (optional)</label>
-        <select
-          id={`${fieldId}-repo-kind`}
-          className="controls__input"
-          value={repositoryKind}
-          onChange={(event) => {
-            setRepositoryKind(event.target.value);
-          }}
-        >
-          <option value="">Infer it from the source</option>
-          <option value="Repository">Repository</option>
-          <option value="ClusterRepository">ClusterRepository</option>
-        </select>
-      </div>
+      <PickerField
+        id={`${fieldId}-repo-kind`}
+        label="Repository (optional)"
+        value={repositoryKind}
+        onChange={setRepositoryKind}
+        options={[
+          { value: "Repository", label: "Repository" },
+          { value: "ClusterRepository", label: "ClusterRepository" },
+        ]}
+        emptyLabel="Infer it from the source"
+        strategy="fixed"
+      />
       {repositoryKind.length > 0 ? (
         <>
           <Field
@@ -379,12 +379,12 @@ export function RestoreDialog({ namespace, snapshot, open, onOpenChange }: Resto
             set={setRepositoryName}
           />
           {repositoryKind === "Repository" ? (
-            <Field
+            <NamespaceField
               id={`${fieldId}-repo-ns`}
-              label="Repository namespace (optional)"
+              label="Repository namespace"
               value={repositoryNamespace}
-              set={setRepositoryNamespace}
-              placeholder={namespace}
+              onChange={setRepositoryNamespace}
+              emptyLabel={`${namespace} (the restore's)`}
             />
           ) : null}
         </>
@@ -585,16 +585,19 @@ function Radio({
   group,
   checked,
   onPick,
+  danger = false,
   children,
 }: {
   id: string;
   group: string;
   checked: boolean;
   onPick: () => void;
+  /** The answer that destroys data: set off by the failed lamp's rule. */
+  danger?: boolean;
   children: ReactNode;
 }) {
   return (
-    <label htmlFor={id}>
+    <label htmlFor={id} data-danger={danger ? "true" : undefined}>
       <input type="radio" id={id} name={group} checked={checked} onChange={onPick} />
       <span>{children}</span>
     </label>

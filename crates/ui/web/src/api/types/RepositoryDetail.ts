@@ -5,7 +5,9 @@ import type { GateHit } from "./GateHit";
 import type { HealthProbeView } from "./HealthProbeView";
 import type { MaintenanceRow } from "./MaintenanceRow";
 import type { PolicyRef } from "./PolicyRef";
+import type { ReplicationRef } from "./ReplicationRef";
 import type { RepositorySummary } from "./RepositorySummary";
+import type { ScheduleRow } from "./ScheduleRow";
 import type { SeedView } from "./SeedView";
 import type { ServerView } from "./ServerView";
 import type { SessionInfo } from "./SessionInfo";
@@ -57,13 +59,18 @@ conditions: Array<ConditionView>,
  */
 policies: Array<PolicyRef>,
 /**
- * Names of replications that read from this repository.
+ * Schedules that fire any policy writing into this repository, sorted by
+ * namespace then name — the "fired by" end of its relationships.
  */
-replicationsOut: Array<string>,
+schedules: Array<ScheduleRow>,
 /**
- * Names of replications that write into this repository.
+ * Replications that read from this repository.
  */
-replicationsIn: Array<string>,
+replicationsOut: Array<ReplicationRef>,
+/**
+ * Replications that write into this repository.
+ */
+replicationsIn: Array<ReplicationRef>,
 /**
  * Browse sessions currently open against this repository.
  */

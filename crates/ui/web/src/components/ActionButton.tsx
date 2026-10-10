@@ -1,4 +1,5 @@
-import { type ButtonHTMLAttributes, type MouseEvent, useId } from "react";
+import { Lock } from "lucide-react";
+import { type ButtonHTMLAttributes, type MouseEvent, type Ref, useId } from "react";
 
 /**
  * A button that can be disabled *with a reason*.
@@ -24,14 +25,30 @@ import { type ButtonHTMLAttributes, type MouseEvent, useId } from "react";
  * ledger shows the short word in the cell instead (`actions/reason.ts`).
  */
 export interface ActionButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
+  /** The button element, for a popover that anchors to it and refocuses it. */
+  ref?: Ref<HTMLButtonElement> | undefined;
   variant?: "default" | "primary" | "quiet" | "danger" | undefined;
   /** When set, the button is disabled and this is shown as the reason. */
   disabledReason?: string | undefined;
+  /**
+   * `refused` (the default) is "you may not" and wears a lock; `blocked` is
+   * "answer something first" and does not — it is not a permission.
+   */
+  reasonKind?: "refused" | "blocked" | undefined;
+  /**
+   * Show the reason beside the button (the default). A caller that prints its
+   * own short word next to the button — a table cell has no room for a
+   * sentence — passes `false`; the sentence is then the button's accessible
+   * description and its `title`, never dropped.
+   */
+  reasonShown?: boolean | undefined;
 }
 
 export function ActionButton({
   variant = "default",
   disabledReason,
+  reasonKind = "refused",
+  reasonShown = true,
   className,
   onClick,
   children,
@@ -63,7 +80,14 @@ export function ActionButton({
         {children}
       </button>
       {blocked ? (
-        <span id={reasonId} className="visually-hidden button__reason">
+        <span
+          id={reasonId}
+          className={reasonShown ? "button__reason" : "visually-hidden button__reason"}
+          data-kind-of-reason={reasonKind}
+        >
+          {reasonShown && reasonKind === "refused" ? (
+            <Lock size={12} strokeWidth={2} aria-hidden="true" />
+          ) : null}
           {disabledReason}
         </span>
       ) : null}

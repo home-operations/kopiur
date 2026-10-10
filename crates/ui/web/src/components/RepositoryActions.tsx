@@ -4,14 +4,15 @@ import { type ReactNode, useState } from "react";
 import { useMaintenanceRun, useScanCatalog, useSuspend } from "../api/hooks";
 import type { RepositoryDetail as RepositoryDetailData } from "../api/types";
 import { ActionButton } from "./ActionButton";
-import { ActionResult } from "./ActionResult";
+import { Popover } from "./Popover";
+import { PickerField } from "./PickerField";
+import { MAINTENANCE_MODES } from "./pickerChoices";
 import {
   actionNamespace,
   isClusterScoped,
   repositoryPatchCapability,
   suspendKindToken,
 } from "./repository";
-import { useConfirmFocus } from "./actions/useConfirmFocus";
 import { useCapabilityReason } from "./useCapabilityReason";
 
 /**
@@ -61,7 +62,6 @@ interface ActionSpec {
   prose: ReactNode;
   running: boolean;
   run: () => void;
-  result: ReactNode;
 }
 
 export function RepositoryActions({ detail }: RepositoryActionsProps) {
@@ -118,13 +118,6 @@ export function RepositoryActions({ detail }: RepositoryActionsProps) {
           ...(namespace !== undefined ? { namespace } : {}),
         });
       },
-      result: (
-        <ActionResult
-          label={suspendLabel}
-          receipt={suspend.data}
-          problem={suspend.error?.problem}
-        />
-      ),
     },
     {
       id: "maintenance",
@@ -143,20 +136,14 @@ export function RepositoryActions({ detail }: RepositoryActionsProps) {
             . <strong>Quick</strong> compacts kopia&apos;s indexes and is cheap;{" "}
             <strong>full</strong> also reclaims unused space, and is slow.
           </p>
-          <div className="controls__field">
-            <label htmlFor="maintenance-mode">Mode</label>
-            <select
-              id="maintenance-mode"
-              className="controls__input"
-              value={mode}
-              onChange={(event) => {
-                setMode(event.target.value);
-              }}
-            >
-              <option value="quick">quick</option>
-              <option value="full">full</option>
-            </select>
-          </div>
+          <PickerField
+            id="maintenance-mode"
+            label="Mode"
+            value={mode}
+            onChange={setMode}
+            options={MAINTENANCE_MODES}
+            strategy="fixed"
+          />
         </>
       ),
       running: maintenanceRun.isPending,
@@ -170,13 +157,6 @@ export function RepositoryActions({ detail }: RepositoryActionsProps) {
           mode,
         });
       },
-      result: (
-        <ActionResult
-          label="Run maintenance"
-          receipt={maintenanceRun.data}
-          problem={maintenanceRun.error?.problem}
-        />
-      ),
     },
     {
       id: "scan",
@@ -202,18 +182,8 @@ export function RepositoryActions({ detail }: RepositoryActionsProps) {
           ...(namespace !== undefined ? { namespace } : {}),
         });
       },
-      result: (
-        <ActionResult label="Scan catalog" receipt={scan.data} problem={scan.error?.problem} />
-      ),
     },
   ];
-
-  const opened = actions.find((action) => action.id === open);
-  // Hand-rolled rather than built from `ActionPanel` (it predates it), so it
-  // borrows the shared focus behaviour directly — see `useConfirmFocus`.
-  const panelRef = useConfirmFocus(opened !== undefined, () => {
-    setOpen(null);
-  });
 
   return (
     <>
@@ -221,57 +191,45 @@ export function RepositoryActions({ detail }: RepositoryActionsProps) {
         {actions.map((action) => {
           const Icon = action.icon;
           return (
-            <ActionButton
+            <Popover
               key={action.id}
-              variant={action.variant}
-              disabledReason={action.reason}
-              aria-expanded={open === action.id}
-              onClick={() => {
-                setOpen((was) => (was === action.id ? null : action.id));
+              label={action.label}
+              open={open === action.id}
+              onOpenChange={(next) => {
+                setOpen((was) => (next ? action.id : was === action.id ? null : was));
               }}
+              className="action__popover"
+              trigger={(props) => (
+                <ActionButton variant={action.variant} disabledReason={action.reason} {...props}>
+                  <Icon size={14} strokeWidth={2} aria-hidden="true" />
+                  {action.label}
+                </ActionButton>
+              )}
             >
-              <Icon size={14} strokeWidth={2} aria-hidden="true" />
-              {action.label}
-            </ActionButton>
+              {(close) => (
+                <>
+                  <div className="action__prose">{action.prose}</div>
+                  <div className="action__actions">
+                    <ActionButton
+                      variant="primary"
+                      disabledReason={action.running ? "The request is in flight." : action.reason}
+                      onClick={() => {
+                        action.run();
+                        close();
+                      }}
+                    >
+                      {action.confirmLabel}
+                    </ActionButton>
+                    <ActionButton variant="quiet" onClick={close}>
+                      Cancel
+                    </ActionButton>
+                  </div>
+                </>
+              )}
+            </Popover>
           );
         })}
       </div>
-
-      {opened !== undefined ? (
-        <div
-          className="action__confirm"
-          role="group"
-          aria-label={opened.label}
-          ref={panelRef}
-          tabIndex={-1}
-        >
-          <div className="action__prose">{opened.prose}</div>
-          <div className="action__actions">
-            <ActionButton
-              variant="primary"
-              disabledReason={opened.running ? "The request is in flight." : opened.reason}
-              onClick={() => {
-                opened.run();
-                setOpen(null);
-              }}
-            >
-              {opened.confirmLabel}
-            </ActionButton>
-            <ActionButton
-              variant="quiet"
-              onClick={() => {
-                setOpen(null);
-              }}
-            >
-              Cancel
-            </ActionButton>
-          </div>
-        </div>
-      ) : null}
-
-      {actions.map((action) => (
-        <div key={action.id}>{action.result}</div>
-      ))}
     </>
   );
 }

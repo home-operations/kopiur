@@ -1,4 +1,5 @@
 import { screen, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { describe, expect, it } from "vitest";
 
 import type { PolicyRow } from "../api/types";
@@ -48,24 +49,28 @@ describe("Policies", () => {
     const body = bodyRows(await table());
     expect(body).toHaveLength(2);
     expect(nth(body, 0)).toHaveTextContent("nightly");
-    expect(nth(body, 0)).toHaveTextContent("Repository/media/nas");
-    expect(nth(body, 0)).toHaveTextContent("ClusterRepository/shared");
+    // What it writes into: references to each repository's own page.
+    expect(
+      nth(body, 0).querySelector('a.ref[data-kind="repository"]')?.getAttribute("href"),
+    ).toMatch(/inspect=repository%2Fmedia%2Fnas$/);
+    expect(
+      nth(body, 0).querySelector('a.ref[data-kind="cluster-repository"]')?.getAttribute("href"),
+    ).toMatch(/inspect=cluster-repository%2Fshared$/);
+    expect(nth(body, 0)).toHaveAttribute("data-kind", "snapshot-policy");
     expect(nth(body, 0)).toHaveTextContent("fans out");
     expect(nth(body, 0)).toHaveTextContent("42");
     expect(nth(body, 1)).toHaveTextContent("hourly");
   });
 
-  it("links a row into its own detail route, carrying namespace and name in the path", async () => {
+  it("opens a row in the resource drawer, carrying namespace and name", async () => {
     mockApi({ "/api/v1/policies": jsonResponse(rows) });
     mountApp("/policies");
     const body = bodyRows(await table());
-    expect(within(nth(body, 0)).getByRole("link", { name: "nightly" })).toHaveAttribute(
-      "href",
-      "/policies/media/nightly",
-    );
-    expect(within(nth(body, 1)).getByRole("link", { name: "hourly" })).toHaveAttribute(
-      "href",
-      "/policies/prod/hourly",
+    expect(
+      within(nth(body, 0)).getByRole("link", { name: "nightly" }).getAttribute("href"),
+    ).toMatch(/inspect=snapshot-policy%2Fmedia%2Fnightly$/);
+    expect(within(nth(body, 1)).getByRole("link", { name: "hourly" }).getAttribute("href")).toMatch(
+      /inspect=snapshot-policy%2Fprod%2Fhourly$/,
     );
   });
 
@@ -163,5 +168,18 @@ describe("Policies", () => {
     mountApp("/policies");
     const region = await screen.findByRole("region", { name: "Policies" });
     expect(within(region).getByRole("status", { busy: true })).toBeInTheDocument();
+  });
+});
+
+describe("Policies — whole-row link", () => {
+  it("makes every row open its policy in the drawer, through the name", async () => {
+    mockApi({ "/api/v1/policies": jsonResponse(rows) });
+    const { router } = mountApp("/policies");
+    const link = nth(bodyRows(await table()), 0).querySelector<HTMLElement>("a.row-link");
+    expect(link?.getAttribute("href")).toMatch(/inspect=snapshot-policy%2Fmedia%2Fnightly$/);
+    if (link === null) throw new Error("no row link");
+    await userEvent.click(link);
+    expect(await screen.findByRole("dialog", { name: /nightly/ })).toBeInTheDocument();
+    expect(router.state.location.pathname).toBe("/policies");
   });
 });

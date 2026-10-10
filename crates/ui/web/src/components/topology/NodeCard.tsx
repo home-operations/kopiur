@@ -1,15 +1,22 @@
 import { LampBadge } from "../HealthBadge";
+import { inspectToken, useInspect } from "../inspect";
+import { InspectLink } from "../InspectLink";
+import { KindChip } from "../KindMark";
+import { KIND_META } from "../kind";
+import { nodeTarget } from "../drawer/graphFacts";
 import type { TopologyNode } from "./model";
 
 /**
  * One plate on the board: what the object is, what it is called, and how it
  * is.
  *
- * The plate is a `button`, not a decorated `div`: selecting a node is the
- * board's only interaction and it must be reachable by tab and by Enter, and
- * the drawer it opens is announced through `aria-expanded`. The kind and the
- * name are the label strip the rest of the console uses (silkscreen caps +
- * monospace), so a plate reads like a row.
+ * A plate that is a resource — a repository, a cluster repository, a policy,
+ * a ghost of one included — is a link that opens it in the resource drawer,
+ * over the board; the board keeps no drawer of its own. A backend, a
+ * namespace or a selector is not a resource and has nothing to open: it is a
+ * plain plate, and what is known about it is in the drawer of the resource
+ * that points at it. The kind and the name are the label strip the rest of
+ * the console uses (silkscreen caps + monospace), so a plate reads like a row.
  *
  * Colour never carries the health on its own — the plate's lamp is an icon
  * and a word, and a `missing` node adds a dashed outline and the words
@@ -17,30 +24,49 @@ import type { TopologyNode } from "./model";
  * reference is a backup destination that does not exist and must be
  * unmistakable at a glance.
  */
-export interface NodeCardProps {
-  node: TopologyNode;
-  selected: boolean;
-  onSelect: () => void;
-}
-
-export function NodeCard({ node, selected, onSelect }: NodeCardProps) {
-  return (
-    <button
-      type="button"
-      className="topo-node"
-      data-node-id={node.id}
-      data-kind={node.node.kind}
-      data-health={node.lamp.key}
-      data-missing={node.missing ? "true" : undefined}
-      data-selected={selected ? "true" : undefined}
-      aria-expanded={selected}
-      onClick={onSelect}
-    >
-      <span className="topo-node__kind">{node.kindWord}</span>
-      <span className="topo-node__name">{node.node.label}</span>
+export function NodeCard({ node }: { node: TopologyNode }) {
+  const target = nodeTarget(node.node);
+  const { target: open } = useInspect();
+  const body = (
+    <>
+      <span className="topo-node__id">
+        {target !== null ? <KindChip kind={target.kind} size="sm" /> : null}
+        <span className="topo-node__text">
+          <span className="topo-node__kind">{node.kindWord}</span>
+          <span className="topo-node__name">{node.node.label}</span>
+        </span>
+      </span>
       <span className="topo-node__lamp">
         <LampBadge lamp={node.lamp} />
       </span>
-    </button>
+    </>
+  );
+  const marks = {
+    "data-node-id": node.id,
+    "data-health": node.lamp.key,
+    "data-missing": node.missing ? "true" : undefined,
+  };
+  if (target === null) {
+    return (
+      <div
+        className="topo-node"
+        role="group"
+        aria-label={`${node.kindWord} ${node.node.label}`}
+        {...marks}
+      >
+        {body}
+      </div>
+    );
+  }
+  const selected = open !== null && inspectToken(open) === inspectToken(target);
+  return (
+    <InspectLink
+      className="topo-node has-stripe"
+      data-kind={KIND_META[target.kind].slug}
+      target={target}
+      data={{ ...marks, "data-selected": selected ? "true" : undefined }}
+    >
+      {body}
+    </InspectLink>
   );
 }

@@ -1,41 +1,39 @@
 /*
- * kopiur-ui design tokens and base styles — "the vault ledger".
+ * kopiur-ui styles — the "Mission dashboard" design system.
  *
- * An operator's console for backup infrastructure: dense, calm, legible at a
- * glance, read many times a day and sometimes at 3am. Two lights, both
- * first-class: the daylit vault and the 3am vault. Every colour is declared
- * once with `light-dark()`; the theme is chosen by `color-scheme` on `:root`
- * (`light dark` follows the OS, `light`/`dark` is the user's override, set by
- * `data-theme`). One declaration per token means the two themes cannot drift.
+ * The token block below is copied verbatim from the `kopiur-ui-design` skill
+ * (`.claude/skills/kopiur-ui-design/references/tokens.md`), which is the
+ * single source: `styles.tokens.test.ts` fails if the two drift, and the
+ * skill's `scripts/check-contrast.py` (run by `ui-check`) proves every pair
+ * clears WCAG AA in both themes. Change a token there first, then here.
  *
- * Health never rides on hue alone. The six health lamps below are paired with
- * an icon and a word wherever they appear (see components/HealthBadge.tsx);
- * the hues are Okabe–Ito-derived so the pairs stay distinct under the common
- * colour-vision deficiencies, and every fg/bg pair clears WCAG AA (4.5:1).
- *
- * The accent is reserved by law for selection, the current marker and the
- * primary action. It is never a health colour and never decoration.
+ * Every colour is declared once with `light-dark()`; the page follows the OS
+ * until the user picks a theme, which sets `data-theme` on `<html>`. Status is
+ * never colour alone (a tinted pill with an icon and a word), and kind colours
+ * mark kinds only — see the skill's `references/rules.md`.
  */
 
 :root {
   color-scheme: light dark;
 
-  /* ---- type ------------------------------------------------------------ */
+  /* ---- type: the system stack, no web fonts ---- */
   --font-sans: ui-sans-serif, system-ui, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
   --font-mono: ui-monospace, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
-  --text-xs: 0.6875rem; /* 11px — kind strips, column labels */
-  --text-sm: 0.8125rem; /* 13px — ledger rows, dense controls */
-  --text-md: 0.875rem; /* 14px — body */
-  --text-lg: 1.0625rem; /* 17px — section heading */
-  --text-xl: 1.375rem; /* 22px — page title */
-  --leading-dense: 1.35;
-  --leading-prose: 1.5;
-  --tracking-caps: 0.06em;
+  --text-xs: 0.6875rem; /* 11px  label caps, kind name, table heads */
+  --text-sm: 0.8125rem; /* 13px  table cells, controls, meta lines  */
+  --text-md: 0.875rem; /* 14px  body                               */
+  --text-lg: 1rem; /* 16px  verdict sentence, section titles   */
+  --text-xl: 1.375rem; /* 22px  page title                         */
+  --text-2xl: 1.5rem; /* 24px  the number on a kind tile          */
   --weight-regular: 400;
   --weight-medium: 500;
   --weight-semibold: 600;
+  --weight-bold: 700;
+  --leading-dense: 1.35;
+  --leading-prose: 1.5;
+  --tracking-caps: 0.08em;
 
-  /* ---- space (4px base) ------------------------------------------------ */
+  /* ---- space (4px base) ---- */
   --space-1: 0.25rem;
   --space-2: 0.5rem;
   --space-3: 0.75rem;
@@ -44,85 +42,94 @@
   --space-6: 2rem;
   --space-7: 3rem;
 
-  /* ---- shape ----------------------------------------------------------- */
-  --radius-sm: 3px; /* chips, lamps */
-  --radius-md: 6px; /* controls, panels — the chassis chamfer */
+  /* ---- shape ---- */
+  --radius-sm: 7px; /* small kind chip, focus ring on chips      */
+  --radius-md: 10px; /* buttons, inputs, kind chip, nav items     */
+  --radius-lg: 16px; /* cards, tables, panels, popovers           */
+  --radius-xl: 20px; /* the floating side panel                  */
+  --radius-pill: 999px; /* status pills only                         */
+  --stripe: 4px; /* the kind stripe on a card / row / header  */
 
-  /* ---- layout ---------------------------------------------------------- */
-  --rail-width: 232px;
-  --header-height: 48px;
-  --content-max: 1440px;
+  /* ---- layout ---- */
+  --sidebar-width: 240px;
+  --drawer-width: 50vw; /* the side panel; set inline once resized   */
+  --drawer-min: 360px;
+  --drawer-max: 85vw;
 
-  /* ---- motion ---------------------------------------------------------- */
+  /* ---- motion ---- */
   --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
   --dur-fast: 120ms;
   --dur-base: 180ms;
 
-  /* ---- surfaces: anodised slate, cool in both lights ------------------- */
-  --bg-canvas: light-dark(#f3f4f6, #131519);
-  --bg-surface: light-dark(#ffffff, #1b1e24);
-  --bg-rail: light-dark(#e9ebef, #0f1114);
-  --bg-inset: light-dark(#edeff2, #22262d);
-  --bg-hover: light-dark(rgba(26, 29, 33, 0.05), rgba(230, 232, 235, 0.06));
-  --bg-active: light-dark(rgba(26, 29, 33, 0.09), rgba(230, 232, 235, 0.1));
+  /* ---- surfaces and ink ---- */
+  --bg-canvas: light-dark(#eef1f7, #0a0e1a);
+  --bg-surface: light-dark(#ffffff, #121829);
+  --bg-inset: light-dark(#f5f7fb, #0f1424);
+  --bg-hover: light-dark(rgb(11 16 32 / 0.04), rgb(232 236 248 / 0.05));
+  --bg-active: light-dark(rgb(11 16 32 / 0.08), rgb(232 236 248 / 0.09));
+  --fg: light-dark(#0b1020, #e8ecf8);
+  --fg-muted: light-dark(#5d6681, #8b93ad);
+  --fg-on-accent: light-dark(#ffffff, #0a0e1a);
+  --line: light-dark(#e1e5ef, #1f2740);
+  --line-strong: light-dark(#c9cfdd, #2c3554);
+  --card-border: light-dark(transparent, #1f2740);
 
-  /* ---- ink ------------------------------------------------------------- */
-  --fg: light-dark(#1a1d21, #e6e8eb);
-  --fg-muted: light-dark(#4f5761, #a7aeb8);
-  --fg-faint: light-dark(#636c78, #858d98);
-  --fg-on-accent: light-dark(#ffffff, #0f1114);
-  /* Ink for a control the user may not use. An explicit colour, not opacity:
-     opacity would dim the control's reason tooltip too, and these controls
-     stay readable on purpose (aria-disabled, focusable) so the reason can be
-     learned. 5.6:1 / 5.5:1 on the surface, 4.8:1 / 5.0:1 on the inset. */
-  --fg-disabled: light-dark(#5f6975, #8d95a0);
+  /* ---- accent: selection, current item, focus, primary action — nothing else ---- */
+  --accent: light-dark(#6c5ce7, #8b7dff);
+  --accent-ink: light-dark(#5a49d6, #a99fff);
+  --accent-soft: light-dark(#ece9fd, #221f45);
+  --selection: light-dark(#d9d4fb, #34306b);
 
-  /* ---- hairlines ------------------------------------------------------- */
-  --line: light-dark(#d5d9df, #2c313a);
-  --line-strong: light-dark(#b8bec7, #3b414c);
-
-  /* ---- the one accent -------------------------------------------------- */
-  --accent: light-dark(#4f55d2, #8b90f0);
-  --accent-soft: light-dark(rgba(79, 85, 210, 0.12), rgba(139, 144, 240, 0.16));
-  --selection: light-dark(#d9dbf8, #34397a);
-
-  /* ---- depth: an offset and a soft blur, or a lighter surface step -----
-     `light-dark()` produces a COLOUR and nothing else. Wrapping a whole
-     shadow list in it — which this file did until a browser was pointed at
-     it — makes the declaration invalid at computed-value time, so `box-shadow`
-     falls back to `none` and every elevation in the console silently
-     disappears: the disabled-control tooltip, the identity panel, the skip
-     link, the selected theme option. The geometry is the same in both themes
-     anyway, so only the ink switches. */
-  --shadow-ink-1: light-dark(rgba(26, 29, 33, 0.08), rgba(0, 0, 0, 0.5));
-  --shadow-ink-2: light-dark(rgba(26, 29, 33, 0.18), rgba(0, 0, 0, 0.7));
-  --shadow-1: 0 1px 2px var(--shadow-ink-1);
-  --shadow-2: 0 6px 16px -4px var(--shadow-ink-2), 0 8px 20px -6px var(--shadow-ink-2);
+  /* ---- depth ---- */
+  --shadow-ink-1: light-dark(rgb(11 16 32 / 0.08), transparent);
+  --shadow-ink-2: light-dark(rgb(11 16 32 / 0.35), rgb(0 0 0 / 0.6));
+  --shadow-1: 0 1px 3px var(--shadow-ink-1);
+  --shadow-2: 0 16px 40px -12px var(--shadow-ink-2);
+  --scrim: light-dark(rgb(15 23 42 / 0.32), rgb(0 0 0 / 0.55));
   --focus-ring: 0 0 0 2px var(--bg-surface), 0 0 0 4px var(--accent);
 
-  /* ---- health lamps: fg on bg, always with an icon and a word ---------- */
-  --health-healthy-fg: light-dark(#0b6e4f, #5fd3a6);
-  --health-healthy-bg: light-dark(#ddf3ea, #10281f);
-  --health-degraded-fg: light-dark(#7a4e00, #f2b84b);
-  --health-degraded-bg: light-dark(#fbefd3, #2e2410);
-  --health-failed-fg: light-dark(#a6320b, #f28b6b);
-  --health-failed-bg: light-dark(#fbe3d9, #331a12);
-  --health-pending-fg: light-dark(#0b5c8f, #6fbbef);
-  --health-pending-bg: light-dark(#dceef8, #10222e);
-  --health-suspended-fg: light-dark(#4f5761, #a7aeb8);
-  --health-suspended-bg: light-dark(#e7e9ed, #23272e);
-  --health-unknown-fg: light-dark(#4f5761, #a7aeb8);
-  --health-unknown-bg: light-dark(#e7e9ed, #23272e);
+  /* ---- status: tinted pill = fg on bg; always with icon + word ---- */
+  --health-healthy-fg: light-dark(#166534, #4ade80);
+  --health-healthy-bg: light-dark(#dcf5e5, #10291c);
+  --health-failed-fg: light-dark(#b91c1c, #fb8a8a);
+  --health-failed-bg: light-dark(#fde2e2, #3a1518);
+  --health-degraded-fg: light-dark(#8a5208, #fbbf24);
+  --health-degraded-bg: light-dark(#fdefcf, #33270b);
+  --health-pending-fg: light-dark(#1d4ed8, #7cb0ff);
+  --health-pending-bg: light-dark(#e0eafd, #13233f);
+  --health-unknown-fg: light-dark(#474f6b, #a3abc4);
+  --health-unknown-bg: light-dark(#e8ebf3, #1e2438);
+  --health-suspended-fg: var(--health-unknown-fg);
+  --health-suspended-bg: var(--health-unknown-bg);
 
-  /* ---- skeleton -------------------------------------------------------- */
-  --skeleton-base: light-dark(#e9ebef, #22262d);
-  --skeleton-sheen: light-dark(#f6f7f9, #2c313a);
+  /* ---- kinds: stripe, chip glyph and small-caps name; -bg is the chip tint ---- */
+  --kind-repository: light-dark(#0e7490, #22d3ee);
+  --kind-repository-bg: light-dark(#ddecef, #164154);
+  --kind-cluster-repository: light-dark(#155e75, #67e8f9);
+  --kind-cluster-repository-bg: light-dark(#dee8ec, #254657);
+  --kind-maintenance: light-dark(#64748b, #94a3b8);
+  --kind-maintenance-bg: light-dark(#e9ecef, #2f3748);
+  --kind-snapshot-policy: light-dark(#c026d3, #e879f9);
+  --kind-snapshot-policy-bg: light-dark(#f6e1f9, #412d57);
+  --kind-snapshot-schedule: light-dark(#9333ea, #c084fc);
+  --kind-snapshot-schedule-bg: light-dark(#f0e2fc, #383057);
+  --kind-snapshot: light-dark(#c2410c, #fb923c);
+  --kind-snapshot-bg: light-dark(#f6e4dd, #45332d);
+  --kind-restore: light-dark(#db2777, #f472b6);
+  --kind-restore-bg: light-dark(#fae1ec, #442c48);
+  --kind-repository-replication: light-dark(#0f766e, #2dd4bf);
+  --kind-repository-replication-bg: light-dark(#ddeceb, #18414a);
+  --kind-snapshot-replication: light-dark(#4f46e5, #818cf8);
+  --kind-snapshot-replication-bg: light-dark(#e6e5fb, #2a3257);
+
+  /* ---- skeleton ---- */
+  --skeleton-base: light-dark(#e1e5ef, #1f2740);
+  --skeleton-sheen: light-dark(#f2f4f9, #2a3352);
 }
 
 :root[data-theme="light"] {
   color-scheme: light;
 }
-
 :root[data-theme="dark"] {
   color-scheme: dark;
 }
@@ -135,11 +142,141 @@
    light-theme values keep keyboard navigation visible on such a browser. */
 @supports not (color: light-dark(#000, #fff)) {
   :root {
-    --fg: #1a1d21;
-    --bg-canvas: #f3f4f6;
+    --fg: #0b1020;
+    --bg-canvas: #eef1f7;
     --bg-surface: #ffffff;
-    --focus-ring: 0 0 0 2px #ffffff, 0 0 0 4px #4f55d2;
+    --focus-ring: 0 0 0 2px #ffffff, 0 0 0 4px #6c5ce7;
   }
+}
+
+/* ---- kind mark ------------------------------------------------------------
+   A kind's identity: --kc / --kc-bg resolve per [data-kind], and the stripe,
+   chip and small-caps name read them. Kind colours appear nowhere else
+   (styles.health.test.ts, "kind colours"). */
+
+[data-kind="repository"] {
+  --kc: var(--kind-repository);
+  --kc-bg: var(--kind-repository-bg);
+}
+[data-kind="cluster-repository"] {
+  --kc: var(--kind-cluster-repository);
+  --kc-bg: var(--kind-cluster-repository-bg);
+}
+[data-kind="maintenance"] {
+  --kc: var(--kind-maintenance);
+  --kc-bg: var(--kind-maintenance-bg);
+}
+[data-kind="snapshot-policy"] {
+  --kc: var(--kind-snapshot-policy);
+  --kc-bg: var(--kind-snapshot-policy-bg);
+}
+[data-kind="snapshot-schedule"] {
+  --kc: var(--kind-snapshot-schedule);
+  --kc-bg: var(--kind-snapshot-schedule-bg);
+}
+[data-kind="snapshot"] {
+  --kc: var(--kind-snapshot);
+  --kc-bg: var(--kind-snapshot-bg);
+}
+[data-kind="restore"] {
+  --kc: var(--kind-restore);
+  --kc-bg: var(--kind-restore-bg);
+}
+[data-kind="repository-replication"] {
+  --kc: var(--kind-repository-replication);
+  --kc-bg: var(--kind-repository-replication-bg);
+}
+[data-kind="snapshot-replication"] {
+  --kc: var(--kind-snapshot-replication);
+  --kc-bg: var(--kind-snapshot-replication-bg);
+}
+
+.kind-chip {
+  display: inline-grid;
+  place-items: center;
+  flex: none;
+  width: 28px;
+  height: 28px;
+  border-radius: var(--radius-md);
+  background: var(--kc-bg);
+  color: var(--kc);
+}
+.kind-chip svg {
+  width: 14px;
+  height: 14px;
+}
+.kind-chip--sm {
+  width: 22px;
+  height: 22px;
+  border-radius: var(--radius-sm);
+}
+.kind-chip--sm svg {
+  width: 12px;
+  height: 12px;
+}
+.kind-chip--lg {
+  width: 40px;
+  height: 40px;
+  border-radius: 12px;
+}
+.kind-chip--lg svg {
+  width: 20px;
+  height: 20px;
+}
+.kind-name {
+  font-size: 0.625rem;
+  font-weight: var(--weight-bold);
+  letter-spacing: var(--tracking-caps);
+  text-transform: uppercase;
+  color: var(--kc);
+}
+.has-stripe {
+  border-left: var(--stripe) solid var(--kc);
+}
+td.has-stripe {
+  position: relative;
+  border-left: 0;
+}
+
+td.has-stripe::before {
+  content: "";
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: var(--stripe);
+  background: var(--kc);
+}
+
+/* A whole-row link: the row's name link is stretched over the row, so the
+   row is one target; any other link or button in it sits above the cover and
+   keeps its own click. The stripe cell gives up its own positioning so the
+   cover — and the stripe — measure from the row. */
+tr:has(.row-link) {
+  position: relative;
+  cursor: pointer;
+}
+
+tr:has(.row-link) td.has-stripe {
+  position: static;
+}
+
+/* The row is the link, so its name needs no underline to say so. */
+.row-link {
+  text-decoration: none;
+}
+
+.row-link::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+}
+
+tr:has(.row-link) :is(a, button, summary, input, select):not(.row-link) {
+  position: relative;
+  z-index: 1;
+}
+
+tr:has(.row-link):hover > td {
+  background: var(--bg-hover);
 }
 
 /* ---- base ---------------------------------------------------------------- */
@@ -298,7 +435,7 @@ svg {
   font-weight: var(--weight-medium);
   letter-spacing: var(--tracking-caps);
   text-transform: uppercase;
-  color: var(--fg-faint);
+  color: var(--fg-muted);
   white-space: nowrap;
 }
 
@@ -311,20 +448,29 @@ svg {
   white-space: nowrap;
 }
 
-/* ---- health lamp: icon + word on a tint ---------------------------------- */
+/* ---- status pill: a tinted pill, an icon and a word ----------------------
+   The one way a state is drawn (HealthBadge / LampBadge). Round, where a kind
+   chip is square. Never colour alone: rule 1 of the kopiur-ui-design skill,
+   pinned by styles.health.test.ts. */
 
 .health {
   display: inline-flex;
   align-items: center;
-  gap: 0.35em;
-  padding: 0.1em 0.5em 0.1em 0.4em;
-  border-radius: var(--radius-sm);
+  gap: 4px;
+  padding: 2px 9px 2px 6px;
+  border-radius: var(--radius-pill);
   font-size: var(--text-sm);
-  font-weight: var(--weight-medium);
-  line-height: 1.5;
+  font-weight: var(--weight-semibold);
+  line-height: 1.4;
   white-space: nowrap;
   color: var(--health-unknown-fg);
   background: var(--health-unknown-bg);
+}
+
+.health svg {
+  flex: none;
+  width: 13px;
+  height: 13px;
 }
 
 .health[data-health="healthy"] {
@@ -352,46 +498,40 @@ svg {
   background: var(--health-suspended-bg);
 }
 
-/* ---- controls ------------------------------------------------------------ */
+/* ---- buttons: solid primary, soft everything else -------------------------- */
 
 .button {
-  position: relative;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  gap: var(--space-2);
-  min-height: 2rem;
-  padding: 0 var(--space-3);
-  border: 1px solid var(--line-strong);
+  gap: 7px;
+  min-height: 34px;
+  padding: 0 14px;
+  border: 1px solid transparent;
   border-radius: var(--radius-md);
-  background: var(--bg-surface);
-  color: var(--fg);
+  background: var(--accent-soft);
+  color: var(--accent-ink);
   font-size: var(--text-sm);
-  font-weight: var(--weight-medium);
-  /* A label can name its object — "Run maintenance for <cluster-repository>" —
-     and that name is one unbreakable token. `nowrap` made the button as wide
-     as the name and pushed the page sideways. The button still sizes to its
-     content, so a short label never wraps; only one that cannot fit does.
-     The line height only shows once a label has two lines; a one-line button
-     is unchanged, being taller than its text either way. */
+  font-weight: var(--weight-semibold);
+  /* A label can name its object — one unbreakable token — so a button that
+     cannot fit wraps rather than pushing the page sideways. */
   line-height: var(--leading-dense);
   max-width: 100%;
   overflow-wrap: anywhere;
-  transition:
-    background-color var(--dur-fast) var(--ease-out),
-    border-color var(--dur-fast) var(--ease-out);
+  transition: background-color var(--dur-fast) var(--ease-out);
+}
+
+.button svg {
+  flex: none;
+  width: 14px;
+  height: 14px;
 }
 
 .button:hover:not([disabled]):not([aria-disabled="true"]) {
-  background: var(--bg-hover);
-}
-
-.button:active:not([disabled]):not([aria-disabled="true"]) {
-  background: var(--bg-active);
+  background: color-mix(in srgb, var(--accent-soft) 70%, var(--accent));
 }
 
 .button--primary {
-  border-color: var(--accent);
   background: var(--accent);
   color: var(--fg-on-accent);
 }
@@ -401,68 +541,551 @@ svg {
 }
 
 .button--quiet {
-  border-color: transparent;
   background: transparent;
+}
+
+.button--quiet:hover:not([disabled]):not([aria-disabled="true"]) {
+  background: var(--bg-hover);
 }
 
 .button--danger {
   color: var(--health-failed-fg);
-  border-color: var(--health-failed-fg);
+  background: var(--health-failed-bg);
 }
 
-/* Disabled reads as disabled by ink, border and fill — never by opacity, which
-   would dim the reason tooltip below (a pseudo-element inherits it). */
+.button--danger:hover:not([disabled]):not([aria-disabled="true"]) {
+  background: color-mix(in srgb, var(--health-failed-bg) 80%, var(--health-failed-fg));
+}
+
+/* Refused or blocked: still focusable (aria-disabled), drawn as an outline,
+   and the reason sits beside it in words — never behind a hover. */
 .button[disabled],
-.button[aria-disabled="true"] {
-  color: var(--fg-disabled);
-  border-color: var(--line);
-  background: var(--bg-inset);
-}
-
-.button--primary[disabled],
+.button[aria-disabled="true"],
 .button--primary[aria-disabled="true"],
-.button--danger[disabled],
 .button--danger[aria-disabled="true"] {
-  color: var(--fg-disabled);
-  border-color: var(--line);
-  background: var(--bg-inset);
+  color: var(--fg-muted);
+  border: 1px dashed var(--line-strong);
+  background: transparent;
+  cursor: not-allowed;
 }
 
-/* The reason a control is disabled: shown on hover and on keyboard focus,
-   so a keyboard user learns the RBAC model too. */
-.button[data-reason]::after {
-  content: attr(data-reason);
-  position: absolute;
-  top: calc(100% + 6px);
-  left: 0;
-  z-index: 20;
-  /* 28rem is the reading measure; the viewport is the hard limit. A control
-     near the right edge of a narrow screen would otherwise open a 448px panel
-     anchored to its own left edge and push the page sideways. */
-  max-width: min(28rem, calc(100vw - 2 * var(--space-4)));
-  width: max-content;
-  padding: var(--space-2) var(--space-3);
-  border: 1px solid var(--line);
-  border-radius: var(--radius-md);
+.button__reason {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  margin-left: var(--space-2);
+  color: var(--fg-muted);
+  font-size: var(--text-sm);
+}
+
+.button__reason svg {
+  flex: none;
+  width: 12px;
+  height: 12px;
+}
+
+/* ---- stat strip: named values, label above value --------------------------- */
+
+.stats {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  margin: 0;
+  overflow: hidden;
+  border: 1px solid var(--card-border);
+  border-radius: var(--radius-lg);
   background: var(--bg-surface);
-  color: var(--fg);
-  box-shadow: var(--shadow-2);
-  font-weight: var(--weight-regular);
-  text-align: left;
-  white-space: normal;
-  line-height: var(--leading-prose);
-  opacity: 0;
-  pointer-events: none;
-  transform: translateY(-4px);
-  transition:
-    opacity var(--dur-base) var(--ease-out),
-    transform var(--dur-base) var(--ease-out);
+  box-shadow: var(--shadow-1);
 }
 
-.button[data-reason]:hover::after,
-.button[data-reason]:focus-visible::after {
-  opacity: 1;
-  transform: translateY(0);
+.stats__item {
+  display: grid;
+  align-content: start;
+  gap: 5px;
+  padding: 12px 16px;
+  border-right: 1px solid var(--line);
+  border-bottom: 1px solid var(--line);
+}
+
+.stats dt {
+  color: var(--fg-muted);
+  font-size: var(--text-xs);
+  font-weight: var(--weight-semibold);
+  letter-spacing: var(--tracking-caps);
+  text-transform: uppercase;
+}
+
+.stats dd {
+  margin: 0;
+  font-size: var(--text-lg);
+  font-weight: var(--weight-semibold);
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+
+.stats__abs {
+  display: block;
+  color: var(--fg-muted);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  font-weight: var(--weight-regular);
+}
+
+.stats--card {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: var(--space-2);
+  padding-top: 10px;
+  border: 0;
+  border-top: 1px solid var(--line);
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+}
+
+.stats--card .stats__item {
+  padding: 0;
+  border: 0;
+}
+
+.stats--card dd {
+  font-size: var(--text-md);
+}
+
+/* The three absences: loud (a real problem), unreported, not applicable. */
+.absent {
+  color: var(--fg-muted);
+  font-weight: var(--weight-regular);
+}
+
+.absent--loud {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--health-failed-fg);
+  font-weight: var(--weight-semibold);
+}
+
+/* ---- object reference: a mini card naming another object ------------------- */
+
+.ref {
+  display: inline-grid;
+  grid-template-columns: auto auto auto;
+  align-items: center;
+  gap: var(--space-2);
+  max-width: 100%;
+  padding: 6px 10px 6px 6px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--bg-surface);
+  color: inherit;
+  text-decoration: none;
+  vertical-align: middle;
+}
+
+a.ref:hover {
+  background: var(--bg-hover);
+}
+
+.ref__id {
+  display: grid;
+  min-width: 0;
+  line-height: 1.2;
+}
+
+.ref__name {
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-semibold);
+  overflow-wrap: anywhere;
+}
+
+.ref__ns {
+  color: var(--fg-muted);
+  font-weight: var(--weight-regular);
+}
+
+.ref .health {
+  font-size: var(--text-xs);
+}
+
+/* ---- object identity: kind word, name, namespace, stacked ------------------- */
+
+.object-id {
+  display: grid;
+  min-width: 0;
+  line-height: 1.25;
+}
+
+.object-name {
+  color: var(--fg);
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-semibold);
+  overflow-wrap: anywhere;
+  text-decoration: none;
+}
+
+a.object-name:hover {
+  text-decoration: underline;
+}
+
+.object-ns {
+  color: var(--fg-muted);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+}
+
+/* ---- status bar: health buckets as segments, beside their words ---------- */
+
+.status-bar {
+  display: flex;
+  gap: 3px;
+  height: 6px;
+}
+
+.status-bar > span {
+  border-radius: 3px;
+  background: var(--health-unknown-fg);
+}
+
+.status-bar > span[data-health="failed"],
+.status-bar > span[data-browse="failed"] {
+  background: var(--health-failed-fg);
+}
+
+.status-bar > span[data-health="degraded"] {
+  background: var(--health-degraded-fg);
+}
+
+.status-bar > span[data-health="pending"] {
+  background: var(--health-pending-fg);
+}
+
+.status-bar > span[data-health="healthy"],
+.status-bar > span[data-browse="active"] {
+  background: var(--health-healthy-fg);
+}
+
+/* ---- overview: what needs you --------------------------------------------- */
+
+/* One list, one row shape: the object (chip, kind, name, namespace) and the
+   pill on the first line, the problem and its fix plate under the name. A
+   doctor check about no object takes the same row with an icon tile. */
+/* Nothing is held back and nothing scrolls on its own: the list runs the
+   length of the page. */
+.attention {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: var(--space-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.attention-row {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  grid-template-areas:
+    "chip id state"
+    ". body body";
+  align-items: center;
+  gap: var(--space-2) 10px;
+  padding: 12px 16px;
+  border: 1px solid var(--card-border);
+  border-radius: var(--radius-lg);
+  background: var(--bg-surface);
+  box-shadow: var(--shadow-1);
+  font-size: var(--text-sm);
+}
+
+/* The whole row opens the object: its name's link is stretched over it
+   (`.row-link`, as in the tables), and the keyboard ring is drawn on the row
+   rather than on the name alone. */
+.attention-row:has(.row-link) {
+  position: relative;
+  cursor: pointer;
+  transition: background-color 120ms ease;
+}
+
+.attention-row:has(.row-link):hover {
+  background: var(--bg-hover);
+}
+
+.attention-row:has(.row-link) :is(a, button):not(.row-link) {
+  position: relative;
+  z-index: 1;
+}
+
+.attention-row .row-link:focus-visible {
+  box-shadow: none;
+}
+
+.attention-row:has(.row-link:focus-visible) {
+  box-shadow: var(--focus-ring);
+}
+
+.attention-row.has-stripe {
+  border-left: var(--stripe) solid var(--kc);
+}
+
+.attention-row > .kind-chip,
+.attention-row__icon {
+  grid-area: chip;
+}
+
+.attention-row > .object-id {
+  grid-area: id;
+}
+
+.attention-row__state {
+  grid-area: state;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.attention-row__at {
+  color: var(--fg-muted);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  white-space: nowrap;
+}
+
+.attention-row__icon {
+  display: inline-grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  border-radius: var(--radius-md);
+  background: var(--bg-canvas);
+  color: var(--fg-muted);
+}
+
+.attention-row__icon svg {
+  width: 16px;
+  height: 16px;
+}
+
+.attention-row__check-word {
+  color: var(--fg-muted);
+}
+
+.attention-row__body {
+  grid-area: body;
+  display: grid;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.attention-row__problem {
+  display: grid;
+  gap: 6px;
+}
+
+.attention-row__what {
+  margin: 0;
+  color: var(--fg);
+  line-height: var(--leading-prose);
+  overflow-wrap: anywhere;
+}
+
+.attention-row .finding__fix {
+  padding: 6px 10px;
+}
+
+.page__section > * + * {
+  margin-top: var(--space-3);
+}
+
+/* ---- split: two cards side by side, an 8px handle between ------------------
+   The share sits in --split-start / --split-end (fr), set by SplitPane. Each
+   side keeps 440px; narrower than both and the gutter, the sides stack, start
+   first, and the handle goes. A container query, so the sidebar counts. */
+
+.split {
+  container: split / inline-size;
+}
+
+.split__grid {
+  display: grid;
+  height: 100%;
+  grid-template-columns:
+    minmax(440px, var(--split-start, 1fr))
+    8px
+    minmax(440px, var(--split-end, 1fr));
+  align-items: stretch;
+}
+
+.split__side {
+  min-width: 0;
+}
+
+.split__gutter {
+  position: relative;
+  cursor: col-resize;
+  touch-action: none;
+}
+
+/* The grip: three dots stacked in a tab the gutter's width, kept in view
+   while a tall card scrolls past. */
+.split__gutter::after {
+  content: "";
+  position: sticky;
+  top: calc(50vh - 18px);
+  display: block;
+  width: 8px;
+  height: 36px;
+  margin-top: var(--space-6);
+  border-radius: 4px;
+  background-color: var(--bg-inset);
+  background-image:
+    radial-gradient(circle, var(--fg-muted) 1.5px, transparent 2px),
+    radial-gradient(circle, var(--fg-muted) 1.5px, transparent 2px),
+    radial-gradient(circle, var(--fg-muted) 1.5px, transparent 2px);
+  background-position:
+    center calc(50% - 8px),
+    center 50%,
+    center calc(50% + 8px);
+  background-repeat: no-repeat;
+  background-size: 6px 6px;
+  transition: background-color var(--dur-fast) var(--ease-out);
+}
+
+.split__gutter:hover::after,
+.split__gutter:active::after {
+  background-color: var(--accent-soft);
+}
+
+/* The gutter is invisible; its ring is drawn on the grip. */
+.split__gutter:focus-visible {
+  outline: none;
+  box-shadow: none;
+}
+
+.split__gutter:focus-visible::after {
+  background-color: var(--accent-soft);
+  box-shadow: var(--focus-ring);
+}
+
+@container split (max-width: 887px) {
+  .split__grid {
+    grid-template-columns: minmax(0, 1fr);
+    row-gap: var(--space-4);
+  }
+
+  .split__gutter {
+    display: none;
+  }
+}
+
+/* A region of the overview as a card. */
+.page__card {
+  height: 100%;
+  padding: var(--space-4) var(--space-4) var(--space-5);
+  border: 1px solid var(--card-border);
+  border-radius: var(--radius-lg);
+  background: var(--bg-surface);
+  box-shadow: var(--shadow-1);
+}
+
+/* ---- recent activity: one compact row per run, newest first ---------------- */
+
+.activity {
+  display: grid;
+  gap: var(--space-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.activity-row {
+  position: relative;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  grid-template-areas:
+    "chip id state"
+    ". what what";
+  align-items: center;
+  gap: 4px 10px;
+  padding: 8px 12px;
+  border: 1px solid var(--line);
+  border-left: var(--stripe) solid var(--kc);
+  border-radius: var(--radius-md);
+  font-size: var(--text-sm);
+  cursor: pointer;
+}
+
+.activity-row:hover {
+  background: var(--bg-hover);
+}
+
+.activity-row > .kind-chip {
+  grid-area: chip;
+}
+
+.activity-row > .object-id {
+  grid-area: id;
+}
+
+.activity-row :is(a, button):not(.row-link) {
+  position: relative;
+  z-index: 1;
+}
+
+.activity-row .row-link:focus-visible {
+  box-shadow: none;
+}
+
+.activity-row:has(.row-link:focus-visible) {
+  box-shadow: var(--focus-ring);
+}
+
+.activity-row__state {
+  grid-area: state;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.activity-row__what {
+  grid-area: what;
+  margin: 0;
+  color: var(--fg-muted);
+  overflow-wrap: anywhere;
+}
+
+/* ---- maintenance: the ledger's name cell -------------------------------------
+   Name, namespace, and who authored it — the one fact that says whether an
+   edit to this object sticks. */
+
+.maintenance-table__object {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+
+.maintenance-table__namespace,
+.maintenance-table__note {
+  font-size: var(--text-xs);
+  color: var(--fg-muted);
+  overflow-wrap: anywhere;
+}
+
+/* ---- grids step down: facts 4 → 2 ----------------------------------------- */
+
+@media (max-width: 700px) {
+  .stats {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 560px) {
+  .attention-row {
+    grid-template-areas:
+      "chip id id"
+      ". state state"
+      ". body body";
+  }
 }
 
 /* ---- skeleton: a ledger row's silhouette, not a spinner ------------------ */
@@ -490,38 +1113,312 @@ svg {
   }
 }
 
-/* ---- ledger: the table every list route inherits ------------------------- */
+/* ---- table: every list route's table, on a card -------------------------------
+   The kind stripe and small chip mark the first cell (`td.has-stripe`);
+   related objects are references; numbers are right-aligned tabular figures. */
 
 .ledger {
   width: 100%;
-  border-collapse: collapse;
+  border-collapse: separate;
+  border-spacing: 0;
   font-size: var(--text-sm);
 }
 
 .ledger th {
-  padding: var(--space-2) var(--space-3);
-  border-bottom: 1px solid var(--line-strong);
+  padding: 9px 14px;
+  border-bottom: 1px solid var(--line);
   text-align: left;
   font-size: var(--text-xs);
-  font-weight: var(--weight-medium);
+  font-weight: var(--weight-semibold);
   letter-spacing: var(--tracking-caps);
   text-transform: uppercase;
-  color: var(--fg-faint);
+  color: var(--fg-muted);
   white-space: nowrap;
 }
 
 .ledger td {
-  padding: var(--space-2) var(--space-3);
+  padding: 11px 14px;
   border-bottom: 1px solid var(--line);
-  vertical-align: top;
+  vertical-align: middle;
 }
 
-.ledger tr:hover td {
+.ledger tbody tr:last-child td {
+  border-bottom: 0;
+}
+
+.ledger tbody tr:hover td {
   background: var(--bg-hover);
 }
 
 .ledger .num {
   text-align: right;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.ledger code,
+.ledger .mono {
+  overflow-wrap: anywhere;
+}
+
+.table__object {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+/* A table whose columns a person sizes (`ColumnLedger`): the colgroup says
+   how wide each column is, so the browser stops guessing from the content.
+   Names still wrap at `/` and `-` (`.ledger code`, `.mono`), and each
+   column's floor is wide enough for what it holds; only a header word too
+   long for a narrowed column is cut, with the full word in its title. */
+.ledger--fixed {
+  table-layout: fixed;
+}
+
+.ledger--fixed th {
+  position: relative;
+}
+
+.ledger__label {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* The resize handle: a strip along the header's right edge, wide enough to
+   catch, drawn as a hairline that brightens when it is held or focused. */
+.ledger__resize {
+  position: absolute;
+  inset: 0 0 0 auto;
+  display: flex;
+  justify-content: flex-end;
+  width: 10px;
+  cursor: col-resize;
+  touch-action: none;
+  user-select: none;
+}
+
+.ledger__resize::after {
+  content: "";
+  width: 1px;
+  height: 100%;
+  background: var(--line-strong);
+  transition: background-color var(--dur-fast) var(--ease-out);
+}
+
+.ledger__resize:hover::after,
+.ledger__resize:focus-visible::after,
+.ledger__resize[data-dragging]::after {
+  width: 2px;
+  background: var(--accent);
+}
+
+/* ---- popover: a panel anchored to the button that opened it ------------------
+   Options for an action, a menu of a table's columns: floating just below
+   its trigger, lined up with the trigger's start or end edge, kept inside a
+   phone-width viewport. Not modal; see `Popover.tsx`. */
+.popover {
+  position: relative;
+  display: inline-block;
+}
+
+.popover__panel {
+  position: absolute;
+  top: calc(100% + 6px);
+  z-index: 30;
+  display: grid;
+  gap: var(--space-2);
+  max-width: calc(100vw - 2 * var(--space-4));
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  background: var(--bg-surface);
+  box-shadow: var(--shadow-2);
+}
+
+.popover__panel[data-align="start"] {
+  left: 0;
+}
+
+.popover__panel[data-align="end"] {
+  right: 0;
+}
+
+.popover__panel[data-side="top"] {
+  top: auto;
+  bottom: calc(100% + 6px);
+}
+
+/* Pinned to the trigger on screen (`strategy="fixed"`): the inline style
+   places it, so the flow offsets above must not. */
+.popover__panel[data-strategy="fixed"] {
+  inset: auto;
+}
+
+/* In a drawer's foot the buttons sit at the bottom of the panel: a question
+   opens upward, over the content it is about, and a tall one scrolls inside
+   itself. */
+.side-panel__foot .popover__panel {
+  top: auto;
+  bottom: calc(100% + 6px);
+  max-height: 60vh;
+  overflow-y: auto;
+}
+
+/* The table's own tools sit just above its card, on the right: the
+   "Columns" menu. One frame, so a section's gap falls around the pair. */
+.ledger-frame {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: var(--space-2);
+}
+
+.ledger-tools {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.column-picker__count {
+  color: var(--fg-muted);
+  font-weight: var(--weight-regular);
+}
+
+.column-picker__panel {
+  width: 18rem;
+}
+
+.column-picker__list {
+  display: grid;
+  gap: 2px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.column-picker__row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: var(--space-1);
+  min-height: 34px;
+  padding: 0 4px;
+  border-radius: var(--radius-md);
+}
+
+.column-picker__row:hover {
+  background: var(--bg-hover);
+}
+
+.column-picker__toggle {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+  font-size: var(--text-sm);
+  overflow-wrap: anywhere;
+  cursor: pointer;
+}
+
+.column-picker__toggle input {
+  accent-color: var(--accent);
+}
+
+.column-picker__grip,
+.column-picker__move {
+  display: inline-grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--fg-muted);
+}
+
+.column-picker__grip {
+  cursor: grab;
+  touch-action: none;
+}
+
+.column-picker__grip:active {
+  cursor: grabbing;
+}
+
+.column-picker__move:hover:not([disabled]),
+.column-picker__grip:hover {
+  background: var(--bg-hover);
+  color: var(--fg);
+}
+
+.column-picker__move[disabled] {
+  opacity: 0.35;
+}
+
+.column-picker__moves {
+  display: inline-flex;
+}
+
+/* A drag: the row's slot stays behind as a dashed outline, a lifted copy
+   rides under the pointer (kept inside the list), and the other rows slide
+   out of its way (`ColumnPicker`, a Web Animations slide). */
+.column-picker__stack {
+  position: relative;
+}
+
+.column-picker__row[data-dragging] {
+  outline: 1px dashed var(--line-strong);
+  outline-offset: -1px;
+  background: var(--bg-inset);
+}
+
+.column-picker__row[data-dragging] > * {
+  visibility: hidden;
+}
+
+.column-picker__ghost {
+  position: absolute;
+  inset-inline: 0;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-height: 34px;
+  padding: 0 10px;
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-md);
+  background: var(--bg-surface);
+  box-shadow: var(--shadow-2);
+  color: var(--fg);
+  font-size: var(--text-sm);
+  pointer-events: none;
+  transform: scale(1.02);
+}
+
+.column-picker__ghost svg {
+  color: var(--accent);
+}
+
+.column-picker__panel[data-dragging],
+.column-picker__panel[data-dragging] * {
+  cursor: grabbing;
+}
+
+.column-picker__panel[data-dragging] .column-picker__row:hover {
+  background: transparent;
+}
+
+.column-picker__panel[data-dragging] .column-picker__row[data-dragging]:hover {
+  background: var(--bg-inset);
+}
+
+.column-picker__foot {
+  display: flex;
+  justify-content: flex-start;
+  padding-top: var(--space-2);
+  border-top: 1px solid var(--line);
 }
 
 /* ---- panel: one level of enclosure, never nested ------------------------- */
@@ -529,7 +1426,7 @@ svg {
 .panel {
   background: var(--bg-surface);
   border: 1px solid var(--line);
-  border-radius: var(--radius-md);
+  border-radius: var(--radius-lg);
 }
 
 .panel__header {
@@ -543,6 +1440,490 @@ svg {
 
 .panel__body {
   padding: var(--space-4);
+}
+
+/* ---- side panel: a resource's details, floating over the page's right edge ----
+   A native modal dialog: the browser puts it in the top layer and makes the
+   page behind it inert. Inset from the edges, so it reads as a sheet laid over
+   the page rather than a column of it. The head and foot stay put; the body is
+   the only thing that scrolls. */
+html:has(dialog.side-panel[open]) {
+  overflow: hidden;
+}
+.side-panel {
+  --panel-w: min(
+    clamp(min(var(--drawer-min), var(--drawer-max)), var(--drawer-width), var(--drawer-max)),
+    calc(100vw - 2 * var(--space-3))
+  );
+  /* Stacked: a panel sits a step further left per panel over it, so its edge
+     shows past the one covering it. */
+  --panel-peek: calc(var(--panels-above, 0) * var(--space-4));
+  position: fixed;
+  inset: var(--space-3) calc(var(--space-3) + var(--panel-peek)) var(--space-3) auto;
+  width: var(--panel-w);
+  transition: right var(--dur-base) var(--ease-out);
+  height: auto;
+  max-width: none;
+  max-height: none;
+  margin: 0;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-xl);
+  background: var(--bg-surface);
+  color: var(--fg);
+  box-shadow: var(--shadow-2);
+  /* Visible, so the resize handle can hang outside the left edge; the frame
+     clips the content to the corners instead. */
+  overflow: visible;
+  animation: side-panel-in var(--dur-base) var(--ease-out);
+}
+.side-panel[data-leaving] {
+  animation: side-panel-out var(--dur-base) var(--ease-out) forwards;
+}
+.side-panel[data-leaving]::backdrop {
+  animation: side-panel-fade-out var(--dur-base) var(--ease-out) forwards;
+}
+/* The panel takes focus only as the starting point for Tab; it is a container,
+   not a control, so it keeps its elevation and draws no ring around itself.
+   Every control inside it carries its own. */
+.side-panel:focus-visible {
+  outline: none;
+  box-shadow: var(--shadow-2);
+}
+.side-panel.has-stripe {
+  border-left: var(--stripe) solid var(--kc);
+}
+.side-panel::backdrop {
+  background: var(--scrim);
+  animation: side-panel-fade var(--dur-base) var(--ease-out);
+}
+/* A panel opened over another sets that one back without darkening the page
+   a second time: its scrim is clear, and the edge of the one beneath, in
+   shadow, is what says there is one. */
+.side-panel:not([data-depth="0"])::backdrop {
+  background: transparent;
+}
+/* Past the right edge by the inset and the handle, so neither peeks in.
+   The slide moves the right edge, not a transform: a transformed dialog would
+   become the box the toasts inside it are placed in, and they would ride in
+   and out with the panel instead of holding their corner. */
+@keyframes side-panel-in {
+  from {
+    right: calc(var(--space-3) - var(--panel-w) - 4rem);
+  }
+}
+@keyframes side-panel-out {
+  to {
+    right: calc(var(--space-3) - var(--panel-w) - 4rem);
+  }
+}
+@keyframes side-panel-fade-out {
+  to {
+    opacity: 0;
+  }
+}
+@keyframes side-panel-fade {
+  from {
+    opacity: 0;
+  }
+}
+/* The resize handle hangs outside the left edge, over the scrim: a
+   full-height strip to grab, carrying a raised rectangular tab with three
+   dots, always shown, standing a few pixels clear of the panel. */
+.side-panel__grip {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: calc(-1 * var(--space-7));
+  z-index: 1;
+  width: var(--space-7);
+  cursor: ew-resize;
+  touch-action: none;
+}
+.side-panel__grip::after {
+  content: "";
+  position: absolute;
+  top: 50%;
+  right: var(--space-3);
+  width: 22px;
+  height: 64px;
+  border: 1px solid var(--line-strong);
+  border-radius: 5px;
+  background-color: var(--bg-surface);
+  /* Three dots, stacked: the conventional "grab here". */
+  background-image:
+    radial-gradient(circle, var(--fg-muted) 2px, transparent 2.5px),
+    radial-gradient(circle, var(--fg-muted) 2px, transparent 2.5px),
+    radial-gradient(circle, var(--fg-muted) 2px, transparent 2.5px);
+  background-position:
+    center calc(50% - 10px),
+    center 50%,
+    center calc(50% + 10px);
+  background-repeat: no-repeat;
+  background-size: 8px 8px;
+  box-shadow: var(--shadow-2);
+  transform: translateY(-50%);
+  transition:
+    background-color var(--dur-fast) var(--ease-out),
+    border-color var(--dur-fast) var(--ease-out);
+}
+/* Stacked, the strip left of a panel is the edge of the one beneath, and a
+   click there backs up one drawer. The handle keeps only its tab there, and
+   a covered panel has none: it cannot be resized until it is on top. */
+.side-panel:not([data-depth="0"]) .side-panel__grip {
+  top: calc(50% - 40px);
+  bottom: auto;
+  height: 80px;
+}
+.side-panel[data-covered] .side-panel__grip {
+  display: none;
+}
+.side-panel__grip:hover::after,
+.side-panel__grip:active::after {
+  border-color: var(--accent);
+  background-color: var(--accent-soft);
+}
+/* The strip is invisible; its ring is drawn on the tab below, not round the
+   whole strip. */
+.side-panel__grip:focus-visible {
+  outline: none;
+  box-shadow: none;
+}
+.side-panel__grip:focus-visible::after {
+  border-color: var(--accent);
+  box-shadow: var(--shadow-2), var(--focus-ring);
+}
+.side-panel__frame {
+  border-radius: inherit;
+  overflow: hidden;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  height: 100%;
+  min-height: 0;
+}
+.side-panel__head {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-3);
+  padding: var(--space-4) var(--space-4) var(--space-4) var(--space-5);
+  border-bottom: 1px solid var(--line);
+}
+.side-panel__heading {
+  display: grid;
+  gap: var(--space-1);
+  flex: 1;
+  min-width: 0;
+}
+.side-panel__title {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: var(--text-lg);
+  font-weight: 600;
+  line-height: 1.3;
+  overflow-wrap: anywhere;
+}
+.side-panel__status {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+.side-panel__body {
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: var(--space-5);
+  display: grid;
+  align-content: start;
+  gap: var(--space-5);
+}
+.side-panel__body[data-layout="fill"] {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  padding: 0;
+}
+/* The foot holds the actions, and is always as tall as its buttons: they
+   never scroll out of view. A question opens upward from its button, over
+   the body, in a popover. */
+.side-panel__foot {
+  display: flex;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  padding: var(--space-3) var(--space-5);
+  border-top: 1px solid var(--line);
+  background: var(--bg-canvas);
+}
+.side-panel__foot a.button {
+  text-decoration: none;
+}
+@media (max-width: 560px) {
+  .side-panel__grip {
+    display: none;
+  }
+  .side-panel {
+    inset: 0;
+    width: 100vw;
+    border-radius: 0;
+    border-width: 0;
+    padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom)
+      env(safe-area-inset-left);
+  }
+}
+
+.side-panel__ns {
+  color: var(--fg-muted);
+  font-weight: 500;
+}
+
+/* ---- resource drawer: what the side panel says about a resource ------------ */
+/* The head: the resource's main information, above the tabs. */
+.drawer__head {
+  display: grid;
+  gap: var(--space-4);
+  flex: none;
+  padding: var(--space-4) var(--space-5) var(--space-4);
+}
+.drawer__head .verdict {
+  padding: 0;
+  border-bottom: 0;
+}
+.drawer__findings {
+  display: grid;
+  gap: var(--space-3);
+}
+/* The tabs take the rest of the height; their panel is the scroller. On a
+   short window they keep a usable minimum and the whole body scrolls. */
+.side-panel__body[data-layout="fill"] > .tabs {
+  flex: 1 0 auto;
+  min-height: 16rem;
+}
+.side-panel__body[data-layout="fill"] > .drawer__panel {
+  flex: 1 0 auto;
+  padding: var(--space-4) var(--space-5) var(--space-5);
+  display: grid;
+  align-content: start;
+  gap: var(--space-5);
+}
+
+/* The actions: a row of buttons at the very bottom. Their answers are toasts. */
+.drawer-actions {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  width: 100%;
+}
+.drawer-actions > .action-bar {
+  order: 2;
+}
+/* An empty slot (a bar with nothing to offer): no box, so no gap. */
+.drawer-actions > :empty {
+  display: none;
+}
+/* A named region of a tab: a small heading, then its facts or table. */
+.drawer__region {
+  display: grid;
+  gap: var(--space-3);
+  min-width: 0;
+}
+.drawer__region-title {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin: 0;
+  color: var(--fg-muted);
+  font-size: var(--text-xs);
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+/* What the kind is, under the verdict. */
+.drawer__meaning {
+  margin: 0;
+  color: var(--fg-muted);
+  font-size: var(--text-sm);
+}
+
+/* The graph's relationships: one line per link — its kind, the other end, the
+   link's own pill, its label. */
+.drawer__edges {
+  display: grid;
+  gap: var(--space-2);
+}
+.drawer__edges-title {
+  margin: 0;
+  font-size: var(--text-sm);
+  font-weight: 600;
+}
+.drawer__edges ul {
+  display: grid;
+  gap: var(--space-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.drawer__edges li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2) var(--space-3);
+}
+.drawer__edge-kind {
+  min-width: 11rem;
+  color: var(--fg-muted);
+  font-size: var(--text-sm);
+}
+.drawer__edge-endkind {
+  color: var(--fg-muted);
+  font-size: var(--text-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+.drawer__edge-note {
+  color: var(--fg-muted);
+  font-size: var(--text-sm);
+  overflow-wrap: anywhere;
+}
+
+/* ---- chain: where a resource sits, read left to right -------------------- */
+.chain {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2) var(--space-3);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.chain__step {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  min-width: 0;
+}
+.chain__group {
+  display: grid;
+  gap: var(--space-1);
+  min-width: 0;
+}
+.chain__label {
+  color: var(--fg-muted);
+  font-size: var(--text-xs);
+}
+.chain__items {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.chain__arrow {
+  color: var(--fg-muted);
+}
+.chain__here {
+  padding: var(--space-1) var(--space-3);
+  border: 1px dashed var(--line-strong);
+  border-radius: var(--radius-md);
+  color: var(--fg-muted);
+  font-size: var(--text-sm);
+}
+.chain__text {
+  font-size: var(--text-sm);
+  overflow-wrap: anywhere;
+}
+
+/* ---- tabs: a row of names over one panel ---------------------------------- */
+.tabs {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+/* The hairline is an inset shadow, not a border, so the selected tab's
+   underline sits on it rather than below it. */
+.tabs__list {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  display: flex;
+  gap: var(--space-4);
+  flex: none;
+  padding: 0 var(--space-5);
+  overflow-x: auto;
+  overflow-y: hidden;
+  /* It still scrolls (swipe, shift-wheel, arrow keys move between tabs); a
+     scrollbar under a row of names only reads as clutter. */
+  scrollbar-width: none;
+  background: var(--bg-surface);
+  box-shadow: inset 0 -1px 0 var(--line);
+}
+.tabs__tab {
+  flex: none;
+  min-height: 40px;
+  padding: 0;
+  border: 0;
+  border-bottom: 2.5px solid transparent;
+  background: none;
+  color: var(--fg-muted);
+  font: inherit;
+  font-size: var(--text-sm);
+  font-weight: 600;
+  cursor: pointer;
+}
+.tabs__tab:hover {
+  color: var(--fg);
+}
+.tabs__tab[aria-selected="true"] {
+  border-bottom-color: var(--accent);
+  color: var(--fg);
+}
+.tabs__tab:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+  box-shadow: none;
+}
+.tabs__count {
+  padding: 0 var(--space-2);
+  border-radius: var(--radius-pill);
+  background: var(--bg-inset);
+  font-size: var(--text-xs);
+}
+.tabs__panel {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: grid;
+  align-content: start;
+  gap: var(--space-5);
+  padding: var(--space-4) var(--space-5) var(--space-5);
+}
+.tabs__panel:focus-visible {
+  outline: none;
+  box-shadow: inset 0 0 0 2px var(--accent);
+}
+
+.drawer__section {
+  display: grid;
+  gap: var(--space-2);
+}
+.drawer__facts {
+  display: grid;
+  grid-template-columns: minmax(8rem, max-content) minmax(0, 1fr);
+  gap: var(--space-2) var(--space-4);
+  margin: 0;
+}
+.drawer__fact {
+  display: contents;
+}
+.drawer__fact dt {
+  color: var(--fg-muted);
+  font-size: var(--text-sm);
+}
+.drawer__fact dd {
+  margin: 0;
+  font-size: var(--text-sm);
+  overflow-wrap: anywhere;
 }
 
 /* ---- skip link: the first focusable element, visible only on focus -------- */
@@ -580,287 +1961,705 @@ svg {
   box-shadow: none;
 }
 
-/* ---- shell --------------------------------------------------------------- */
+/* ---- shell: a sidebar and the page — no header bar ------------------------ */
 
 .shell {
   display: grid;
-  grid-template-columns: var(--rail-width) minmax(0, 1fr);
-  grid-template-rows: var(--header-height) minmax(0, 1fr);
-  grid-template-areas:
-    "rail header"
-    "rail main";
+  grid-template-columns: var(--sidebar-width) minmax(0, 1fr);
   min-height: 100vh;
 }
 
-.rail {
-  grid-area: rail;
-  position: sticky;
-  top: 0;
-  height: 100vh;
-  display: flex;
-  flex-direction: column;
-  background: var(--bg-rail);
-  border-right: 1px solid var(--line);
-  overflow-y: auto;
+.mobile-bar {
+  display: none;
 }
 
-.rail__brand {
+.sidebar {
+  position: sticky;
+  top: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  height: 100vh;
+  /* No overflow here: the nav scrolls instead, so the user card's panel can
+     open over the page instead of being clipped at the sidebar's edge. The
+     z-index keeps that panel above the page it spills onto. */
+  z-index: 20;
+  padding: 14px 12px;
+  border-right: 1px solid var(--line);
+  background: var(--bg-surface);
+}
+
+.sidebar__brand {
   display: flex;
   align-items: center;
   gap: var(--space-2);
-  height: var(--header-height);
-  padding: 0 var(--space-4);
-  border-bottom: 1px solid var(--line);
+  padding: 2px 6px 12px;
   color: var(--fg);
+  font-size: 15px;
+  font-weight: var(--weight-bold);
   text-decoration: none;
 }
 
-.rail__brand:hover {
-  text-decoration: none;
+.sidebar__mark {
+  display: inline-grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  border-radius: 8px;
+  background: var(--accent);
+  color: var(--fg-on-accent);
 }
 
-.rail__wordmark {
-  font-size: var(--text-md);
-  font-weight: var(--weight-semibold);
-  letter-spacing: 0.02em;
+.sidebar__nav {
+  display: grid;
+  align-content: start;
+  gap: 2px;
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  margin-top: var(--space-1);
 }
 
-.rail__product {
+.nav-group {
+  display: grid;
+  gap: 2px;
+}
+
+.nav-group__label {
+  padding: 12px 8px 4px;
+  color: var(--fg-muted);
   font-size: var(--text-xs);
+  font-weight: var(--weight-bold);
   letter-spacing: var(--tracking-caps);
   text-transform: uppercase;
-  color: var(--fg-faint);
 }
 
-.rail__nav {
-  display: flex;
-  flex-direction: column;
-  padding: var(--space-2) 0;
+.nav-group__rule {
+  width: calc(100% - 12px);
+  margin: var(--space-2) 6px;
+  border: 0;
+  border-top: 1px solid var(--line);
 }
 
+/* A section: chip, name, and — for a kind — its count (with a failed pill
+   when anything fails) and a thin health bar under the name. */
 .nav-item {
-  position: relative;
-  display: flex;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  grid-template-areas: "chip label tally";
   align-items: center;
-  gap: var(--space-3);
-  min-height: 2.125rem;
-  padding: 0 var(--space-4);
+  column-gap: 10px;
+  padding: 6px 8px;
+  border-radius: var(--radius-md);
   color: var(--fg-muted);
   font-size: var(--text-sm);
   font-weight: var(--weight-medium);
   text-decoration: none;
-  transition:
-    background-color var(--dur-fast) var(--ease-out),
-    color var(--dur-fast) var(--ease-out);
+  transition: background-color var(--dur-fast) var(--ease-out);
 }
 
 .nav-item:hover {
   background: var(--bg-hover);
   color: var(--fg);
-  text-decoration: none;
 }
 
-.nav-item:focus-visible {
-  border-radius: 0;
-  box-shadow: inset var(--focus-ring);
+.nav-item[aria-current="page"] {
+  background: var(--accent-soft);
+  color: var(--accent-ink);
 }
 
-/* The one current marker: a single accent bar in the rail. */
-.nav-item[aria-current="page"],
-.nav-item[data-status="active"] {
-  color: var(--fg);
-  background: var(--bg-active);
+.nav-item:has(.status-bar--nav) {
+  grid-template-areas:
+    "chip label tally"
+    "chip bar bar";
 }
 
-.nav-item[aria-current="page"]::before,
-.nav-item[data-status="active"]::before {
-  content: "";
-  position: absolute;
-  inset: 4px auto 4px 0;
-  width: 3px;
-  border-radius: 0 2px 2px 0;
-  background: var(--accent);
-}
-
-.rail__foot {
-  margin-top: auto;
-  padding: var(--space-3) var(--space-4);
-  border-top: 1px solid var(--line);
-  font-size: var(--text-xs);
-  color: var(--fg-faint);
-}
-
-.header {
-  grid-area: header;
-  position: sticky;
-  top: 0;
-  z-index: 10;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: var(--space-4);
-  height: var(--header-height);
-  padding: 0 var(--space-5);
-  background: var(--bg-surface);
-  border-bottom: 1px solid var(--line);
-}
-
-.header__title {
-  display: flex;
-  align-items: baseline;
-  gap: var(--space-3);
-  min-width: 0;
-  font-size: var(--text-md);
-  font-weight: var(--weight-semibold);
-}
-
-/* `min-width: 0` lets the title's BOX shrink; without this its TEXT keeps its
-   full width and paints straight over the theme switch beside it. Each part
-   truncates on its own so the section name survives longest. */
-.header__title > * {
+.nav-item__label {
+  grid-area: label;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.header__scope {
-  font-weight: var(--weight-regular);
-  color: var(--fg-muted);
-  font-family: var(--font-mono);
-  font-size: var(--text-sm);
-}
-
-.header__tools {
-  display: flex;
+.nav-item__tally {
+  grid-area: tally;
+  display: inline-flex;
   align-items: center;
-  gap: var(--space-3);
+  gap: 6px;
 }
 
-.main {
-  grid-area: main;
-  min-width: 0;
+.nav-item__count {
+  color: var(--fg-muted);
+  font-size: var(--text-xs);
+  font-variant-numeric: tabular-nums;
 }
 
-.content {
-  max-width: var(--content-max);
-  padding: var(--space-5);
+.nav-item[aria-current="page"] .nav-item__count {
+  color: var(--accent-ink);
 }
 
-/* ---- identity strip: who, how, where -------------------------------------- */
+.health--compact {
+  gap: 2px;
+  padding: 0 6px 0 4px;
+  font-size: var(--text-xs);
+  line-height: 1.5;
+}
 
-.identity {
+.health--compact svg {
+  width: 11px;
+  height: 11px;
+}
+
+.status-bar--nav {
+  grid-area: bar;
+  gap: 2px;
+  height: 3px;
+  margin-top: 4px;
+}
+
+.status-bar--nav > span {
+  border-radius: 2px;
+}
+
+.nav-item__chip,
+.kind-chip--nav {
+  grid-area: chip;
+  display: inline-grid;
+  place-items: center;
+  flex: none;
+  width: 26px;
+  height: 26px;
+  border-radius: 8px;
+}
+
+.nav-item__chip {
+  background: var(--bg-inset);
+  color: var(--fg-muted);
+}
+
+.nav-item__chip svg,
+.kind-chip--nav svg {
+  width: 14px;
+  height: 14px;
+}
+
+.nav-item[aria-current="page"] .nav-item__chip,
+.nav-item[aria-current="page"] .kind-chip--nav {
+  background: transparent;
+  color: var(--accent-ink);
+}
+
+/* Namespace switcher: the scope, switched like a workspace. */
+.ns-switcher {
   position: relative;
 }
 
-.identity__summary {
+.ns-switcher__button {
   display: flex;
   align-items: center;
-  gap: var(--space-2);
-  min-height: 2rem;
-  padding: 0 var(--space-2);
-  border: 1px solid transparent;
-  border-radius: var(--radius-md);
-  font-size: var(--text-sm);
-  list-style: none;
-  cursor: pointer;
-  user-select: none;
-}
-
-.identity__summary::-webkit-details-marker {
-  display: none;
-}
-
-.identity__summary:hover {
-  background: var(--bg-hover);
-}
-
-.identity__user {
-  font-family: var(--font-mono);
+  gap: 9px;
+  width: 100%;
+  padding: 6px 8px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--bg-canvas);
   color: var(--fg);
+  text-align: left;
 }
 
-.identity__source {
-  display: inline-flex;
-  align-items: center;
-  gap: 0.3em;
+.ns-switcher__button[aria-expanded="true"] {
+  border-color: var(--accent);
+}
+
+.ns-switcher__button > svg {
+  margin-left: auto;
   color: var(--fg-muted);
 }
 
-.identity__panel {
-  position: absolute;
-  top: calc(100% + 6px);
-  right: 0;
-  z-index: 30;
-  width: min(26rem, calc(100vw - 2rem));
-  padding: var(--space-4);
+.ns-switcher__text {
+  display: grid;
+  min-width: 0;
+  line-height: 1.2;
+}
+
+.ns-switcher__scope {
+  overflow: hidden;
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-semibold);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ns-switcher__hint {
+  color: var(--fg-muted);
+  font-size: var(--text-xs);
+}
+
+.ns-switcher__avatar,
+.picker__avatar,
+.user-chip__avatar {
+  display: inline-grid;
+  place-items: center;
+  flex: none;
+  width: 24px;
+  height: 24px;
+  border-radius: 7px;
+  background: var(--accent-soft);
+  color: var(--accent-ink);
+  font-weight: var(--weight-bold);
+}
+
+.ns-switcher__avatar::before,
+.picker__avatar::before,
+.user-chip__avatar::before {
+  content: attr(data-initial);
+}
+
+.ns-switcher__avatar--all,
+.picker__avatar--all {
+  background: var(--bg-inset);
+  color: var(--fg-muted);
+}
+
+/* The switcher's popover spans the sidebar, like the button it hangs from. */
+.ns-switcher > .popover {
+  display: block;
+}
+
+.ns-switcher__panel {
+  /* An auto track would size to the filter input's natural width, wider than
+     the sidebar; the panel's own width is the limit. */
+  grid-template-columns: minmax(0, 1fr);
+  gap: 4px;
+  width: 100%;
+}
+
+.picker__filter,
+.search__field {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: 0 10px;
   border: 1px solid var(--line);
   border-radius: var(--radius-md);
+  background: var(--bg-canvas);
+  color: var(--fg-muted);
+}
+
+.picker__filter input,
+.search__field input {
+  flex: 1;
+  min-width: 0;
+  height: 32px;
+  border: 0;
+  background: transparent;
+  color: var(--fg);
+  font: inherit;
+  font-size: var(--text-sm);
+  outline: none;
+}
+
+/* A text field is focus-visible on a mouse click too, so the global tab ring
+   would light on every click. The field's own border takes the accent
+   instead: quieter, and still a visible focus for the keyboard. */
+.picker__filter input:focus-visible,
+.search__field input:focus-visible {
+  box-shadow: none;
+}
+
+.picker__filter:focus-within,
+.search__field:focus-within {
+  border-color: var(--accent);
+}
+
+.picker__list,
+.search__results {
+  display: grid;
+  gap: 2px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.picker__option {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  width: 100%;
+  padding: 6px 8px;
+  border: 0;
+  border-radius: 9px;
+  background: transparent;
+  color: var(--fg);
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  text-align: left;
+}
+
+.picker__option:hover {
+  background: var(--bg-hover);
+}
+
+.picker__option[aria-current="true"] {
+  background: var(--accent-soft);
+  color: var(--accent-ink);
+}
+
+.picker__meta {
+  margin-left: auto;
+  color: var(--fg-muted);
+  font-family: var(--font-sans);
+  font-size: var(--text-xs);
+}
+
+/* Every picker's body: a list of choices under an optional filter. */
+.picker {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 4px;
+}
+
+/* The picker's top row: the filter (or a count of what is chosen), and Clear
+   at the right. */
+.picker__head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.picker__head > .picker__filter {
+  flex: 1;
+  min-width: 0;
+}
+
+.picker__summary {
+  flex: 1;
+  padding: 0 4px;
+  color: var(--fg-muted);
+  font-size: var(--text-xs);
+}
+
+.picker__clear {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 4px;
+  min-height: 28px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--accent-ink);
+  font-size: var(--text-xs);
+  font-weight: var(--weight-medium);
+}
+
+.picker__clear:hover:not(:disabled) {
+  background: var(--bg-hover);
+}
+
+.picker__clear:disabled {
+  color: var(--fg-muted);
+  cursor: default;
+}
+
+.picker__option[aria-pressed="true"] {
+  background: var(--accent-soft);
+  color: var(--accent-ink);
+}
+
+.picker__label {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.picker__option > svg:last-child {
+  flex: none;
+  color: var(--accent-ink);
+}
+
+/* A picker in a form: a field-shaped button opening the list under it. */
+.picker-field > .popover {
+  display: block;
+}
+
+.picker-field__button {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  text-align: left;
+}
+
+.picker-field__button[aria-expanded="true"] {
+  border-color: var(--accent);
+}
+
+.picker-field__button > svg {
+  flex: none;
+  margin-left: auto;
+  color: var(--fg-muted);
+}
+
+.picker-field__value {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.picker-field__button[data-empty="true"] .picker-field__value {
+  color: var(--fg-muted);
+}
+
+.picker-field__panel {
+  width: 18rem;
+}
+
+/* In the page's flow it is at least as wide as its field; pinned to the
+   screen, a percentage would be of the viewport. */
+.picker-field__panel:not([data-strategy="fixed"]) {
+  min-width: 100%;
+}
+
+/* Long lists scroll inside the panel rather than past the page. */
+.picker-field__panel .picker__list {
+  max-height: 20rem;
+  overflow-y: auto;
+}
+
+/* Object search. */
+.search {
+  position: relative;
+  margin: 4px 0 6px;
+}
+
+.search__key {
+  padding: 0 5px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  font: var(--text-xs) var(--font-mono);
+}
+
+.search__results {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  z-index: 30;
+  width: 100%;
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
   background: var(--bg-surface);
   box-shadow: var(--shadow-2);
+}
+
+.search__results .ref {
+  width: 100%;
+  grid-template-columns: auto 1fr;
+}
+
+.search__empty {
+  padding: 6px 8px;
+  color: var(--fg-muted);
   font-size: var(--text-sm);
+}
+
+/* User chip: compact, with the rest behind it. */
+.user-chip {
+  position: relative;
+  margin-top: auto;
+}
+
+.user-chip > summary {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 6px 8px;
+  border: 1px solid transparent;
+  border-radius: 12px;
+  cursor: pointer;
+  list-style: none;
+}
+
+.user-chip > summary::-webkit-details-marker {
+  display: none;
+}
+
+.user-chip > summary:hover,
+.user-chip[open] > summary {
+  border-color: var(--line);
+  background: var(--bg-canvas);
+}
+
+.user-chip > summary > svg {
+  margin-left: auto;
+  color: var(--fg-muted);
+}
+
+.user-chip__who {
+  display: grid;
+  min-width: 0;
+  line-height: 1.2;
+}
+
+.identity__user {
+  overflow: hidden;
+  font-weight: var(--weight-semibold);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.identity__source {
+  color: var(--fg-muted);
+  font-size: var(--text-xs);
+}
+
+/* The panel opens above the chip from its left edge, wider than the sidebar
+   so it spills out over the page — who you are on the left, what you may do
+   on the right. */
+.identity__panel {
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 0;
+  z-index: 60;
+  display: grid;
+  grid-template-columns: minmax(0, 15rem) minmax(0, 1fr);
+  align-content: start;
+  gap: 10px 22px;
+  width: min(44rem, calc(100vw - 24px));
+  max-height: calc(100vh - 90px);
+  overflow-y: auto;
+  padding: 16px 18px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  background: var(--bg-surface);
+  box-shadow: var(--shadow-2);
+}
+
+.identity__panel > * {
+  grid-column: 1;
+}
+
+.identity__panel > .cap-list {
+  grid-column: 2;
+  grid-row: 1 / span 5;
+  align-self: start;
+}
+
+/* In the mobile drawer the sidebar is the whole width it can have: the panel
+   opens above the chip, inside it, in one column. */
+@media (max-width: 900px) {
+  .identity__panel {
+    position: absolute;
+    bottom: calc(100% + 6px);
+    left: 0;
+    grid-template-columns: minmax(0, 1fr);
+    width: 100%;
+  }
+
+  .identity__panel > .cap-list {
+    grid-column: 1;
+    grid-row: auto;
+  }
 }
 
 .identity__grid {
   display: grid;
-  grid-template-columns: max-content 1fr;
-  gap: var(--space-1) var(--space-3);
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 4px 12px;
+  margin: 0;
+  font-size: var(--text-sm);
 }
 
 .identity__grid dt {
-  color: var(--fg-faint);
-  font-size: var(--text-xs);
-  letter-spacing: var(--tracking-caps);
-  text-transform: uppercase;
-  padding-top: 0.2em;
+  color: var(--fg-muted);
 }
 
 .identity__grid dd {
-  font-family: var(--font-mono);
+  margin: 0;
   overflow-wrap: anywhere;
+}
+
+.identity__count {
+  margin: 0;
+  color: var(--fg-muted);
+  font-size: var(--text-sm);
 }
 
 .cap-list {
   display: grid;
   grid-template-columns: 1fr 1fr;
-  gap: var(--space-1) var(--space-3);
-  margin-top: var(--space-3);
+  gap: 4px 10px;
+  margin: 0;
   padding: 0;
   list-style: none;
+  font-size: var(--text-sm);
 }
 
 .cap-list li {
   display: flex;
   align-items: center;
-  gap: 0.4em;
+  gap: 5px;
 }
 
-.cap-list [data-allowed="false"] {
-  color: var(--fg-faint);
+.cap-list li[data-allowed="true"] svg {
+  color: var(--health-healthy-fg);
 }
 
-/* ---- theme switch: a segmented control, icon + label ---------------------- */
+.cap-list li[data-allowed="false"] {
+  color: var(--fg-muted);
+}
 
+.cap-list li[data-allowed="false"] svg {
+  color: var(--health-failed-fg);
+}
+
+.identity__theme {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding-top: 10px;
+  border-top: 1px solid var(--line);
+}
+
+.identity__theme-label {
+  color: var(--fg-muted);
+  font-size: var(--text-xs);
+  font-weight: var(--weight-bold);
+  letter-spacing: var(--tracking-caps);
+  text-transform: uppercase;
+}
+
+/* Theme switch: a segmented control. */
 .theme-switch {
   display: inline-flex;
-  padding: 2px;
+  gap: 2px;
+  padding: 3px;
   border: 1px solid var(--line);
   border-radius: var(--radius-md);
-  background: var(--bg-inset);
+  background: var(--bg-canvas);
 }
 
 .theme-switch__option {
   display: inline-flex;
   align-items: center;
-  gap: 0.35em;
-  min-height: 1.625rem;
-  padding: 0 var(--space-2);
+  gap: 4px;
+  padding: 3px 8px;
   border: 0;
-  border-radius: var(--radius-sm);
+  border-radius: 7px;
   background: transparent;
   color: var(--fg-muted);
   font-size: var(--text-xs);
-  font-weight: var(--weight-medium);
+}
+
+.theme-switch__option span {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
 }
 
 .theme-switch__option[aria-pressed="true"] {
@@ -869,11 +2668,47 @@ svg {
   box-shadow: var(--shadow-1);
 }
 
-/* The selected option's elevation would otherwise eat the focus ring — see the
-   note on `.skip-link:focus-visible`. The ring leads and the elevation stays,
-   so tabbing across the switch shows a ring on all three, not two of three. */
 .theme-switch__option[aria-pressed="true"]:focus-visible {
-  box-shadow: var(--focus-ring), var(--shadow-1);
+  box-shadow: var(--focus-ring);
+}
+
+/* The page: the title opens the content. */
+.main {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  outline: none;
+}
+
+.page-head {
+  padding: var(--space-5) var(--space-5) 0;
+}
+
+.page-title {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-3);
+  margin: 0;
+  font-size: var(--text-xl);
+  font-weight: var(--weight-bold);
+  letter-spacing: -0.01em;
+}
+
+.page-title__scope {
+  color: var(--fg-muted);
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-regular);
+}
+
+/* Full width, and down to the bottom of the window: a page that fills
+   (`.page--fill`) can hand the room to its last row. */
+.content {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  padding: var(--space-4) var(--space-5) var(--space-6);
 }
 
 /* ---- problem banner: what, why, fix — fix set apart ----------------------- */
@@ -885,7 +2720,7 @@ svg {
   align-items: start;
   padding: var(--space-3) var(--space-4);
   border: 1px solid var(--health-failed-fg);
-  border-radius: var(--radius-md);
+  border-radius: var(--radius-lg);
   background: var(--health-failed-bg);
   color: var(--fg);
   font-size: var(--text-sm);
@@ -933,8 +2768,8 @@ svg {
   gap: var(--space-2);
   align-items: baseline;
   margin-top: var(--space-1);
-  padding: var(--space-2) var(--space-3);
-  border-radius: var(--radius-sm);
+  padding: 10px 12px;
+  border-radius: 12px;
   background: var(--bg-surface);
   color: var(--fg);
 }
@@ -942,53 +2777,91 @@ svg {
 .problem__fix-label {
   flex-shrink: 0;
   font-size: var(--text-xs);
-  font-weight: var(--weight-semibold);
-  letter-spacing: var(--tracking-caps);
+  font-weight: var(--weight-bold);
+  letter-spacing: 0.1em;
   text-transform: uppercase;
-  color: var(--accent);
+  color: var(--accent-ink);
 }
 
 .problem__meta {
   font-family: var(--font-mono);
   font-size: var(--text-xs);
-  color: var(--fg-faint);
+  color: var(--fg-muted);
 }
 
 .problem__dismiss {
   margin: -0.25rem -0.5rem 0 0;
 }
 
-/* ---- states: loading, empty, error, not permitted ------------------------- */
+/* ---- states: compact, left-aligned, led by an icon tile ------------------------
+   Empty says what would appear and how it comes to exist; loading is a
+   skeleton, never a spinner; an error carries the server's what / why / fix;
+   not permitted names the refusal and offers no retry. */
 
 .state {
   display: grid;
-  gap: var(--space-2);
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: start;
+  gap: var(--space-2) var(--space-3);
   max-width: 48rem;
-  padding: var(--space-5) var(--space-4);
+  padding: var(--space-4);
+  border: 1px solid var(--card-border);
+  border-radius: var(--radius-lg);
+  background: var(--bg-surface);
+  box-shadow: var(--shadow-1);
 }
 
-.state--centered {
-  justify-items: start;
+.state > :not(.state__icon) {
+  grid-column: 2;
+}
+
+.state__icon {
+  grid-row: 1 / span 4;
+  display: inline-grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  border-radius: var(--radius-md);
+  background: var(--health-unknown-bg);
+  color: var(--health-unknown-fg);
+}
+
+.state__icon svg {
+  width: 16px;
+  height: 16px;
+}
+
+.state[data-tone="failed"] .state__icon {
+  background: var(--health-failed-bg);
+  color: var(--health-failed-fg);
+}
+
+.state[data-tone="degraded"] .state__icon {
+  background: var(--health-degraded-bg);
+  color: var(--health-degraded-fg);
 }
 
 .state__title {
   display: flex;
   align-items: center;
   gap: var(--space-2);
-  font-size: var(--text-lg);
+  margin: 0;
+  font-size: var(--text-md);
   font-weight: var(--weight-semibold);
 }
 
 .state__body {
   color: var(--fg-muted);
+  font-size: var(--text-sm);
   line-height: var(--leading-prose);
   max-width: 65ch;
 }
 
 .state__actions {
   display: flex;
+  flex-wrap: wrap;
   gap: var(--space-2);
-  margin-top: var(--space-2);
+  margin-top: var(--space-1);
 }
 
 .skeleton-ledger {
@@ -1016,6 +2889,12 @@ svg {
   gap: var(--space-6);
 }
 
+/* A page whose last row takes whatever height is left (the overview's split). */
+.page--fill {
+  flex: 1;
+  grid-template-rows: auto minmax(0, 1fr);
+}
+
 .page__section {
   display: grid;
   grid-template-columns: minmax(0, 1fr);
@@ -1039,10 +2918,20 @@ svg {
      where it was always meant to be. Every `NotReported` and every disabled
      control's reason is such a span. */
   position: relative;
+  border: 1px solid var(--card-border);
+  border-radius: var(--radius-lg);
+  background: var(--bg-surface);
+  box-shadow: var(--shadow-1);
 }
 
 .ledger-scroll > .ledger {
   min-width: 30rem;
+}
+
+/* A scroll container can take keyboard focus (to scroll it); its card lift
+   must not hide the ring when it does. */
+.ledger-scroll:focus-visible {
+  box-shadow: var(--focus-ring);
 }
 
 .page__section-head {
@@ -1064,13 +2953,6 @@ svg {
   font-size: var(--text-sm);
 }
 
-/* Two ledgers side by side at width; stacked below it (see responsive). */
-.page__pair {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: var(--space-5) var(--space-6);
-}
-
 .page__prose {
   color: var(--fg-muted);
   line-height: var(--leading-prose);
@@ -1086,6 +2968,37 @@ svg {
   flex-wrap: wrap;
   padding: var(--space-3) 0 var(--space-4);
   border-bottom: 1px solid var(--line);
+}
+
+/* Doctor: the verdict, and under it on the left the one Run doctor button
+   whose options open in a popover. The pair shares the verdict's rule. */
+.doctor-head {
+  display: grid;
+  justify-items: start;
+  gap: var(--space-2);
+  padding-bottom: var(--space-4);
+  border-bottom: 1px solid var(--line);
+}
+
+.doctor-head > .verdict {
+  justify-self: stretch;
+  padding-bottom: 0;
+  border-bottom: 0;
+}
+
+.doctor-options {
+  width: 22rem;
+  padding: var(--space-4);
+}
+
+.doctor-options__form {
+  display: grid;
+  gap: var(--space-3);
+}
+
+.doctor-options__actions {
+  display: flex;
+  justify-content: flex-end;
 }
 
 .verdict__lamp {
@@ -1128,7 +3041,7 @@ svg {
 
 .verdict__meta {
   margin-left: auto;
-  color: var(--fg-faint);
+  color: var(--fg-muted);
   font-size: var(--text-xs);
   font-family: var(--font-mono);
 }
@@ -1174,89 +3087,90 @@ svg {
 }
 
 .health-strip__list [data-empty="true"] .health-strip__lamp {
-  color: var(--fg-faint);
+  color: var(--fg-muted);
 }
 
 .health-strip__list [data-empty="true"] .health {
-  color: var(--fg-faint);
+  color: var(--fg-muted);
   background: var(--bg-inset);
 }
 
-/* ---- in-flight: two counts with their words --------------------------------- */
-
-.in-flight {
-  display: grid;
-  grid-template-columns: max-content 1fr;
-  gap: var(--space-1) var(--space-3);
-  align-items: baseline;
-  margin: 0;
-}
-
-.in-flight dt {
-  color: var(--fg-faint);
-  font-size: var(--text-xs);
-  letter-spacing: var(--tracking-caps);
-  text-transform: uppercase;
-  padding-top: 0.2em;
-}
-
-.in-flight dd {
-  display: flex;
-  align-items: baseline;
-  gap: var(--space-2);
-  font-size: var(--text-sm);
-}
-
-.in-flight__count {
-  font-size: var(--text-lg);
-  font-weight: var(--weight-semibold);
-  line-height: 1;
-}
-
-.in-flight__count[data-unknown="true"] {
-  color: var(--fg-faint);
-  font-weight: var(--weight-regular);
-}
-
-/* ---- finding: what / why / fix, the fix on the banner's plate -------------- */
+/* ---- finding: what / why / fix, the fix on its own plate ----------------------
+   A problem explained in the server's own words: a card edged in its state's
+   colour, an icon tile, what (semibold), why (muted), and the fix on the
+   accent plate led by a "Fix" label. */
 
 .finding {
   display: grid;
   grid-template-columns: auto minmax(0, 1fr);
-  gap: var(--space-2) var(--space-3);
   align-items: start;
+  gap: var(--space-2) var(--space-3);
+  padding: 14px 16px;
+  border: 1px solid var(--card-border);
+  border-left: var(--stripe) solid var(--line-strong);
+  border-radius: var(--radius-lg);
+  background: var(--bg-surface);
+  box-shadow: var(--shadow-1);
   font-size: var(--text-sm);
 }
 
+.finding[data-health="failed"] {
+  border-left-color: var(--health-failed-fg);
+}
+
+.finding[data-health="degraded"] {
+  border-left-color: var(--health-degraded-fg);
+}
+
+.finding[data-health="healthy"] {
+  border-left-color: var(--health-healthy-fg);
+}
+
 .finding__icon {
-  margin-top: 0.15em;
+  display: inline-grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  border-radius: var(--radius-md);
+  background: var(--health-unknown-bg);
   color: var(--health-unknown-fg);
 }
 
 .finding[data-health="failed"] .finding__icon {
+  background: var(--health-failed-bg);
   color: var(--health-failed-fg);
 }
 
 .finding[data-health="degraded"] .finding__icon {
+  background: var(--health-degraded-bg);
   color: var(--health-degraded-fg);
+}
+
+.finding[data-health="healthy"] .finding__icon {
+  background: var(--health-healthy-bg);
+  color: var(--health-healthy-fg);
 }
 
 .finding__body {
   display: grid;
-  gap: var(--space-1);
+  gap: var(--space-2);
   min-width: 0;
 }
 
 .finding__title {
+  margin: 0;
   font-size: var(--text-md);
 }
 
 .finding__what {
+  margin: 0;
+  font-size: var(--text-md);
   font-weight: var(--weight-semibold);
   overflow-wrap: anywhere;
 }
 
 .finding__why {
+  margin: 0;
   color: var(--fg-muted);
   line-height: var(--leading-prose);
   overflow-wrap: anywhere;
@@ -1264,13 +3178,12 @@ svg {
 
 .finding__fix {
   display: flex;
-  gap: var(--space-2);
   align-items: baseline;
-  margin-top: var(--space-1);
-  padding: var(--space-2) var(--space-3);
-  border: 1px solid var(--line);
-  border-radius: var(--radius-sm);
-  background: var(--bg-inset);
+  gap: var(--space-3);
+  margin: 0;
+  padding: 10px 12px;
+  border-radius: 12px;
+  background: var(--accent-soft);
   color: var(--fg);
   line-height: var(--leading-prose);
   overflow-wrap: anywhere;
@@ -1278,65 +3191,25 @@ svg {
 
 .finding__fix-label {
   flex-shrink: 0;
+  color: var(--accent-ink);
   font-size: var(--text-xs);
-  font-weight: var(--weight-semibold);
-  letter-spacing: var(--tracking-caps);
+  font-weight: var(--weight-bold);
+  letter-spacing: 0.1em;
   text-transform: uppercase;
-  color: var(--accent);
 }
 
 .finding__meta {
+  color: var(--fg-muted);
   font-family: var(--font-mono);
   font-size: var(--text-xs);
-  color: var(--fg-faint);
 }
 
 .finding-list {
   display: grid;
-  gap: var(--space-4);
+  gap: var(--space-3);
+  margin: 0;
   padding: 0;
   list-style: none;
-}
-
-.finding-list > li {
-  padding-bottom: var(--space-4);
-  border-bottom: 1px solid var(--line);
-}
-
-.finding-list > li:last-child {
-  padding-bottom: 0;
-  border-bottom: 0;
-}
-
-/* ---- work table ----------------------------------------------------------- */
-
-.work-table__object {
-  display: grid;
-  gap: 2px;
-  min-width: 12rem;
-}
-
-/* Names wrap in a ledger row; an ellipsis on the one word the operator
-   needs (the object's name) is the wrong thing to lose. */
-.work-table .label-strip {
-  align-items: baseline;
-  flex-wrap: wrap;
-}
-
-.work-table .label-strip__name {
-  white-space: normal;
-  overflow: visible;
-  overflow-wrap: anywhere;
-}
-
-.work-table__namespace {
-  font-size: var(--text-xs);
-  color: var(--fg-faint);
-}
-
-.work-table__detail {
-  color: var(--fg-muted);
-  overflow-wrap: anywhere;
 }
 
 .ledger time {
@@ -1363,7 +3236,7 @@ svg {
 }
 
 .controls__field > label {
-  color: var(--fg-faint);
+  color: var(--fg-muted);
   font-size: var(--text-xs);
   font-weight: var(--weight-medium);
   letter-spacing: var(--tracking-caps);
@@ -1383,7 +3256,7 @@ svg {
 }
 
 .controls__input::placeholder {
-  color: var(--fg-faint);
+  color: var(--fg-muted);
   opacity: 1;
 }
 
@@ -1392,7 +3265,7 @@ svg {
 }
 
 .controls__hint {
-  color: var(--fg-faint);
+  color: var(--fg-muted);
   font-size: var(--text-xs);
 }
 
@@ -1417,7 +3290,7 @@ svg {
 
 .doctor-checks__id {
   font-size: var(--text-xs);
-  color: var(--fg-faint);
+  color: var(--fg-muted);
 }
 
 .doctor-checks__scope {
@@ -1426,7 +3299,7 @@ svg {
 }
 
 .doctor-checks__note {
-  color: var(--fg-faint);
+  color: var(--fg-muted);
   white-space: normal;
 }
 
@@ -1462,7 +3335,7 @@ svg {
 /* ---- gates ---------------------------------------------------------------- */
 
 .gate-list__status-eq {
-  color: var(--fg-faint);
+  color: var(--fg-muted);
 }
 
 .gate-list__kinds {
@@ -1475,18 +3348,11 @@ svg {
 
 /* ---- topology board ------------------------------------------------------- */
 
-/* The board and its drawer. The drawer is a column beside the board at width
-   and a block under it below 900px (see responsive) — never an overlay: the
-   plate you clicked has to stay on screen while you read about it. */
 .topo-layout {
   display: grid;
   grid-template-columns: minmax(0, 1fr);
   gap: var(--space-4);
   align-items: start;
-}
-
-.topo-layout[data-drawer="open"] {
-  grid-template-columns: minmax(0, 1fr) 22rem;
 }
 
 /* The chassis the graph sits on: the inset, so the plates (surface) read as
@@ -1499,7 +3365,7 @@ svg {
      its track instead of scrolling inside it. */
   min-width: 0;
   border: 1px solid var(--line);
-  border-radius: var(--radius-md);
+  border-radius: var(--radius-lg);
   background: var(--bg-inset);
   overflow: auto;
   max-height: 70vh;
@@ -1551,7 +3417,7 @@ svg {
   min-height: 64px;
   padding: var(--space-2) var(--space-3);
   border: 1px solid var(--line-strong);
-  border-radius: var(--radius-md);
+  border-radius: var(--radius-lg);
   background: var(--bg-surface);
   color: var(--fg);
   text-align: left;
@@ -1561,8 +3427,34 @@ svg {
     border-color var(--dur-fast) var(--ease-out);
 }
 
+/* A resource plate is a link to its drawer; it still reads as a plate. */
+a.topo-node {
+  color: inherit;
+  text-decoration: none;
+}
+
 .topo-node:hover {
   background: var(--bg-hover);
+}
+
+/* A kopiur object's plate wears its kind's stripe, like a summary card. A
+   ghost's dashed outline (below) replaces it: "not a real thing" wins. */
+.topo-node.has-stripe {
+  border-left: var(--stripe) solid var(--kc);
+}
+
+.topo-node__id {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.topo-node__text {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
 }
 
 .topo-node:focus-visible {
@@ -1591,7 +3483,7 @@ svg {
   font-weight: var(--weight-medium);
   letter-spacing: var(--tracking-caps);
   text-transform: uppercase;
-  color: var(--fg-faint);
+  color: var(--fg-muted);
 }
 
 .topo-node__name {
@@ -1645,246 +3537,63 @@ svg {
   color: var(--fg-muted);
 }
 
-/* ---- topology drawer ------------------------------------------------------ */
-
-.topo-drawer {
-  position: sticky;
-  top: var(--space-2);
-}
-
-.topo-drawer:focus-visible {
-  outline: none;
-  box-shadow: var(--focus-ring);
-}
-
-.topo-drawer__body {
-  display: grid;
-  gap: var(--space-4);
-}
-
-.topo-drawer__meaning {
-  margin: 0;
-  color: var(--fg-muted);
-  line-height: var(--leading-prose);
-}
-
-.topo-drawer__facts {
-  display: grid;
-  grid-template-columns: max-content 1fr;
-  gap: var(--space-1) var(--space-3);
-  align-items: baseline;
-  margin: 0;
-}
-
-.topo-drawer__facts dt {
-  font-size: var(--text-xs);
-  font-weight: var(--weight-medium);
-  letter-spacing: var(--tracking-caps);
-  text-transform: uppercase;
-  color: var(--fg-faint);
-}
-
-.topo-drawer__facts dd {
-  margin: 0;
-  font-size: var(--text-sm);
-}
-
-.topo-drawer__rel h4 {
-  margin: 0 0 var(--space-2);
-  font-size: var(--text-xs);
-  font-weight: var(--weight-medium);
-  letter-spacing: var(--tracking-caps);
-  text-transform: uppercase;
-  color: var(--fg-faint);
-}
-
-.topo-drawer__rel ul {
-  display: grid;
-  gap: var(--space-2);
-  margin: 0;
-  padding: 0;
-  list-style: none;
-}
-
-.topo-drawer__rel li {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: var(--space-1) var(--space-2);
-  font-size: var(--text-sm);
-  padding-bottom: var(--space-2);
-  border-bottom: 1px solid var(--line);
-}
-
-.topo-drawer__rel li:last-child {
-  padding-bottom: 0;
-  border-bottom: 0;
-}
-
-.topo-drawer__rel-kind {
-  font-size: var(--text-xs);
-  font-weight: var(--weight-medium);
-  letter-spacing: var(--tracking-caps);
-  text-transform: uppercase;
-  color: var(--fg-faint);
-  flex-basis: 100%;
-}
-
-.topo-drawer__rel-note {
-  color: var(--fg-faint);
-  font-size: var(--text-xs);
-}
-
-.topo-drawer__empty {
-  margin: 0;
-  color: var(--fg-faint);
-  font-size: var(--text-sm);
-}
-
-.topo-drawer__link {
-  margin: 0;
-  font-size: var(--text-sm);
-}
-
 /* ---- responsive: structural, not fluid ------------------------------------ */
 
 @media (max-width: 900px) {
-  :root {
-    --rail-width: 100%;
-  }
-
+  /* The sidebar becomes a drawer behind a compact bar; the page takes the
+     whole width. */
   .shell {
     grid-template-columns: minmax(0, 1fr);
-    /* `auto` for the header, not `var(--header-height)`: it wraps to two rows
-       at this width (see `.header` below) and a fixed row would clip it. */
-    grid-template-rows: auto auto minmax(0, 1fr);
-    grid-template-areas:
-      "rail"
-      "header"
-      "main";
   }
 
-  .rail {
-    position: static;
-    height: auto;
-    border-right: 0;
-    border-bottom: 1px solid var(--line);
-  }
-
-  .rail__nav {
-    flex-direction: row;
-    overflow-x: auto;
-    padding: 0 var(--space-2);
-    scrollbar-width: none;
-    /* The strip scrolls; fade its trailing edge so a clipped row reads as
-       "more this way" rather than as a broken label. */
-    mask-image: linear-gradient(to right, black calc(100% - 2.5rem), transparent);
-  }
-
-  .rail__nav::-webkit-scrollbar {
-    display: none;
-  }
-
-  .nav-item {
-    flex-shrink: 0;
-  }
-
-  .rail__foot {
-    display: none;
-  }
-
-  .nav-item {
-    min-height: 2.5rem;
-    padding: 0 var(--space-3);
-  }
-
-  .nav-item[aria-current="page"]::before,
-  .nav-item[data-status="active"]::before {
-    inset: auto 4px 0 4px;
-    width: auto;
-    height: 3px;
-    border-radius: 2px 2px 0 0;
-  }
-
-  /* Two rows, not one. At 390px the page name, the scope, the theme switch and
-     the identity strip cannot share a line — truncating them all to fit would
-     leave three ellipses and no facts. The header grows instead, so the grid
-     row that holds it has to stop being a fixed height (below). */
-  .header {
-    position: static;
-    height: auto;
-    min-height: var(--header-height);
+  .mobile-bar {
+    position: sticky;
+    top: 0;
+    z-index: 40;
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
     padding: var(--space-2) var(--space-4);
-    flex-wrap: wrap;
-    justify-content: flex-start;
-    row-gap: var(--space-2);
+    border-bottom: 1px solid var(--line);
+    background: var(--bg-surface);
   }
 
-  .header__title {
-    font-size: var(--text-sm);
-    flex: 1 0 100%;
+  .mobile-bar__menu {
+    display: inline-grid;
+    place-items: center;
+    width: 34px;
+    height: 34px;
+    border: 1px solid var(--line);
+    border-radius: var(--radius-md);
+    background: var(--bg-canvas);
+    color: var(--fg);
   }
 
-  .header__tools {
-    flex-wrap: wrap;
+  .mobile-bar__brand {
+    font-weight: var(--weight-bold);
   }
 
-  /* No hover exists here, so a tooltip is a reason nobody can read — and one
-     anchored to a control's left edge would run off the page besides. The
-     refusal becomes a line under the control instead. A ledger keeps its own
-     answer (the short word in the cell, `actions/reason.ts`), so the sentence
-     stays hidden there rather than doubling up. */
-  .button[data-reason]::after {
-    content: none;
+  .sidebar {
+    position: fixed;
+    inset: 0 auto 0 0;
+    z-index: 50;
+    width: min(var(--sidebar-width), 85vw);
+    transform: translateX(-100%);
+    transition: transform var(--dur-base) var(--ease-out);
   }
 
-  .button__reason {
-    position: static;
-    display: block;
-    width: auto;
-    height: auto;
-    margin: var(--space-1) 0 0;
-    overflow: visible;
-    clip: auto;
-    clip-path: none;
-    white-space: normal;
-    max-width: 34rem;
-    color: var(--fg-muted);
-    font-size: var(--text-xs);
-    line-height: var(--leading-prose);
+  .shell[data-nav-open="true"] .sidebar {
+    transform: none;
+    box-shadow: var(--shadow-2);
   }
 
-  .ledger-scroll .button__reason {
-    position: absolute;
-    width: 1px;
-    height: 1px;
-    margin: -1px;
-    overflow: hidden;
-    clip-path: inset(50%);
-    white-space: nowrap;
-  }
-
+  .page-head,
   .content {
-    padding: var(--space-4);
+    padding-right: var(--space-4);
+    padding-left: var(--space-4);
   }
-
-  .cap-list {
-    grid-template-columns: 1fr;
-  }
-
-  .page__pair {
-    grid-template-columns: minmax(0, 1fr);
-  }
-
-  /* The drawer stops being a column and becomes the block under the board;
-     it also stops sticking, since there is no longer a tall neighbour to
-     stick beside. */
-  .topo-layout[data-drawer="open"] {
-    grid-template-columns: minmax(0, 1fr);
-  }
-
-  .topo-drawer {
-    position: static;
+  :root {
+    --rail-width: 100%;
   }
 
   .topo-board {
@@ -1922,13 +3631,6 @@ svg {
 }
 
 @media (max-width: 560px) {
-  .theme-switch__option span {
-    display: none;
-  }
-
-  .identity__source span {
-    display: none;
-  }
   .retention-rules > li {
     grid-template-columns: 2.5rem minmax(0, 1fr);
   }
@@ -1938,27 +3640,13 @@ svg {
   }
 }
 
-/* No floating tooltip inside a scrolling ledger. A scroll container clips its
-   descendants, so the reason for the last row's disabled control was cut off
-   mid-sentence — and, worse, the *hidden* tooltip still counted toward the
-   container's scrollable overflow, putting a horizontal and a vertical
-   scrollbar on a table that fits. `content: none` means the pseudo-element is
-   never generated there at all.
-
-   A ledger row says it a better way instead: a short word in the cell (always
-   visible, no hover, no keyboard trap) with the full sentence still on the
-   button's `aria-describedby` sibling and its native `title`. */
-.ledger-scroll .button[data-reason]::after {
-  content: none;
-}
-
 /* ---- not reported: a value nothing ever writes ---------------------------- */
 
 /* Set in the faint ink and in italics so the eye reads it as a note about the
    value rather than as the value — but still a word, never a dash, because
    the absence is the fact (see components/unwired.tsx). */
 .not-reported {
-  color: var(--fg-faint);
+  color: var(--fg-muted);
   font-style: italic;
   white-space: nowrap;
   cursor: help;
@@ -1987,7 +3675,7 @@ svg {
 
 .repo-table__namespace {
   font-size: var(--text-xs);
-  color: var(--fg-faint);
+  color: var(--fg-muted);
 }
 
 .repo-table__access {
@@ -2004,15 +3692,14 @@ svg {
 
 .repo-table__note {
   font-size: var(--text-xs);
-  color: var(--fg-faint);
+  color: var(--fg-muted);
   overflow-wrap: anywhere;
 }
 
-/* The lamp the list is currently filtered to. `aria-current="page"` is the
-   router's own doing — the link's search is a subset of the URL's — so the
-   marker needs no state kept here. It is the one current marker the system
-   has: the inset tint and a 3px accent bar, as on the rail. */
-.health-strip__lamp[aria-current="page"] {
+/* The lamp the list is currently filtered to (`aria-current`), which links
+   back to the whole list. It is the one current marker the system has: the
+   inset tint and a 3px accent bar, as on the rail. */
+.health-strip__lamp[aria-current="true"] {
   background: var(--bg-inset);
   border-color: var(--line-strong);
   box-shadow: inset 0 -3px 0 0 var(--accent);
@@ -2038,7 +3725,7 @@ svg {
   font-weight: var(--weight-medium);
   letter-spacing: var(--tracking-caps);
   text-transform: uppercase;
-  color: var(--fg-faint);
+  color: var(--fg-muted);
 }
 
 .facts__row dd {
@@ -2057,13 +3744,6 @@ svg {
     grid-template-columns: minmax(0, 1fr);
     gap: 0;
   }
-}
-
-/* A fact whose value is a way in, not a value: the icon marks it as a move. */
-.facts__action {
-  display: inline-flex;
-  align-items: center;
-  gap: var(--space-2);
 }
 
 /* ---- reference lists: named objects with no detail route yet -------------- */
@@ -2106,13 +3786,24 @@ svg {
   display: grid;
   gap: var(--space-3);
   max-width: 34rem;
-  padding: var(--space-3) var(--space-4);
+  padding: var(--space-4);
   border: 1px solid var(--line);
-  border-radius: var(--radius-md);
-  background: var(--bg-surface);
+  border-radius: var(--radius-lg);
+  /* Canvas, not surface: inside a hero card the panel reads as set into it. */
+  background: var(--bg-canvas);
 }
 
-.action__confirm .controls__field {
+/* The same question floating over a page of cards (`presentation="popover"`):
+   the popover is the enclosure, so it gets the panel's spacing, not its
+   border and fill. */
+.action__popover {
+  gap: var(--space-3);
+  width: 26rem;
+  padding: var(--space-4);
+}
+
+.action__confirm .controls__field,
+.action__popover .controls__field {
   max-width: 12rem;
 }
 
@@ -2133,56 +3824,174 @@ svg {
   gap: var(--space-2);
 }
 
-/* ---- receipt: what a mutating action answered ----------------------------- */
+/* ---- toasts: what every action answered ---------------------------------- */
 
-.receipt {
+/* A stack at the bottom right, newest at the bottom. The region itself lets
+   the pointer through; only the toasts take it. */
+.toaster {
+  position: fixed;
+  right: var(--space-4);
+  bottom: var(--space-4);
+  z-index: 70;
+  /* A fixed box's percentage is of the viewport without its scrollbar; 100vw
+     would put the left gutter under it at phone width. */
+  width: min(22rem, calc(100% - 2 * var(--space-4)));
+  pointer-events: none;
+}
+
+.toaster__list {
   display: grid;
-  grid-template-columns: auto minmax(0, 1fr);
+  gap: var(--space-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.toast {
+  position: relative;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: start;
   gap: var(--space-3);
-  max-width: 34rem;
-  padding: var(--space-3) var(--space-4);
-  border: 1px solid var(--health-healthy-fg);
-  border-radius: var(--radius-md);
-  background: var(--health-healthy-bg);
+  overflow: hidden;
+  padding: var(--space-3) var(--space-3) calc(var(--space-3) + 2px) var(--space-4);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  background: var(--bg-surface);
+  color: var(--fg);
+  box-shadow: var(--shadow-2);
+  pointer-events: auto;
+  animation: toast-in var(--dur-base) cubic-bezier(0.2, 0, 0, 1);
 }
 
-.receipt__icon {
-  display: flex;
+/* Already on screen when the toaster moved into or out of a drawer. */
+.toast[data-arrived="true"] {
+  animation: none;
+}
+
+.toast[data-leaving="true"] {
+  animation: toast-out 140ms var(--ease-out) forwards;
+}
+
+.toast__icon {
+  display: inline-flex;
+  padding-top: 2px;
+}
+
+.toast[data-tone="healthy"] .toast__icon {
   color: var(--health-healthy-fg);
-  padding-top: 1px;
 }
 
-.receipt__body {
+.toast[data-tone="failed"] {
+  border-color: var(--health-failed-fg);
+}
+
+.toast[data-tone="failed"] .toast__icon {
+  color: var(--health-failed-fg);
+}
+
+.toast__body {
   display: grid;
   gap: var(--space-1);
   min-width: 0;
 }
 
-.receipt__what {
+.toast__what {
   margin: 0;
   font-weight: var(--weight-semibold);
+  overflow-wrap: anywhere;
 }
 
-.receipt__note {
+.toast__note {
   margin: 0;
   color: var(--fg-muted);
   line-height: var(--leading-prose);
   overflow-wrap: anywhere;
 }
 
-.receipt__created {
+.toast__created {
   display: flex;
   flex-wrap: wrap;
-  gap: var(--space-1) var(--space-4);
+  gap: var(--space-2);
   margin: 0;
   padding: 0;
   list-style: none;
 }
 
-.receipt__meta {
+.toast__meta {
   margin: 0;
   font-size: var(--text-xs);
-  color: var(--fg-faint);
+  color: var(--fg-muted);
+}
+
+.toast__close {
+  display: inline-grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--fg-muted);
+}
+
+.toast__close:hover {
+  background: var(--bg-hover);
+  color: var(--fg);
+}
+
+.toast__close:focus-visible {
+  box-shadow: var(--focus-ring);
+}
+
+/* The time left, running down along the foot. It stops with the clock: the
+   pointer on the toast, focus inside it, the tab hidden (`data-paused`). A
+   toast remounted part-way starts its line part-way (`--toast-elapsed`). */
+.toast__timer {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  height: 2px;
+  background: var(--health-healthy-fg);
+  transform-origin: left center;
+  animation: toast-decay var(--toast-ms) linear var(--toast-elapsed, 0ms) forwards;
+}
+
+.toast[data-paused="true"] .toast__timer {
+  animation-play-state: paused;
+}
+
+@keyframes toast-in {
+  from {
+    opacity: 0;
+    transform: translateY(12px);
+  }
+}
+
+@keyframes toast-out {
+  to {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+}
+
+@keyframes toast-decay {
+  from {
+    transform: scaleX(1);
+  }
+  to {
+    transform: scaleX(0);
+  }
+}
+
+/* With less motion the line would only jump to empty; the toast still lasts
+   its time and still pauses, on the JS clock. */
+@media (prefers-reduced-motion: reduce) {
+  .toast__timer {
+    display: none;
+  }
 }
 
 /* ---- replication ledger --------------------------------------------------- */
@@ -2223,12 +4032,12 @@ svg {
 .replication-table__namespace,
 .replication-table__note {
   font-size: var(--text-xs);
-  color: var(--fg-faint);
+  color: var(--fg-muted);
   overflow-wrap: anywhere;
 }
 
 .replication-table__arrow {
-  color: var(--fg-faint);
+  color: var(--fg-muted);
 }
 
 .replication-table__schedule .mono {
@@ -2253,16 +4062,64 @@ svg {
 /* The intro and the way back out, on one line at width and stacked below it.
    The prose is capped like every other `page__prose`; the button does not
    stretch to meet it. */
+/* The page's one card: the snapshot being browsed (the picker that names it,
+   a way to its details, its facts in one row) and, under a rule, the browse
+   session that reads it. */
 .browse-head {
+  display: grid;
+  gap: var(--space-3);
+  max-width: 46rem;
+  padding: var(--space-4);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  background: var(--bg-surface);
+}
+
+.browse-head__pick {
   display: flex;
-  align-items: start;
-  justify-content: space-between;
-  gap: var(--space-3) var(--space-5);
+  align-items: end;
+  gap: var(--space-3);
   flex-wrap: wrap;
 }
 
-.browse-head .page__prose {
-  margin: 0;
+.browse-head__pick .picker-field {
+  flex: 1 1 18rem;
+  grid-template-columns: minmax(0, 1fr);
+  min-width: 0;
+}
+
+/* Snapshot names are long: the field takes the row, not the width of its
+   placeholder. */
+.browse-head__pick .picker-field__button {
+  width: 100%;
+  min-width: 0;
+  max-width: 34rem;
+}
+
+.browse-head__body {
+  padding-top: var(--space-4);
+  border-top: 1px solid var(--line);
+}
+
+/* Inside the card the session is a half of it, not a panel of its own. */
+.browse-head .browse-session {
+  max-width: none;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: none;
+}
+
+.browse-head .facts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2) var(--space-5);
+}
+
+.browse-head .facts__row {
+  display: grid;
+  grid-template-columns: none;
+  gap: var(--space-1);
 }
 
 /* The one panel on this screen, and the one place the cost of browsing is
@@ -2275,7 +4132,7 @@ svg {
   max-width: 46rem;
   padding: var(--space-4);
   border: 1px solid var(--line);
-  border-radius: var(--radius-md);
+  border-radius: var(--radius-lg);
   background: var(--bg-surface);
 }
 
@@ -2328,7 +4185,7 @@ svg {
 /* An absent deadline is not "never" and not "expired": it is a value the
    server did not publish, written the way every other unpublished value is. */
 .browse-session__no-expiry {
-  color: var(--fg-faint);
+  color: var(--fg-muted);
   font-style: italic;
 }
 
@@ -2359,7 +4216,7 @@ svg {
 }
 
 .browse-crumbs__sep {
-  color: var(--fg-faint);
+  color: var(--fg-muted);
   flex: none;
 }
 
@@ -2373,18 +4230,9 @@ svg {
 
 /* The directory ledger. Names wrap rather than losing characters to an
    ellipsis, as everywhere else on this console: a filename truncated to
-   nothing is the one thing this screen must not do.
-
-   Six columns need more than `.ledger-scroll > .ledger`'s 30rem floor. Below
-   it the Entry column was squeezed to about two characters and a filename
-   wrapped one letter per line — technically not truncated, and completely
-   unreadable. Same selector shape as the rule it raises (later wins at equal
-   specificity), so the ledger scrolls on a narrow viewport instead, which is
-   the console's documented answer for a wide ledger. */
-.ledger-scroll > .dir-table {
-  min-width: 52rem;
-}
-
+   nothing is the one thing this screen must not do. The Entry column's floor
+   (`DirTable.tsx`) keeps a name from wrapping one letter per line; past it the
+   ledger scrolls. */
 .dir-table__entry {
   display: flex;
   align-items: baseline;
@@ -2395,7 +4243,7 @@ svg {
 }
 
 .dir-table__icon {
-  color: var(--fg-faint);
+  color: var(--fg-muted);
   flex: none;
   align-self: center;
 }
@@ -2405,7 +4253,7 @@ svg {
 }
 
 .dir-table__note {
-  color: var(--fg-faint);
+  color: var(--fg-muted);
   font-size: var(--text-xs);
 }
 
@@ -2416,11 +4264,9 @@ svg {
   justify-content: start;
 }
 
-/* A refused download and its short word. The word is in the cell rather than
-   in a hover tooltip because a ledger scrolls, and a scroll container clips
-   the tooltip a disabled control would carry — see `.ledger-scroll
-   .button[data-reason]::after`. The full sentence is still on the button's
-   `aria-describedby` sibling and its native `title`. */
+/* A refused download and its short word. A table cell has no room for the
+   sentence, so the cell shows the word and the full sentence stays on the
+   button's `aria-describedby` sibling and its native `title`. */
 .dir-table__file {
   display: flex;
   align-items: center;
@@ -2498,7 +4344,7 @@ svg {
 
 .snapshot-table__namespace {
   font-size: var(--text-xs);
-  color: var(--fg-faint);
+  color: var(--fg-muted);
   overflow-wrap: anywhere;
 }
 
@@ -2533,7 +4379,7 @@ svg {
 /* ---- the detail ---------------------------------------------------------- */
 
 .facts__age {
-  color: var(--fg-faint);
+  color: var(--fg-muted);
 }
 
 /* The mover's own last lines, already redacted server-side. */
@@ -2543,7 +4389,7 @@ svg {
   max-height: 22rem;
   overflow: auto;
   border: 1px solid var(--line);
-  border-radius: var(--radius-md);
+  border-radius: var(--radius-lg);
   background: var(--bg-inset);
   color: var(--fg);
   font-family: var(--font-mono);
@@ -2554,21 +4400,6 @@ svg {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
   tab-size: 2;
-}
-
-/* A checkbox whose consequence is permanent gets the consequence beside it,
-   not in a hover. */
-.action__switch {
-  display: grid;
-  gap: var(--space-1);
-  margin-top: var(--space-3);
-}
-
-.action__switch label {
-  display: flex;
-  align-items: center;
-  gap: var(--space-2);
-  font-weight: var(--weight-medium);
 }
 
 /* ---- lineage: one hop up, one hop down ----------------------------------- */
@@ -2604,7 +4435,7 @@ svg {
 
 .lineage__meta {
   font-size: var(--text-xs);
-  color: var(--fg-faint);
+  color: var(--fg-muted);
   overflow-wrap: anywhere;
 }
 
@@ -2672,7 +4503,7 @@ svg {
 .retention-table__age {
   display: block;
   font-size: var(--text-xs);
-  color: var(--fg-faint);
+  color: var(--fg-muted);
 }
 
 /* The holding rule is a sentence, not a chip: it is the whole explanation of
@@ -2693,7 +4524,7 @@ svg {
 /* A pruned row is quieter than a kept one but never struck through or hidden:
    it is still a snapshot that exists today. */
 .retention-table tr[data-kept="false"] .retention-table__rule {
-  color: var(--fg-faint);
+  color: var(--fg-muted);
 }
 
 /* ---- the size chart ------------------------------------------------------ */
@@ -2709,7 +4540,7 @@ svg {
   gap: var(--space-2);
   padding: var(--space-3);
   border: 1px solid var(--line);
-  border-radius: var(--radius-md);
+  border-radius: var(--radius-lg);
   background: var(--bg-surface);
 }
 
@@ -2744,7 +4575,7 @@ svg {
 
 .chart__readout-meta {
   font-size: var(--text-xs);
-  color: var(--fg-faint);
+  color: var(--fg-muted);
 }
 
 /* A plot scrolls; it does not shrink. Both charts are drawn in a 560-unit
@@ -2774,24 +4605,33 @@ svg {
 }
 
 .chart__axis {
-  fill: var(--fg-faint);
+  fill: var(--fg-muted);
   font-family: var(--font-sans);
   font-size: 9px;
   font-variant-numeric: tabular-nums;
 }
 
-/* One series, so no categorical palette: the body ink the console already
-   uses, at the 2px the mark specs ask for. */
+/* One series, so no categorical palette: the accent, at the 2.2px the chart
+   spec asks for. */
 .chart__line {
   fill: none;
-  stroke: var(--fg-muted);
-  stroke-width: 2;
+  stroke: var(--accent);
+  stroke-width: 2.2;
   stroke-linejoin: round;
   stroke-linecap: round;
 }
 
+/* The fill under the line: the same accent, quiet enough that gridlines
+   still read through it. */
+.chart__area {
+  fill: color-mix(in srgb, var(--accent) 16%, transparent);
+  stroke: none;
+}
+
 .chart__dot {
-  fill: var(--fg-muted);
+  fill: var(--bg-surface);
+  stroke: var(--accent);
+  stroke-width: 1.5;
 }
 
 /* The point under the pointer takes the accent — selection, which is what the
@@ -2808,40 +4648,28 @@ svg {
   fill: transparent;
 }
 
-/* ---- the lag bars -------------------------------------------------------- */
+/* ---- lag: each replication's age, as a bar under its "Last replicated" ----
+   One axis down the column, scaled to the stalest copy. One hue: nothing here
+   encodes state in colour; suspension and "never" are words in the row. */
 
-/* The unfilled remainder of each row: the same inset the ledgers use, so the
-   bar reads as a length against a known track rather than as a floating mark. */
-.lag__track {
-  fill: var(--bg-inset);
+.lag {
+  display: grid;
+  gap: 4px;
 }
 
-/* One series, one hue. Nothing here encodes state in colour — the only state
-   that matters, suspension, is a word in the table. */
-.lag__bar {
-  fill: var(--fg-muted);
+.lag-bar {
+  display: block;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--bg-inset);
+  overflow: hidden;
 }
 
-/* A stopped schedule: the age is real, the alarm is not, so the bar recedes.
-   Opacity rather than a second fill, so it composes with selection below —
-   a suspended bar under the pointer must still show it is the selected one.
-   The word in the table is what actually says why it is dimmed. */
-.lag__bar[data-suspended="true"] {
-  opacity: 0.55;
-}
-
-/* Selection, which is what the accent is for. The 2px surface ring is the
-   mark spec's gap between overlapping fills. */
-.lag__bar[data-current="true"] {
-  fill: var(--accent);
-  stroke: var(--bg-surface);
-  stroke-width: 2;
-}
-
-.lag__suspended {
-  font-family: var(--font-sans);
-  font-size: var(--text-xs);
-  color: var(--fg-faint);
+.lag-bar__fill {
+  display: block;
+  height: 100%;
+  border-radius: 2px;
+  background: var(--fg-muted);
 }
 
 /* A lone measurement: the value IS the chart, so it is set as a figure rather
@@ -2924,20 +4752,31 @@ svg {
 
 .action__choice > legend {
   padding: 0;
-  color: var(--fg-faint);
+  color: var(--fg-muted);
   font-size: var(--text-xs);
   font-weight: var(--weight-medium);
   letter-spacing: var(--tracking-caps);
   text-transform: uppercase;
 }
 
+/* Each answer is a bordered row, so the consequence beside a radio reads as
+   one choice; the chosen row takes the accent edge. */
 .action__choice > label {
   display: grid;
   grid-template-columns: auto minmax(0, 1fr);
   align-items: start;
   gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  background: var(--bg-surface);
   color: var(--fg);
   line-height: var(--leading-prose);
+  cursor: pointer;
+}
+
+.action__choice > label:has(input:checked) {
+  border-color: var(--accent);
 }
 
 .action__choice input[type="radio"] {
@@ -2949,14 +4788,13 @@ svg {
 /* The destructive question is the one that decides whether existing data
    survives, so it is set off by the failed lamp's own rule rather than by a
    second box. */
-.action__choice[data-danger="true"] {
-  padding-left: var(--space-3);
+.action__choice > label[data-danger="true"] {
   border-left: 2px solid var(--health-failed-fg);
 }
 
 .action__note {
   margin: 0;
-  color: var(--fg-faint);
+  color: var(--fg-muted);
   font-size: var(--text-sm);
   line-height: var(--leading-prose);
 }
@@ -2997,7 +4835,7 @@ svg {
 .policy-table__namespace,
 .policy-table__note {
   font-size: var(--text-xs);
-  color: var(--fg-faint);
+  color: var(--fg-muted);
   overflow-wrap: anywhere;
 }
 
@@ -3045,7 +4883,7 @@ svg {
 }
 
 .retention-rules__field {
-  color: var(--fg-faint);
+  color: var(--fg-muted);
   font-size: var(--text-xs);
 }
 
@@ -3082,7 +4920,7 @@ svg {
 .schedule-table__namespace,
 .schedule-table__note {
   font-size: var(--text-xs);
-  color: var(--fg-faint);
+  color: var(--fg-muted);
   overflow-wrap: anywhere;
 }
 
@@ -3104,7 +4942,7 @@ svg {
 /* An absence that is merely an absence (no next slot computed) stays quiet:
    it is usually just a suspended schedule. */
 .schedule-table__absent {
-  color: var(--fg-faint);
+  color: var(--fg-muted);
 }
 
 .schedule-table__action {
@@ -3151,14 +4989,14 @@ svg {
 }
 
 .restore-table__arrow {
-  color: var(--fg-faint);
+  color: var(--fg-muted);
 }
 
 .restore-table__namespace,
 .restore-table__note,
 .restore-table__absent {
   font-size: var(--text-xs);
-  color: var(--fg-faint);
+  color: var(--fg-muted);
   overflow-wrap: anywhere;
 }
 
@@ -3167,15 +5005,6 @@ svg {
 /* The resource's own coordinate, beside the repository the region is titled
    by — the two differ whenever a ClusterRepository's maintenance lives in the
    operator's namespace rather than the repository's. */
-.maintenance__resource {
-  color: var(--fg-faint);
-  font-size: var(--text-xs);
-  /* A flex item cannot shrink past its content without this pair, and a
-     `kopiur-system/<cluster-repository>-maintenance` name is long enough to
-     push a phone-width page sideways on its own. */
-  min-width: 0;
-  overflow-wrap: anywhere;
-}
 
 /* The refusal at its short length, beside a trigger the reader cannot press.
    Needed wherever `.ledger-scroll` suppresses the floating tooltip: without
@@ -3183,7 +5012,7 @@ svg {
    mouse user can reach. The full sentence is still on the button's
    aria-describedby sibling and its native title. */
 .action__short {
-  color: var(--fg-faint);
+  color: var(--fg-muted);
   font-size: var(--text-xs);
   overflow-wrap: anywhere;
 }
@@ -3208,15 +5037,15 @@ svg {
 }
 
 /* An open confirmation must not move the other triggers.
-   `ActionPanel` keeps its trigger, panel and result in one wrapper so a dialog
+   `ActionPanel` keeps its trigger and panel in one wrapper so a dialog
    drops anywhere as a single element — but inside an `action-bar` that wrapper
    is a flex item, and an open 34rem panel grew it and shoved every other
    trigger across the row. (Task 5 hit the same thing and moved the panel below
    the bar; this is that, without splitting the component.)
 
    `display: contents` takes the wrapper out of the layout, so the trigger is a
-   flex item of the bar and keeps its place, while the panel and the receipt
-   become full-width rows *after* every trigger. The short refusal stays beside
+   flex item of the bar and keeps its place, while an inline panel becomes a
+   full-width row *after* every trigger. The short refusal stays beside
    its own button in source order. */
 .action-bar > .action {
   display: contents;
@@ -3225,10 +5054,4 @@ svg {
 .action-bar > .action > .action__confirm {
   flex: 1 0 100%;
   order: 2;
-}
-
-.action-bar > .action > .receipt,
-.action-bar > .action > .problem {
-  flex: 1 0 100%;
-  order: 3;
 }

@@ -10,6 +10,56 @@ const quiet: VerdictInputs = {
 };
 
 describe("overviewVerdict", () => {
+  it("is never healthy beside a failed tile: a failed snapshot tally fails the verdict", () => {
+    const verdict = overviewVerdict({
+      ...quiet,
+      tallies: [
+        {
+          kind: "snapshot",
+          total: 3,
+          byHealth: [
+            { health: "failed", count: 1 },
+            { health: "healthy", count: 2 },
+          ],
+          refused: false,
+        },
+      ],
+    });
+    expect(verdict).toEqual({ health: "failed", text: "Needs attention: 1 snapshot failed." });
+  });
+
+  it("reads an unknown or degraded tally as degraded, named by its kind", () => {
+    const verdict = overviewVerdict({
+      ...quiet,
+      tallies: [
+        { kind: "restore", total: 1, byHealth: [{ health: "unknown", count: 1 }], refused: false },
+        {
+          kind: "snapshotPolicy",
+          total: 2,
+          byHealth: [{ health: "degraded", count: 2 }],
+          refused: false,
+        },
+      ],
+    });
+    expect(verdict.health).toBe("degraded");
+    expect(verdict.text).toBe("Mostly healthy: 1 restore unknown, 2 policies degraded.");
+  });
+
+  it("leaves repositories to the repository list, so they are not counted twice", () => {
+    const verdict = overviewVerdict({
+      ...quiet,
+      tallies: [
+        {
+          kind: "repository",
+          total: 3,
+          byHealth: [{ health: "failed", count: 3 }],
+          refused: false,
+        },
+      ],
+    });
+    expect(verdict.health).toBe("healthy");
+  });
+
   it("is healthy only when every source loaded and nothing is lit", () => {
     const verdict = overviewVerdict(quiet);
     expect(verdict.health).toBe("healthy");
@@ -128,5 +178,45 @@ describe("overviewVerdict", () => {
     });
     expect(verdict.health).toBe("unknown");
     expect(verdict.text).toBe("No repositories in scope, nothing stalled, no failing checks.");
+  });
+
+  it("is never green while a kind could not be listed, and says which", () => {
+    const verdict = overviewVerdict({
+      ...quiet,
+      tallies: [
+        { kind: "repositoryReplication", total: 0, byHealth: [], refused: true },
+        { kind: "snapshotReplication", total: 0, byHealth: [], refused: true },
+        { kind: "restore", total: 0, byHealth: [], refused: true },
+      ],
+    });
+    expect(verdict).toEqual({
+      health: "unknown",
+      text: "Cannot fully check: you may not list replications or restores here.",
+    });
+  });
+
+  it("names a refused kind beside what failed", () => {
+    const verdict = overviewVerdict({
+      ...quiet,
+      tallies: [
+        { kind: "snapshot", total: 1, byHealth: [{ health: "failed", count: 1 }], refused: false },
+        { kind: "restore", total: 0, byHealth: [], refused: true },
+      ],
+    });
+    expect(verdict).toEqual({
+      health: "failed",
+      text: "Needs attention: 1 snapshot failed. You may not list restores here.",
+    });
+  });
+
+  it("names both a blocked check and a refused kind, each its own sentence", () => {
+    const verdict = overviewVerdict({
+      ...quiet,
+      doctor: { ...quiet.doctor, rbac: 1 },
+      tallies: [{ kind: "restore", total: 0, byHealth: [], refused: true }],
+    });
+    expect(verdict.text).toBe(
+      "Cannot fully check: 1 doctor check could not run with your permissions. You may not list restores here.",
+    );
   });
 });

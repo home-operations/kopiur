@@ -34,7 +34,7 @@ import { CircleHelp } from "lucide-react";
 import type { OriginView, SnapshotPhaseView, SnapshotRow } from "../api/types";
 import { unknownVariant } from "../util/assertNever";
 import { EMPTY_CELL } from "../util/format";
-import { type Lamp, healthLamp } from "./health";
+import { type Lamp, healthLamp, inFlightLamp } from "./health";
 
 /** A lamp carrying a phase's own word instead of the health word. */
 function lampWith(key: Parameters<typeof healthLamp>[0], word: string): Lamp {
@@ -59,7 +59,7 @@ export function snapshotPhaseLamp(phase: SnapshotPhaseView | null | undefined): 
       case "pending":
         return lampWith("pending", "Pending");
       case "running":
-        return lampWith("pending", "Running");
+        return inFlightLamp("Running");
       case "succeeded":
         return lampWith("healthy", "Succeeded");
       case "failed":

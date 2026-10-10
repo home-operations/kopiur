@@ -29,14 +29,35 @@ const CSS = readStyles();
  * it needs a `:focus-visible` rule instead.
  */
 const NEVER_FOCUSED = new Set([
-  // The disabled-control tooltip: a `::after` pseudo-element.
-  ".button[data-reason]::after",
-  // A floating panel, not a control.
+  // Card lifts: a stat strip (`<dl>`) and an attention row (`<li>`) are
+  // never focusable themselves; the links inside them carry the ring.
+  ".stats",
+  ".attention-row",
+  // A finding (`<article>`/`<div>`) and a page state are cards, not controls.
+  ".finding",
+  ".state",
+  // Floating panels and the open drawer: containers, not controls.
   ".identity__panel",
+  ".search__results",
+  // An anchored popover's panel is a container; its controls carry the ring.
+  ".popover__panel",
+  // A toast is a card; its close button carries the ring.
+  ".toast",
+  // The lifted copy of a dragged row: a picture, `aria-hidden`, never focused.
+  ".column-picker__ghost",
+  '.shell[data-nav-open="true"] .sidebar',
   // The pressed theme option — covered by its own rule, asserted separately.
   '.theme-switch__option[aria-pressed="true"]',
   // The skip link — covered by its own rule, asserted separately.
   ".skip-link",
+  // The side panel's resize tab is a pseudo-element of the handle; the handle
+  // draws its ring on that tab, asserted separately.
+  ".side-panel__grip::after",
+  // The overview split's grip, likewise a pseudo-element of its gutter.
+  ".split__gutter::after",
+  // A region card and an activity row: containers; the links inside carry
+  // the ring (an activity row draws it when its link is focused).
+  ".page__card",
 ]);
 
 function setsOuterBoxShadow(body: string): boolean {
@@ -76,6 +97,21 @@ describe("the focus ring", () => {
 
   it("survives on the skip link, which is the first control a keyboard reaches", () => {
     const rule = all.find((r) => r.selector === ".skip-link:focus-visible");
+    expect(rule?.body).toContain("var(--focus-ring)");
+  });
+
+  it("survives on the side panel's resize handle, drawn on its raised tab", () => {
+    const rule = all.find((r) => r.selector === ".side-panel__grip:focus-visible::after");
+    expect(rule?.body).toContain("var(--focus-ring)");
+  });
+
+  it("survives on the overview split's handle, drawn on its grip", () => {
+    const rule = all.find((r) => r.selector === ".split__gutter:focus-visible::after");
+    expect(rule?.body).toContain("var(--focus-ring)");
+  });
+
+  it("survives on a whole-row link in the activity list, drawn on the row", () => {
+    const rule = all.find((r) => r.selector === ".activity-row:has(.row-link:focus-visible)");
     expect(rule?.body).toContain("var(--focus-ring)");
   });
 

@@ -187,3 +187,12 @@ describe("snapshotVerdict", () => {
     warn.mockRestore();
   });
 });
+
+describe("in-flight phases", () => {
+  it("draw the play icon on the pending colour, so running reads differently from waiting", async () => {
+    const { CirclePlay, Clock } = await import("lucide-react");
+    expect(snapshotPhaseLamp("running").icon).toBe(CirclePlay);
+    expect(snapshotPhaseLamp("pending").icon).toBe(Clock);
+    expect(snapshotPhaseLamp("running").key).toBe("pending");
+  });
+});

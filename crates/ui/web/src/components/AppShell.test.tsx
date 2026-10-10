@@ -1,6 +1,6 @@
 import { QueryClientProvider } from "@tanstack/react-query";
 import { RouterProvider, createMemoryHistory, createRouter } from "@tanstack/react-router";
-import { act, render, screen, within } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import createFetchMock from "vitest-fetch-mock";
@@ -11,6 +11,7 @@ import type { Me } from "../api/types";
 import { routeTree } from "../routeTree.gen";
 import { setThemePreference } from "../util/theme";
 import { CAPABILITY_KEYS, capabilityReason } from "./capabilities";
+import { browsed } from "./browse/browsed";
 import { NAV_ITEMS, sectionFor } from "./nav";
 
 const fetchMock = createFetchMock(vi);
@@ -87,14 +88,26 @@ afterEach(() => {
 });
 
 describe("AppShell", () => {
-  it("lists the ten sections, marks the current one, and scopes the header to the namespace", async () => {
+  it("closes the navigation drawer on Escape and hands focus back to its button", async () => {
+    mockShell();
+    mountAt("/snapshots");
+    const user = userEvent.setup();
+    const menu = await screen.findByRole("button", { name: "Navigation" });
+    await user.click(menu);
+    expect(menu).toHaveAttribute("aria-expanded", "true");
+    await user.keyboard("{Escape}");
+    expect(menu).toHaveAttribute("aria-expanded", "false");
+    expect(menu).toHaveFocus();
+  });
+
+  it("lists the eleven sections, marks the current one, and scopes the header to the namespace", async () => {
     mockShell();
     mountAt("/snapshots?namespace=prod");
 
     const nav = await screen.findByRole("navigation", { name: "Primary" });
     const links = within(nav).getAllByRole("link");
     expect(links.map((link) => link.textContent)).toEqual(NAV_ITEMS.map((item) => item.label));
-    expect(links).toHaveLength(10);
+    expect(links).toHaveLength(11);
     expect(within(nav).getByRole("link", { name: "Snapshots" })).toHaveAttribute(
       "aria-current",
       "page",
@@ -109,6 +122,202 @@ describe("AppShell", () => {
     const heading = screen.getByRole("heading", { level: 1 });
     expect(heading).toHaveTextContent("Snapshots");
     expect(heading).toHaveTextContent("prod");
+  });
+
+  it("puts each kind's count and health beside its section, the failures first and in words", async () => {
+    fetchMock.resetMocks();
+    fetchMock.mockResponse((request) => {
+      const url = new URL(request.url, "http://localhost");
+      const body =
+        url.pathname === "/api/v1/me"
+          ? alice
+          : url.pathname === "/api/v1/overview"
+            ? {
+                snapshotWindowHours: 24,
+                generatedAt: "2026-10-08T12:00:00Z",
+                kinds: [
+                  {
+                    kind: "repository",
+                    total: 2,
+                    byHealth: [
+                      { health: "failed", count: 1 },
+                      { health: "healthy", count: 1 },
+                    ],
+                  },
+                  {
+                    kind: "clusterRepository",
+                    total: 1,
+                    byHealth: [{ health: "healthy", count: 1 }],
+                  },
+                  { kind: "snapshotSchedule", total: 0, byHealth: [] },
+                  { kind: "snapshotPolicy", total: 2, byHealth: [{ health: "healthy", count: 2 }] },
+                ],
+              }
+            : [];
+      return Promise.resolve(
+        new Response(JSON.stringify(body), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }),
+      );
+    });
+    mountAt("/policies?namespace=media");
+    const nav = await screen.findByRole("navigation", { name: "Primary" });
+
+    // The name stays the section's; the count and health are its description.
+    const repositories = await within(nav).findByRole("link", {
+      name: "Repositories",
+      description: "3: 1 failed, 2 ok",
+    });
+    expect(repositories.querySelector(".nav-item__count")).toHaveTextContent("3");
+    expect(repositories.querySelector(".health[data-health='failed']")).toHaveTextContent("1");
+    expect(repositories.querySelector(".status-bar")).toHaveAttribute("aria-hidden", "true");
+    // A failing section links straight to what is failing, keeping the scope.
+    expect(repositories).toHaveAttribute("href", "/repositories?health=failed&namespace=media");
+
+    const policies = within(nav).getByRole("link", { name: "Policies", description: "2: 2 ok" });
+    expect(policies.querySelector(".health")).toBeNull();
+    expect(within(nav).getByRole("link", { name: "Schedules" })).toHaveAccessibleDescription(
+      "none in scope",
+    );
+    for (const name of ["Overview", "Topology", "Doctor"]) {
+      expect(within(nav).getByRole("link", { name }).querySelector(".nav-item__count")).toBeNull();
+    }
+  });
+
+  it("shows no counts when the fleet overview could not be read", async () => {
+    mockShell();
+    mountAt("/doctor");
+    const nav = await screen.findByRole("navigation", { name: "Primary" });
+    expect(
+      within(nav).getByRole("link", { name: "Repositories" }),
+    ).not.toHaveAccessibleDescription();
+    expect(nav.querySelector(".nav-item__count")).toBeNull();
+  });
+
+  describe("the Browse line", () => {
+    const SESSION = "/api/v1/snapshots/media/nightly-1/session";
+
+    /** The shell, with the session read answering `session`. */
+    function mockSession(session: () => Response) {
+      mockShell();
+      fetchMock.mockResponse((request) => {
+        const url = new URL(request.url, "http://localhost");
+        if (url.pathname === SESSION) return Promise.resolve(session());
+        const body = url.pathname === "/api/v1/me" ? JSON.stringify(alice) : "[]";
+        return Promise.resolve(
+          new Response(body, { status: 200, headers: { "content-type": "application/json" } }),
+        );
+      });
+    }
+
+    const json = (body: unknown, status = 200) =>
+      new Response(JSON.stringify(body), {
+        status,
+        headers: { "content-type": "application/json" },
+      });
+    const none = () =>
+      json(
+        {
+          type: "urn:kopiur:problem:session-required",
+          title: "Session required",
+          status: 404,
+          detail: "none",
+          what: "none",
+          why: "none",
+          fix: "start one",
+          instance: null,
+          kubeReason: null,
+        },
+        404,
+      );
+
+    async function line() {
+      const nav = await screen.findByRole("navigation", { name: "Primary" });
+      const link = within(nav).getByRole("link", { name: "Browse" });
+      return { link, bar: link.querySelector(".status-bar--nav > span") };
+    }
+
+    it("is grey while nothing is browsed", async () => {
+      mockShell();
+      mountAt("/");
+      const { link, bar } = await line();
+      expect(bar).toHaveAttribute("data-browse", "idle");
+      expect(link).toHaveAccessibleDescription("No session running");
+    });
+
+    it("is green while a session runs on the snapshot Browse is on", async () => {
+      browsed.browse("media/nightly-1");
+      mockSession(() =>
+        json({
+          namespace: "media",
+          job: "kopiur-browse-nas",
+          pod: "kopiur-browse-nas-abcde",
+          reused: true,
+          expiresAt: null,
+          downloadMaxBytes: 1,
+          manifestMaxBytes: 1,
+        }),
+      );
+      mountAt("/");
+      const { link } = await line();
+      await waitFor(() => {
+        expect(link.querySelector(".status-bar--nav > span")).toHaveAttribute(
+          "data-browse",
+          "active",
+        );
+      });
+      expect(link).toHaveAccessibleDescription("A browse session is running on media/nightly-1");
+    });
+
+    it("is red when the last start on it failed", async () => {
+      browsed.browse("media/nightly-1");
+      browsed.started("media/nightly-1", false);
+      mockSession(none);
+      mountAt("/");
+      const { link } = await line();
+      await waitFor(() => {
+        expect(link.querySelector(".status-bar--nav > span")).toHaveAttribute(
+          "data-browse",
+          "failed",
+        );
+      });
+      expect(link).toHaveAccessibleDescription("The last browse session on media/nightly-1 failed");
+    });
+  });
+
+  it("groups the sections by family, and the group names are not links", async () => {
+    mockShell();
+    mountAt("/");
+    const nav = await screen.findByRole("navigation", { name: "Primary" });
+    for (const group of ["Storage", "Protection", "Data"]) {
+      const label = within(nav).getByText(group);
+      expect(label.closest("a")).toBeNull();
+    }
+    // The data itself reads before the recipes that protect it.
+    const labels = [...nav.querySelectorAll(".nav-group__label")].map((label) => label.textContent);
+    expect(labels).toEqual(["Storage", "Data", "Protection"]);
+    const data = within(nav).getByText("Data").closest(".nav-group");
+    expect(
+      within(data as HTMLElement)
+        .getAllByRole("link")
+        .map((link) => link.textContent),
+    ).toEqual(["Snapshots", "Browse", "Restores"]);
+    // A kind section carries its kind's chip, so the nav already teaches the colours.
+    const repositories = within(nav).getByRole("link", { name: "Repositories" });
+    expect(repositories.querySelector('[data-kind="repository"]')).not.toBeNull();
+  });
+
+  it("has no header bar: the sidebar holds the namespace switcher, search and user", async () => {
+    mockShell();
+    mountAt("/snapshots?namespace=prod");
+    const sidebar = await screen.findByRole("complementary", { name: "Sections" });
+    expect(within(sidebar).getByRole("button", { name: "Namespace: prod" })).toBeInTheDocument();
+    expect(within(sidebar).getByRole("searchbox", { name: "Find an object" })).toBeInTheDocument();
+    expect(
+      await within(sidebar).findByText("alice", { selector: ".identity__user" }),
+    ).toBeInTheDocument();
+    expect(document.querySelector("header.header")).toBeNull();
   });
 
   it("shows the signed-in identity and re-asks /me for the current namespace", async () => {

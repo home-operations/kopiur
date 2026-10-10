@@ -27,9 +27,14 @@ use serde::Deserialize;
 use std::collections::BTreeSet;
 use std::time::Duration;
 
-use kopiur_ops::doctor::{DoctorCheck, DoctorParams, DoctorReport, Outcome, run_all};
+use kopiur_ops::doctor::{
+    DoctorCheck, DoctorParams, DoctorReport, FindingKind, FindingSeverity, ObjectFinding, Outcome,
+    run_all,
+};
 use kopiur_ops::{OpsCtx, Scope};
-use kopiur_ui_model::views::{DoctorCheckView, DoctorReportView, DoctorScopeView};
+use kopiur_ui_model::views::{
+    DoctorCheckView, DoctorObjectView, DoctorReportView, DoctorScopeView, ObjectKind,
+};
 
 use crate::AppState;
 use crate::api::problem::{ApiError, problem};
@@ -260,7 +265,11 @@ pub fn check_scope(check: DoctorCheck) -> DoctorScopeView {
 /// Exhaustive over [`Outcome`]. Only a `Fail` carries what/why/fix: a `Warn`'s
 /// single sentence is its whole story and splitting it into three would put
 /// words in the check's mouth, and a `Pass` has nothing to say.
-pub fn view_check(check: DoctorCheck, outcome: &Outcome) -> DoctorCheckView {
+pub fn view_check(
+    check: DoctorCheck,
+    outcome: &Outcome,
+    objects: &[ObjectFinding],
+) -> DoctorCheckView {
     let (label, what, why, fix) = match outcome {
         Outcome::Pass => ("Pass", None, None, None),
         Outcome::Warn(message) => ("Warn", Some(message.clone()), None, None),
@@ -279,6 +288,34 @@ pub fn view_check(check: DoctorCheck, outcome: &Outcome) -> DoctorCheckView {
         what,
         why,
         fix,
+        objects: objects.iter().map(view_object).collect(),
+    }
+}
+
+/// **Pure.** One object finding onto the wire. Exhaustive over both enums, so
+/// a kind or severity added to doctor cannot reach the console unmapped.
+pub fn view_object(finding: &ObjectFinding) -> DoctorObjectView {
+    let kind = match finding.kind {
+        FindingKind::Repository => ObjectKind::Repository,
+        FindingKind::ClusterRepository => ObjectKind::ClusterRepository,
+        FindingKind::SnapshotPolicy => ObjectKind::SnapshotPolicy,
+        FindingKind::SnapshotSchedule => ObjectKind::SnapshotSchedule,
+        FindingKind::Snapshot => ObjectKind::Snapshot,
+        FindingKind::Restore => ObjectKind::Restore,
+        FindingKind::SnapshotReplication => ObjectKind::SnapshotReplication,
+    };
+    let failing = match finding.severity {
+        FindingSeverity::Fail => true,
+        FindingSeverity::Warn => false,
+    };
+    DoctorObjectView {
+        kind,
+        namespace: finding.namespace.clone(),
+        name: finding.name.clone(),
+        failing,
+        message: finding.message.clone(),
+        fix: finding.fix.clone(),
+        at: finding.at.map(|t| t.to_rfc3339()),
     }
 }
 
@@ -288,7 +325,7 @@ pub fn view_report(report: &DoctorReport, ran_at: &str) -> DoctorReportView {
         checks: report
             .checks
             .iter()
-            .map(|c| view_check(c.check, &c.outcome))
+            .map(|c| view_check(c.check, &c.outcome, &c.objects))
             .collect(),
         exit_code: report.exit_code(),
         ran_at: ran_at.to_string(),
@@ -472,7 +509,7 @@ mod tests {
     #[test]
     fn every_check_publishes_its_scope_on_the_wire() {
         for check in DoctorCheck::ALL {
-            let row = view_check(check, &Outcome::Pass);
+            let row = view_check(check, &Outcome::Pass, &[]);
             assert_eq!(
                 row.scope,
                 check_scope(check),
@@ -484,7 +521,7 @@ mod tests {
 
     #[test]
     fn a_pass_says_nothing_and_a_warn_says_one_thing() {
-        let pass = view_check(DoctorCheck::CrdsInstalled, &Outcome::Pass);
+        let pass = view_check(DoctorCheck::CrdsInstalled, &Outcome::Pass, &[]);
         assert_eq!(pass.outcome, "Pass");
         assert_eq!(pass.check, "crds-installed");
         assert_eq!(pass.title, "CRDs installed");
@@ -495,6 +532,7 @@ mod tests {
         let warn = view_check(
             DoctorCheck::WebhookRunning,
             &Outcome::Warn("cannot list deployments (RBAC)".into()),
+            &[],
         );
         assert_eq!(warn.outcome, "Warn");
         assert_eq!(
@@ -515,6 +553,7 @@ mod tests {
                 why: "its password Secret is missing".into(),
                 fix: "create the Secret nas-pw in namespace media".into(),
             },
+            &[],
         );
         assert_eq!(fail.outcome, "Fail");
         assert_eq!(fail.what.as_deref(), Some("Repository media/nas is Failed"));
@@ -528,18 +567,15 @@ mod tests {
     #[test]
     fn the_reports_exit_code_is_the_one_the_cli_would_have_returned() {
         let all_good = DoctorReport {
-            checks: vec![CheckResult {
-                check: DoctorCheck::CrdsInstalled,
-                outcome: Outcome::Pass,
-            }],
+            checks: vec![CheckResult::new(DoctorCheck::CrdsInstalled, Outcome::Pass)],
         };
         assert_eq!(view_report(&all_good, "2026-09-08T12:00:00Z").exit_code, 0);
 
         let warned = DoctorReport {
-            checks: vec![CheckResult {
-                check: DoctorCheck::CrdsInstalled,
-                outcome: Outcome::Warn("could not verify".into()),
-            }],
+            checks: vec![CheckResult::new(
+                DoctorCheck::CrdsInstalled,
+                Outcome::Warn("could not verify".into()),
+            )],
         };
         assert_eq!(
             view_report(&warned, "2026-09-08T12:00:00Z").exit_code,
@@ -549,10 +585,7 @@ mod tests {
 
         let failed = DoctorReport {
             checks: vec![
-                CheckResult {
-                    check: DoctorCheck::CrdsInstalled,
-                    outcome: Outcome::Pass,
-                },
+                CheckResult::new(DoctorCheck::CrdsInstalled, Outcome::Pass),
                 CheckResult {
                     check: DoctorCheck::NoStuckWork,
                     outcome: Outcome::Fail {
@@ -560,6 +593,7 @@ mod tests {
                         why: "MoverPermitted=False".into(),
                         fix: "annotate the namespace".into(),
                     },
+                    objects: Vec::new(),
                 },
             ],
         };
@@ -567,6 +601,66 @@ mod tests {
         assert_eq!(view.exit_code, 1);
         assert_eq!(view.checks.len(), 2, "every check that ran is reported");
         assert_eq!(view.ran_at, "2026-09-08T12:00:00Z");
+    }
+
+    /// The objects a check names travel one per entry, so the console can
+    /// point at each instead of re-reading the sentence.
+    #[test]
+    fn a_check_carries_each_object_it_names() {
+        let at = chrono::DateTime::parse_from_rfc3339("2026-09-08T11:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let row = view_check(
+            DoctorCheck::RecentFailures,
+            &Outcome::Fail {
+                what: "1 failed".into(),
+                why: "it did not happen".into(),
+                fix: "look".into(),
+            },
+            &[
+                ObjectFinding {
+                    kind: FindingKind::Snapshot,
+                    namespace: Some("media".into()),
+                    name: "nightly-1".into(),
+                    severity: FindingSeverity::Fail,
+                    message: "source PVC missing".into(),
+                    fix: None,
+                    at: Some(at),
+                },
+                ObjectFinding {
+                    kind: FindingKind::ClusterRepository,
+                    namespace: None,
+                    name: "shared".into(),
+                    severity: FindingSeverity::Warn,
+                    message: "read-only".into(),
+                    fix: Some("switch it back".into()),
+                    at: None,
+                },
+            ],
+        );
+        assert_eq!(
+            row.objects,
+            vec![
+                DoctorObjectView {
+                    kind: ObjectKind::Snapshot,
+                    namespace: Some("media".into()),
+                    name: "nightly-1".into(),
+                    failing: true,
+                    message: "source PVC missing".into(),
+                    fix: None,
+                    at: Some("2026-09-08T11:00:00+00:00".into()),
+                },
+                DoctorObjectView {
+                    kind: ObjectKind::ClusterRepository,
+                    namespace: None,
+                    name: "shared".into(),
+                    failing: false,
+                    message: "read-only".into(),
+                    fix: Some("switch it back".into()),
+                    at: None,
+                },
+            ]
+        );
     }
 
     #[test]

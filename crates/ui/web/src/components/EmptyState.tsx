@@ -21,8 +21,10 @@ export interface EmptyStateProps {
 export function EmptyState({ title, children, action, icon: Icon = Archive }: EmptyStateProps) {
   return (
     <div className="state" role="status">
+      <span className="state__icon" aria-hidden="true">
+        <Icon strokeWidth={2} />
+      </span>
       <h2 className="state__title">
-        <Icon size={18} strokeWidth={1.75} aria-hidden="true" />
         <span>{title}</span>
       </h2>
       {children !== undefined && children !== null ? (

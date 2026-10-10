@@ -206,10 +206,35 @@ pub struct RepositorySummary {
     /// `status.server.endpoint`, when running in repository-server mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server_endpoint: Option<String>,
-    /// For `ClusterRepository`: how many namespaces `spec.allowedNamespaces`
-    /// currently admits.
+    /// For `ClusterRepository`: which namespaces `spec.allowedNamespaces`
+    /// admits. Absent for a namespaced `Repository`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub allowed_namespace_count: Option<i64>,
+    pub admits: Option<AdmittedNamespacesView>,
+}
+
+/// Which namespaces a `ClusterRepository` admits, read from its spec.
+///
+/// Named rather than counted: the controller's `status.allowedNamespaceCount`
+/// writes `-1` for "all" and `0` for an unresolved selector, and neither is a
+/// count a person can read. Exhaustive over `AllowedNamespaces`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum AdmittedNamespacesView {
+    /// `allowedNamespaces: { all: true }`.
+    All,
+    /// `allowedNamespaces: { all: false }` — admits none.
+    None,
+    /// An explicit list of this many namespaces.
+    Listed {
+        /// How many namespaces the list names.
+        count: u32,
+    },
+    /// Namespaces matching a label selector, rendered as `k=v,…`.
+    Selector {
+        /// The selector, in `kubectl -l` form.
+        selector: String,
+    },
 }
 
 /// Everything the repository detail screen shows.
@@ -245,10 +270,13 @@ pub struct RepositoryDetail {
     pub conditions: Vec<ConditionView>,
     /// Policies that write into this repository.
     pub policies: Vec<PolicyRef>,
-    /// Names of replications that read from this repository.
-    pub replications_out: Vec<String>,
-    /// Names of replications that write into this repository.
-    pub replications_in: Vec<String>,
+    /// Schedules that fire any policy writing into this repository, sorted by
+    /// namespace then name — the "fired by" end of its relationships.
+    pub schedules: Vec<ScheduleRow>,
+    /// Replications that read from this repository.
+    pub replications_out: Vec<ReplicationRef>,
+    /// Replications that write into this repository.
+    pub replications_in: Vec<ReplicationRef>,
     /// Browse sessions currently open against this repository.
     pub sessions: Vec<SessionInfo>,
 }
@@ -363,6 +391,31 @@ pub struct ConditionView {
     /// `conditions[].lastTransitionTime` as RFC3339.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_transition_time: Option<String>,
+}
+
+/// Which of the two replication kinds a [`ReplicationRef`] names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum ReplicationKind {
+    /// `RepositoryReplication` — blobs synced to a bare backend.
+    RepositoryReplication,
+    /// `SnapshotReplication` — snapshots copied into another repository.
+    SnapshotReplication,
+}
+
+/// A replication named with its kind and namespace, so a client never joins
+/// on a bare name — two replications may share one across namespaces.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct ReplicationRef {
+    /// Which replication kind this is.
+    pub kind: ReplicationKind,
+    /// `metadata.namespace` of the replication.
+    pub namespace: String,
+    /// `metadata.name` of the replication.
+    pub name: String,
 }
 
 /// A namespaced reference to a `SnapshotPolicy`.
@@ -786,6 +839,88 @@ pub struct RepoVerificationView {
     pub last_verified: Option<String>,
 }
 
+/// The nine kopiur kinds the console shows, as one closed vocabulary.
+///
+/// The SPA keys each kind's identity (colour, glyph, label) on this, so a new
+/// kind cannot reach the console without being given one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum ObjectKind {
+    /// `Repository`.
+    Repository,
+    /// `ClusterRepository`.
+    ClusterRepository,
+    /// `Maintenance`.
+    Maintenance,
+    /// `SnapshotPolicy`.
+    SnapshotPolicy,
+    /// `SnapshotSchedule`.
+    SnapshotSchedule,
+    /// `Snapshot`.
+    Snapshot,
+    /// `Restore`.
+    Restore,
+    /// `RepositoryReplication`.
+    RepositoryReplication,
+    /// `SnapshotReplication`.
+    SnapshotReplication,
+}
+
+/// How many objects of one kind are in one health state.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct HealthCount {
+    /// The state.
+    pub health: Health,
+    /// How many objects are in it.
+    pub count: u32,
+}
+
+/// One kind's objects in scope, split by health.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct KindTally {
+    /// The kind.
+    pub kind: ObjectKind,
+    /// Every object of this kind in scope (for snapshots, only the window).
+    pub total: u32,
+    /// Non-zero states only, worst first: failed, degraded, pending, unknown,
+    /// suspended, healthy.
+    pub by_health: Vec<HealthCount>,
+    /// The caller may not list this kind in scope, so it was not counted:
+    /// `total` is 0 because nothing was read, not because there is nothing.
+    /// The other kinds are counted all the same.
+    #[serde(default)]
+    pub refused: bool,
+}
+
+/// `GET /api/v1/overview` — the fleet by kind.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct OverviewView {
+    /// All nine kinds, in [`ObjectKind`] order, zero-total ones included.
+    pub kinds: Vec<KindTally>,
+    /// Snapshots are counted over this many trailing hours.
+    pub snapshot_window_hours: u32,
+    /// RFC3339 instant the tallies were taken.
+    pub generated_at: String,
+}
+
+/// A namespace that holds kopiur objects the caller may see.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct NamespaceSummary {
+    /// The namespace.
+    pub name: String,
+    /// How many namespaced kopiur objects in it the caller may see.
+    pub objects: u32,
+}
+
 /// One row of the schedules table.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
@@ -1169,6 +1304,39 @@ pub struct DoctorCheckView {
     /// What to do about it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fix: Option<String>,
+    /// The objects the check found something wrong with, one entry each —
+    /// the same findings `what` puts in one sentence. Empty for a check that
+    /// is not about particular objects (the CRDs, the operator's own
+    /// Deployments) and for one that found nothing.
+    #[serde(default)]
+    pub objects: Vec<DoctorObjectView>,
+}
+
+/// One object a doctor check found something wrong with.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct DoctorObjectView {
+    /// Its kind.
+    pub kind: ObjectKind,
+    /// Its namespace; absent for a cluster-scoped object.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
+    /// Its name.
+    pub name: String,
+    /// `true` when this object is part of why the check failed; `false` when
+    /// it is reported but does not count as red (a deliberate configuration,
+    /// a failure older than the window).
+    pub failing: bool,
+    /// What is wrong with it, in the check's words.
+    pub message: String,
+    /// What to do, when the check knows something more specific than the
+    /// message says.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fix: Option<String>,
+    /// RFC3339 instant it went wrong, when the check can date it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub at: Option<String>,
 }
 
 /// The full doctor report.

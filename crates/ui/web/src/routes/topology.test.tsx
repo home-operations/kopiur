@@ -3,10 +3,12 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { problemBanner } from "../api/problem";
+import { cssRules, readStyles } from "../testing/css";
 import type { RepositoryGraph } from "../api/types";
 import type { LaidOut } from "../components/topology/elk";
 import { NODE_HEIGHT, NODE_WIDTH } from "../components/topology/elk";
 import {
+  BLOBSYNC_BACKEND,
   FIXTURE_EDGE_IDS,
   FIXTURE_GRAPH,
   FIXTURE_NODE_IDS,
@@ -14,7 +16,6 @@ import {
   GONE,
   MIRROR,
   NAS,
-  SHARED,
 } from "../components/topology/fixture";
 import type { TopologyLayoutState } from "../components/topology/layout";
 import type { TopologyModel } from "../components/topology/model";
@@ -232,58 +233,79 @@ describe("Topology", () => {
     expect(legend.querySelector("details")).toBeNull();
   });
 
-  it("opens a drawer on a plate, puts it in the URL, and closes back to the board", async () => {
+  it("opens a plate's resource in the resource drawer, in the URL, and closes back to the board", async () => {
     mockApi({ "/api/v1/graph": jsonResponse(FIXTURE_GRAPH) });
     const { router } = mountApp("/topology?namespace=media");
     const region = await drawnBoard();
-
-    await userEvent.click(plate(region, NAS.id));
-    const drawer = await screen.findByRole("complementary", { name: /media\/nas/ });
-    expect(router.state.location.search).toMatchObject({ node: NAS.id, namespace: "media" });
-
-    // Both directions, named as the CRD names them.
-    const out = within(drawer).getByRole("region", { name: "Points at" });
-    expect(within(out).getByText("Snapshot replication")).toBeInTheDocument();
-    expect(within(out).getByText("Repository replication")).toBeInTheDocument();
-    expect(within(out).getByText("Seed")).toBeInTheDocument();
-    const into = within(drawer).getByRole("region", { name: "Pointed at by" });
-    expect(within(into).getByText("Policy membership")).toBeInTheDocument();
-    // The failing replication's lamp is in the drawer as a word, not only as a colour.
-    expect(within(out).getByText("Failed")).toBeInTheDocument();
-
-    await userEvent.click(within(drawer).getByRole("button", { name: "Close details" }));
-    expect(screen.queryByRole("complementary", { name: /media\/nas/ })).toBeNull();
-    expect(router.state.location.search).not.toHaveProperty("node");
+    const nas = plate(region, NAS.id);
+    // A plate is a link to the resource, not a button that opens a board-only drawer.
+    expect(nas.tagName).toBe("A");
+    await userEvent.click(nas);
+    const drawer = await screen.findByRole("dialog", { name: /media\/nas/ });
+    expect(drawer).toHaveAttribute("data-kind", "repository");
+    expect(router.state.location.search).toMatchObject({
+      namespace: "media",
+      inspect: "repository/media/nas",
+    });
+    await userEvent.keyboard("{Escape}");
+    await waitFor(() => {
+      expect(screen.queryByRole("dialog")).toBeNull();
+    });
+    expect(router.state.location.search).not.toHaveProperty("inspect");
+    expect(document.activeElement).toBe(nas);
   });
 
-  it("explains the ghost in the drawer as what, why and fix, and links no deeper than the section", async () => {
+  it("explains the ghost as what, why and fix, with what refers to it", async () => {
     mockApi({ "/api/v1/graph": jsonResponse(FIXTURE_GRAPH) });
     mountApp("/topology");
     const region = await drawnBoard();
 
     await userEvent.click(plate(region, GONE.id));
-    const drawer = await screen.findByRole("complementary", { name: /gone/ });
-    expect(drawer).toHaveTextContent("gone is referenced here but does not exist");
+    const drawer = await screen.findByRole("dialog", { name: /gone/ });
+    expect(
+      await within(drawer).findByText("gone is referenced here but does not exist."),
+    ).toBeInTheDocument();
     expect(drawer).toHaveTextContent("nowhere to land");
     expect(within(drawer).getByText("Fix")).toBeInTheDocument();
-
-    // addenda item 16: the URL segment for a repository is the server's
-    // `kindPath`, which the graph does not carry — so no link here guesses one.
-    const link = within(drawer).getByRole("link", { name: /gone in repositories/ });
-    expect(link).toHaveAttribute("href", "/repositories");
+    const into = within(drawer).getByRole("region", { name: "Pointed at by" });
+    expect(within(into).getByRole("link", { name: /orphaned/ })).toBeInTheDocument();
   });
 
-  it("says when a repository that exists is copied nowhere", async () => {
+  it("draws a resource plate as a plate, not as underlined link text", () => {
+    const rule = cssRules(readStyles()).find((r) => r.selector === "a.topo-node");
+    expect(rule?.body).toMatch(/text-decoration:\s*none/);
+    expect(rule?.body).toMatch(/color:\s*inherit/);
+  });
+
+  it("leaves a backend, a namespace and a selector as plates, not controls", async () => {
     mockApi({ "/api/v1/graph": jsonResponse(FIXTURE_GRAPH) });
     mountApp("/topology");
     const region = await drawnBoard();
+    for (const id of [BLOBSYNC_BACKEND.id, "Namespace/prod"]) {
+      const inert = plate(region, id);
+      expect(inert.tagName).toBe("DIV");
+      expect(inert).toHaveAttribute("role", "group");
+      expect(inert.querySelector("a, button")).toBeNull();
+    }
+  });
 
-    await userEvent.click(plate(region, SHARED.id));
-    const drawer = await screen.findByRole("complementary", { name: /shared/ });
-    expect(drawer).toHaveTextContent("Nothing copies shared anywhere");
-    // And the gate the server reported on it, in the server's own words.
-    expect(drawer).toHaveTextContent("acknowledge to release");
-    expect(drawer).toHaveTextContent("DeletionProtectionEngaged");
+  it("sends an old ?node= link to the resource drawer, and drops one that is not a resource", async () => {
+    mockApi({ "/api/v1/graph": jsonResponse(FIXTURE_GRAPH) });
+    const one = mountApp("/topology?namespace=media&node=Repository%2Fmedia%2Fnas");
+    await waitFor(() => {
+      expect(one.router.state.location.search).toEqual({
+        namespace: "media",
+        inspect: "repository/media/nas",
+      });
+    });
+  });
+
+  it("drops an old ?node= link to something that is not a resource", async () => {
+    mockApi({ "/api/v1/graph": jsonResponse(FIXTURE_GRAPH) });
+    const two = mountApp("/topology?node=Backend%2Fmedia%2Fblobsync");
+    await waitFor(() => {
+      expect(two.router.state.location.search).toEqual({});
+    });
   });
 
   it("shows a skeleton while the graph is loading", async () => {
@@ -365,5 +387,22 @@ describe("Topology", () => {
     // Deterministic: the same graph would fail the same way, so no retry.
     expect(within(region).queryByRole("button", { name: "Retry" })).toBeNull();
     expect(region.querySelector("[data-node-id]")).toBeNull();
+  });
+});
+
+describe("Topology — kind identity", () => {
+  it("stripes each plate in its object's kind, and leaves non-kopiur nodes unmarked", async () => {
+    mockApi({ "/api/v1/graph": jsonResponse(FIXTURE_GRAPH) });
+    mountApp("/topology?namespace=media");
+    const region = await drawnBoard();
+    expect(plate(region, "Repository/media/nas")).toHaveAttribute("data-kind", "repository");
+    expect(plate(region, "ClusterRepository/shared")).toHaveAttribute(
+      "data-kind",
+      "cluster-repository",
+    );
+    expect(plate(region, "Policy/media/nightly")).toHaveAttribute("data-kind", "snapshot-policy");
+    expect(plate(region, "Policy/media/nightly").querySelector(".kind-chip svg")).not.toBeNull();
+    expect(plate(region, "Backend/media/blobsync")).not.toHaveAttribute("data-kind");
+    expect(plate(region, "Namespace/prod")).not.toHaveAttribute("data-kind");
   });
 });

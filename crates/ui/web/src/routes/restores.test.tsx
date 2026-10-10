@@ -92,14 +92,13 @@ describe("Restores", () => {
     expect(nth(body, 0).querySelector(".health")).toHaveAttribute("data-health", "unknown");
   });
 
-  it("links a row into its own detail route", async () => {
+  it("opens a row in the resource drawer, keeping the scope", async () => {
     mockApi({ "/api/v1/restores": jsonResponse(rows) });
     mountApp("/restores?namespace=media");
     const body = bodyRows(await table());
-    expect(within(nth(body, 0)).getByRole("link", { name: "recover-db" })).toHaveAttribute(
-      "href",
-      "/restores/media/recover-db",
-    );
+    expect(
+      within(nth(body, 0)).getByRole("link", { name: "recover-db" }).getAttribute("href"),
+    ).toMatch(/namespace=media.*inspect=restore%2Fmedia%2Frecover-db$/);
   });
 
   it("creates a restore from the page's namespace, with overwrite said explicitly", async () => {
@@ -193,5 +192,18 @@ describe("Restores", () => {
     mountApp("/restores");
     const region = await screen.findByRole("region", { name: "Restores" });
     expect(within(region).getByRole("status", { busy: true })).toBeInTheDocument();
+  });
+});
+
+describe("Restores — kind identity", () => {
+  it("stripes each restore and names its repository as a reference", async () => {
+    mockApi({ "/api/v1/restores": jsonResponse(rows) });
+    mountApp("/restores");
+    const row = nth(bodyRows(await table()), 0);
+    expect(row).toHaveAttribute("data-kind", "restore");
+    expect(row.querySelector("td.has-stripe .kind-chip svg")).not.toBeNull();
+    expect(row.querySelector('a.ref[data-kind="repository"]')?.getAttribute("href")).toMatch(
+      /inspect=repository%2Fmedia%2Fnas$/,
+    );
   });
 });

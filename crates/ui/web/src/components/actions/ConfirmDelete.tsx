@@ -65,8 +65,6 @@ export function ConfirmDelete({
       onConfirm={() => {
         remove.mutate({ namespace, name });
       }}
-      receipt={remove.data}
-      problem={remove.error?.problem}
       open={open}
       onOpenChange={onOpenChange}
     >

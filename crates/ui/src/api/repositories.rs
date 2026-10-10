@@ -17,16 +17,18 @@ use k8s_openapi::api::batch::v1::Job;
 
 use kopiur_api::cluster_repository::AllowedNamespaces;
 use kopiur_api::common::{RepositoryKind, RepositoryMode, repo_key};
+use kopiur_api::expand::label_selector_string;
 use kopiur_api::gates::GateScope;
 use kopiur_api::repository::CatalogCoverage;
 use kopiur_api::{
     ClusterRepository, Maintenance, Repository, RepositoryPhase, RepositoryReplication,
-    SnapshotPolicy, SnapshotReplication,
+    SnapshotPolicy, SnapshotReplication, SnapshotSchedule,
 };
 use kopiur_ui_model::graph::GateHit;
 use kopiur_ui_model::views::{
-    CatalogCoverageView, CatalogView, HealthProbeView, PolicyRef, RepositoryDetail,
-    RepositorySummary, SeedView, ServerView, SessionInfo,
+    AdmittedNamespacesView, CatalogCoverageView, CatalogView, HealthProbeView, PolicyRef,
+    ReplicationKind, ReplicationRef, RepositoryDetail, RepositorySummary, ScheduleRow, SeedView,
+    ServerView, SessionInfo,
 };
 
 use crate::AppState;
@@ -34,6 +36,7 @@ use crate::api::graph::repository_health;
 use crate::api::maintenance::maintenance_row;
 use crate::api::policies::writes_into;
 use crate::api::problem::{ApiError, problem};
+use crate::api::schedules::{fires_policy, schedule_row};
 use crate::api::{
     NamespaceQuery, RepositoryKindPath, UiPath, UiQuery, client_for, conditions_view,
     covering_maintenances, gate_hits, ops_ctx, repo_phase_view,
@@ -65,7 +68,7 @@ struct RepoFacts<'a> {
     index_blob_count: Option<i64>,
     last_observed_at: Option<String>,
     server_endpoint: Option<String>,
-    allowed_namespace_count: Option<i64>,
+    admits: Option<AdmittedNamespacesView>,
 }
 
 /// **Pure.** `spec.mode` as the string every other kopiur front end prints.
@@ -117,7 +120,7 @@ fn summary_from(facts: &RepoFacts<'_>, gates: &[GateHit]) -> RepositorySummary {
         index_blob_count: facts.index_blob_count,
         last_observed_at: facts.last_observed_at.clone(),
         server_endpoint: facts.server_endpoint.clone(),
-        allowed_namespace_count: facts.allowed_namespace_count,
+        admits: facts.admits.clone(),
     }
 }
 
@@ -144,7 +147,7 @@ pub fn view_repository(repo: &Repository) -> RepositorySummary {
         server_endpoint: status
             .and_then(|s| s.server.as_ref())
             .and_then(|s| s.endpoint.clone()),
-        allowed_namespace_count: None,
+        admits: None,
     };
     summary_from(&facts, &gate_hits(conditions, GateScope::covers_repository))
 }
@@ -172,21 +175,23 @@ pub fn view_cluster_repository(repo: &ClusterRepository) -> RepositorySummary {
         server_endpoint: status
             .and_then(|s| s.server.as_ref())
             .and_then(|s| s.endpoint.clone()),
-        allowed_namespace_count: status
-            .and_then(|s| s.allowed_namespace_count)
-            .or_else(|| declared_namespace_count(&repo.spec.allowed_namespaces)),
+        admits: Some(admits(&repo.spec.allowed_namespaces)),
     };
     summary_from(&facts, &gate_hits(conditions, GateScope::covers_repository))
 }
 
-/// **Pure.** How many namespaces the *spec* names, for a repository the
-/// controller has not counted yet. Exhaustive: only a `List` can be counted
-/// without asking the apiserver, and a `Selector`/`All` honestly has no
-/// spec-side answer.
-fn declared_namespace_count(allowed: &AllowedNamespaces) -> Option<i64> {
+/// **Pure.** Which namespaces the spec admits — exact, unlike the status
+/// count, whose `-1`/`0` sentinels are not counts.
+fn admits(allowed: &AllowedNamespaces) -> AdmittedNamespacesView {
     match allowed {
-        AllowedNamespaces::List(names) => Some(names.len() as i64),
-        AllowedNamespaces::Selector(_) | AllowedNamespaces::All(_) => None,
+        AllowedNamespaces::All(true) => AdmittedNamespacesView::All,
+        AllowedNamespaces::All(false) => AdmittedNamespacesView::None,
+        AllowedNamespaces::List(names) => AdmittedNamespacesView::Listed {
+            count: u32::try_from(names.len()).unwrap_or(u32::MAX),
+        },
+        AllowedNamespaces::Selector(selector) => AdmittedNamespacesView::Selector {
+            selector: label_selector_string(selector),
+        },
     }
 }
 
@@ -210,9 +215,12 @@ pub fn view_detail(
     snapshot_replications: &[Arc<SnapshotReplication>],
     repository_replications: &[Arc<RepositoryReplication>],
     maintenances: &[Arc<Maintenance>],
+    schedules: &[Arc<SnapshotSchedule>],
     sessions: Vec<SessionInfo>,
 ) -> RepositoryDetail {
     let name = summary.name.clone();
+    let writing: Vec<&Arc<SnapshotPolicy>> =
+        policies.iter().filter(|p| writes_into(p, key)).collect();
     RepositoryDetail {
         identity_cluster,
         catalog,
@@ -224,6 +232,7 @@ pub fn view_detail(
         gates: gate_hits(conditions, GateScope::covers_repository),
         conditions: conditions_view(conditions),
         policies: policies_writing_into(policies, key),
+        schedules: schedules_firing(schedules, &writing),
         replications_out: replications_from(snapshot_replications, repository_replications, key),
         replications_in: replications_into(snapshot_replications, key),
         sessions,
@@ -246,38 +255,65 @@ fn policies_writing_into(policies: &[Arc<SnapshotPolicy>], key: &str) -> Vec<Pol
         .collect()
 }
 
-/// **Pure.** Names of the replications that *read* from `key` — both kinds, since
+/// **Pure.** The schedules that fire any of `writing`, as rows, sorted.
+///
+/// [`fires_policy`] is the schedule screen's own predicate (a `policyRef` by
+/// name in the schedule's namespace, a `policySelector` with the operator's
+/// matcher), so this lane can never disagree with what the operator fires.
+fn schedules_firing(
+    schedules: &[Arc<SnapshotSchedule>],
+    writing: &[&Arc<SnapshotPolicy>],
+) -> Vec<ScheduleRow> {
+    let mut rows: Vec<ScheduleRow> = schedules
+        .iter()
+        .filter(|s| writing.iter().any(|p| fires_policy(s, p)))
+        .map(|s| schedule_row(s))
+        .collect();
+    rows.sort_by(|a, b| (&a.namespace, &a.name).cmp(&(&b.namespace, &b.name)));
+    rows
+}
+
+/// **Pure.** The replications that *read* from `key` — both kinds, since
 /// a repository is equally drained by a snapshot copy and by a blob sync.
 fn replications_from(
     snapshot: &[Arc<SnapshotReplication>],
     repository: &[Arc<RepositoryReplication>],
     key: &str,
-) -> Vec<String> {
+) -> Vec<ReplicationRef> {
     let from_snapshot = snapshot.iter().filter_map(|r| {
         let owner_ns = r.metadata.namespace.clone().unwrap_or_default();
-        (repo_key(&r.spec.source_ref, &owner_ns) == key)
-            .then(|| r.metadata.name.clone().unwrap_or_default())
+        (repo_key(&r.spec.source_ref, &owner_ns) == key).then(|| ReplicationRef {
+            kind: ReplicationKind::SnapshotReplication,
+            name: r.metadata.name.clone().unwrap_or_default(),
+            namespace: owner_ns,
+        })
     });
     let from_repository = repository.iter().filter_map(|r| {
         let owner_ns = r.metadata.namespace.clone().unwrap_or_default();
-        (repo_key(&r.spec.source_ref, &owner_ns) == key)
-            .then(|| r.metadata.name.clone().unwrap_or_default())
+        (repo_key(&r.spec.source_ref, &owner_ns) == key).then(|| ReplicationRef {
+            kind: ReplicationKind::RepositoryReplication,
+            name: r.metadata.name.clone().unwrap_or_default(),
+            namespace: owner_ns,
+        })
     });
     from_snapshot.chain(from_repository).collect()
 }
 
-/// **Pure.** Names of the replications that *write into* `key`.
+/// **Pure.** The replications that *write into* `key`.
 ///
 /// Only `SnapshotReplication` can: a `RepositoryReplication` writes to a bare
 /// backend, which is not a repository CR and therefore not something that can
 /// name this one as a destination.
-fn replications_into(snapshot: &[Arc<SnapshotReplication>], key: &str) -> Vec<String> {
+fn replications_into(snapshot: &[Arc<SnapshotReplication>], key: &str) -> Vec<ReplicationRef> {
     snapshot
         .iter()
         .filter_map(|r| {
             let owner_ns = r.metadata.namespace.clone().unwrap_or_default();
-            (repo_key(&r.spec.destination_ref, &owner_ns) == key)
-                .then(|| r.metadata.name.clone().unwrap_or_default())
+            (repo_key(&r.spec.destination_ref, &owner_ns) == key).then(|| ReplicationRef {
+                kind: ReplicationKind::SnapshotReplication,
+                name: r.metadata.name.clone().unwrap_or_default(),
+                namespace: owner_ns,
+            })
         })
         .collect()
 }
@@ -437,6 +473,10 @@ async fn detail(
         .list::<RepositoryReplication>(&id, &client, None)
         .await?;
     let maintenances = app.source.list::<Maintenance>(&id, &client, None).await?;
+    let schedules = app
+        .source
+        .list::<SnapshotSchedule>(&id, &client, None)
+        .await?;
 
     let sessions = load_sessions(&app, client, kind.kind(), repo_ns.as_deref(), &name).await?;
 
@@ -454,6 +494,7 @@ async fn detail(
         &snapshot_replications,
         &repository_replications,
         &maintenances,
+        &schedules,
         sessions,
     )))
 }
@@ -648,8 +689,8 @@ status:
         assert_eq!(row.total_size_bytes, Some(987_654_321));
         assert_eq!(row.index_blob_count, Some(17));
         assert_eq!(
-            row.allowed_namespace_count, None,
-            "only a cluster repository has one"
+            row.admits, None,
+            "only a cluster repository admits namespaces"
         );
     }
 
@@ -781,57 +822,66 @@ status:
         }
     }
 
-    #[test]
-    fn a_cluster_repository_counts_its_namespaces_from_the_spec_until_the_controller_does() {
-        let listed: ClusterRepository = from_yaml(
+    fn cluster_repo(allowed: &str, status: &str) -> ClusterRepository {
+        from_yaml(&format!(
             r#"
 apiVersion: kopiur.home-operations.com/v1alpha1
 kind: ClusterRepository
-metadata: { name: shared }
+metadata: {{ name: shared }}
 spec:
-  backend: { s3: { bucket: shared } }
-  encryption: { passwordSecretRef: { name: pw, key: password } }
-  allowedNamespaces: { list: [prod, staging, dev] }
-"#,
+  backend: {{ s3: {{ bucket: shared }} }}
+  encryption: {{ passwordSecretRef: {{ name: pw, key: password }} }}
+  allowedNamespaces: {allowed}
+{status}
+"#
+        ))
+    }
+
+    /// The controller writes `allowedNamespaceCount: -1` for "all namespaces"
+    /// (and `0` for a selector it never resolves). Neither is a count, and the
+    /// console used to print "admits -1 namespaces". The view names the
+    /// admission from the spec instead, which is exact.
+    #[test]
+    fn a_cluster_repository_admitting_everyone_says_all_not_minus_one() {
+        let repo = cluster_repo(
+            "{ all: true }",
+            "status: { phase: Ready, allowedNamespaceCount: -1 }",
+        );
+        assert_eq!(
+            view_cluster_repository(&repo).admits,
+            Some(AdmittedNamespacesView::All)
+        );
+        let none = cluster_repo("{ all: false }", "");
+        assert_eq!(
+            view_cluster_repository(&none).admits,
+            Some(AdmittedNamespacesView::None)
+        );
+    }
+
+    #[test]
+    fn listed_and_selector_admission_are_named_not_counted_as_zero() {
+        let listed = cluster_repo(
+            "{ list: [prod, staging, dev] }",
+            "status: { allowedNamespaceCount: 3 }",
         );
         let row = view_cluster_repository(&listed);
         assert_eq!(row.kind, "ClusterRepository");
         assert_eq!(row.namespace, None);
-        assert_eq!(row.allowed_namespace_count, Some(3));
-
-        let selected: ClusterRepository = from_yaml(
-            r#"
-apiVersion: kopiur.home-operations.com/v1alpha1
-kind: ClusterRepository
-metadata: { name: selected }
-spec:
-  backend: { s3: { bucket: shared } }
-  encryption: { passwordSecretRef: { name: pw, key: password } }
-  allowedNamespaces: { selector: { matchLabels: { backup: "yes" } } }
-"#,
-        );
         assert_eq!(
-            view_cluster_repository(&selected).allowed_namespace_count,
-            None,
-            "a selector cannot be counted without asking the apiserver"
+            row.admits,
+            Some(AdmittedNamespacesView::Listed { count: 3 })
         );
 
-        let counted: ClusterRepository = from_yaml(
-            r#"
-apiVersion: kopiur.home-operations.com/v1alpha1
-kind: ClusterRepository
-metadata: { name: counted }
-spec:
-  backend: { s3: { bucket: shared } }
-  encryption: { passwordSecretRef: { name: pw, key: password } }
-  allowedNamespaces: { all: true }
-status: { phase: Ready, allowedNamespaceCount: 12 }
-"#,
+        let selected = cluster_repo(
+            "{ selector: { matchLabels: { backup: \"yes\" } } }",
+            "status: { allowedNamespaceCount: 0 }",
         );
         assert_eq!(
-            view_cluster_repository(&counted).allowed_namespace_count,
-            Some(12),
-            "the controller's count wins wherever it exists"
+            view_cluster_repository(&selected).admits,
+            Some(AdmittedNamespacesView::Selector {
+                selector: "backup=yes".into()
+            }),
+            "a selector is shown as the selector, never as a count of 0"
         );
     }
 
@@ -910,6 +960,7 @@ spec:
             &snapshot_replications,
             &repository_replications,
             &[],
+            &[],
             Vec::new(),
         );
 
@@ -921,10 +972,113 @@ spec:
             }],
             "a same-named repository in another namespace is a different repository"
         );
-        assert_eq!(detail.replications_out, vec!["offsite", "blobsync"]);
-        assert_eq!(detail.replications_in, vec!["inbound"]);
+        // Kind and namespace ride with the name: two replications may share a
+        // name across namespaces, and the SPA must not guess which one it is.
+        let r = |kind, name: &str| ReplicationRef {
+            kind,
+            namespace: "media".into(),
+            name: name.into(),
+        };
+        assert_eq!(
+            detail.replications_out,
+            vec![
+                r(ReplicationKind::SnapshotReplication, "offsite"),
+                r(ReplicationKind::RepositoryReplication, "blobsync"),
+            ]
+        );
+        assert_eq!(
+            detail.replications_in,
+            vec![r(ReplicationKind::SnapshotReplication, "inbound")]
+        );
         assert_eq!(detail.identity_cluster.as_deref(), Some("east"));
         assert!(detail.maintenance.is_none());
+    }
+
+    /// The "fired by" lane on the repository page: every schedule that fires a
+    /// policy writing here, whether it names the policy or selects it. A
+    /// schedule firing a policy that writes elsewhere is not listed.
+    #[test]
+    fn the_detail_lists_the_schedules_that_fire_policies_writing_here() {
+        let named_policy: SnapshotPolicy = from_yaml(
+            r#"
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: SnapshotPolicy
+metadata: { name: nightly, namespace: media }
+spec:
+  repository: { kind: Repository, name: nas }
+  sources: [{ pvc: { name: data } }]
+"#,
+        );
+        let gold_policy: SnapshotPolicy = from_yaml(
+            r#"
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: SnapshotPolicy
+metadata: { name: gold, namespace: media, labels: { tier: gold } }
+spec:
+  repository: { kind: Repository, name: nas }
+  sources: [{ pvc: { name: db } }]
+"#,
+        );
+        let elsewhere_policy: SnapshotPolicy = from_yaml(
+            r#"
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: SnapshotPolicy
+metadata: { name: archive, namespace: media }
+spec:
+  repository: { kind: Repository, name: tape }
+  sources: [{ pvc: { name: old } }]
+"#,
+        );
+        let schedule = |name: &str, target: &str| -> Arc<SnapshotSchedule> {
+            Arc::new(from_yaml(&format!(
+                r#"
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: SnapshotSchedule
+metadata: {{ name: {name}, namespace: media }}
+spec:
+  {target}
+  schedule: {{ cron: "0 2 * * *" }}
+"#
+            )))
+        };
+        let schedules = vec![
+            schedule("nightly-cron", "policyRef: { name: nightly }"),
+            schedule(
+                "gold-cron",
+                "policySelector: { matchLabels: { tier: gold } }",
+            ),
+            schedule("archive-cron", "policyRef: { name: archive }"),
+        ];
+        let policies = vec![
+            Arc::new(named_policy),
+            Arc::new(gold_policy),
+            Arc::new(elsewhere_policy),
+        ];
+
+        let detail = view_detail(
+            view_repository(&nas()),
+            "Repository/media/nas",
+            RepositoryKind::Repository,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[],
+            &policies,
+            &[],
+            &[],
+            &[],
+            &schedules,
+            Vec::new(),
+        );
+
+        let names: Vec<&str> = detail.schedules.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["gold-cron", "nightly-cron"],
+            "sorted, and archive-cron fires a policy writing elsewhere"
+        );
     }
 
     #[test]

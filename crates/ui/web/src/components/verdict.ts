@@ -1,3 +1,4 @@
+import type { KindTally, ObjectKind } from "../api/types";
 import type { DoctorSummary } from "./doctor";
 import type { HealthKey } from "./health";
 
@@ -25,6 +26,73 @@ export interface VerdictInputs {
   doctor: DoctorSummary;
   /** Sources that failed to load, named as the sentence should name them. */
   unavailable: readonly string[];
+  /**
+   * The fleet-by-kind tallies from `/overview`. Every kind but the two
+   * repository kinds lights the verdict — repositories are already counted
+   * from their own list above, and counting them twice would double them.
+   */
+  tallies?: readonly KindTally[] | undefined;
+}
+
+/** What a tally line calls one of a kind, and many; `null` for a kind counted elsewhere. */
+function tallyNoun(kind: ObjectKind): readonly [string, string] | null {
+  switch (kind) {
+    case "repository":
+    case "clusterRepository":
+      return null;
+    case "maintenance":
+      return ["maintenance", "maintenance"];
+    case "snapshotPolicy":
+      return ["policy", "policies"];
+    case "snapshotSchedule":
+      return ["schedule", "schedules"];
+    case "snapshot":
+      return ["snapshot", "snapshots"];
+    case "restore":
+      return ["restore", "restores"];
+    case "repositoryReplication":
+    case "snapshotReplication":
+      return ["replication", "replications"];
+  }
+}
+
+/** Failed, then degraded, then unknown counts across the non-repository tallies, as phrases. */
+export function tallyPhrases(tallies: readonly KindTally[]): {
+  failed: string[];
+  worrying: string[];
+} {
+  const failed: string[] = [];
+  const worrying: string[] = [];
+  for (const tally of tallies) {
+    const noun = tallyNoun(tally.kind);
+    if (noun === null) continue;
+    const count = (health: HealthKey) =>
+      tally.byHealth.filter((h) => h.health === health).reduce((sum, h) => sum + h.count, 0);
+    const name = (n: number) => `${n} ${n === 1 ? noun[0] : noun[1]}`;
+    const bad = count("failed");
+    if (bad > 0) failed.push(`${name(bad)} failed`);
+    const degraded = count("degraded");
+    if (degraded > 0) worrying.push(`${name(degraded)} degraded`);
+    const unknown = count("unknown");
+    if (unknown > 0) worrying.push(`${name(unknown)} unknown`);
+  }
+  return { failed, worrying };
+}
+
+/** The kinds the caller may not list in scope, as the sentence names them, once each. */
+export function refusedNouns(tallies: readonly KindTally[]): string[] {
+  const nouns: string[] = [];
+  for (const tally of tallies) {
+    const noun = tallyNoun(tally.kind);
+    if (!tally.refused || noun === null || nouns.includes(noun[1])) continue;
+    nouns.push(noun[1]);
+  }
+  return nouns;
+}
+
+function orList(parts: readonly string[]): string {
+  if (parts.length <= 1) return parts.join("");
+  return `${parts.slice(0, -1).join(", ")} or ${parts[parts.length - 1] ?? ""}`;
 }
 
 export interface Verdict {
@@ -52,7 +120,9 @@ export function overviewVerdict({
   stalled,
   doctor,
   unavailable,
+  tallies = [],
 }: VerdictInputs): Verdict {
+  const fleet = tallyPhrases(tallies);
   const lit: string[] = [];
   if (repositories.failed > 0) {
     lit.push(`${plural(repositories.failed, "repository", "repositories")} failed`);
@@ -71,6 +141,7 @@ export function overviewVerdict({
         : `${plural(repositories.unknown, "repository", "repositories")} unknown`,
     );
   }
+  lit.push(...fleet.failed);
   if (stalled > 0) {
     lit.push(`${plural(stalled, "object")} stalled`);
   }
@@ -82,6 +153,7 @@ export function overviewVerdict({
       doctor.fail > 0 ? `${doctor.warn} warning` : `${plural(doctor.warn, "doctor check")} warning`,
     );
   }
+  lit.push(...fleet.worrying);
 
   const missing =
     unavailable.length > 0 ? ` ${capitalize(joinList(unavailable))} did not load.` : "";
@@ -89,9 +161,15 @@ export function overviewVerdict({
   // the overview keeps warning detail off the screen — so a count with no
   // words beside it would leave the operator no way to learn what it meant.
   const blockedSentence = `${plural(doctor.rbac, "doctor check")} could not run with your permissions.`;
-  const blocked = doctor.rbac > 0 ? ` ${blockedSentence}` : "";
+  // A kind the caller may not list was not counted: its zero says nothing, so
+  // the verdict cannot be green over it, and names it like a blocked check.
+  const refused = refusedNouns(tallies);
+  const refusedSentence = `You may not list ${orList(refused)} here.`;
+  const refusedTail = refused.length > 0 ? ` ${refusedSentence}` : "";
+  const blocked = (doctor.rbac > 0 ? ` ${blockedSentence}` : "") + refusedTail;
 
-  const failed = repositories.failed > 0 || stalled > 0 || doctor.fail > 0;
+  const failed =
+    repositories.failed > 0 || stalled > 0 || doctor.fail > 0 || fleet.failed.length > 0;
   if (failed) {
     return { health: "failed", text: `Needs attention: ${lit.join(", ")}.${missing}${blocked}` };
   }
@@ -105,7 +183,13 @@ export function overviewVerdict({
     return { health: "degraded", text: `Mostly healthy: ${lit.join(", ")}.${blocked}` };
   }
   if (doctor.rbac > 0) {
-    return { health: "unknown", text: `Cannot fully check: ${blockedSentence}` };
+    return { health: "unknown", text: `Cannot fully check: ${blockedSentence}${refusedTail}` };
+  }
+  if (refused.length > 0) {
+    return {
+      health: "unknown",
+      text: `Cannot fully check: you may not list ${orList(refused)} here.`,
+    };
   }
 
   const total = Object.values(repositories).reduce((sum, count) => sum + count, 0);

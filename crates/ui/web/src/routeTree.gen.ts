@@ -10,6 +10,7 @@
 
 import { Route as rootRouteImport } from './routes/__root'
 import { Route as IndexRouteImport } from './routes/index'
+import { Route as BrowseRouteImport } from './routes/browse'
 import { Route as DoctorRouteImport } from './routes/doctor'
 import { Route as GatesRouteImport } from './routes/gates'
 import { Route as MaintenanceRouteImport } from './routes/maintenance'
@@ -29,6 +30,11 @@ import { Route as SnapshotsNamespaceNameBrowseRouteImport } from './routes/snaps
 const IndexRoute = IndexRouteImport.update({
   id: '/',
   path: '/',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const BrowseRoute = BrowseRouteImport.update({
+  id: '/browse',
+  path: '/browse',
   getParentRoute: () => rootRouteImport,
 } as any)
 const DoctorRoute = DoctorRouteImport.update({
@@ -110,6 +116,7 @@ const SnapshotsNamespaceNameBrowseRoute =
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
+  '/browse': typeof BrowseRoute
   '/doctor': typeof DoctorRoute
   '/gates': typeof GatesRoute
   '/maintenance': typeof MaintenanceRoute
@@ -128,6 +135,7 @@ export interface FileRoutesByFullPath {
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
+  '/browse': typeof BrowseRoute
   '/doctor': typeof DoctorRoute
   '/gates': typeof GatesRoute
   '/maintenance': typeof MaintenanceRoute
@@ -147,6 +155,7 @@ export interface FileRoutesByTo {
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
+  '/browse': typeof BrowseRoute
   '/doctor': typeof DoctorRoute
   '/gates': typeof GatesRoute
   '/maintenance': typeof MaintenanceRoute
@@ -167,6 +176,7 @@ export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
   fullPaths:
     | '/'
+    | '/browse'
     | '/doctor'
     | '/gates'
     | '/maintenance'
@@ -185,6 +195,7 @@ export interface FileRouteTypes {
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/'
+    | '/browse'
     | '/doctor'
     | '/gates'
     | '/maintenance'
@@ -203,6 +214,7 @@ export interface FileRouteTypes {
   id:
     | '__root__'
     | '/'
+    | '/browse'
     | '/doctor'
     | '/gates'
     | '/maintenance'
@@ -222,6 +234,7 @@ export interface FileRouteTypes {
 }
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
+  BrowseRoute: typeof BrowseRoute
   DoctorRoute: typeof DoctorRoute
   GatesRoute: typeof GatesRoute
   MaintenanceRoute: typeof MaintenanceRoute
@@ -246,6 +259,13 @@ declare module '@tanstack/react-router' {
       path: '/'
       fullPath: '/'
       preLoaderRoute: typeof IndexRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/browse': {
+      id: '/browse'
+      path: '/browse'
+      fullPath: '/browse'
+      preLoaderRoute: typeof BrowseRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/doctor': {
@@ -358,6 +378,7 @@ declare module '@tanstack/react-router' {
 
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
+  BrowseRoute: BrowseRoute,
   DoctorRoute: DoctorRoute,
   GatesRoute: GatesRoute,
   MaintenanceRoute: MaintenanceRoute,

@@ -67,6 +67,7 @@ export function DownloadButton({
         <ActionButton
           className="dir-table__download"
           disabledReason={disabledReason}
+          reasonShown={false}
           title={disabledReason}
         >
           <Download size={14} strokeWidth={2} aria-hidden="true" />

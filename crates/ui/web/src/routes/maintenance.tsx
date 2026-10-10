@@ -6,7 +6,7 @@ import { useMaintenance } from "../api/hooks";
 import { EmptyState } from "../components/EmptyState";
 import { ErrorState } from "../components/ErrorState";
 import { LoadingState } from "../components/LoadingState";
-import { MaintenanceList } from "../components/MaintenanceList";
+import { MaintenanceTable } from "../components/MaintenanceTable";
 import { RunDialog } from "../components/actions/RunDialog";
 import { useCurrentNamespace } from "../util/namespace";
 
@@ -82,27 +82,34 @@ function Maintenance() {
           </EmptyState>
         </section>
       ) : (
-        <MaintenanceList
-          rows={maintenance.data}
-          renderAction={(row) => {
-            const id = `${row.namespace}/${row.name}`;
-            return (
-              <RunDialog
-                target={{
-                  kind: "maintenance",
-                  namespace: row.namespace,
-                  name: row.name,
-                  repository: row.repository,
-                }}
-                labelSuffix={row.repository}
-                open={open === id}
-                onOpenChange={(next) => {
-                  setOpen(next ? id : null);
-                }}
-              />
-            );
-          }}
-        />
+        <section className="page__section" aria-label="Maintenance">
+          <MaintenanceTable
+            rows={maintenance.data}
+            renderAction={(row) => {
+              const id = `${row.namespace}/${row.name}`;
+              return (
+                <RunDialog
+                  target={{
+                    kind: "maintenance",
+                    namespace: row.namespace,
+                    name: row.name,
+                    repository: row.repository,
+                  }}
+                  labelSuffix={row.repository}
+                  shortLabel="Run"
+                  inLedger
+                  align="end"
+                  strategy="fixed"
+                  open={open === id}
+                  onOpenChange={(next) => {
+                    // A close from one row must not undo another row opening.
+                    setOpen((current) => (next ? id : current === id ? null : current));
+                  }}
+                />
+              );
+            }}
+          />
+        </section>
       )}
     </div>
   );

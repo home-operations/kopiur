@@ -22,15 +22,23 @@ const report: DoctorReportView = {
   ranAt: "2026-09-08T11:59:30Z",
   exitCode: 1,
   checks: [
-    { check: "crds-installed", scope: "installation", title: "CRDs installed", outcome: "Pass" },
+    {
+      check: "crds-installed",
+      scope: "installation",
+      title: "CRDs installed",
+      outcome: "Pass",
+      objects: [],
+    },
     {
       check: "controller-running",
+      objects: [],
       scope: "installation",
       title: "controller running",
       outcome: "Pass",
     },
     {
       check: "credentials-present",
+      objects: [],
       scope: "mixed",
       title: "credential secrets present",
       outcome: "Warn",
@@ -38,6 +46,7 @@ const report: DoctorReportView = {
     },
     {
       check: "no-stuck-work",
+      objects: [],
       scope: "namespace",
       title: "no blocked or stuck work",
       outcome: "Fail",
@@ -47,6 +56,12 @@ const report: DoctorReportView = {
     },
   ],
 };
+
+/** Opens the Run doctor button's options. */
+async function openOptions(user: ReturnType<typeof userEvent.setup>) {
+  await user.click(screen.getByRole("button", { name: "Run doctor" }));
+  return screen.getByRole("dialog", { name: "Doctor options" });
+}
 
 beforeEach(() => {
   problemBanner.dismiss();
@@ -71,10 +86,14 @@ describe("Doctor", () => {
     expect(summary.querySelector(".verdict__lamp")).toHaveAttribute("data-health", "failed");
     expect(screen.getByText(/ran 30s ago/)).toBeInTheDocument();
 
-    // The controls reflect the URL, which is the state.
-    expect(screen.getByRole("textbox", { name: "Namespace" })).toHaveValue("media");
-    expect(screen.getByRole("textbox", { name: "Stuck threshold" })).toHaveValue("2h");
-    expect(screen.getByRole("textbox", { name: "Failure lookback" })).toHaveValue("24h");
+    // The options are behind the one Run doctor button, and reflect the URL,
+    // which is the state.
+    expect(screen.queryByRole("dialog", { name: "Doctor options" })).toBeNull();
+    const options = await openOptions(userEvent.setup({ advanceTimers: vi.advanceTimersByTime }));
+    // The namespace is picked, like the shell's scope, not typed blind.
+    expect(within(options).getByRole("button", { name: "Namespace: media" })).toBeInTheDocument();
+    expect(within(options).getByRole("textbox", { name: "Stuck threshold" })).toHaveValue("2h");
+    expect(within(options).getByRole("textbox", { name: "Failure lookback" })).toHaveValue("24h");
 
     // A namespaced run says which checks the namespace moved.
     const rows = bodyRows(table);
@@ -97,31 +116,66 @@ describe("Doctor", () => {
     );
   });
 
-  it("re-runs with new windows from the controls and refuses a duration the server would refuse", async () => {
+  it("has one Run doctor button, under the verdict, and no settings form on the page", async () => {
+    mockApi({ "/api/v1/doctor": jsonResponse(report) });
+    mountApp("/doctor");
+    await screen.findByRole("table", { name: "Doctor checks" });
+    expect(screen.queryByRole("form", { name: "Doctor controls" })).toBeNull();
+    expect(screen.queryByRole("button", { name: /Run again/ })).toBeNull();
+    const run = screen.getAllByRole("button", { name: "Run doctor" });
+    expect(run).toHaveLength(1);
+    const verdict = screen.getByRole("status", { name: "Doctor verdict" });
+    expect(
+      verdict.compareDocumentPosition(nth(run, 0)) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+  });
+
+  it("runs again with the same settings when nothing was changed", async () => {
+    mockApi({ "/api/v1/doctor": jsonResponse(report) });
+    mountApp("/doctor?stuckThreshold=2h");
+    await screen.findByRole("table", { name: "Doctor checks" });
+    const asked = () => calledPaths().filter((p) => p.startsWith("/api/v1/doctor")).length;
+    const before = asked();
+    const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
+    const options = await openOptions(user);
+    await user.click(within(options).getByRole("button", { name: "Run" }));
+    expect(screen.queryByRole("dialog", { name: "Doctor options" })).toBeNull();
+    await vi.waitFor(() => {
+      expect(asked()).toBe(before + 1);
+    });
+    expect(calledPaths().at(-1)).toBe("/api/v1/doctor?stuckThreshold=7200");
+  });
+
+  it("re-runs with new windows from the options and refuses a duration the server would refuse", async () => {
     mockApi({ "/api/v1/doctor": jsonResponse(report) });
     mountApp("/doctor");
     await screen.findByRole("table", { name: "Doctor checks" });
     expect(calledPaths()).toContain("/api/v1/doctor");
 
     const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime });
-    const stuck = screen.getByRole("textbox", { name: "Stuck threshold" });
+    const options = await openOptions(user);
+    const stuck = within(options).getByRole("textbox", { name: "Stuck threshold" });
     await user.clear(stuck);
     await user.type(stuck, "1d");
-    await user.click(screen.getByRole("button", { name: "Run doctor" }));
+    await user.click(within(options).getByRole("button", { name: "Run" }));
+    // Refused before it leaves: the options stay open and say why.
     expect(stuck).toHaveAttribute("aria-invalid", "true");
-    expect(screen.getByText(/like 90s, 30m or 1h/)).toBeInTheDocument();
+    expect(within(options).getByText(/like 90s, 30m or 1h/)).toBeInTheDocument();
     expect(calledPaths().filter((p) => p.includes("stuckThreshold"))).toHaveLength(0);
 
     await user.clear(stuck);
     await user.type(stuck, "30m");
-    await user.type(screen.getByRole("textbox", { name: "Namespace" }), "prod");
-    await user.click(screen.getByRole("button", { name: "Run doctor" }));
-    expect(await screen.findByRole("textbox", { name: "Stuck threshold" })).not.toHaveAttribute(
-      "aria-invalid",
-    );
+    await user.click(within(options).getByRole("button", { name: "Namespace: all namespaces" }));
+    const picker = screen.getByRole("dialog", { name: "Choose the namespace" });
+    await user.type(within(picker).getByRole("searchbox", { name: "Filter namespaces" }), "prod");
+    await user.click(within(picker).getByRole("button", { name: /^prod/ }));
+    // Choosing closes the picker only; the options stay open to run.
+    expect(screen.getByRole("dialog", { name: "Doctor options" })).toBeInTheDocument();
+    await user.click(within(options).getByRole("button", { name: "Run" }));
     await vi.waitFor(() => {
       expect(calledPaths()).toContain("/api/v1/doctor?namespace=prod&stuckThreshold=1800");
     });
+    expect(screen.queryByRole("dialog", { name: "Doctor options" })).toBeNull();
   });
 
   it("never sends a window the server would refuse, even from the URL", async () => {
@@ -134,12 +188,13 @@ describe("Doctor", () => {
     await screen.findByRole("table", { name: "Doctor checks" });
     expect(calledPaths().filter((p) => p.includes("stuckThreshold"))).toHaveLength(0);
     expect(calledPaths().filter((p) => p.includes("failureLookback"))).toHaveLength(0);
-    expect(screen.getByRole("textbox", { name: "Stuck threshold" })).toHaveAttribute(
+    const options = await openOptions(userEvent.setup({ advanceTimers: vi.advanceTimersByTime }));
+    expect(within(options).getByRole("textbox", { name: "Stuck threshold" })).toHaveAttribute(
       "aria-invalid",
       "true",
     );
-    expect(screen.getByText(/more than zero seconds/)).toBeInTheDocument();
-    expect(screen.getByText(/at most a year/)).toBeInTheDocument();
+    expect(within(options).getByText(/more than zero seconds/)).toBeInTheDocument();
+    expect(within(options).getByText(/at most a year/)).toBeInTheDocument();
   });
 
   it("shows a window a shared link asked for that it could not use, rather than dropping it", async () => {
@@ -149,10 +204,11 @@ describe("Doctor", () => {
     mockApi({ "/api/v1/doctor": jsonResponse(report) });
     mountApp("/doctor?stuckThreshold=1d");
     await screen.findByRole("table", { name: "Doctor checks" });
-    const stuck = screen.getByRole("textbox", { name: "Stuck threshold" });
+    const options = await openOptions(userEvent.setup({ advanceTimers: vi.advanceTimersByTime }));
+    const stuck = within(options).getByRole("textbox", { name: "Stuck threshold" });
     expect(stuck).toHaveValue("1d");
     expect(stuck).toHaveAttribute("aria-invalid", "true");
-    expect(screen.getByText(/like 90s, 30m or 1h/)).toBeInTheDocument();
+    expect(within(options).getByText(/like 90s, 30m or 1h/)).toBeInTheDocument();
     // And the page says which window actually ran.
     expect(screen.getByText(/ran with the default/)).toHaveTextContent("1h");
     expect(calledPaths().filter((p) => p.includes("stuckThreshold"))).toHaveLength(0);
@@ -198,5 +254,8 @@ describe("Doctor", () => {
     expect(within(region).getByRole("status", { busy: true })).toHaveTextContent(
       "Loading the doctor report",
     );
+    // The one button says a run is under way and will not start another.
+    const running = screen.getByRole("button", { name: "Running…" });
+    expect(running).toHaveAttribute("aria-disabled", "true");
   });
 });

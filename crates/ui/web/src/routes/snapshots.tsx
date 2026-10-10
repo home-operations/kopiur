@@ -1,15 +1,15 @@
 import { Link, createFileRoute, useNavigate } from "@tanstack/react-router";
-import { Camera, Filter, Sigma } from "lucide-react";
-import { type SubmitEvent, useState } from "react";
+import { Camera, Filter } from "lucide-react";
 
 import { type SnapshotListParams, useSnapshots } from "../api/hooks";
 import { problemKind } from "../api/problem";
-import { SnapshotSizeChart } from "../charts/SnapshotSizeChart";
-import { ActionButton } from "../components/ActionButton";
 import { EmptyState } from "../components/EmptyState";
 import { ErrorState } from "../components/ErrorState";
 import { Finding } from "../components/Finding";
 import { LoadingState } from "../components/LoadingState";
+import { PickerField } from "../components/PickerField";
+import { PolicyField, RepositoryField } from "../components/ResourceFields";
+import { repositoryKey } from "../components/pickerChoices";
 import { SnapshotTable } from "../components/SnapshotTable";
 import { healthLamp } from "../components/health";
 import {
@@ -74,6 +74,37 @@ function textParam(value: unknown): string | undefined {
     return text.length > 0 ? text : undefined;
   }
   return typeof value === "number" || typeof value === "boolean" ? String(value) : undefined;
+}
+
+/** A comma-separated list filter's values: trimmed, blanks dropped, each once. */
+function listParam(value: string | undefined): string[] {
+  return [
+    ...new Set(
+      (value ?? "")
+        .split(",")
+        .map((part) => part.trim())
+        .filter((part) => part.length > 0),
+    ),
+  ];
+}
+
+/**
+ * The repositories a URL names, as the filter's qualified keys. A bare name
+ * from an older link is qualified with its `repositoryKind` and
+ * `repositoryNamespace` (else the listing's namespace) where those say where
+ * it is; one they cannot place is kept bare, for the server to locate.
+ */
+function repositoryEntries(
+  search: Record<string, string | undefined>,
+  namespace: string | undefined,
+): string[] {
+  const cluster = search.repositoryKind === "cluster-repository";
+  const home = search.repositoryNamespace ?? namespace;
+  return listParam(search.repository).map((entry) => {
+    if (entry.includes("/")) return entry;
+    if (cluster) return repositoryKey("cluster-repository", undefined, entry);
+    return home === undefined ? entry : repositoryKey("repository", home, entry);
+  });
 }
 
 /** A non-negative whole number, or `undefined` for anything else. */
@@ -148,24 +179,26 @@ function Snapshots() {
   const limit = countParam(search.limit) ?? DEFAULT_LIMIT;
 
   const ignored: IgnoredFilter[] = [];
+  // Each value of a list is judged on its own: one the server would refuse is
+  // named and left out, and the rest are still sent.
   const usable = (key: "origin" | "phase" | "repositoryKind"): string | undefined => {
-    const value = asked[key];
-    if (value === undefined) {
-      return undefined;
-    }
     const accepts =
       key === "origin" ? isOriginFilter : key === "phase" ? isPhaseFilter : isKindFilter;
-    if (accepts(value)) {
-      return value;
-    }
     const vocabulary =
       key === "origin"
         ? ORIGIN_FILTERS.map((f) => f.value)
         : key === "phase"
           ? PHASE_FILTERS.map((f) => f.value)
           : KIND_FILTERS.map((f) => f.value);
-    ignored.push({ key, value, accepted: vocabulary.join(", ") });
-    return undefined;
+    const kept: string[] = [];
+    for (const value of listParam(asked[key])) {
+      if (accepts(value)) {
+        kept.push(value);
+      } else {
+        ignored.push({ key, value, accepted: vocabulary.join(", ") });
+      }
+    }
+    return kept.length > 0 ? kept.join(",") : undefined;
   };
 
   const params: SnapshotListParams = {
@@ -205,7 +238,7 @@ function Snapshots() {
       </p>
 
       <section className="page__section" aria-label="Filters">
-        <Filters search={asked} namespace={namespace} limit={limit} key={JSON.stringify(search)} />
+        <Filters search={asked} namespace={namespace} limit={limit} />
       </section>
 
       {ignored.map((filter) => (
@@ -271,19 +304,6 @@ function Snapshots() {
           </>
         )}
       </section>
-
-      {items.length > 0 ? (
-        <section className="page__section" aria-label="Snapshot size over time">
-          <div className="page__section-head">
-            <h2>
-              <Sigma size={16} strokeWidth={2} aria-hidden="true" />
-              Size over time
-            </h2>
-          </div>
-          <p className="page__section-note">Drawn from the rows on this page only.</p>
-          <SnapshotSizeChart rows={items} />
-        </section>
-      ) : null}
     </div>
   );
 }
@@ -364,176 +384,104 @@ interface FiltersProps {
 }
 
 /**
- * The seven filters, submitted into the URL.
+ * The four filters, applied to the URL as they change, beside the shell's
+ * namespace. Each takes any number of values (sent comma-separated, matching
+ * any of them); choosing none is the Clear button in its list.
  *
- * Submitting always resets `offset`: a page-3 window over the old filter is
+ * A repository is chosen with its kind and namespace in one key, so the bar
+ * has no separate kind or namespace field to keep in step with it.
+ *
+ * A change always resets `offset`: a page-3 window over the old filter is
  * meaningless under a new one, and leaving it would show an empty page that
  * looks like "no such snapshots".
  */
 function Filters({ search, namespace, limit }: FiltersProps) {
   const navigate = useNavigate();
-  const [ns, setNs] = useState(namespace ?? "");
-  const [repository, setRepository] = useState(search.repository ?? "");
-  const [repositoryKind, setRepositoryKind] = useState(search.repositoryKind ?? "");
-  const [repositoryNamespace, setRepositoryNamespace] = useState(search.repositoryNamespace ?? "");
-  const [policy, setPolicy] = useState(search.policy ?? "");
-  const [origin, setOrigin] = useState(search.origin ?? "");
-  const [phase, setPhase] = useState(search.phase ?? "");
-
-  const submit = (event: SubmitEvent<HTMLFormElement>) => {
-    event.preventDefault();
+  // The URL is the state: each field reads it, and a change is applied at
+  // once by navigating. Nothing is held locally, so the bar never disagrees
+  // with the list under it — and it is not remounted per change, so a list
+  // still open for another pick stays open.
+  const current = {
+    repository: repositoryEntries(search, namespace),
+    policy: listParam(search.policy),
+    origin: listParam(search.origin),
+    phase: listParam(search.phase),
+  };
+  const apply = (key: keyof typeof current, values: readonly string[]) => {
+    const chosen = { ...current, [key]: values };
     const next: Record<string, string | number> = {};
-    const put = (key: string, value: string) => {
-      const text = value.trim();
-      if (text.length > 0) {
-        next[key] = text;
-      }
-    };
-    put("namespace", ns);
-    put("repository", repository);
-    put("repositoryKind", repositoryKind);
-    put("repositoryNamespace", repositoryNamespace);
-    put("policy", policy);
-    put("origin", origin);
-    put("phase", phase);
+    // The namespace is the shell's scope, chosen in the sidebar's switcher;
+    // the filters keep it.
+    if (namespace !== undefined) next.namespace = namespace;
+    for (const [name, list] of Object.entries(chosen)) {
+      if (list.length > 0) next[name] = list.join(",");
+    }
     if (limit !== DEFAULT_LIMIT) {
       next.limit = limit;
     }
     void navigate({ to: "/snapshots", search: next });
   };
+  const anyChosen = Object.values(current).some((list) => list.length > 0);
 
   return (
-    <form className="controls snapshot-filters" onSubmit={submit} aria-label="Snapshot filters">
-      <div className="controls__field">
-        <label htmlFor="snapshots-namespace">Namespace</label>
-        <input
-          id="snapshots-namespace"
-          className="controls__input"
-          name="namespace"
-          value={ns}
-          onChange={(event) => {
-            setNs(event.target.value);
-          }}
-          placeholder="all namespaces"
-          autoComplete="off"
-          spellCheck={false}
-        />
-      </div>
-      <div className="controls__field">
-        <label htmlFor="snapshots-policy">Policy</label>
-        <input
-          id="snapshots-policy"
-          className="controls__input"
-          name="policy"
-          value={policy}
-          onChange={(event) => {
-            setPolicy(event.target.value);
-          }}
-          placeholder="any policy"
-          autoComplete="off"
-          spellCheck={false}
-        />
-      </div>
-      <div className="controls__field">
-        <label htmlFor="snapshots-repository">Repository</label>
-        <input
-          id="snapshots-repository"
-          className="controls__input"
-          name="repository"
-          value={repository}
-          onChange={(event) => {
-            setRepository(event.target.value);
-          }}
-          placeholder="any repository"
-          autoComplete="off"
-          spellCheck={false}
-        />
-      </div>
-      <div className="controls__field">
-        <label htmlFor="snapshots-repository-kind">Repository kind</label>
-        <select
-          id="snapshots-repository-kind"
-          className="controls__input"
-          name="repositoryKind"
-          value={repositoryKind}
-          onChange={(event) => {
-            setRepositoryKind(event.target.value);
-          }}
-        >
-          <option value="">Repository (default)</option>
-          {KIND_FILTERS.map((kind) => (
-            <option value={kind.value} key={kind.value}>
-              {kind.label}
-            </option>
-          ))}
-        </select>
-      </div>
-      <div className="controls__field">
-        <label htmlFor="snapshots-repository-namespace">Repository namespace</label>
-        <input
-          id="snapshots-repository-namespace"
-          className="controls__input"
-          name="repositoryNamespace"
-          value={repositoryNamespace}
-          onChange={(event) => {
-            setRepositoryNamespace(event.target.value);
-          }}
-          placeholder="the listing's namespace"
-          aria-describedby="snapshots-repository-namespace-hint"
-          autoComplete="off"
-          spellCheck={false}
-        />
-        <span className="controls__hint" id="snapshots-repository-namespace-hint">
-          where a namespaced Repository lives; ignored for a ClusterRepository
-        </span>
-      </div>
-      <div className="controls__field">
-        <label htmlFor="snapshots-origin">Origin</label>
-        <select
-          id="snapshots-origin"
-          className="controls__input"
-          name="origin"
-          value={origin}
-          onChange={(event) => {
-            setOrigin(event.target.value);
-          }}
-        >
-          <option value="">any origin</option>
-          {ORIGIN_FILTERS.map((option) => (
-            <option value={option.value} key={option.value}>
-              {option.label}
-            </option>
-          ))}
-        </select>
-      </div>
-      <div className="controls__field">
-        <label htmlFor="snapshots-phase">Phase</label>
-        <select
-          id="snapshots-phase"
-          className="controls__input"
-          name="phase"
-          value={phase}
-          onChange={(event) => {
-            setPhase(event.target.value);
-          }}
-        >
-          <option value="">any phase</option>
-          {PHASE_FILTERS.map((option) => (
-            <option value={option.value} key={option.value}>
-              {option.label}
-            </option>
-          ))}
-        </select>
-      </div>
-      <div className="controls__actions">
-        <ActionButton variant="primary" type="submit">
-          <Filter size={14} strokeWidth={2} aria-hidden="true" />
-          Apply filters
-        </ActionButton>
-        <Link className="button button--quiet" to="/snapshots" search={{}}>
-          Clear
-        </Link>
-      </div>
+    <form
+      className="controls snapshot-filters"
+      aria-label="Snapshot filters"
+      onSubmit={(event) => {
+        event.preventDefault();
+      }}
+    >
+      <PolicyField
+        id="snapshots-policy"
+        label="Policy"
+        value={current.policy}
+        onChange={(values) => {
+          apply("policy", values);
+        }}
+        emptyLabel="any policy"
+      />
+      <RepositoryField
+        id="snapshots-repository"
+        label="Repository"
+        value={current.repository}
+        onChange={(values) => {
+          apply("repository", values);
+        }}
+        emptyLabel="any repository"
+      />
+      <PickerField
+        id="snapshots-origin"
+        label="Origin"
+        multiple
+        value={current.origin}
+        onChange={(values) => {
+          apply("origin", values);
+        }}
+        options={ORIGIN_FILTERS}
+        emptyLabel="any origin"
+      />
+      <PickerField
+        id="snapshots-phase"
+        label="Phase"
+        multiple
+        value={current.phase}
+        onChange={(values) => {
+          apply("phase", values);
+        }}
+        options={PHASE_FILTERS}
+        emptyLabel="any phase"
+      />
+      {anyChosen ? (
+        <div className="controls__actions">
+          <Link
+            className="button button--quiet"
+            to="/snapshots"
+            search={namespace === undefined ? {} : { namespace }}
+          >
+            Clear all
+          </Link>
+        </div>
+      ) : null}
     </form>
   );
 }

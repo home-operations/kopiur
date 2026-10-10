@@ -18,6 +18,9 @@ const router = createRouter({
   // A stale bundle after a release: the chunk a route needs is gone. Reload
   // once rather than showing a broken route.
   defaultPreloadStaleTime: 0,
+  // Back and Forward return to where the page was scrolled, which is also how
+  // closing a drawer (a step back) leaves the page as it was.
+  scrollRestoration: true,
 });
 
 declare module "@tanstack/react-router" {

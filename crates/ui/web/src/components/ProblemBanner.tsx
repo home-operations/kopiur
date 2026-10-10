@@ -28,7 +28,6 @@ export function ProblemBanner({
 }: ProblemBannerProps) {
   const forbidden = isNotPermitted(problem);
   const Icon = forbidden ? ShieldOff : CircleAlert;
-  const kind = problemKind(problem);
   const classes = [
     "problem",
     variant === "banner" ? "problem--banner" : "",
@@ -41,21 +40,7 @@ export function ProblemBanner({
       <span className="problem__icon">
         <Icon size={18} strokeWidth={2} aria-hidden="true" />
       </span>
-      <div className="problem__body">
-        <div className="problem__what">{problem.what}</div>
-        <div className="problem__why">{problem.why}</div>
-        <div className="problem__fix">
-          <span className="problem__fix-label">Fix</span>
-          <span>{problem.fix}</span>
-        </div>
-        <div className="problem__meta">
-          {source !== undefined ? <span className="problem__source">{source} · </span> : null}
-          {problem.status > 0 ? `${problem.status} ` : ""}
-          {kind ?? problem.title}
-          {problem.kubeReason ? ` · ${problem.kubeReason}` : ""}
-          {problem.instance ? ` · ${problem.instance}` : ""}
-        </div>
-      </div>
+      <ProblemBody problem={problem} source={source} />
       {onDismiss !== undefined ? (
         <button
           type="button"
@@ -66,6 +51,37 @@ export function ProblemBanner({
           <X size={16} strokeWidth={2} aria-hidden="true" />
         </button>
       ) : null}
+    </div>
+  );
+}
+
+/**
+ * The three lines and the meta line, shared by the banner and a refused
+ * action's toast so the two never word a problem differently.
+ */
+export function ProblemBody({
+  problem,
+  source,
+}: {
+  problem: Problem;
+  source?: string | undefined;
+}) {
+  const kind = problemKind(problem);
+  return (
+    <div className="problem__body">
+      <div className="problem__what">{problem.what}</div>
+      <div className="problem__why">{problem.why}</div>
+      <div className="problem__fix">
+        <span className="problem__fix-label">Fix</span>
+        <span>{problem.fix}</span>
+      </div>
+      <div className="problem__meta">
+        {source !== undefined ? <span className="problem__source">{source} · </span> : null}
+        {problem.status > 0 ? `${problem.status} ` : ""}
+        {kind ?? problem.title}
+        {problem.kubeReason ? ` · ${problem.kubeReason}` : ""}
+        {problem.instance ? ` · ${problem.instance}` : ""}
+      </div>
     </div>
   );
 }

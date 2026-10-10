@@ -41,6 +41,7 @@ import {
   isApiProblemError,
   withQuery,
 } from "./client";
+import { browsed } from "../components/browse/browsed";
 import { isSessionRequired } from "./problem";
 import type {
   ActionReceipt,
@@ -51,6 +52,8 @@ import type {
   MaintenanceRow,
   MaintenanceRunBody,
   Me,
+  NamespaceSummary,
+  OverviewView,
   Page,
   PolicyDetail,
   PolicyRow,
@@ -96,6 +99,8 @@ const API = "/api/v1";
 /** Every path the SPA requests, in one place. */
 export const paths = {
   me: `${API}/me`,
+  namespaces: `${API}/namespaces`,
+  overview: `${API}/overview`,
   status: `${API}/status`,
   graph: `${API}/graph`,
   repositories: `${API}/repositories`,
@@ -152,6 +157,8 @@ export interface SnapshotListParams {
   policy?: string | undefined;
   origin?: string | undefined;
   phase?: string | undefined;
+  /** Name contains this text (case-insensitive, literal); blank is no filter. */
+  q?: string | undefined;
   offset?: number | undefined;
   limit?: number | undefined;
 }
@@ -192,6 +199,8 @@ export interface TreeParams {
  */
 export const queryKeys = {
   me: (namespace: Namespace) => ["me", { namespace: namespace ?? null }] as const,
+  namespaces: () => ["namespaces"] as const,
+  overview: (namespace: Namespace) => ["overview", { namespace: namespace ?? null }] as const,
   status: (namespace: Namespace) => ["status", { namespace: namespace ?? null }] as const,
   graph: (namespace: Namespace) => ["graph", { namespace: namespace ?? null }] as const,
   repositories: (namespace: Namespace) =>
@@ -262,6 +271,15 @@ export interface ApiMutationOptions<TData, TVariables> {
    */
   invalidates: (variables: TVariables) => readonly QueryKey[];
   onSuccess?: ((data: TData, variables: TVariables) => void) | undefined;
+  onError?: ((error: ApiProblemError, variables: TVariables) => void) | undefined;
+  /**
+   * The action, worded for the toast that answers it: "Suspend schedule
+   * media/nightly". Every mutation is answered by a toast from the query
+   * client's cache (`queryClient.ts`), so every mutation names itself.
+   */
+  describe: (variables: TVariables) => string;
+  /** `errors`: only a refusal toasts; the success shows where it was asked. */
+  announce?: "receipt" | "errors" | undefined;
 }
 
 /**
@@ -283,9 +301,16 @@ export function useApiMutation<TData, TVariables>(
   const mutationOptions: UseMutationOptions<TData, ApiProblemError, TVariables> = {
     mutationFn: (variables) => options.mutationFn(variables, {}),
     onSettled: (_data, _error, variables) => invalidate(variables),
+    meta: {
+      describe: (variables) => options.describe(variables as TVariables),
+      ...(options.announce !== undefined ? { announce: options.announce } : {}),
+    },
   };
   if (options.onSuccess !== undefined) {
     mutationOptions.onSuccess = options.onSuccess;
+  }
+  if (options.onError !== undefined) {
+    mutationOptions.onError = options.onError;
   }
   return useMutation(mutationOptions);
 }
@@ -302,6 +327,23 @@ export function useMe(namespace: Namespace, options: ReadOptions = {}) {
     staleTime: staleTime.me,
     ...options,
   });
+}
+
+/** Namespaces holding kopiur objects the caller may see — the switcher's list. */
+export function useNamespaces(options: ReadOptions = {}) {
+  return useApiQuery<NamespaceSummary[]>(queryKeys.namespaces(), paths.namespaces, {
+    staleTime: staleTime.list,
+    ...options,
+  });
+}
+
+/** The fleet by kind: per-kind health tallies for the scope. */
+export function useOverview(namespace: Namespace, options: ReadOptions = {}) {
+  return useApiQuery<OverviewView>(
+    queryKeys.overview(namespace),
+    withQuery(paths.overview, { namespace }),
+    { staleTime: staleTime.list, ...options },
+  );
 }
 
 export function useStatus(namespace: Namespace, options: ReadOptions = {}) {
@@ -352,6 +394,22 @@ export function useSnapshots(params: SnapshotListParams, options: ReadOptions = 
     queryKeys.snapshots(params),
     withQuery(paths.snapshots, { ...params }),
     { staleTime: staleTime.list, ...options },
+  );
+}
+
+/** The shortest query worth sending: one character matches nearly everything. */
+export const SEARCH_MIN_CHARS = 2;
+
+/**
+ * Snapshots whose name contains `q`, for the object search. Ten at most —
+ * the search shows a handful of matches, not a list page — and nothing is
+ * asked until `q` has {@link SEARCH_MIN_CHARS} non-blank characters.
+ */
+export function useSnapshotSearch(q: string, namespace: Namespace, options: ReadOptions = {}) {
+  const term = q.trim();
+  return useSnapshots(
+    { q: term, namespace: namespace ?? undefined, limit: 10 },
+    { ...options, enabled: (options.enabled ?? true) && term.length >= SEARCH_MIN_CHARS },
   );
 }
 
@@ -522,6 +580,7 @@ export function useSnapshotTree(
 export function useSnapshotNow() {
   return useApiMutation<ActionReceipt, SnapshotNowBody>({
     mutationFn: (body, init) => apiPost<ActionReceipt>(paths.actions.snapshotNow, body, init),
+    describe: (body) => `Take a snapshot of ${body.namespace}/${body.policy}`,
     invalidates: (body) => [
       ["snapshots"],
       queryKeys.policy(body.namespace, body.policy),
@@ -535,6 +594,7 @@ export function useSnapshotNow() {
 export function useCreateRestore() {
   return useApiMutation<ActionReceipt, RestoreBody>({
     mutationFn: (body, init) => apiPost<ActionReceipt>(paths.actions.restore, body, init),
+    describe: (body) => `Create a restore in ${body.namespace}`,
     invalidates: (body) => [
       ["restores"],
       queryKeys.status(body.namespace),
@@ -543,12 +603,21 @@ export function useCreateRestore() {
   });
 }
 
+/** A suspend body's `kind` token (`suspendable.ts`), in the words a sentence uses. */
+function suspendNoun(kind: string): string {
+  return kind.replaceAll("-", " ");
+}
+
 /** `POST /actions/suspend` → 200. Explicit `suspend: true|false`, never a toggle. */
 export function useSuspend() {
   return useApiMutation<ActionReceipt, SuspendBody>({
     mutationFn: (body, init) => apiPost<ActionReceipt>(paths.actions.suspend, body, init),
     // Which list a suspend touches depends on `kind`; a kind this bundle does
     // not know still invalidates every candidate rather than none.
+    describe: (body) =>
+      `${body.suspend ? "Suspend" : "Resume"} ${suspendNoun(body.kind)} ${
+        body.namespace !== null && body.namespace !== undefined ? `${body.namespace}/` : ""
+      }${body.name}`,
     invalidates: () => [
       ["policies"],
       ["schedules"],
@@ -564,6 +633,8 @@ export function useSuspend() {
 export function useMaintenanceRun() {
   return useApiMutation<ActionReceipt, MaintenanceRunBody>({
     mutationFn: (body, init) => apiPost<ActionReceipt>(paths.actions.maintenanceRun, body, init),
+    describe: (body) =>
+      `Run ${body.mode} maintenance on ${body.namespace}/${body.name ?? "its repository"}`,
     invalidates: () => [["maintenance"], ["status"]],
   });
 }
@@ -572,6 +643,7 @@ export function useMaintenanceRun() {
 export function useReplicationRun() {
   return useApiMutation<ActionReceipt, ReplicationRunBody>({
     mutationFn: (body, init) => apiPost<ActionReceipt>(paths.actions.replicationRun, body, init),
+    describe: (body) => `Run replication ${body.namespace}/${body.name}`,
     invalidates: () => [["replications"], ["graph"], ["status"]],
   });
 }
@@ -580,6 +652,10 @@ export function useReplicationRun() {
 export function useScanCatalog() {
   return useApiMutation<ActionReceipt, ScanCatalogBody>({
     mutationFn: (body, init) => apiPost<ActionReceipt>(paths.actions.scanCatalog, body, init),
+    describe: (body) =>
+      `Scan the catalog of ${
+        body.namespace !== null && body.namespace !== undefined ? `${body.namespace}/` : ""
+      }${body.name}`,
     invalidates: () => [["repositories"], ["snapshots"], ["status"]],
   });
 }
@@ -593,6 +669,7 @@ export function useDeleteSnapshot() {
   return useApiMutation<ActionReceipt, { namespace: string; name: string }>({
     mutationFn: ({ namespace, name }, init) =>
       apiDelete<ActionReceipt>(paths.snapshot(namespace, name), init),
+    describe: ({ namespace, name }) => `Delete snapshot ${namespace}/${name}`,
     invalidates: ({ namespace, name }) => [
       ["snapshots"],
       queryKeys.snapshot(namespace, name),
@@ -606,7 +683,16 @@ export function useStartSession() {
   return useApiMutation<SessionInfo, { namespace: string; name: string; body: SessionCreateBody }>({
     mutationFn: ({ namespace, name, body }, init) =>
       apiPost<SessionInfo>(paths.snapshotSession(namespace, name), body, init),
+    describe: ({ namespace, name }) => `Start a browse session on ${namespace}/${name}`,
+    announce: "errors",
     invalidates: ({ namespace, name }) => [queryKeys.snapshotSession(namespace, name)],
+    // The sidebar's Browse line turns red on a failed start, green once one runs.
+    onSuccess: (_session, { namespace, name }) => {
+      browsed.started(`${namespace}/${name}`, true);
+    },
+    onError: (_error, { namespace, name }) => {
+      browsed.started(`${namespace}/${name}`, false);
+    },
   });
 }
 
@@ -615,6 +701,8 @@ export function useEndSession() {
   return useApiMutation<undefined, { namespace: string; name: string }>({
     mutationFn: ({ namespace, name }, init) =>
       apiDelete(paths.snapshotSession(namespace, name), init),
+    describe: ({ namespace, name }) => `Stop the browse session on ${namespace}/${name}`,
+    announce: "errors",
     invalidates: ({ namespace, name }) => [
       queryKeys.snapshotSession(namespace, name),
       ["repositories"],
@@ -638,6 +726,8 @@ export function useEndRepositorySession() {
         withQuery(paths.repositorySession(kindPath, name), { namespace, sessionNamespace }),
         init,
       ),
+    describe: ({ name }) => `Stop the repository session on ${name}`,
+    announce: "errors",
     invalidates: ({ kindPath, name, namespace }) => [
       queryKeys.repository(kindPath, name, namespace),
       ["snapshots"],

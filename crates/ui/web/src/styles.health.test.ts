@@ -1,7 +1,8 @@
 /**
  * The Lettered Lamp Rule, enforced against the stylesheet.
  *
- * `DESIGN.md`: *a health colour never appears without its icon and its word*.
+ * The `kopiur-ui-design` skill (`.claude/skills/kopiur-ui-design/references/rules.md`,
+ * rule 1): *a health colour never appears without its icon and its word*.
  * The reason is not decorative. This is backup software; an operator opens the
  * console at three in the morning to find out whether their data is safe, and
  * a red/green board tells a colour-blind reader nothing at all. Contrast does
@@ -101,6 +102,16 @@ interface Exception {
  */
 const INK_ON_TEXT: ReadonlyMap<string, Exception> = new Map<string, Exception>([
   [
+    ".absent--loud",
+    {
+      reason:
+        'A loud absence — "never verified", "never run" — is the fact itself, ' +
+        "worded, and it always carries the failed lamp's OctagonX icon beside " +
+        "the words (StatStrip's AbsenceText), so the colour is never alone.",
+      callSites: 1,
+    },
+  ],
+  [
     ".button--danger",
     {
       reason:
@@ -146,7 +157,7 @@ const INK_ON_TEXT: ReadonlyMap<string, Exception> = new Map<string, Exception>([
       reason:
         "The cell's own text is `N failed` plus a visually-hidden `to read`. " +
         "The word `failed` is already in the sentence the colour emphasises. " +
-        "Two call sites: the ledger cell and the detail's twin of it.",
+        "Two call sites: the ledger cell and the drawer's twin of it.",
       callSites: 2,
     },
   ],
@@ -287,5 +298,39 @@ describe("the failed lamp", () => {
       const occurrences = CSS.split(hex).length - 1;
       expect(`${hex} x${occurrences}`).toBe(`${hex} x1`);
     }
+  });
+});
+
+/**
+ * Kind colours mark kinds; status colours mark states — never each other's.
+ *
+ * Rule 2 of the `kopiur-ui-design` skill (`references/rules.md`). Several kind
+ * hues sit near a status hue (orange Snapshot / amber Degraded, pink Restore /
+ * red Failed), which is acceptable only because each family keeps to its own
+ * shapes: a `--kind-*` colour appears on a kind's stripe, chip and small-caps
+ * name and nowhere else, and a `[data-kind]` rule never reaches for a status
+ * colour.
+ */
+describe("kind colours", () => {
+  const rules = cssRules(CSS).filter((r) => !r.selector.includes(":root"));
+  const KIND_TOKEN = /var\(--kind-[a-z-]+\)/;
+  const KIND_SURFACE = /\[data-kind|\.kind-|\.has-stripe/;
+
+  it("appear only on a kind's stripe, chip and name", () => {
+    const strays = rules
+      .filter((r) => KIND_TOKEN.test(r.body) && !KIND_SURFACE.test(r.selector))
+      .map((r) => r.selector);
+    expect(strays).toEqual([]);
+  });
+
+  it("are never mixed with a status colour in a kind rule", () => {
+    const mixed = rules
+      .filter((r) => r.selector.includes("[data-kind") && r.body.includes("--health-"))
+      .map((r) => r.selector);
+    expect(mixed).toEqual([]);
+  });
+
+  it("are actually in use, so a rename cannot make this vacuous", () => {
+    expect(rules.filter((r) => KIND_TOKEN.test(r.body)).length).toBeGreaterThanOrEqual(9);
   });
 });

@@ -1,0 +1,846 @@
+# Dev-stack seed — a small, populated kopiur install for working on the web console.
+#
+# Applied by `mise run //crates/e2e:ui-dev-stack` into the throwaway kopiur-e2e
+# kind cluster, AFTER the operator chart is installed. It is NOT part of any e2e
+# scenario: the suite provisions its own fixtures from Rust (crates/e2e `World`),
+# and nothing here is asserted on. Its only job is to give every console screen
+# something real to render — repositories, policies, a schedule that keeps firing,
+# succeeded snapshots, a restore, and the default-managed Maintenance those imply.
+#
+# Most of it is filesystem-backed over hostPath dirs under /kopiur-dev on the
+# kind node (created by the task before this is applied); the S3 repositories and
+# the blob replication use the dev MinIO from minio.yaml, applied first. Nothing
+# here shares a dir or a bucket with the e2e fixtures.
+#
+# The `kopiur-dev` user at the bottom is who the locally-run `kopiur-ui` backend
+# impersonates (`--anonymous-user kopiur-dev`). The console refuses every
+# `system:` principal, so it cannot impersonate `system:masters`; this binding is
+# the throwaway-cluster stand-in for a real user's RBAC.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: kopiur-dev
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: dev-kopia-creds
+  namespace: kopiur-dev
+type: Opaque
+stringData:
+  KOPIA_PASSWORD: "kopiur-dev-password"
+---
+# The ClusterRepository's password lives in the operator namespace, where its
+# bootstrap and Maintenance run.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: dev-kopia-creds
+  namespace: kopiur-e2e
+type: Opaque
+stringData:
+  KOPIA_PASSWORD: "kopiur-dev-password"
+# --- storage: statically bound hostPath PVs (storageClassName "", 1:1 PV↔PVC) ---
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: kopiur-dev-repo
+spec:
+  capacity: { storage: 1Gi }
+  accessModes: [ReadWriteOnce]
+  storageClassName: ""
+  hostPath: { path: /kopiur-dev/repo, type: Directory }
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: dev-repo
+  namespace: kopiur-dev
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: ""
+  volumeName: kopiur-dev-repo
+  resources: { requests: { storage: 1Gi } }
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: kopiur-dev-cluster-repo
+spec:
+  capacity: { storage: 1Gi }
+  accessModes: [ReadWriteOnce]
+  storageClassName: ""
+  hostPath: { path: /kopiur-dev/cluster-repo, type: Directory }
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: dev-cluster-repo
+  namespace: kopiur-e2e
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: ""
+  volumeName: kopiur-dev-cluster-repo
+  resources: { requests: { storage: 1Gi } }
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: kopiur-dev-src
+spec:
+  capacity: { storage: 1Gi }
+  accessModes: [ReadWriteOnce]
+  storageClassName: ""
+  hostPath: { path: /kopiur-dev/src, type: Directory }
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: app-data
+  namespace: kopiur-dev
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: ""
+  volumeName: kopiur-dev-src
+  resources: { requests: { storage: 1Gi } }
+# --- kopiur resources -----------------------------------------------------------
+---
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: Repository
+metadata:
+  name: dev-repo
+  namespace: kopiur-dev
+spec:
+  backend:
+    filesystem:
+      path: /repo
+      volume:
+        pvc:
+          name: dev-repo
+  encryption:
+    passwordSecretRef:
+      name: dev-kopia-creds
+      key: KOPIA_PASSWORD
+  create:
+    enabled: true
+---
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: ClusterRepository
+metadata:
+  name: dev-cluster-repo
+spec:
+  backend:
+    filesystem:
+      path: /repo
+      volume:
+        pvc:
+          name: dev-cluster-repo
+  encryption:
+    passwordSecretRef:
+      name: dev-kopia-creds
+      namespace: kopiur-e2e
+      key: KOPIA_PASSWORD
+  create:
+    enabled: true
+  allowedNamespaces:
+    all: true
+---
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: SnapshotPolicy
+metadata:
+  name: app-data
+  namespace: kopiur-dev
+spec:
+  repository:
+    kind: Repository
+    name: dev-repo
+  sources:
+    - pvc:
+        name: app-data
+  # A statically provisioned hostPath PVC has no CSI driver to snapshot it.
+  copyMethod: Direct
+  retention:
+    keepLatest: 10
+    keepHourly: 6
+    keepDaily: 7
+---
+# A second policy over the same data, so policy filters have something to leave out.
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: SnapshotPolicy
+metadata:
+  name: app-data-weekly
+  namespace: kopiur-dev
+spec:
+  repository:
+    kind: Repository
+    name: dev-repo
+  sources:
+    - pvc:
+        name: app-data
+  copyMethod: Direct
+  retention:
+    keepWeekly: 4
+---
+# Keeps producing Snapshots while the stack is up, so list/timeline views move.
+# Hourly, not tighter: the webhook (rightly) warns that a sub-hourly cron piles up
+# Snapshot CRs, and a dev cluster left running overnight should not.
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: SnapshotSchedule
+metadata:
+  name: app-data-frequent
+  namespace: kopiur-dev
+spec:
+  policyRef:
+    name: app-data
+  schedule:
+    cron: "H * * * *"
+    runOnCreate: true
+---
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: Snapshot
+metadata:
+  name: app-data-manual
+  namespace: kopiur-dev
+spec:
+  policyRef:
+    name: app-data
+  description: "seeded by the dev stack"
+  tags:
+    reason: dev-stack
+  pin: true
+  deletionPolicy: Retain
+---
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: Snapshot
+metadata:
+  name: app-data-weekly-manual
+  namespace: kopiur-dev
+spec:
+  policyRef:
+    name: app-data-weekly
+---
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: Restore
+metadata:
+  name: app-data-restore
+  namespace: kopiur-dev
+spec:
+  source:
+    snapshotRef:
+      name: app-data-manual
+      namespace: kopiur-dev
+  target:
+    pvc:
+      name: app-data-restored
+      capacity: 1Gi
+      accessModes: [ReadWriteOnce]
+  policy:
+    # The Snapshot is created in the same apply; give it time to finish.
+    waitTimeout: 10m
+# --- the rest of the console's cases --------------------------------------------
+# Everything below exists to put one more case on screen: a second backend kind,
+# namespaces admitted by list and by selector, a fan-out, a selector schedule,
+# both replication kinds, a seed, a gate, failures, suspended objects and a
+# dangling reference. Some of it is MEANT to fail or be held; the task waits
+# only on the snapshots above.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: media
+  labels:
+    team: media
+  annotations:
+    kopiur.home-operations.com/privileged-movers: "true"
+---
+# Not opted in to privileged movers: the root mover below is held by a gate.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: billing
+  labels:
+    team: billing
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: dev-kopia-creds
+  namespace: media
+type: Opaque
+stringData:
+  KOPIA_PASSWORD: "kopiur-dev-password"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: dev-kopia-creds
+  namespace: billing
+type: Opaque
+stringData:
+  KOPIA_PASSWORD: "kopiur-dev-password"
+---
+# MinIO's keys (minio.yaml) and a repository password, wherever an S3 repository,
+# its replication or its ClusterRepository reads them.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: dev-s3-creds
+  namespace: media
+type: Opaque
+stringData:
+  AWS_ACCESS_KEY_ID: "minioadmin"
+  AWS_SECRET_ACCESS_KEY: "minioadmin123"
+  KOPIA_PASSWORD: "kopiur-dev-password"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: dev-s3-creds
+  namespace: kopiur-dev
+type: Opaque
+stringData:
+  AWS_ACCESS_KEY_ID: "minioadmin"
+  AWS_SECRET_ACCESS_KEY: "minioadmin123"
+  KOPIA_PASSWORD: "kopiur-dev-password"
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: dev-s3-creds
+  namespace: kopiur-e2e
+type: Opaque
+stringData:
+  AWS_ACCESS_KEY_ID: "minioadmin"
+  AWS_SECRET_ACCESS_KEY: "minioadmin123"
+  KOPIA_PASSWORD: "kopiur-dev-password"
+# --- more hostPath volumes (dirs created by the task) ---------------------------
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: kopiur-dev-media-nas
+spec:
+  capacity: { storage: 1Gi }
+  accessModes: [ReadWriteOnce]
+  storageClassName: ""
+  hostPath: { path: /kopiur-dev/media-nas, type: Directory }
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: media-nas
+  namespace: media
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: ""
+  volumeName: kopiur-dev-media-nas
+  resources: { requests: { storage: 1Gi } }
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: kopiur-dev-media-src
+spec:
+  capacity: { storage: 1Gi }
+  accessModes: [ReadWriteOnce]
+  storageClassName: ""
+  hostPath: { path: /kopiur-dev/media-src, type: Directory }
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: photos
+  namespace: media
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: ""
+  volumeName: kopiur-dev-media-src
+  resources: { requests: { storage: 1Gi } }
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: kopiur-dev-shared-list
+spec:
+  capacity: { storage: 1Gi }
+  accessModes: [ReadWriteOnce]
+  storageClassName: ""
+  hostPath: { path: /kopiur-dev/shared-list, type: Directory }
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: shared-list
+  namespace: kopiur-e2e
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: ""
+  volumeName: kopiur-dev-shared-list
+  resources: { requests: { storage: 1Gi } }
+---
+# A filesystem ClusterRepository is mounted by the claim of the same name in
+# whichever namespace the mover runs: kopiur-dev needs its own, on the same directory.
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: kopiur-dev-shared-list-kopiur-dev
+spec:
+  capacity: { storage: 1Gi }
+  accessModes: [ReadWriteOnce]
+  storageClassName: ""
+  hostPath: { path: /kopiur-dev/shared-list, type: Directory }
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: shared-list
+  namespace: kopiur-dev
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: ""
+  volumeName: kopiur-dev-shared-list-kopiur-dev
+  resources: { requests: { storage: 1Gi } }
+---
+# A filesystem ClusterRepository is mounted by the claim of the same name in
+# whichever namespace the mover runs: media needs its own, on the same directory.
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: kopiur-dev-shared-list-media
+spec:
+  capacity: { storage: 1Gi }
+  accessModes: [ReadWriteOnce]
+  storageClassName: ""
+  hostPath: { path: /kopiur-dev/shared-list, type: Directory }
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: shared-list
+  namespace: media
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: ""
+  volumeName: kopiur-dev-shared-list-media
+  resources: { requests: { storage: 1Gi } }
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: kopiur-dev-billing-repo
+spec:
+  capacity: { storage: 1Gi }
+  accessModes: [ReadWriteOnce]
+  storageClassName: ""
+  hostPath: { path: /kopiur-dev/billing-repo, type: Directory }
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ledger-repo
+  namespace: billing
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: ""
+  volumeName: kopiur-dev-billing-repo
+  resources: { requests: { storage: 1Gi } }
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: kopiur-dev-billing-src
+spec:
+  capacity: { storage: 1Gi }
+  accessModes: [ReadWriteOnce]
+  storageClassName: ""
+  hostPath: { path: /kopiur-dev/billing-src, type: Directory }
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ledger
+  namespace: billing
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: ""
+  volumeName: kopiur-dev-billing-src
+  resources: { requests: { storage: 1Gi } }
+# --- media: filesystem and S3 side by side, a fan-out, a selector schedule ------
+---
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: Repository
+metadata:
+  name: nas
+  namespace: media
+spec:
+  backend:
+    filesystem:
+      path: /repo
+      volume:
+        pvc:
+          name: media-nas
+  encryption:
+    passwordSecretRef:
+      name: dev-kopia-creds
+      key: KOPIA_PASSWORD
+  create:
+    enabled: true
+---
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: Repository
+metadata:
+  name: offsite
+  namespace: media
+spec:
+  backend:
+    s3:
+      bucket: dev-media
+      prefix: offsite/
+      endpoint: minio.kopiur-dev.svc.cluster.local:9000
+      region: us-east-1
+      tls:
+        disableTls: true
+      auth:
+        secretRef:
+          name: dev-s3-creds
+  encryption:
+    passwordSecretRef:
+      name: dev-s3-creds
+      key: KOPIA_PASSWORD
+  create:
+    enabled: true
+---
+# Admits a listed set of namespaces. Mounted at /repo-shared, not /repo: it is
+# the destination of a snapshot replication from dev-repo, and the replication
+# mover mounts both filesystem repositories in one pod.
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: ClusterRepository
+metadata:
+  name: shared-list
+spec:
+  backend:
+    filesystem:
+      path: /repo-shared
+      volume:
+        pvc:
+          name: shared-list
+  encryption:
+    passwordSecretRef:
+      name: dev-kopia-creds
+      namespace: kopiur-e2e
+      key: KOPIA_PASSWORD
+  create:
+    enabled: true
+  allowedNamespaces:
+    list: [kopiur-dev, media]
+---
+# Admits namespaces by label, on S3.
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: ClusterRepository
+metadata:
+  name: shared-teams
+spec:
+  backend:
+    s3:
+      bucket: dev-offsite
+      prefix: shared-teams/
+      endpoint: minio.kopiur-dev.svc.cluster.local:9000
+      region: us-east-1
+      tls:
+        disableTls: true
+      auth:
+        secretRef:
+          name: dev-s3-creds
+          namespace: kopiur-e2e
+  encryption:
+    passwordSecretRef:
+      name: dev-s3-creds
+      namespace: kopiur-e2e
+      key: KOPIA_PASSWORD
+  create:
+    enabled: true
+  allowedNamespaces:
+    selector:
+      matchLabels:
+        team: media
+---
+# A fan-out: one run, one Snapshot per repository — one of them a ClusterRepository.
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: SnapshotPolicy
+metadata:
+  name: photos
+  namespace: media
+  labels:
+    tier: gold
+spec:
+  repositories:
+    - kind: Repository
+      name: nas
+    - kind: ClusterRepository
+      name: shared-list
+  sources:
+    - pvc:
+        name: photos
+  copyMethod: Direct
+  retention:
+    keepDaily: 7
+    keepWeekly: 4
+---
+# The same data to S3, also gold.
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: SnapshotPolicy
+metadata:
+  name: photos-offsite
+  namespace: media
+  labels:
+    tier: gold
+spec:
+  repository:
+    kind: Repository
+    name: offsite
+  sources:
+    - pvc:
+        name: photos
+  copyMethod: Direct
+  retention:
+    keepDaily: 14
+---
+# Fires every policy labelled tier=gold — by selector, not by name.
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: SnapshotSchedule
+metadata:
+  name: gold-nightly
+  namespace: media
+spec:
+  policySelector:
+    matchLabels:
+      tier: gold
+  schedule:
+    cron: "H 3 * * *"
+    timezone: Europe/Berlin
+    runOnCreate: true
+# --- kopiur-dev: replication, a seed, a dangling reference, failures, suspends --
+---
+# Every blob of dev-repo, copied to a bare S3 backend.
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: RepositoryReplication
+metadata:
+  name: offsite-blobs
+  namespace: kopiur-dev
+spec:
+  sourceRef:
+    kind: Repository
+    name: dev-repo
+  destination:
+    s3:
+      bucket: dev-offsite
+      prefix: offsite-blobs/
+      endpoint: minio.kopiur-dev.svc.cluster.local:9000
+      region: us-east-1
+      tls:
+        disableTls: true
+      auth:
+        secretRef:
+          name: dev-s3-creds
+  schedule:
+    cron: "H */6 * * *"
+---
+# dev-repo's snapshots, copied into a ClusterRepository that admits kopiur-dev.
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: SnapshotReplication
+metadata:
+  name: to-cluster
+  namespace: kopiur-dev
+spec:
+  sourceRef:
+    kind: Repository
+    name: dev-repo
+  destinationRef:
+    kind: ClusterRepository
+    name: shared-list
+  schedule:
+    cron: "H */6 * * *"
+---
+# Seeded once, at creation, from dev-repo (migrate mode) — on S3.
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: Repository
+metadata:
+  name: dev-repo-mirror
+  namespace: kopiur-dev
+spec:
+  backend:
+    s3:
+      bucket: dev-mirror
+      prefix: mirror/
+      endpoint: minio.kopiur-dev.svc.cluster.local:9000
+      region: us-east-1
+      tls:
+        disableTls: true
+      auth:
+        secretRef:
+          name: dev-s3-creds
+  encryption:
+    passwordSecretRef:
+      name: dev-s3-creds
+      key: KOPIA_PASSWORD
+  create:
+    enabled: true
+  seed:
+    from:
+      repository:
+        kind: Repository
+        name: dev-repo
+    # The seed may run before dev-repo has a snapshot; an empty source is fine here.
+    allowEmptySource: true
+---
+# Names a repository that does not exist: a ghost on the topology board.
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: SnapshotPolicy
+metadata:
+  name: orphaned
+  namespace: kopiur-dev
+spec:
+  repository:
+    kind: Repository
+    name: does-not-exist
+  sources:
+    - pvc:
+        name: app-data
+  copyMethod: Direct
+---
+# Backs up a claim that does not exist, so its run fails.
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: SnapshotPolicy
+metadata:
+  name: broken
+  namespace: kopiur-dev
+spec:
+  repository:
+    kind: Repository
+    name: dev-repo
+  sources:
+    - pvc:
+        name: missing-claim
+  copyMethod: Direct
+---
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: Snapshot
+metadata:
+  name: app-data-broken
+  namespace: kopiur-dev
+spec:
+  policyRef:
+    name: broken
+---
+# Restores a snapshot that does not exist; it gives up after a minute.
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: Restore
+metadata:
+  name: restore-of-nothing
+  namespace: kopiur-dev
+spec:
+  source:
+    snapshotRef:
+      name: does-not-exist
+      namespace: kopiur-dev
+  target:
+    pvc:
+      name: restored-nothing
+      capacity: 1Gi
+      accessModes: [ReadWriteOnce]
+  policy:
+    waitTimeout: 1m
+---
+# Suspended: a policy, and a schedule that would fire it.
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: SnapshotPolicy
+metadata:
+  name: archive
+  namespace: kopiur-dev
+spec:
+  repository:
+    kind: Repository
+    name: dev-repo
+  sources:
+    - pvc:
+        name: app-data
+  copyMethod: Direct
+  retention:
+    keepMonthly: 12
+  suspend: true
+---
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: SnapshotSchedule
+metadata:
+  name: archive-monthly
+  namespace: kopiur-dev
+spec:
+  policyRef:
+    name: archive
+  schedule:
+    cron: "H 4 1 * *"
+    suspend: true
+# --- billing: a root mover in a namespace that has not opted in ------------------
+---
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: Repository
+metadata:
+  name: ledger-repo
+  namespace: billing
+spec:
+  backend:
+    filesystem:
+      path: /repo
+      volume:
+        pvc:
+          name: ledger-repo
+  encryption:
+    passwordSecretRef:
+      name: dev-kopia-creds
+      key: KOPIA_PASSWORD
+  create:
+    enabled: true
+---
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: SnapshotPolicy
+metadata:
+  name: ledger
+  namespace: billing
+spec:
+  repository:
+    kind: Repository
+    name: ledger-repo
+  sources:
+    - pvc:
+        name: ledger
+  copyMethod: Direct
+  mover:
+    securityContext:
+      runAsUser: 0
+      runAsNonRoot: false
+---
+# The gate is checked when a run starts: this one is held by it.
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: Snapshot
+metadata:
+  name: ledger-manual
+  namespace: billing
+spec:
+  policyRef:
+    name: ledger
+# --- the console's identity ----------------------------------------------------
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kopiur-dev-admin
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-admin
+subjects:
+  - apiGroup: rbac.authorization.k8s.io
+    kind: User
+    name: kopiur-dev

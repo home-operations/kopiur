@@ -21,7 +21,7 @@ const nas: RepositorySummary = {
   indexBlobCount: 17,
   lastObservedAt: null,
   serverEndpoint: null,
-  allowedNamespaceCount: null,
+  admits: null,
 };
 
 const shared: RepositorySummary = {
@@ -40,7 +40,7 @@ const shared: RepositorySummary = {
   indexBlobCount: null,
   lastObservedAt: null,
   serverEndpoint: "https://kopia.internal:51515",
-  allowedNamespaceCount: 3,
+  admits: "all",
 };
 
 function table() {
@@ -62,17 +62,13 @@ describe("RepositoryTable", () => {
     expect(row).toHaveTextContent("17");
   });
 
-  it("links with the summary's kindPath, never a segment derived from the display kind", async () => {
+  it("opens each row in the resource drawer, the cluster-scoped kind without a namespace", async () => {
     renderWithRouter(<RepositoryTable repositories={[nas, shared]} />);
-    expect(await screen.findByRole("link", { name: "nas" })).toHaveAttribute(
-      "href",
-      "/repositories/repository/nas?namespace=media",
+    expect((await screen.findByRole("link", { name: "nas" })).getAttribute("href")).toMatch(
+      /inspect=repository%2Fmedia%2Fnas$/,
     );
-    // "ClusterRepository" would give `/repositories/ClusterRepository/shared`;
-    // the kebab segment is the server's own `kindPath`.
-    expect(await screen.findByRole("link", { name: "shared" })).toHaveAttribute(
-      "href",
-      "/repositories/cluster-repository/shared",
+    expect((await screen.findByRole("link", { name: "shared" })).getAttribute("href")).toMatch(
+      /inspect=cluster-repository%2Fshared$/,
     );
   });
 
@@ -82,11 +78,12 @@ describe("RepositoryTable", () => {
     expect(within(row).getByText("not reported")).toBeInTheDocument();
   });
 
-  it("says how a server-backed repository is reached and how many namespaces it admits", async () => {
+  it("says how a server-backed repository is reached and which namespaces it admits", async () => {
     renderWithRouter(<RepositoryTable repositories={[shared]} />);
     const row = nth(bodyRows(await table()), 0);
     expect(row).toHaveTextContent("Repository server");
-    expect(row).toHaveTextContent("3 namespaces");
+    expect(row).toHaveTextContent("admits all namespaces");
+    expect(row).not.toHaveTextContent("-1");
   });
 
   it("marks a suspended repository as taking no new backups", async () => {
@@ -115,5 +112,15 @@ describe("RepositoryTable", () => {
     const row = nth(bodyRows(await table()), 0);
     expect(row).toHaveTextContent("0");
     expect(row).toHaveTextContent("0 B");
+  });
+});
+
+describe("RepositoryTable — kind identity", () => {
+  it("stripes each row in its own kind, Repository and ClusterRepository apart", async () => {
+    renderWithRouter(<RepositoryTable repositories={[nas, shared]} />);
+    const rows = bodyRows(await table());
+    expect(nth(rows, 0)).toHaveAttribute("data-kind", "repository");
+    expect(nth(rows, 1)).toHaveAttribute("data-kind", "cluster-repository");
+    expect(nth(rows, 0).querySelector("td.has-stripe .kind-chip svg")).not.toBeNull();
   });
 });

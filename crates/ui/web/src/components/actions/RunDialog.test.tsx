@@ -1,4 +1,4 @@
-import { screen, waitFor } from "@testing-library/react";
+import { screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it } from "vitest";
 
@@ -12,6 +12,8 @@ import {
   jsonResponse,
   meWith,
   mockApi,
+  notifications,
+  pickOption,
   problemResponse,
   renderWithClient,
   sentBody,
@@ -74,7 +76,7 @@ describe("RunDialog", () => {
       />,
     );
     const user = await open("Run maintenance");
-    await user.selectOptions(screen.getByLabelText("Mode"), "full");
+    await pickOption(user, "Mode", "full");
     await user.click(screen.getByRole("button", { name: "Request the run" }));
     const expected: MaintenanceRunBody = {
       namespace: "media",
@@ -211,11 +213,13 @@ describe("RunDialog", () => {
       />,
     );
     const user = await open("Run maintenance");
-    expect(screen.getByRole("group", { name: "Run maintenance" })).toHaveTextContent(
+    expect(screen.getByRole("dialog", { name: "Run maintenance" })).toHaveTextContent(
       "watch the object's status for the outcome",
     );
     await user.click(screen.getByRole("button", { name: "Request the run" }));
-    expect(await screen.findByRole("status")).toHaveTextContent("Run maintenance requested");
+    expect(await within(await notifications()).findByRole("status")).toHaveTextContent(
+      "Run quick maintenance on media/nas-maintenance requested",
+    );
   });
 
   it("renders the problem's what, why and fix when the run is refused", async () => {

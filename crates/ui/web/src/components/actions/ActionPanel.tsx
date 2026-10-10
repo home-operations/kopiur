@@ -1,19 +1,19 @@
 import type { LucideIcon } from "lucide-react";
 import { type ReactNode, useState } from "react";
 
-import type { ActionReceipt, Problem } from "../../api/types";
 import { ActionButton } from "../ActionButton";
-import { ActionResult } from "../ActionResult";
+import { Popover } from "../Popover";
 import { useConfirmFocus } from "./useConfirmFocus";
 
 /**
  * The shell every mutating control on this console is built from: a trigger,
- * the question it opens, and the answer the server gave.
+ * and the question it opens. The server's answer is a toast.
  *
- * It is a confirmation *panel*, not a modal. The committed direction's
- * **Action** pattern (DESIGN.md) is a bare `action-bar` of triggers whose
- * first box is the `action__confirm` panel below them; a `<dialog>` here
- * would be a second enclosure over the same content. Every dialog in this
+ * It is a confirmation *panel*, not a modal. The design system's
+ * action pattern (`kopiur-ui-design` skill, `references/composites.md`) opens
+ * the confirmation in a popover anchored to its trigger (or, for a long form,
+ * inline under it); a modal here would be a second enclosure over the same
+ * content. Every dialog in this
  * directory is therefore this shell plus its own fields, which is also why
  * they can be dropped into a ledger row, a detail page or an action bar
  * unchanged.
@@ -42,14 +42,20 @@ import { useConfirmFocus } from "./useConfirmFocus";
  * **Asked before it runs.** Opening the trigger shows what the action will
  * do, in the terms the API uses, before anything is sent.
  *
- * **Answered by the server.** The outcome is the `ActionReceipt` — `note`
- * included, which is where an accepted-but-not-performed action explains
- * itself — or the problem's what / why / fix. Never a word of this component's
- * own.
+ * **Answered by the server, in a toast.** The outcome — the `ActionReceipt`,
+ * `note` included, or the problem's what / why / fix — is toasted by the query
+ * client's mutation cache (`api/queryClient.ts`), never beside this trigger:
+ * it arrives even if this panel is gone by then, and never in a word of this
+ * component's own.
  */
 export interface ActionPanelProps {
-  /** The action's name: the trigger's words and the result's label. */
+  /** The action's name: the trigger's words and the question's. */
   label: string;
+  /**
+   * Shorter words for the trigger, where `label` will not fit (a table's
+   * Action cell); `label` stays its accessible name and the question's.
+   */
+  shortLabel?: string | undefined;
   icon?: LucideIcon | undefined;
   /** `danger` for anything that stops backups or destroys data. */
   variant?: "default" | "danger" | undefined;
@@ -73,8 +79,6 @@ export interface ActionPanelProps {
   /** True while the request is in flight. */
   running: boolean;
   onConfirm: () => void;
-  receipt?: ActionReceipt | undefined;
-  problem?: Problem | undefined;
   /** What the action will do, and the fields it needs. */
   children: ReactNode;
   /**
@@ -84,20 +88,21 @@ export interface ActionPanelProps {
   open?: boolean | undefined;
   onOpenChange?: ((open: boolean) => void) | undefined;
   /**
-   * Render the confirmation and the result without a trigger of their own.
-   *
-   * For a ledger: a table cell is a column, and a column squeezes a
-   * paragraph into a tall thin ribbon that shoves every other column narrow —
-   * the row version of the defect that moved the repository action bar's
-   * confirmation out of its trigger. The caller puts a bare `ActionButton` in
-   * the cell, keeps the open row in state, and renders this once *below* the
-   * ledger at full width. `open` must then be controlled.
+   * `popover` (the default) floats the confirmation over the page, anchored
+   * to its trigger (`Popover`), so asking never shoves the page around it.
+   * `inline` opens it under the trigger, in the flow — for a question too
+   * long to float, such as creating a restore.
    */
-  hideTrigger?: boolean | undefined;
+  presentation?: "inline" | "popover" | undefined;
+  /** For a popover: which edge of the trigger it lines up with. */
+  align?: "start" | "end" | undefined;
+  /** For a popover: `fixed` inside a box that clips, such as a table. */
+  strategy?: "absolute" | "fixed" | undefined;
 }
 
 export function ActionPanel({
   label,
+  shortLabel,
   icon: Icon,
   variant = "default",
   disabledReason,
@@ -106,12 +111,12 @@ export function ActionPanel({
   blockedReason,
   running,
   onConfirm,
-  receipt,
-  problem,
   children,
   open,
   onOpenChange,
-  hideTrigger = false,
+  presentation = "popover",
+  align,
+  strategy,
 }: ActionPanelProps) {
   const [ownOpen, setOwnOpen] = useState(false);
   const controlled = open !== undefined;
@@ -127,7 +132,8 @@ export function ActionPanel({
 
   // Managed focus and Escape — the same implementation the two bespoke action
   // bars use, so a confirmation cannot behave one way here and another there.
-  const panelRef = useConfirmFocus(isOpen, () => {
+  const floating = presentation === "popover";
+  const panelRef = useConfirmFocus(isOpen && !floating, () => {
     setOpen(false);
   });
 
@@ -136,27 +142,76 @@ export function ActionPanel({
   const confirmReason = running ? "The request is in flight." : (disabledReason ?? blockedReason);
   const blocked = disabledReason !== undefined && disabledReason.length > 0;
 
+  const trigger = (props: object = {}) => (
+    <ActionButton
+      variant={variant}
+      disabledReason={disabledReason}
+      reasonShown={shortReason === undefined}
+      aria-expanded={isOpen}
+      aria-label={shortLabel !== undefined ? label : undefined}
+      onClick={() => {
+        setOpen(!isOpen);
+      }}
+      {...props}
+    >
+      {Icon !== undefined ? <Icon size={14} strokeWidth={2} aria-hidden="true" /> : null}
+      {shortLabel ?? label}
+    </ActionButton>
+  );
+  const shortShown =
+    blocked && shortReason !== undefined ? (
+      <span className="action__short">{shortReason}</span>
+    ) : null;
+  const questions = (close: () => void) => (
+    <>
+      <div className="action__prose">{children}</div>
+      <div className="action__actions">
+        <ActionButton
+          variant="primary"
+          disabledReason={confirmReason}
+          reasonKind={
+            disabledReason !== undefined && disabledReason.length > 0 ? "refused" : "blocked"
+          }
+          onClick={() => {
+            onConfirm();
+            close();
+          }}
+        >
+          {confirmLabel}
+        </ActionButton>
+        <ActionButton variant="quiet" onClick={close}>
+          Cancel
+        </ActionButton>
+      </div>
+    </>
+  );
+
+  if (floating) {
+    // The popover owns focus and dismissal: it opens onto its first control,
+    // and Escape, a click elsewhere, Cancel and confirming all close it and
+    // hand focus back to the trigger.
+    return (
+      <div className="action">
+        <Popover
+          label={label}
+          open={isOpen}
+          onOpenChange={setOpen}
+          className="action__popover"
+          align={align}
+          strategy={strategy}
+          trigger={(props) => trigger(props)}
+        >
+          {questions}
+        </Popover>
+        {shortShown}
+      </div>
+    );
+  }
+
   return (
     <div className="action">
-      {hideTrigger ? null : (
-        <>
-          <ActionButton
-            variant={variant}
-            disabledReason={disabledReason}
-            aria-expanded={isOpen}
-            onClick={() => {
-              setOpen(!isOpen);
-            }}
-          >
-            {Icon !== undefined ? <Icon size={14} strokeWidth={2} aria-hidden="true" /> : null}
-            {label}
-          </ActionButton>
-
-          {blocked && shortReason !== undefined ? (
-            <span className="action__short">{shortReason}</span>
-          ) : null}
-        </>
-      )}
+      {trigger()}
+      {shortShown}
 
       {isOpen ? (
         <div
@@ -166,31 +221,11 @@ export function ActionPanel({
           ref={panelRef}
           tabIndex={-1}
         >
-          <div className="action__prose">{children}</div>
-          <div className="action__actions">
-            <ActionButton
-              variant="primary"
-              disabledReason={confirmReason}
-              onClick={() => {
-                onConfirm();
-                setOpen(false);
-              }}
-            >
-              {confirmLabel}
-            </ActionButton>
-            <ActionButton
-              variant="quiet"
-              onClick={() => {
-                setOpen(false);
-              }}
-            >
-              Cancel
-            </ActionButton>
-          </div>
+          {questions(() => {
+            setOpen(false);
+          })}
         </div>
       ) : null}
-
-      <ActionResult label={label} receipt={receipt} problem={problem} />
     </div>
   );
 }

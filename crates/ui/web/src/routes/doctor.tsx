@@ -1,5 +1,5 @@
 import { Link, createFileRoute, useNavigate } from "@tanstack/react-router";
-import { RefreshCw, Stethoscope } from "lucide-react";
+import { Play, Stethoscope } from "lucide-react";
 import { type SubmitEvent, useState } from "react";
 
 import { useDoctor } from "../api/hooks";
@@ -8,6 +8,8 @@ import { DoctorChecks } from "../components/DoctorChecks";
 import { EmptyState } from "../components/EmptyState";
 import { ErrorState } from "../components/ErrorState";
 import { LoadingState } from "../components/LoadingState";
+import { NamespaceField } from "../components/ResourceFields";
+import { Popover } from "../components/Popover";
 import { DOCTOR_DEFAULTS, summarizeDoctor } from "../components/doctor";
 import { type HealthKey, healthLamp } from "../components/health";
 import { parseGoDuration } from "../util/duration";
@@ -131,14 +133,24 @@ function Doctor() {
 
   return (
     <div className="page">
-      <Controls
-        key={`${namespace ?? ""}|${stuckThreshold ?? ""}|${failureLookback ?? ""}`}
-        namespace={namespace}
-        stuckThreshold={stuckThreshold}
-        failureLookback={failureLookback}
-        running={doctor.isFetching}
-        onRerun={() => void doctor.refetch()}
-      />
+      <div className="doctor-head">
+        {doctor.data !== undefined ? (
+          <Summary
+            checks={doctor.data.checks}
+            ranAt={doctor.data.ranAt}
+            now={now}
+            namespace={namespace}
+          />
+        ) : null}
+        <RunDoctor
+          key={`${namespace ?? ""}|${stuckThreshold ?? ""}|${failureLookback ?? ""}`}
+          namespace={namespace}
+          stuckThreshold={stuckThreshold}
+          failureLookback={failureLookback}
+          running={doctor.isFetching}
+          onRerun={() => void doctor.refetch()}
+        />
+      </div>
 
       {ignored.length > 0 ? (
         <p className="page__prose" role="status">
@@ -150,15 +162,6 @@ function Doctor() {
             </span>
           ))}
         </p>
-      ) : null}
-
-      {doctor.data !== undefined ? (
-        <Summary
-          checks={doctor.data.checks}
-          ranAt={doctor.data.ranAt}
-          now={now}
-          namespace={namespace}
-        />
       ) : null}
 
       <section className="page__section" aria-label="Doctor checks">
@@ -240,7 +243,7 @@ function Summary({ checks, ranAt, now, namespace }: SummaryProps) {
   );
 }
 
-interface ControlsProps {
+interface RunDoctorProps {
   namespace: string | undefined;
   stuckThreshold: string | undefined;
   failureLookback: string | undefined;
@@ -249,19 +252,67 @@ interface ControlsProps {
 }
 
 /**
- * The three inputs, submitted into the URL. Validation is the server's rule
+ * The one way to run the report: a button under the verdict whose options —
+ * the namespace and the two windows, all optional — open beside it in an
+ * anchored popover, filled in with what the current report ran with.
+ *
+ * Running with the settings unchanged runs the report again; changing any of
+ * them writes the new ones into the URL, which runs the report for those.
+ * While a run is under way the button says so and starts nothing.
+ */
+function RunDoctor({ running, ...current }: RunDoctorProps) {
+  const [open, setOpen] = useState(false);
+  return (
+    <Popover
+      label="Doctor options"
+      open={open}
+      onOpenChange={setOpen}
+      className="doctor-options"
+      trigger={(props) => (
+        <ActionButton
+          variant="primary"
+          {...props}
+          disabledReason={running ? "A run is already in progress." : undefined}
+          reasonShown={false}
+        >
+          <Stethoscope size={14} strokeWidth={2} aria-hidden="true" />
+          {running ? "Running…" : "Run doctor"}
+        </ActionButton>
+      )}
+    >
+      {(close) => <DoctorOptions {...current} onRun={close} />}
+    </Popover>
+  );
+}
+
+interface DoctorOptionsProps {
+  namespace: string | undefined;
+  stuckThreshold: string | undefined;
+  failureLookback: string | undefined;
+  onRerun: () => void;
+  /** Called once the run has been asked for; closes the popover. */
+  onRun: () => void;
+}
+
+/**
+ * The three options, submitted into the URL. Validation is the server's rule
  * repeated in the client so a refused value never costs a round trip: a
  * window is a Go-style duration, positive, at most a year.
  */
-function Controls({ namespace, stuckThreshold, failureLookback, running, onRerun }: ControlsProps) {
+function DoctorOptions({
+  namespace,
+  stuckThreshold,
+  failureLookback,
+  onRerun,
+  onRun,
+}: DoctorOptionsProps) {
   const navigate = useNavigate();
   const [ns, setNs] = useState(namespace ?? "");
   const [stuck, setStuck] = useState(stuckThreshold ?? "");
   const [lookback, setLookback] = useState(failureLookback ?? "");
   // A window that arrived invalid from the URL is already wrong, so its
-  // message shows on first paint rather than waiting for a submit the reader
-  // of a shared link has no reason to perform. The route re-keys this form
-  // on the URL, so the seed is re-evaluated whenever the URL changes.
+  // message shows as soon as the options open rather than waiting for a
+  // submit the reader of a shared link has no reason to perform.
   const [submitted, setSubmitted] = useState(
     () => windowError(stuckThreshold ?? "") !== null || windowError(failureLookback ?? "") !== null,
   );
@@ -286,30 +337,28 @@ function Controls({ namespace, stuckThreshold, failureLookback, running, onRerun
     if (lookback.trim().length > 0) {
       search.failureLookback = lookback.trim();
     }
-    void navigate({ to: "/doctor", search });
+    const unchanged =
+      search.namespace === namespace &&
+      search.stuckThreshold === stuckThreshold &&
+      search.failureLookback === failureLookback;
+    if (unchanged) {
+      onRerun();
+    } else {
+      void navigate({ to: "/doctor", search });
+    }
+    onRun();
   };
 
   return (
-    <form className="controls" onSubmit={submit} aria-label="Doctor controls">
-      <div className="controls__field">
-        <label htmlFor="doctor-namespace">Namespace</label>
-        <input
-          id="doctor-namespace"
-          className="controls__input"
-          name="namespace"
-          value={ns}
-          onChange={(event) => {
-            setNs(event.target.value);
-          }}
-          placeholder="all namespaces"
-          aria-describedby="doctor-namespace-hint"
-          autoComplete="off"
-          spellCheck={false}
-        />
-        <span className="controls__hint" id="doctor-namespace-hint">
-          empty runs the whole installation
-        </span>
-      </div>
+    <form className="doctor-options__form" onSubmit={submit} aria-label="Doctor options">
+      <NamespaceField
+        id="doctor-namespace"
+        label="Namespace"
+        value={ns}
+        onChange={setNs}
+        emptyLabel="all namespaces"
+        hint="empty runs the whole installation"
+      />
       <div className="controls__field">
         <label htmlFor="doctor-stuck">Stuck threshold</label>
         <input
@@ -360,19 +409,10 @@ function Controls({ namespace, stuckThreshold, failureLookback, running, onRerun
             `a failure this recent is current; default ${DOCTOR_DEFAULTS.failureLookback}`}
         </span>
       </div>
-      <div className="controls__actions">
+      <div className="doctor-options__actions">
         <ActionButton variant="primary" type="submit">
-          <Stethoscope size={14} strokeWidth={2} aria-hidden="true" />
-          Run doctor
-        </ActionButton>
-        <ActionButton
-          variant="quiet"
-          onClick={onRerun}
-          disabledReason={running ? "A run is already in progress." : undefined}
-          aria-label="Run again with the same settings"
-        >
-          <RefreshCw size={14} strokeWidth={2} aria-hidden="true" />
-          Run again
+          <Play size={14} strokeWidth={2} aria-hidden="true" />
+          Run
         </ActionButton>
       </div>
     </form>

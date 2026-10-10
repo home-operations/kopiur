@@ -53,6 +53,9 @@
 //! | [`views::ReplicationPhaseView`] | `pending`, `replicating`, `succeeded`, `failed`, `suspended` | `{ unknown: { raw: string } }` | `unknown` |
 //! | [`views::OriginView`] | `scheduled`, `manual`, `discovered`, `adopted`, `replicated` | — | **none** — `Origin` is parsed strictly and an unrecognized marker never decodes |
 //! | [`views::DoctorScopeView`] | `namespace`, `installation`, `mixed` | — | **none** |
+//! | [`views::ObjectKind`] | `repository`, `clusterRepository`, `maintenance`, `snapshotPolicy`, `snapshotSchedule`, `snapshot`, `restore`, `repositoryReplication`, `snapshotReplication` | — | **none** — a new kind must be given an identity before it ships |
+//! | [`views::ReplicationKind`] | `repositoryReplication`, `snapshotReplication` | — | **none** — the two replication CRDs |
+//! | [`views::AdmittedNamespacesView`] | `all`, `none` | `{ listed: { count } }`, `{ selector: { selector } }` | **none** — exhaustive over the spec's `AllowedNamespaces` |
 //! | [`views::EntryKind`] | `file`, `dir`, `symlink` | `{ other: { raw: string } }` | **`other`**, not `unknown` |
 //! | [`requests::RestoreSourceBody`] | — | `{ snapshotRef: … }`, `{ fromPolicy: … }`, `{ identity: … }` | none (a request body: the client picks the variant) |
 //! | [`requests::RestoreTargetBody`] | — | `{ pvcRef: … }`, `{ pvc: … }` | none (as above) |
@@ -113,6 +116,8 @@ pub fn export_all(dir: &Path) -> Result<(), ExportError> {
     views::RepositoryReplicationRow::export_all(&cfg)?;
     views::SnapshotReplicationRow::export_all(&cfg)?;
     views::ReplicationsView::export_all(&cfg)?;
+    views::NamespaceSummary::export_all(&cfg)?;
+    views::OverviewView::export_all(&cfg)?;
     views::DoctorReportView::export_all(&cfg)?;
     views::GateDescriptor::export_all(&cfg)?;
     views::EventRow::export_all(&cfg)?;
@@ -201,7 +206,7 @@ mod tests {
             .filter(|n| n.ends_with(".ts"))
             .count();
         assert_eq!(
-            exported, 74,
+            exported, 83,
             "expected one .ts file per wire type; add the new type's root to \
              `export_all` and bump this count deliberately. 64 -> 65 when \
              `GateSeverityView` replaced `GateHit.severity`/`GateDescriptor.severity`'s \
@@ -219,7 +224,18 @@ mod tests {
              hand-maintained table, and the table said `repositories-ready` \
              was namespace-scoped when `list_repos` lists `ClusterRepository` \
              cluster-wide; 73 -> 74 for `CatalogCoverageView` (#476), so the \
-             discovered-backup count says when it is only the newest window"
+             discovered-backup count says when it is only the newest window; \
+             74 -> 75 for `AdmittedNamespacesView`, which names a \
+             `ClusterRepository`'s admission from its spec instead of passing \
+             the controller's `-1` (all) / `0` (selector) sentinels through as \
+             a count; 75 -> 76 for `NamespaceSummary`, the namespace \
+             switcher's list; 76 -> 80 for `OverviewView` and its \
+             `KindTally`, `HealthCount` and `ObjectKind`, the overview's \
+             fleet-by-kind tiles; 80 -> 82 for `ReplicationRef` and its \
+             `ReplicationKind`, so a repository's replications carry their \
+             kind and namespace and the SPA never joins on a bare name; \
+             82 -> 83 for `DoctorObjectView`, so a doctor check names each \
+             object it found instead of only one sentence about them all"
         );
     }
 }

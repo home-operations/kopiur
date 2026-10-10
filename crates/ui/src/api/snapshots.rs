@@ -66,6 +66,11 @@ pub fn router() -> Router<AppState> {
 
 /// The snapshot table's query string.
 ///
+/// `repository`, `policy`, `origin` and `phase` each take a comma-separated
+/// list and match a row holding **any** of the values; different parameters
+/// still all have to match. A comma never appears in a Kubernetes name, a
+/// phase or an origin, so the separator cannot collide with a value.
+///
 /// `deny_unknown_fields`: with nine optional parameters, a mistyped one is the
 /// likeliest mistake a caller makes, and silently ignoring it would return a
 /// wider set than was asked for — a snapshots table showing another
@@ -73,24 +78,28 @@ pub fn router() -> Router<AppState> {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SnapshotQuery {
-    /// Only snapshots in this repository.
+    /// Only snapshots in these repositories. Each entry is either qualified,
+    /// in the form rows display a repository (`Repository/media/nas`,
+    /// `ClusterRepository/shared`), or a bare name resolved with
+    /// `repositoryKind` and `repositoryNamespace`.
     #[serde(default)]
     pub repository: Option<String>,
-    /// Which repository CRD `repository` names; defaults to `repository`.
+    /// Which repository CRD a bare `repository` entry names; defaults to
+    /// `repository`.
     #[serde(default)]
     pub repository_kind: Option<RepositoryKindPath>,
-    /// The namespace the named `Repository` lives in; ignored for a
+    /// The namespace a bare `Repository` entry lives in; ignored for a
     /// `ClusterRepository`.
     #[serde(default)]
     pub repository_namespace: Option<String>,
-    /// Only snapshots produced from this `SnapshotPolicy`.
+    /// Only snapshots produced from these `SnapshotPolicy` names.
     #[serde(default)]
     pub policy: Option<String>,
-    /// Only snapshots with this origin, as the wire value
+    /// Only snapshots with these origins, as the wire values
     /// (`scheduled`/`manual`/`discovered`/`adopted`/`replicated`).
     #[serde(default)]
     pub origin: Option<String>,
-    /// Only snapshots in this phase, as the wire view name
+    /// Only snapshots in these phases, as the wire view names
     /// (`succeeded`, `failed`, …) plus `unknown` for anything this build does
     /// not recognize.
     #[serde(default)]
@@ -98,6 +107,10 @@ pub struct SnapshotQuery {
     /// Restrict to this namespace; absent lists cluster-wide.
     #[serde(default)]
     pub namespace: Option<String>,
+    /// Only snapshots whose name contains this text, case-insensitively and
+    /// literally. Empty or whitespace-only is no filter.
+    #[serde(default)]
+    pub q: Option<String>,
     /// Index of the first row to return.
     #[serde(default)]
     pub offset: Option<usize>,
@@ -113,8 +126,8 @@ pub struct SnapshotQuery {
 ///
 /// # Why the label filters are applied client-side
 ///
-/// `labels` is exactly the `kopiur_ops::SnapshotListFilter` the CLI builds from
-/// `--policy`/`--origin`, and the CLI hands it to the apiserver as a label
+/// Each policy and origin is matched as exactly the `kopiur_ops::SnapshotListFilter`
+/// the CLI builds from `--policy`/`--origin`, and the CLI hands that to the apiserver as a label
 /// selector. This API cannot: reads go through [`crate::cache::Source`], whose
 /// cache arm answers from reflector stores that hold whole kinds and have no
 /// selector to push anywhere. So the same filter is evaluated here instead, by
@@ -125,14 +138,29 @@ pub struct SnapshotQuery {
 /// filtered it on the label.
 #[derive(Debug, Clone, Default)]
 pub struct ParsedFilter {
-    /// The resolved repository, when one was named. Not a label filter: a
-    /// produced snapshot records its repository in status, not in a label.
-    pub repository: Option<RepoFilter>,
-    /// The policy and origin, in the shared ops type.
-    pub labels: SnapshotListFilter,
-    /// The phase to match. Not a label filter either — the phase lives in
-    /// status, so the CLI cannot select on it server-side and neither can this.
-    pub phase: Option<PhaseFilter>,
+    /// The resolved repositories; a row in any of them matches, and none is no
+    /// filter. Not a label filter: a produced snapshot records its repository
+    /// in status, not in a label.
+    pub repositories: Vec<RepoFilter>,
+    /// The policies; a row from any of them matches, and none is no filter.
+    pub policies: Vec<String>,
+    /// The origins, likewise.
+    pub origins: Vec<Origin>,
+    /// The phases to match, likewise. Not a label filter either — the phase
+    /// lives in status, so the CLI cannot select on it server-side and neither
+    /// can this.
+    pub phases: Vec<PhaseFilter>,
+    /// Lowercased name substring, already trimmed; see [`name_filter`].
+    pub name: Option<String>,
+}
+
+/// **Pure.** The `?q=` search as a filter: trimmed and lowercased, `None` when
+/// there is nothing to search for. Matched literally — `%` is a character, not
+/// a wildcard — because a name search should find the name typed.
+pub fn name_filter(q: Option<&str>) -> Option<String> {
+    q.map(str::trim)
+        .filter(|q| !q.is_empty())
+        .map(str::to_lowercase)
 }
 
 /// A phase the caller asked for.
@@ -192,18 +220,96 @@ fn phase_matches(snap: &Snapshot, filter: &PhaseFilter) -> bool {
     }
 }
 
+/// **Pure.** The values of a comma-separated list parameter: trimmed, blanks
+/// dropped, each kept once in the order given. Absent is the empty list.
+pub fn list_values(value: Option<&str>) -> Vec<&str> {
+    let mut values: Vec<&str> = Vec::new();
+    for value in value.unwrap_or_default().split(',').map(str::trim) {
+        if !value.is_empty() && !values.contains(&value) {
+            values.push(value);
+        }
+    }
+    values
+}
+
+/// One `?repository=` entry, before it is resolved against the cluster.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepoEntry<'a> {
+    /// `Repository/<namespace>/<name>`.
+    Namespaced {
+        /// Where the `Repository` lives.
+        namespace: &'a str,
+        /// Its name.
+        name: &'a str,
+    },
+    /// `ClusterRepository/<name>`.
+    Cluster {
+        /// Its name.
+        name: &'a str,
+    },
+    /// A bare name, located by `repositoryKind`/`repositoryNamespace`.
+    Bare(&'a str),
+}
+
+/// **Pure.** Parse one `?repository=` entry. The qualified forms are the ones
+/// `SnapshotRow.repository` carries, so a row's repository can be sent back as
+/// a filter as it is; `None` for anything else with a `/` in it.
+pub fn parse_repo_entry(entry: &str) -> Option<RepoEntry<'_>> {
+    let parts: Vec<&str> = entry.split('/').collect();
+    match parts.as_slice() {
+        [name] => Some(RepoEntry::Bare(name)),
+        ["Repository", namespace, name] if !namespace.is_empty() && !name.is_empty() => {
+            Some(RepoEntry::Namespaced { namespace, name })
+        }
+        ["ClusterRepository", name] if !name.is_empty() => Some(RepoEntry::Cluster { name }),
+        _ => None,
+    }
+}
+
+/// **Pure.** Whether a snapshot came from any of `policies` and has any of
+/// `origins` — each value matched by the CLI's own [`matches_filter`].
+fn labels_match(snap: &Snapshot, policies: &[String], origins: &[Origin]) -> bool {
+    let policy_ok = policies.is_empty()
+        || policies.iter().any(|policy| {
+            matches_filter(
+                snap,
+                &SnapshotListFilter {
+                    policy: Some(policy.clone()),
+                    origin: None,
+                },
+            )
+        });
+    let origin_ok = origins.is_empty()
+        || origins.iter().any(|origin| {
+            matches_filter(
+                snap,
+                &SnapshotListFilter {
+                    policy: None,
+                    origin: Some(*origin),
+                },
+            )
+        });
+    policy_ok && origin_ok
+}
+
 /// **Pure.** Apply every parsed filter, newest run first.
 pub fn filter_rows(snapshots: &[Arc<Snapshot>], filter: &ParsedFilter) -> Vec<Arc<Snapshot>> {
     let mut kept: Vec<Arc<Snapshot>> = snapshots
         .iter()
         .filter(|s| {
-            filter
-                .repository
-                .as_ref()
-                .is_none_or(|r| matches_repository(s, r))
+            filter.repositories.is_empty()
+                || filter.repositories.iter().any(|r| matches_repository(s, r))
         })
-        .filter(|s| matches_filter(s, &filter.labels))
-        .filter(|s| filter.phase.as_ref().is_none_or(|p| phase_matches(s, p)))
+        .filter(|s| labels_match(s, &filter.policies, &filter.origins))
+        .filter(|s| filter.phases.is_empty() || filter.phases.iter().any(|p| phase_matches(s, p)))
+        .filter(|s| {
+            filter.name.as_ref().is_none_or(|needle| {
+                s.metadata
+                    .name
+                    .as_deref()
+                    .is_some_and(|name| name.to_lowercase().contains(needle.as_str()))
+            })
+        })
         .cloned()
         .collect();
     // Newest run first, with the CR name as the tiebreaker so two snapshots
@@ -814,59 +920,67 @@ async fn parse_query(
     client: kube::Client,
     q: &SnapshotQuery,
 ) -> Result<ParsedFilter, ApiError> {
-    let repository = match &q.repository {
-        None => None,
-        Some(name) => {
-            let kind = q
-                .repository_kind
-                .unwrap_or(RepositoryKindPath::Repository)
-                .kind();
-            // The repository lives where the caller says, else in the listing's
-            // namespace: a `?repository=` with no location on a cluster-wide
-            // list would otherwise resolve against the operator's namespace,
-            // which is almost never where the repository is.
-            let repo_namespace = match kind {
-                RepositoryKind::Repository => q
-                    .repository_namespace
-                    .as_deref()
-                    .or(q.namespace.as_deref())
-                    .ok_or_else(repository_namespace_required)?,
-                RepositoryKind::ClusterRepository => "",
+    let mut repositories = Vec::new();
+    for entry in list_values(q.repository.as_deref()) {
+        let (name, kind, namespace) =
+            match parse_repo_entry(entry).ok_or_else(|| bad_repository(entry))? {
+                RepoEntry::Namespaced { namespace, name } => {
+                    (name, RepositoryKind::Repository, namespace)
+                }
+                RepoEntry::Cluster { name } => (name, RepositoryKind::ClusterRepository, ""),
+                RepoEntry::Bare(name) => {
+                    let kind = q
+                        .repository_kind
+                        .unwrap_or(RepositoryKindPath::Repository)
+                        .kind();
+                    // A bare name lives where the caller says, else in the
+                    // listing's namespace: on a cluster-wide list it would
+                    // otherwise resolve against the operator's namespace, which is
+                    // almost never where the repository is.
+                    let namespace = match kind {
+                        RepositoryKind::Repository => q
+                            .repository_namespace
+                            .as_deref()
+                            .or(q.namespace.as_deref())
+                            .ok_or_else(repository_namespace_required)?,
+                        RepositoryKind::ClusterRepository => "",
+                    };
+                    (name, kind, namespace)
+                }
             };
-            let ctx = ops_ctx(&app.cfg, client, Some(repo_namespace));
-            Some(
-                resolve_repo_filter_for(
-                    &ctx,
-                    name,
-                    kind,
-                    match kind {
-                        RepositoryKind::Repository => Some(repo_namespace),
-                        RepositoryKind::ClusterRepository => None,
-                    },
-                )
-                .await?,
+        let ctx = ops_ctx(&app.cfg, client.clone(), Some(namespace));
+        repositories.push(
+            resolve_repo_filter_for(
+                &ctx,
+                name,
+                kind,
+                match kind {
+                    RepositoryKind::Repository => Some(namespace),
+                    RepositoryKind::ClusterRepository => None,
+                },
             )
-        }
-    };
+            .await?,
+        );
+    }
 
-    let origin = match &q.origin {
-        None => None,
-        Some(value) => Some(Origin::parse(value).ok_or_else(|| bad_origin(value))?),
-    };
-    let phase = match &q.phase {
-        None => None,
-        Some(value) => Some(parse_phase(value).ok_or_else(|| bad_phase(value))?),
-    };
+    let origins = list_values(q.origin.as_deref())
+        .into_iter()
+        .map(|value| Origin::parse(value).ok_or_else(|| bad_origin(value)))
+        .collect::<Result<Vec<_>, _>>()?;
+    let phases = list_values(q.phase.as_deref())
+        .into_iter()
+        .map(|value| parse_phase(value).ok_or_else(|| bad_phase(value)))
+        .collect::<Result<Vec<_>, _>>()?;
 
     Ok(ParsedFilter {
-        repository,
-        // The same value `--policy`/`--origin` build, so `matches_filter` and
-        // the CLI's `label_selector` select the same rows.
-        labels: SnapshotListFilter {
-            policy: q.policy.clone(),
-            origin,
-        },
-        phase,
+        repositories,
+        policies: list_values(q.policy.as_deref())
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+        origins,
+        phases,
+        name: name_filter(q.q.as_deref()),
     })
 }
 
@@ -1185,6 +1299,17 @@ fn bad_origin(value: &str) -> ApiError {
     )
 }
 
+/// The 400 for a repository entry in neither accepted form.
+fn bad_repository(value: &str) -> ApiError {
+    problem(
+        400,
+        "invalid-filter",
+        format!("`{value}` is not a repository this filter can read."),
+        "A repository is named bare, or qualified the way rows show it.",
+        "use a name, Repository/<namespace>/<name>, or ClusterRepository/<name>",
+    )
+}
+
 /// The 400 for a phase nothing produces.
 fn bad_phase(value: &str) -> ApiError {
     problem(
@@ -1402,7 +1527,7 @@ status: { phase: Quiescing }
         let unrecognized = filter_rows(
             &all,
             &ParsedFilter {
-                phase: Some(PhaseFilter::Unrecognized),
+                phases: vec![PhaseFilter::Unrecognized],
                 ..Default::default()
             },
         );
@@ -1412,12 +1537,59 @@ status: { phase: Quiescing }
         let succeeded = filter_rows(
             &all,
             &ParsedFilter {
-                phase: Some(PhaseFilter::Exactly(SnapshotPhase::Succeeded)),
+                phases: vec![PhaseFilter::Exactly(SnapshotPhase::Succeeded)],
                 ..Default::default()
             },
         );
         assert_eq!(succeeded.len(), 1);
         assert_eq!(succeeded[0].metadata.name.as_deref(), Some("nightly-1"));
+    }
+
+    fn names(rows: &[Arc<Snapshot>]) -> Vec<&str> {
+        rows.iter()
+            .filter_map(|s| s.metadata.name.as_deref())
+            .collect()
+    }
+
+    #[test]
+    fn q_matches_names_case_insensitively_and_literally() {
+        let all = vec![
+            nightly_run("app-data-manual", "2026-10-07T01:00:00Z", "Succeeded"),
+            nightly_run("postgres-nightly-1", "2026-10-07T02:00:00Z", "Succeeded"),
+            nightly_run("100%-done", "2026-10-07T03:00:00Z", "Succeeded"),
+        ];
+        let by = |q: &str| ParsedFilter {
+            name: name_filter(Some(q)),
+            ..Default::default()
+        };
+        assert_eq!(names(&filter_rows(&all, &by("APP"))), ["app-data-manual"]);
+        assert_eq!(
+            names(&filter_rows(&all, &by("%"))),
+            ["100%-done"],
+            "matched literally, not as a pattern"
+        );
+        assert_eq!(
+            filter_rows(&all, &by("   ")).len(),
+            3,
+            "a blank q is no filter"
+        );
+        assert_eq!(name_filter(None), None);
+        assert_eq!(name_filter(Some("")), None);
+    }
+
+    /// The list-too-large cap is applied to the *matched* set, so a search can
+    /// bring a cluster with more snapshots than the cap back under it.
+    #[test]
+    fn q_narrows_before_the_cap_is_counted() {
+        let all: Vec<_> = (0..20)
+            .map(|i| nightly_run(&format!("run-{i:02}"), "2026-10-07T01:00:00Z", "Succeeded"))
+            .chain([nightly_run("needle", "2026-10-07T01:00:00Z", "Succeeded")])
+            .collect();
+        let filter = ParsedFilter {
+            name: name_filter(Some("needle")),
+            ..Default::default()
+        };
+        assert_eq!(filter_rows(&all, &filter).len(), 1);
     }
 
     #[test]
@@ -1456,11 +1628,9 @@ status:
         let scoped = filter_rows(
             &all,
             &ParsedFilter {
-                labels: SnapshotListFilter {
-                    policy: Some("nightly".into()),
-                    origin: Some(Origin::Scheduled),
-                },
-                phase: Some(PhaseFilter::Exactly(SnapshotPhase::Succeeded)),
+                policies: vec!["nightly".into()],
+                origins: vec![Origin::Scheduled],
+                phases: vec![PhaseFilter::Exactly(SnapshotPhase::Succeeded)],
                 ..Default::default()
             },
         );
@@ -1469,6 +1639,93 @@ status:
             .map(|s| s.metadata.name.as_deref().unwrap_or_default())
             .collect();
         assert_eq!(names, vec!["nightly-2", "nightly-1"]);
+    }
+
+    #[test]
+    fn list_values_split_on_commas_trim_and_keep_each_once() {
+        assert_eq!(list_values(None), Vec::<&str>::new());
+        assert_eq!(list_values(Some("")), Vec::<&str>::new());
+        assert_eq!(
+            list_values(Some(" nightly, weekly ,,nightly")),
+            ["nightly", "weekly"]
+        );
+    }
+
+    #[test]
+    fn a_repository_entry_is_bare_or_qualified_the_way_rows_show_it() {
+        assert_eq!(parse_repo_entry("nas"), Some(RepoEntry::Bare("nas")));
+        assert_eq!(
+            parse_repo_entry("Repository/media/nas"),
+            Some(RepoEntry::Namespaced {
+                namespace: "media",
+                name: "nas"
+            })
+        );
+        assert_eq!(
+            parse_repo_entry("ClusterRepository/shared"),
+            Some(RepoEntry::Cluster { name: "shared" })
+        );
+        for refused in [
+            "Repository/nas",
+            "ClusterRepository/a/b",
+            "Repository//nas",
+            "Other/media/nas",
+        ] {
+            assert_eq!(parse_repo_entry(refused), None, "{refused}");
+        }
+        // The form a row carries is one this filter reads back.
+        let row = view_row(&nightly_run(
+            "nightly-1",
+            "2026-09-08T02:00:00Z",
+            "Succeeded",
+        ));
+        let shown = row.repository.unwrap_or_default();
+        assert!(matches!(
+            parse_repo_entry(&shown),
+            Some(RepoEntry::Namespaced { .. })
+        ));
+    }
+
+    #[test]
+    fn several_values_of_one_filter_match_any_and_different_filters_all() {
+        let nightly = nightly_run("nightly-1", "2026-09-08T02:00:00Z", "Succeeded");
+        let failed = nightly_run("nightly-2", "2026-09-07T02:00:00Z", "Failed");
+        let running = nightly_run("nightly-3", "2026-09-06T02:00:00Z", "Running");
+        let weekly = snapshot(
+            r#"
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: Snapshot
+metadata:
+  name: weekly-1
+  namespace: media
+  labels: { "kopiur.home-operations.com/config": weekly }
+spec: { policyRef: { name: weekly } }
+status: { phase: Failed, timing: { startTime: "2026-09-05T02:00:00Z" } }
+"#,
+        );
+        let all = vec![nightly, failed, running, weekly];
+        let phases = vec![
+            PhaseFilter::Exactly(SnapshotPhase::Succeeded),
+            PhaseFilter::Exactly(SnapshotPhase::Failed),
+        ];
+        let any_phase = filter_rows(
+            &all,
+            &ParsedFilter {
+                phases: phases.clone(),
+                ..Default::default()
+            },
+        );
+        assert_eq!(names(&any_phase), ["nightly-1", "nightly-2", "weekly-1"]);
+
+        let both = filter_rows(
+            &all,
+            &ParsedFilter {
+                policies: vec!["nightly".into(), "monthly".into()],
+                phases,
+                ..Default::default()
+            },
+        );
+        assert_eq!(names(&both), ["nightly-1", "nightly-2"]);
     }
 
     #[test]
@@ -1498,12 +1755,12 @@ status:
 "#,
         );
         let filter = ParsedFilter {
-            repository: Some(RepoFilter {
+            repositories: vec![RepoFilter {
                 uid: "uid-nas".into(),
                 name: "nas".into(),
                 kind: RepositoryKind::Repository,
                 namespace: Some("media".into()),
-            }),
+            }],
             ..Default::default()
         };
         let rows = filter_rows(&[pinned, labelled, elsewhere], &filter);

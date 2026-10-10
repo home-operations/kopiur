@@ -1,16 +1,14 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { CalendarClock, PauseCircle, PlayCircle } from "lucide-react";
+import { CalendarClock } from "lucide-react";
 import { useState } from "react";
 
 import { useSchedules } from "../api/hooks";
 import type { ScheduleRow } from "../api/types";
-import { ActionButton } from "../components/ActionButton";
 import { EmptyState } from "../components/EmptyState";
 import { ErrorState } from "../components/ErrorState";
 import { LoadingState } from "../components/LoadingState";
 import { ScheduleTable } from "../components/ScheduleTable";
 import { SuspendToggle } from "../components/actions/SuspendToggle";
-import { useRefusal } from "../components/actions/reason";
 import { useCurrentNamespace } from "../util/namespace";
 
 /**
@@ -26,7 +24,9 @@ import { useCurrentNamespace } from "../util/namespace";
  *
  * One confirmation is open at a time, across the whole ledger. Two open
  * questions in a table of near-identical rows is how the wrong schedule gets
- * suspended.
+ * suspended. It opens in a popover pinned to the row's button (the table's
+ * card clips, so it is pinned on screen rather than hung inside it), and the
+ * answer is a toast.
  */
 export const Route = createFileRoute("/schedules")({
   component: Schedules,
@@ -68,16 +68,24 @@ function Schedules() {
             <ScheduleTable
               schedules={schedules.data}
               renderAction={(schedule) => (
-                <SuspendTrigger
-                  schedule={schedule}
+                <SuspendToggle
+                  kind="schedule"
+                  name={schedule.name}
+                  namespace={schedule.namespace}
+                  suspended={schedule.suspended}
+                  consequence="this cron is not evaluated at all, so the policy it fires goes unrun"
+                  inLedger
+                  align="end"
+                  strategy="fixed"
                   open={open === rowId(schedule)}
-                  onOpen={(next) => {
-                    setOpen(next ? rowId(schedule) : null);
+                  onOpenChange={(next) => {
+                    setOpen((current) =>
+                      next ? rowId(schedule) : current === rowId(schedule) ? null : current,
+                    );
                   }}
                 />
               )}
             />
-            <Confirmation schedules={schedules.data} open={open} onOpenChange={setOpen} />
           </>
         )}
       </section>
@@ -93,84 +101,4 @@ function Schedules() {
 /** The row's stable key, and the value `open` holds while its panel is up. */
 function rowId(schedule: ScheduleRow): string {
   return `${schedule.namespace}/${schedule.name}`;
-}
-
-/**
- * The trigger that lives in a row's Action cell.
- *
- * Bare, because the confirmation cannot live here: a cell is a column, and a
- * column turns a paragraph into a tall thin ribbon that shoves every other
- * column narrow. It opens the one panel below the ledger instead.
- *
- * The refusal is judged in this row's own namespace, and shown at both
- * lengths — a ledger suppresses `ActionButton`'s floating tooltip, so the
- * short word in the cell is the only reason a sighted mouse user can reach.
- */
-function SuspendTrigger({
-  schedule,
-  open,
-  onOpen,
-}: {
-  schedule: ScheduleRow;
-  open: boolean;
-  onOpen: (open: boolean) => void;
-}) {
-  const refusal = useRefusal(schedule.namespace, "patchSchedules");
-  const label = schedule.suspended ? "Resume" : "Suspend";
-  return (
-    <div className="action">
-      <ActionButton
-        variant={schedule.suspended ? "default" : "danger"}
-        disabledReason={refusal?.full}
-        aria-expanded={open}
-        onClick={() => {
-          onOpen(!open);
-        }}
-      >
-        {schedule.suspended ? (
-          <PlayCircle size={14} strokeWidth={2} aria-hidden="true" />
-        ) : (
-          <PauseCircle size={14} strokeWidth={2} aria-hidden="true" />
-        )}
-        {label}
-      </ActionButton>
-      {refusal !== undefined ? <span className="action__short">{refusal.short}</span> : null}
-    </div>
-  );
-}
-
-/**
- * The open row's confirmation and receipt, at the page's full width.
- *
- * One at a time by construction: there is one of these, and `open` names the
- * row it belongs to. A row that leaves the list while its panel is open takes
- * the panel with it.
- */
-function Confirmation({
-  schedules,
-  open,
-  onOpenChange,
-}: {
-  schedules: readonly ScheduleRow[];
-  open: OpenRow;
-  onOpenChange: (open: OpenRow) => void;
-}) {
-  const schedule = schedules.find((row) => rowId(row) === open);
-  if (schedule === undefined) {
-    return null;
-  }
-  return (
-    <SuspendToggle
-      kind="schedule"
-      name={schedule.name}
-      namespace={schedule.namespace}
-      suspended={schedule.suspended}
-      consequence="this cron is not evaluated at all, so the policy it fires goes unrun"
-      hideTrigger
-      open
-      onOpenChange={(next) => {
-        onOpenChange(next ? rowId(schedule) : null);
-      }}
-    />
-  );
 }

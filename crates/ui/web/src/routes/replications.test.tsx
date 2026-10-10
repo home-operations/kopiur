@@ -5,14 +5,15 @@ import { beforeEach, describe, expect, it } from "vitest";
 import { problemBanner } from "../api/problem";
 import type { ActionReceipt, Capabilities, ReplicationsView } from "../api/types";
 import {
-  ME,
   bodyRows,
   calledPaths,
   fetchMock,
   forbiddenProblem,
   jsonResponse,
+  ME,
   mockApi,
   mountApp,
+  notifications,
   nth,
   problemResponse,
 } from "../test-utils";
@@ -102,12 +103,41 @@ describe("Replications", () => {
     expect(nth(rows, 1)).toHaveTextContent("ClusterRepository/shared");
   });
 
+  it("opens a row in the resource drawer, as its own kind", async () => {
+    mockApi({ "/api/v1/replications": jsonResponse(view) });
+    mountApp("/replications");
+    const rows = bodyRows(await table());
+    await userEvent.click(within(nth(rows, 1)).getByRole("link", { name: "offsite" }));
+    const dialog = await screen.findByRole("dialog", { name: /offsite/ });
+    expect(dialog).toHaveAttribute("data-kind", "snapshot-replication");
+    expect(within(dialog).getByText("0 3 * * *")).toBeInTheDocument();
+    // Its Run button still sits above the stretched row link.
+    expect(within(nth(rows, 0)).getByRole("button", { name: "Run blobsync now" })).toBeVisible();
+  });
+
   it("shows the lag, and says 'never' for a copy that has not once succeeded", async () => {
     mockApi({ "/api/v1/replications": jsonResponse(view) });
     mountApp("/replications");
     const rows = bodyRows(await table());
     expect(nth(rows, 0)).toHaveTextContent("ago");
     expect(within(nth(rows, 1)).getByText("never")).toBeInTheDocument();
+  });
+
+  it("draws each copy's age as a bar under it, and none for a copy never made", async () => {
+    mockApi({ "/api/v1/replications": jsonResponse(view) });
+    mountApp("/replications");
+    const rows = bodyRows(await table());
+    // The only copy on record is the stalest, so its bar runs nearly the
+    // whole track (the axis has a little headroom past the stalest copy).
+    const bar = nth(rows, 0).querySelector<HTMLElement>(".lag-bar__fill");
+    expect(bar).not.toBeNull();
+    expect(Number.parseFloat(bar?.style.width ?? "0")).toBeGreaterThan(80);
+    expect(bar?.closest(".lag-bar")).toHaveAttribute("aria-hidden", "true");
+    // "never" stays a word; there is no age to draw.
+    expect(nth(rows, 1).querySelector(".lag-bar")).toBeNull();
+    // And the table is the one place this is said: no separate lag section.
+    expect(screen.queryByRole("region", { name: "Replication lag" })).toBeNull();
+    expect(screen.queryByText("Time since the last copy")).toBeNull();
   });
 
   it("never reads a failed replication as healthy", async () => {
@@ -144,6 +174,9 @@ describe("Replications", () => {
       name: "blobsync",
       kind: "replication",
     });
+    expect(await within(await notifications()).findByRole("status")).toHaveTextContent(
+      "Run replication media/blobsync requested",
+    );
   });
 
   it("judges each row's run against the row's own namespace, not the page's scope", async () => {
@@ -229,3 +262,13 @@ describe("Replications", () => {
 function nthRepository() {
   return nth(view.repository, 0);
 }
+
+describe("Replications — kind identity", () => {
+  it("stripes each row in its own replication kind", async () => {
+    mockApi({ "/api/v1/replications": jsonResponse(view) });
+    mountApp("/replications");
+    const kinds = bodyRows(await table()).map((r) => r.getAttribute("data-kind"));
+    expect(kinds).toContain("snapshot-replication");
+    expect(kinds).toContain("repository-replication");
+  });
+});

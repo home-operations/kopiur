@@ -1,4 +1,4 @@
-import { createFileRoute, useNavigate } from "@tanstack/react-router";
+import { createFileRoute, redirect } from "@tanstack/react-router";
 import { Waypoints } from "lucide-react";
 import { useMemo } from "react";
 
@@ -7,13 +7,14 @@ import { EmptyState } from "../components/EmptyState";
 import { ErrorState } from "../components/ErrorState";
 import { LoadingState } from "../components/LoadingState";
 import { healthLamp } from "../components/health";
-import { Drawer } from "../components/topology/Drawer";
 import { EdgeLegend } from "../components/topology/EdgeLegend";
 import { Graph } from "../components/topology/Graph";
 import { useTopologyLayout } from "../components/topology/layout";
 import { topologyModel, topologyVerdict } from "../components/topology/model";
+import { targetFromGraphId } from "../components/drawer/graphFacts";
+import { inspectToken } from "../components/inspect";
 import { relativeTime } from "../util/format";
-import { useCurrentNamespace } from "../util/namespace";
+import { namespaceFromSearch, useCurrentNamespace } from "../util/namespace";
 
 /**
  * Topology — where the copies of your data are, and where a copy was
@@ -39,25 +40,32 @@ import { useCurrentNamespace } from "../util/namespace";
  *   the chunk every other page pays for.
  *
  * The URL is the state: `?namespace=` scopes the graph (shared with every
- * route) and `?node=` is the open drawer, so a dangling reference can be sent
- * to someone as a link.
+ * route), and a resource plate opens the resource drawer (`?inspect=`), so a
+ * dangling reference can be sent to someone as a link. The board once had a
+ * drawer of its own on `?node=`; such a link is sent to the resource drawer
+ * when it names a resource, and dropped when it does not.
  */
-export interface TopologySearch {
-  node?: string;
-}
-
 export const Route = createFileRoute("/topology")({
-  validateSearch: (search: Record<string, unknown>): TopologySearch => {
-    const node = search.node;
-    return typeof node === "string" && node.length > 0 ? { node } : {};
+  beforeLoad: ({ search }) => {
+    const raw = search as Record<string, unknown>;
+    if (typeof raw.node !== "string") return;
+    const target = targetFromGraphId(raw.node);
+    const scope = namespaceFromSearch(raw);
+    redirect({
+      throw: true,
+      to: "/topology",
+      search: {
+        ...(scope !== undefined ? { namespace: scope } : {}),
+        ...(target !== null ? { inspect: inspectToken(target) } : {}),
+      },
+      replace: true,
+    });
   },
   component: Topology,
 });
 
 function Topology() {
   const namespace = useCurrentNamespace();
-  const { node: openNode } = Route.useSearch();
-  const navigate = useNavigate();
   const graph = useGraph(namespace);
 
   const model = useMemo(
@@ -68,20 +76,6 @@ function Topology() {
   // out, and the empty state says so better than an empty canvas would.
   const toLayOut = model !== null && model.nodes.length > 0 ? model : null;
   const { layout, problem: layoutFailure, pending: laying } = useTopologyLayout(toLayOut);
-
-  const selected =
-    model !== null && openNode !== undefined ? (model.byId.get(openNode) ?? null) : null;
-  const open = (node: string | undefined) => {
-    const search: TopologySearch & { namespace?: string } = {};
-    if (namespace !== undefined) {
-      search.namespace = namespace;
-    }
-    if (node !== undefined) {
-      search.node = node;
-    }
-    // `replace`: inspecting six nodes should not be six steps of history.
-    void navigate({ to: "/topology", search, replace: true });
-  };
 
   const board = graph.data !== undefined && graph.data.nodes.length > 0;
 
@@ -110,18 +104,8 @@ function Topology() {
         ) : laying || layout === null || model === null ? (
           <LoadingState what="the topology layout" rows={6} />
         ) : (
-          <div className="topo-layout" data-drawer={selected !== null ? "open" : undefined}>
-            <Graph model={model} layout={layout} selected={selected?.id ?? null} onSelect={open} />
-            {selected !== null ? (
-              <Drawer
-                model={model}
-                node={selected}
-                namespace={namespace}
-                onClose={() => {
-                  open(undefined);
-                }}
-              />
-            ) : null}
+          <div className="topo-layout">
+            <Graph model={model} layout={layout} />
           </div>
         )}
       </section>
@@ -134,11 +118,6 @@ function Topology() {
           <EdgeLegend />
         </section>
       ) : null}
-
-      <p className="page__prose">
-        Each line runs from the object that acts to the object it acts on. Select a plate to see its
-        relationships and gates. A dashed plate is referenced but missing from the cluster.
-      </p>
     </div>
   );
 }

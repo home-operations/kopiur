@@ -533,6 +533,8 @@ mod tests {
         ("api/graph.rs", include_str!("graph.rs")),
         ("api/maintenance.rs", include_str!("maintenance.rs")),
         ("api/me.rs", include_str!("me.rs")),
+        ("api/namespaces.rs", include_str!("namespaces.rs")),
+        ("api/overview.rs", include_str!("overview.rs")),
         ("api/policies.rs", include_str!("policies.rs")),
         ("api/replications.rs", include_str!("replications.rs")),
         ("api/repositories.rs", include_str!("repositories.rs")),
@@ -601,7 +603,7 @@ mod tests {
             .map(|(_, src)| router_bodies(src).len())
             .sum();
         assert_eq!(
-            read, 17,
+            read, 19,
             "one router per module in ROUTER_SOURCES, plus browse's second \
              (`router_untimed`). If a module gained or lost one, bump this \
              deliberately; if the count dropped to zero the scan stopped \

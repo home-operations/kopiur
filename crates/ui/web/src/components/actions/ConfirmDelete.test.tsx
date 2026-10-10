@@ -1,4 +1,4 @@
-import { screen, waitFor } from "@testing-library/react";
+import { screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it } from "vitest";
 
@@ -9,6 +9,7 @@ import {
   jsonResponse,
   meWith,
   mockApi,
+  notifications,
   problemResponse,
   renderWithClient,
 } from "../../test-utils";
@@ -49,7 +50,7 @@ describe("ConfirmDelete", () => {
     mockApi({ [SNAPSHOT]: jsonResponse(held, 202) });
     renderWithClient(<ConfirmDelete namespace="media" name="nightly-1" deletionPolicy="Delete" />);
     await open();
-    const panel = screen.getByRole("group", { name: "Delete" });
+    const panel = screen.getByRole("dialog", { name: "Delete" });
     expect(panel).toHaveTextContent("deletionPolicy: Delete");
     expect(panel).toHaveTextContent("kopia snapshot delete");
     expect(panel.querySelector('[data-destructive="true"]')).not.toBeNull();
@@ -59,7 +60,7 @@ describe("ConfirmDelete", () => {
     mockApi({ [SNAPSHOT]: jsonResponse(held, 202) });
     renderWithClient(<ConfirmDelete namespace="media" name="nightly-1" />);
     await open();
-    const panel = screen.getByRole("group", { name: "Delete" });
+    const panel = screen.getByRole("dialog", { name: "Delete" });
     expect(panel).toHaveTextContent("deletionPolicy: not set");
     expect(panel).toHaveTextContent("the operator decides at deletion time");
     expect(panel).not.toHaveTextContent("kopia snapshot delete");
@@ -72,7 +73,7 @@ describe("ConfirmDelete", () => {
       <ConfirmDelete namespace="media" name="nightly-1" deletionPolicy="Delete" pinned />,
     );
     await open();
-    expect(screen.getByRole("group", { name: "Delete" })).toHaveTextContent(
+    expect(screen.getByRole("dialog", { name: "Delete" })).toHaveTextContent(
       "A pin stops pruning, not this deletion.",
     );
   });
@@ -81,12 +82,12 @@ describe("ConfirmDelete", () => {
     mockApi({ [SNAPSHOT]: jsonResponse(held, 202) });
     renderWithClient(<ConfirmDelete namespace="media" name="nightly-1" deletionPolicy="Retain" />);
     const user = await open();
-    expect(screen.getByRole("group", { name: "Delete" })).toHaveTextContent(
+    expect(screen.getByRole("dialog", { name: "Delete" })).toHaveTextContent(
       "Check the snapshot's conditions to be sure.",
     );
     await user.click(screen.getByRole("button", { name: "Request the deletion" }));
-    const answer = await screen.findByRole("status");
-    expect(answer).toHaveTextContent("Delete requested");
+    const answer = await within(await notifications()).findByRole("status");
+    expect(answer).toHaveTextContent("Delete snapshot media/nightly-1 requested");
     expect(answer).toHaveTextContent("mass-deletion breaker");
   });
 

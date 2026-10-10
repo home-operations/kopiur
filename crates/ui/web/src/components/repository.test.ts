@@ -6,7 +6,6 @@ import {
   accessLabel,
   actionNamespace,
   catalogCoverageNote,
-  detailSearch,
   filterByHealth,
   isClusterScoped,
   isHealthKey,
@@ -33,7 +32,7 @@ function summary(over: Partial<RepositorySummary> = {}): RepositorySummary {
     indexBlobCount: 17,
     lastObservedAt: null,
     serverEndpoint: null,
-    allowedNamespaceCount: null,
+    admits: null,
     ...over,
   };
 }
@@ -129,24 +128,6 @@ describe("the cluster-scoped split", () => {
 
   it("never sends an empty namespace, which the handler answers 400 for", () => {
     expect(actionNamespace(summary({ namespace: "" }))).toBeUndefined();
-  });
-});
-
-describe("detailSearch", () => {
-  it("carries the repository's own namespace for a namespaced kind", () => {
-    expect(detailSearch(summary({ namespace: "media" }))).toEqual({ namespace: "media" });
-  });
-
-  it("carries no namespace for a ClusterRepository, so /me is reviewed cluster-scoped", () => {
-    expect(
-      detailSearch(
-        summary({ kind: "ClusterRepository", kindPath: "cluster-repository", namespace: null }),
-      ),
-    ).toEqual({});
-  });
-
-  it("carries none when a namespaced row arrived without one, so the server explains it", () => {
-    expect(detailSearch(summary({ namespace: null }))).toEqual({});
   });
 });
 

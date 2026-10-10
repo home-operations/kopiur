@@ -84,4 +84,18 @@ describe("StatusCards", () => {
       "/repositories?health=failed",
     );
   });
+
+  it("turns the lamp the list is filtered to into the way back to all of them", async () => {
+    mount(<StatusCards repositories={fleet} namespace="media" active="failed" />);
+    const nav = await screen.findByRole("navigation", { name: "Repositories by health" });
+    const failed = within(nav).getByRole("link", {
+      name: "1 failed repository, shown — select again to show all",
+    });
+    expect(failed).toHaveAttribute("href", "/repositories?namespace=media");
+    expect(failed).toHaveAttribute("aria-current", "true");
+    expect(within(nav).getByRole("link", { name: "2 healthy repositories" })).toHaveAttribute(
+      "href",
+      "/repositories?namespace=media&health=healthy",
+    );
+  });
 });

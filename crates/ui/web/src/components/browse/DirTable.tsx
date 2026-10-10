@@ -3,8 +3,10 @@ import { File, FileQuestion, Folder, Link2, type LucideIcon } from "lucide-react
 
 import type { DirEntryView, DirListing, EntryKind } from "../../api/types";
 import { EMPTY_CELL, formatTimestamp, humanBytes } from "../../util/format";
+import { ColumnLedger } from "../ColumnLedger";
+import type { ColumnSpec } from "../tableColumns";
 import { DownloadButton } from "./DownloadButton";
-import { childPath, entryAction, entryKindLabel } from "./browse";
+import { browseSearch, childPath, entryAction, entryKindLabel } from "./browse";
 
 /**
  * One page of a directory inside the snapshot, as a ledger.
@@ -32,72 +34,75 @@ export interface DirTableProps {
   scope: string | undefined;
 }
 
+type DirColumn = "entry" | "kind" | "size" | "modified" | "mode" | "file";
+
+const DIR_COLUMNS: readonly ColumnSpec<DirColumn>[] = [
+  { id: "entry", label: "Entry", width: 360, min: 240, locked: true },
+  { id: "kind", label: "Kind", width: 110, min: 70 },
+  { id: "size", label: "Size", width: 110, min: 96, numeric: true },
+  { id: "modified", label: "Modified", width: 200, min: 110 },
+  { id: "mode", label: "Mode", width: 120, min: 80, className: "mono" },
+  { id: "file", label: "File", width: 220, min: 160, locked: true, resizable: false },
+];
+
 export function DirTable({ namespace, name, listing, scope }: DirTableProps) {
-  const scoped = scope !== undefined ? { namespace: scope } : {};
   const caption =
     listing.path.length > 0 ? `Entries in ${listing.path}` : "Entries in the snapshot";
   return (
-    <div className="ledger-scroll">
-      <table className="ledger dir-table" aria-label={caption}>
-        <thead>
-          <tr>
-            <th scope="col">Entry</th>
-            <th scope="col">Kind</th>
-            <th scope="col" className="num">
-              Size
-            </th>
-            <th scope="col">Modified</th>
-            <th scope="col">Mode</th>
-            <th scope="col">File</th>
-          </tr>
-        </thead>
-        <tbody>
-          {listing.entries.map((entry) => {
-            const path = childPath(listing.path, entry.name);
-            const action = entryAction(entry, listing.session);
+    <ColumnLedger
+      id="browse"
+      label={caption}
+      className="dir-table"
+      columns={DIR_COLUMNS}
+      rows={listing.entries}
+      rowKey={(entry) => childPath(listing.path, entry.name)}
+      cell={(entry, id) => {
+        const path = childPath(listing.path, entry.name);
+        const action = entryAction(entry, listing.session);
+        switch (id) {
+          case "entry":
             return (
-              <tr key={path}>
-                <td>
-                  <span className="dir-table__entry">
-                    <EntryIcon kind={entry.kind} />
-                    {action.action === "open" ? (
-                      <Link
-                        className="mono dir-table__name"
-                        to="/snapshots/$namespace/$name/browse"
-                        params={{ namespace, name }}
-                        search={{ ...scoped, path }}
-                      >
-                        {entry.name}
-                      </Link>
-                    ) : (
-                      <span className="mono dir-table__name">{entry.name}</span>
-                    )}
-                  </span>
-                </td>
-                <td>{entryKindLabel(entry.kind)}</td>
-                <td className="num">{humanBytes(entry.size)}</td>
-                <td>{formatTimestamp(entry.mtime)}</td>
-                <td className="mono">{modeCell(entry)}</td>
-                <td>
-                  {action.action === "open" ? (
-                    <span className="dir-table__note">Open it to list its contents.</span>
-                  ) : (
-                    <DownloadButton
-                      namespace={namespace}
-                      name={name}
-                      path={path}
-                      label={entry.name}
-                      disabledReason={action.action === "refused" ? action.reason : undefined}
-                      disabledWord={action.action === "refused" ? action.word : undefined}
-                    />
-                  )}
-                </td>
-              </tr>
+              <span className="dir-table__entry">
+                <EntryIcon kind={entry.kind} />
+                {action.action === "open" ? (
+                  <Link
+                    className="mono dir-table__name"
+                    to="/browse"
+                    search={browseSearch(namespace, name, { scope, path })}
+                  >
+                    {entry.name}
+                  </Link>
+                ) : (
+                  <span className="mono dir-table__name">{entry.name}</span>
+                )}
+              </span>
             );
-          })}
-        </tbody>
-      </table>
-    </div>
+          case "kind":
+            return entryKindLabel(entry.kind);
+          case "size":
+            return humanBytes(entry.size);
+          case "modified":
+            return formatTimestamp(entry.mtime);
+          case "mode":
+            return modeCell(entry);
+          case "file":
+            return action.action === "open" ? (
+              <span className="dir-table__note">Open it to list its contents.</span>
+            ) : (
+              <DownloadButton
+                namespace={namespace}
+                name={name}
+                path={path}
+                label={entry.name}
+                disabledReason={action.action === "refused" ? action.reason : undefined}
+                disabledWord={action.action === "refused" ? action.word : undefined}
+              />
+            );
+          default:
+            return id satisfies never;
+        }
+      }}
+    />
   );
 }
 

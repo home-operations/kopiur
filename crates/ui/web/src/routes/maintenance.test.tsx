@@ -1,8 +1,9 @@
 import { screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 
 import type { ActionReceipt, MaintenanceRow, MaintenanceRunBody } from "../api/types";
+import { forgetColumnPrefs } from "../components/columnPrefs";
 import {
   calledPaths,
   fetchMock,
@@ -11,6 +12,8 @@ import {
   meWith,
   mockApi,
   mountApp,
+  notifications,
+  pickOption,
   problemResponse,
   sentBody,
   unletteredLamps,
@@ -79,42 +82,73 @@ function region(name: string) {
   return screen.findByRole("region", { name });
 }
 
+function table() {
+  return screen.findByRole("table", { name: "Maintenance" });
+}
+
+/** The ledger row a Maintenance is on, found by its name link. */
+async function row(name: string): Promise<HTMLElement> {
+  const link = within(await table()).getByRole("link", { name });
+  const tr = link.closest("tr");
+  if (tr === null) throw new Error(`no row for ${name}`);
+  return tr;
+}
+
+const headers = async () =>
+  within(await table())
+    .getAllByRole("columnheader")
+    .map((th) => th.textContent);
+
+afterEach(() => {
+  window.localStorage.clear();
+  forgetColumnPrefs();
+});
+
 describe("Maintenance", () => {
-  it("gives each Maintenance its own region, titled by the repository it governs", async () => {
+  it("lists each Maintenance as a row of the ledger, with the repository it governs", async () => {
     mockApi({ "/api/v1/maintenance": jsonResponse(rows) });
     mountApp("/maintenance");
-    const first = await region("Maintenance media/nas-maintenance");
-    expect(first).toHaveTextContent("Repository/media/nas");
-    expect(first).toHaveTextContent("media/nas-maintenance");
-    expect(await region("Maintenance kopiur-system/shared-maintenance")).toHaveTextContent(
-      "ClusterRepository/shared",
-    );
+    const first = await row("nas-maintenance");
+    expect(first.querySelector('a.ref[data-kind="repository"]')).toHaveTextContent("nas");
+    expect(first).toHaveTextContent("media");
+    const second = await row("shared-maintenance");
+    expect(
+      second.querySelector('a.ref[data-kind="cluster-repository"]')?.getAttribute("href"),
+    ).toMatch(/inspect=cluster-repository%2Fshared$/);
+    // One ledger, not a card per object.
+    expect(document.querySelector(".maintenance-card")).toBeNull();
+  });
+
+  it("opens a Maintenance object in the resource drawer from its row", async () => {
+    mockApi({ "/api/v1/maintenance": jsonResponse(rows) });
+    mountApp("/maintenance");
+    await userEvent.click(await screen.findByRole("link", { name: "nas-maintenance" }));
+    const dialog = await screen.findByRole("dialog", { name: /nas-maintenance/ });
+    expect(dialog).toHaveAttribute("data-kind", "maintenance");
   });
 
   it("says whether editing this object will stick or be reconciled away", async () => {
     mockApi({ "/api/v1/maintenance": jsonResponse(rows) });
     mountApp("/maintenance");
-    expect(await region("Maintenance media/nas-maintenance")).toHaveTextContent("reconciled away");
-    expect(await region("Maintenance kopiur-system/shared-maintenance")).toHaveTextContent(
-      "never rewrites it",
-    );
+    expect(await row("nas-maintenance")).toHaveTextContent("reconciled away");
+    expect(await row("shared-maintenance")).toHaveTextContent("never rewrites it");
   });
 
   it("renders both tracks, a track that has never run, and a failure count", async () => {
     mockApi({ "/api/v1/maintenance": jsonResponse(rows) });
     mountApp("/maintenance");
-    const first = await region("Maintenance media/nas-maintenance");
-    expect(first).toHaveTextContent("Quick last run");
-    expect(first).toHaveTextContent("Full last run");
+    const first = await row("nas-maintenance");
+    expect(await headers()).toEqual(
+      expect.arrayContaining(["Quick last run", "Full last run", "Full failures", "Reclaimed"]),
+    );
     expect(within(first).getByText("never run")).toBeInTheDocument();
-    expect(first).toHaveTextContent("Full failures since success");
     expect(first).toHaveTextContent("4.0 KiB");
   });
 
   it("lamps a track that has never run, and the count of failures behind it", async () => {
     mockApi({ "/api/v1/maintenance": jsonResponse(rows) });
     mountApp("/maintenance");
-    const first = await region("Maintenance media/nas-maintenance");
+    const first = await row("nas-maintenance");
 
     // "never run" keeps its own wording and gains the icon.
     const never = within(first).getByText("never run").closest(".health");
@@ -137,23 +171,31 @@ describe("Maintenance", () => {
   it("leaves no health colour on this screen carried by hue alone", async () => {
     mockApi({ "/api/v1/maintenance": jsonResponse(rows) });
     mountApp("/maintenance");
-    await region("Maintenance media/nas-maintenance");
+    await row("nas-maintenance");
     expect(unletteredLamps(document.body)).toEqual([]);
   });
 
-  it("renders the next run as 'not reported' on both tracks — nothing writes it", async () => {
+  it("keeps the next-run columns, which nothing writes yet, off until asked for", async () => {
     mockApi({ "/api/v1/maintenance": jsonResponse(rows) });
     mountApp("/maintenance");
-    const first = await region("Maintenance media/nas-maintenance");
-    expect(within(first).getAllByText("not reported")).toHaveLength(2);
-    expect(within(first).getAllByTitle(/No controller writes/)[0]).toBeDefined();
+    const first = await row("nas-maintenance");
+    expect(await headers()).not.toContain("Quick next run");
+    expect(within(first).queryByText("not reported")).toBeNull();
+
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: /^Columns/ }));
+    await user.click(screen.getByRole("checkbox", { name: "Quick next run" }));
+    await user.click(screen.getByRole("checkbox", { name: "Full next run" }));
+    const again = await row("nas-maintenance");
+    expect(within(again).getAllByText("not reported")).toHaveLength(2);
+    expect(within(again).getAllByTitle(/No controller writes/)[0]).toBeDefined();
   });
 
   it("shows a pending manual run with the token the operator echoes back", async () => {
     mockApi({ "/api/v1/maintenance": jsonResponse(rows) });
     mountApp("/maintenance");
-    const second = await region("Maintenance kopiur-system/shared-maintenance");
-    expect(second).toHaveTextContent("Manual run");
+    const second = await row("shared-maintenance");
+    expect(await headers()).toContain("Manual run");
     expect(second).toHaveTextContent("full");
     expect(second).toHaveTextContent("Running");
     expect(second).toHaveTextContent("asked for");
@@ -170,7 +212,7 @@ describe("Maintenance", () => {
       expect(trigger).not.toHaveAttribute("aria-disabled");
     });
     await user.click(trigger);
-    await user.selectOptions(screen.getByLabelText("Mode"), "full");
+    await pickOption(user, "Mode", "full");
     await user.click(screen.getByRole("button", { name: "Request the run" }));
     const expected: MaintenanceRunBody = {
       namespace: "media",
@@ -178,6 +220,46 @@ describe("Maintenance", () => {
       mode: "full",
     };
     expect(sentBody(RUN)).toEqual(expected);
+    // The answer is a toast, not squeezed into the row.
+    const answer = await within(await notifications()).findByRole("status");
+    expect(answer).toHaveTextContent("Run full maintenance on media/nas-maintenance requested");
+    expect(answer.closest("table")).toBeNull();
+  });
+
+  it("asks in a popover anchored to its button, one at a time, and Escape hands focus back", async () => {
+    mockApi({ "/api/v1/maintenance": jsonResponse(rows), [RUN]: jsonResponse(receipt) });
+    mountApp("/maintenance");
+    const user = userEvent.setup();
+    const name = "Run maintenance for Repository/media/nas";
+    const trigger = await screen.findByRole("button", { name });
+    await waitFor(() => {
+      expect(trigger).not.toHaveAttribute("aria-disabled");
+    });
+    await user.click(trigger);
+    const popover = screen.getByRole("dialog", { name });
+    expect(popover).toHaveClass("popover__panel");
+    expect(popover.closest(".popover")).toContainElement(trigger);
+    // A table cell's button says "Run"; its name says which repository. The
+    // card clips, so the question is pinned to the button on screen.
+    expect(trigger).toHaveTextContent(/^Run$/);
+    expect(popover).toHaveAttribute("data-strategy", "fixed");
+    expect(trigger).toHaveAttribute("aria-expanded", "true");
+    expect(within(popover).getByLabelText("Mode")).toHaveFocus();
+
+    // Opening the other card's run closes this one.
+    const other = screen.getByRole("button", {
+      name: /Run maintenance for ClusterRepository/,
+    });
+    await waitFor(() => {
+      expect(other).not.toHaveAttribute("aria-disabled");
+    });
+    await user.click(other);
+    expect(screen.queryByRole("dialog", { name })).toBeNull();
+    expect(screen.getAllByRole("dialog")).toHaveLength(1);
+
+    await user.keyboard("{Escape}");
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(other).toHaveFocus();
   });
 
   it("judges each run in the Maintenance's own namespace, not the repository's", async () => {
@@ -205,28 +287,6 @@ describe("Maintenance", () => {
     );
     expect(calledPaths()).toContain("/api/v1/me?namespace=media");
     expect(calledPaths()).toContain("/api/v1/me?namespace=kopiur-system");
-  });
-
-  it("keeps one confirmation open at a time", async () => {
-    mockApi({ "/api/v1/maintenance": jsonResponse(rows), [RUN]: jsonResponse(receipt) });
-    mountApp("/maintenance");
-    const user = userEvent.setup();
-    const first = await screen.findByRole("button", {
-      name: "Run maintenance for Repository/media/nas",
-    });
-    await waitFor(() => {
-      expect(first).not.toHaveAttribute("aria-disabled");
-    });
-    await user.click(first);
-    expect(
-      screen.getByRole("group", { name: "Run maintenance for Repository/media/nas" }),
-    ).toBeInTheDocument();
-    await user.click(
-      screen.getByRole("button", { name: "Run maintenance for ClusterRepository/shared" }),
-    );
-    expect(
-      screen.queryByRole("group", { name: "Run maintenance for Repository/media/nas" }),
-    ).toBeNull();
   });
 
   it("says an empty page is a risk rather than a quiet state", async () => {
@@ -268,5 +328,19 @@ describe("Maintenance", () => {
     mountApp("/maintenance");
     const section = await region("Maintenance");
     expect(within(section).getByRole("status", { busy: true })).toBeInTheDocument();
+  });
+});
+
+describe("Maintenance — kind identity", () => {
+  it("marks each Maintenance with its kind and names its repository as a reference", async () => {
+    mockApi({ "/api/v1/maintenance": jsonResponse(rows) });
+    mountApp("/maintenance");
+    const first = await row("nas-maintenance");
+    expect(first).toHaveAttribute("data-kind", "maintenance");
+    expect(first.querySelector("td")).toHaveClass("has-stripe");
+    expect(first.querySelector(".kind-chip svg")).not.toBeNull();
+    expect(first.querySelector('a.ref[data-kind="repository"]')?.getAttribute("href")).toMatch(
+      /inspect=repository%2Fmedia%2Fnas$/,
+    );
   });
 });

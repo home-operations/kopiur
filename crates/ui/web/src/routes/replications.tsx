@@ -1,8 +1,7 @@
 import { createFileRoute } from "@tanstack/react-router";
-import { ArrowLeftRight, Hourglass } from "lucide-react";
+import { ArrowLeftRight } from "lucide-react";
 
 import { useReplications } from "../api/hooks";
-import { ReplicationLagChart } from "../charts/ReplicationLagChart";
 import { EmptyState } from "../components/EmptyState";
 import { ErrorState } from "../components/ErrorState";
 import { LoadingState } from "../components/LoadingState";
@@ -36,7 +35,7 @@ function Replications() {
       <p className="page__prose">
         A replication copies a repository to a second backend, or selected snapshots into another
         repository, on a schedule. Watch <strong>Last replicated</strong>: a copy that is overdue is
-        a copy you do not have.
+        a copy you do not have. Its bar is the age of the last copy, on one scale for every row.
       </p>
 
       <section className="page__section" aria-label="Replications">
@@ -57,21 +56,6 @@ function Replications() {
           <ReplicationTable rows={rows} />
         )}
       </section>
-
-      {rows.length > 0 ? (
-        <section className="page__section" aria-label="Replication lag">
-          <div className="page__section-head">
-            <h2>
-              <Hourglass size={16} strokeWidth={2} aria-hidden="true" />
-              Replication lag
-            </h2>
-          </div>
-          <p className="page__section-note">
-            The same rows, ordered by time since each last finished a copy.
-          </p>
-          <ReplicationLagChart rows={rows} />
-        </section>
-      ) : null}
 
       <p className="page__prose">
         &ldquo;Next run&rdquo; reads <em>not reported</em> because the operator does not publish a

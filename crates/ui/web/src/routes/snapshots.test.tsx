@@ -12,7 +12,9 @@ import {
   mockApi,
   mountApp,
   nth,
+  pickOption,
   problemResponse,
+  typeOption,
 } from "../test-utils";
 
 function row(over: Partial<SnapshotRow> = {}): SnapshotRow {
@@ -69,12 +71,11 @@ describe("Snapshots list", () => {
     expect(snapshotRequest()).toContain("namespace=media");
   });
 
-  it("links each row to its detail route, which is NOT nested under the list", async () => {
+  it("opens each row in the resource drawer, on the list itself", async () => {
     mockApi({ "/api/v1/snapshots": jsonResponse(page([row()])) });
     mountApp("/snapshots");
-    expect(await screen.findByRole("link", { name: "nightly-29" })).toHaveAttribute(
-      "href",
-      "/snapshots/media/nightly-29",
+    expect((await screen.findByRole("link", { name: "nightly-29" })).getAttribute("href")).toMatch(
+      /^\/snapshots\?inspect=snapshot%2Fmedia%2Fnightly-29$/,
     );
   });
 
@@ -98,18 +99,109 @@ describe("Snapshots list", () => {
     }
   });
 
-  it("round-trips a filter through the address bar when the form is submitted", async () => {
+  it("takes several values per filter, comma-separated, with no kind or namespace field beside the repository", async () => {
+    mockApi({
+      "/api/v1/snapshots": jsonResponse(page([row()])),
+      "/api/v1/repositories": jsonResponse([
+        {
+          kind: "Repository",
+          kindPath: "repository",
+          name: "nas",
+          namespace: "media",
+          health: "healthy",
+          mode: "direct",
+          serverBacked: false,
+          suspended: false,
+        },
+        {
+          kind: "ClusterRepository",
+          kindPath: "cluster-repository",
+          name: "shared",
+          health: "healthy",
+          mode: "direct",
+          serverBacked: false,
+          suspended: false,
+        },
+      ]),
+    });
+    const { router } = mountApp("/snapshots?namespace=media");
+    await list();
+    const filters = screen.getByRole("form", { name: "Snapshot filters" });
+    expect(within(filters).queryByText("Repository kind")).toBeNull();
+    expect(within(filters).queryByText("Repository namespace")).toBeNull();
+    expect(within(filters).queryByRole("button", { name: /^Namespace:/ })).toBeNull();
+    const user = userEvent.setup();
+    await pickOption(user, "Phase", "Failed", filters);
+    await pickOption(user, "Phase", "Running", filters);
+    await pickOption(user, "Repository", "nas", filters);
+    await pickOption(user, "Repository", "shared", filters);
+    // Applied as picked: no Apply button, and the open list survived each
+    // change (the helper reuses it), so the bar was not rebuilt under it.
+    expect(within(filters).queryByRole("button", { name: /Apply/ })).toBeNull();
+    expect(screen.getByRole("dialog", { name: "Choose the repository" })).toBeInTheDocument();
+    expect(router.state.location.search).toMatchObject({
+      namespace: "media",
+      phase: "failed,running",
+      repository: "Repository/media/nas,ClusterRepository/shared",
+    });
+    expect(router.state.location.search).not.toHaveProperty("repositoryKind");
+    expect(snapshotRequest()).toContain(
+      `repository=${encodeURIComponent("Repository/media/nas,ClusterRepository/shared")}`,
+    );
+  });
+
+  it("reads an older single-repository link as one qualified choice", async () => {
+    mockApi({ "/api/v1/snapshots": jsonResponse(page([row()])) });
+    const { router } = mountApp(
+      "/snapshots?repository=nas&repositoryKind=repository&repositoryNamespace=infra",
+    );
+    await list();
+    const filters = screen.getByRole("form", { name: "Snapshot filters" });
+    expect(within(filters).getByRole("button", { name: "Repository: nas" })).toBeInTheDocument();
+    // The link is sent as it is until something changes…
+    expect(snapshotRequest()).toContain("repositoryNamespace=infra");
+    const user = userEvent.setup();
+    await pickOption(user, "Phase", "Failed", filters);
+    // …and then it is written back in the qualified form.
+    expect(router.state.location.search).toMatchObject({
+      repository: "Repository/infra/nas",
+      phase: "failed",
+    });
+    expect(router.state.location.search).not.toHaveProperty("repositoryNamespace");
+  });
+
+  it("sends the values of a list the server accepts and names the one it would refuse", async () => {
+    mockApi({ "/api/v1/snapshots": jsonResponse(page([row()])) });
+    mountApp("/snapshots?phase=failed,bogus");
+    await list();
+    expect(snapshotRequest()).toContain("phase=failed");
+    expect(snapshotRequest()).not.toContain("bogus");
+    expect(screen.getAllByText(/bogus/).length).toBeGreaterThan(0);
+  });
+
+  it("puts each filter in the address bar the moment it is chosen", async () => {
     mockApi({ "/api/v1/snapshots": jsonResponse(page([row()])) });
     const { router } = mountApp("/snapshots");
     await list();
     const user = userEvent.setup();
-    await user.selectOptions(screen.getByLabelText("Phase"), "failed");
-    await user.type(screen.getByLabelText("Policy"), "nightly");
-    await user.click(screen.getByRole("button", { name: /Apply filters/ }));
+    await pickOption(user, "Phase", "Failed");
+    await typeOption(user, "Policy", "nightly");
     // The URL is the state: the filter is in the address bar, so the view is a
     // link a colleague can open.
     expect(router.state.location.search).toMatchObject({ phase: "failed", policy: "nightly" });
     expect(snapshotRequest()).toContain("phase=failed");
+  });
+
+  it("offers Clear all only when a filter is set, and it keeps the shell's namespace", async () => {
+    mockApi({ "/api/v1/snapshots": jsonResponse(page([row()])) });
+    const { router } = mountApp("/snapshots?namespace=media");
+    await list();
+    expect(screen.queryByRole("link", { name: "Clear all" })).toBeNull();
+    const user = userEvent.setup();
+    await pickOption(user, "Origin", "Manual");
+    await user.click(await screen.findByRole("link", { name: "Clear all" }));
+    expect(router.state.location.search).toEqual({ namespace: "media" });
+    expect(screen.getByRole("button", { name: "Origin: any origin" })).toBeInTheDocument();
   });
 
   it("keeps a filter value the server would refuse, says so, and does not send it", async () => {
@@ -241,7 +333,7 @@ describe("Snapshots list", () => {
     expect(first.querySelector(".health")).toHaveAttribute("data-health", "unknown");
   });
 
-  it("charts the rows on the page and says the chart follows the filter", async () => {
+  it("draws no size chart: that lives in each snapshot's drawer", async () => {
     mockApi({
       "/api/v1/snapshots": jsonResponse(
         page([row(), row({ name: "nightly-28", endTime: "2026-09-08T01:04:00Z" })]),
@@ -249,7 +341,7 @@ describe("Snapshots list", () => {
     });
     mountApp("/snapshots");
     await list();
-    expect(screen.getByRole("figure")).toBeInTheDocument();
-    expect(screen.getByText(/Drawn from the rows on this page only/)).toBeInTheDocument();
+    expect(screen.queryByRole("figure")).toBeNull();
+    expect(screen.queryByRole("region", { name: "Snapshot size over time" })).toBeNull();
   });
 });

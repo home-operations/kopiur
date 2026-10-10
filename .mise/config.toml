@@ -317,6 +317,18 @@ depends = ["ui-install", "ui-types"]
 # than `git diff`, which is blind to UNTRACKED files: a brand-new wire type
 # whose `.ts` was generated but never `git add`ed would slip past a plain diff.
 run = [
+  # The design system's colour contract (`kopiur-ui-design` skill): every
+  # token pair clears WCAG AA in both themes. styles.tokens.test.ts keeps
+  # styles.css equal to the tokens this checks.
+  '''
+set -eu
+out="$(python3 .claude/skills/kopiur-ui-design/scripts/check-contrast.py)" || {
+  printf '%s\n' "$out" | grep -E '^FAIL|failing' >&2
+  echo "       fix: adjust the token in .claude/skills/kopiur-ui-design/references/tokens.md, then copy it into styles.css." >&2
+  exit 1
+}
+printf '%s\n' "$out" | tail -1
+''',
   "pnpm -C crates/ui/web check",
   '''
 set -eu

@@ -1,8 +1,10 @@
 import { PlayCircle } from "lucide-react";
+import type { ReactNode } from "react";
 
 import { useReplicationRun } from "../api/hooks";
+import { lagSeries, lagShare } from "../charts/lag";
 import { ActionButton } from "./ActionButton";
-import { ActionResult } from "./ActionResult";
+import { ColumnLedger } from "./ColumnLedger";
 import { HealthBadge } from "./HealthBadge";
 import {
   type ReplicationRow,
@@ -12,7 +14,11 @@ import {
   replicationPhaseLabel,
 } from "./replication";
 import { NotReported } from "./NotReported";
+import { KindChip, KindName } from "./KindMark";
+import { KIND_META } from "./kind";
 import { useCapabilityReason } from "./useCapabilityReason";
+import { InspectLink } from "./InspectLink";
+import type { ColumnSpec } from "./tableColumns";
 
 /**
  * Both replication kinds in one ledger, worst question first: how far behind
@@ -35,99 +41,161 @@ export interface ReplicationTableProps {
   now?: Date | undefined;
 }
 
+/** A merged row as its own replication kind. */
+function replicationKind(row: ReplicationRow): "repositoryReplication" | "snapshotReplication" {
+  return row.kind === "RepositoryReplication" ? "repositoryReplication" : "snapshotReplication";
+}
+
+type ReplicationColumn =
+  | "replication"
+  | "state"
+  | "copies"
+  | "schedule"
+  | "lastReplicated"
+  | "lastRun"
+  | "run";
+
+const REPLICATION_COLUMNS: readonly ColumnSpec<ReplicationColumn>[] = [
+  { id: "replication", label: "Replication", width: 260, min: 240, locked: true, stripe: true },
+  { id: "state", label: "State", width: 140, min: 130 },
+  { id: "copies", label: "Copies", width: 260, min: 140 },
+  { id: "schedule", label: "Schedule", width: 170, min: 110 },
+  { id: "lastReplicated", label: "Last replicated", width: 160, min: 150 },
+  { id: "lastRun", label: "Last run", width: 160, min: 100 },
+  { id: "run", label: "Run", width: 150, min: 120, locked: true, resizable: false },
+];
+
 export function ReplicationTable({ rows, now = new Date() }: ReplicationTableProps) {
+  // One axis for every row's lag bar, scaled to the stalest copy.
+  const lag = lagSeries(rows, now);
   return (
-    <div className="ledger-scroll">
-      <table className="ledger replication-table" aria-label="Replications">
-        <thead>
-          <tr>
-            <th scope="col">Replication</th>
-            <th scope="col">State</th>
-            <th scope="col">Copies</th>
-            <th scope="col">Schedule</th>
-            <th scope="col">Last replicated</th>
-            <th scope="col">Last run</th>
-            <th scope="col">Run</th>
-          </tr>
-        </thead>
-        <tbody>
-          {rows.map((row) => (
-            <tr key={row.id}>
-              <td>
-                <div className="replication-table__object">
-                  <span className="label-strip">
-                    <span className="label-strip__kind">{row.kind}</span>
-                    <span className="label-strip__name">{row.name}</span>
-                  </span>
-                  <span className="replication-table__namespace mono">{row.namespace}</span>
-                </div>
-              </td>
-              <td>
-                <HealthBadge
-                  health={replicationHealth(row.phase, row.suspended)}
-                  label={row.suspended ? "Suspended" : replicationPhaseLabel(row.phase)}
-                />
-              </td>
-              <td>
-                <div className="replication-table__route">
-                  <span className="replication-table__hops">
-                    <span className="mono">{row.source}</span>
-                    <span className="replication-table__arrow" aria-hidden="true">
-                      →
-                    </span>
-                    <span className="mono">
-                      {row.destination}
-                      <span className="visually-hidden"> (destination)</span>
-                    </span>
-                  </span>
-                  <span className="replication-table__note">
-                    {row.destinationIsRepository
-                      ? "snapshots copied into another repository"
-                      : "blobs synced to a bare backend"}
-                  </span>
-                </div>
-              </td>
-              <td>
-                {/* The next run rides here rather than in a column of its own:
-                    it is "not reported" on every row of both kinds, so a
-                    column would spend a full width saying nothing, and the
-                    cron beside it is what actually answers the question. */}
-                <div className="replication-table__schedule">
-                  <span className="mono">{row.cron}</span>
-                  <span className="replication-table__note">
-                    next run{" "}
-                    {row.destinationIsRepository ? (
-                      <NotReported reason="SnapshotReplication reports no next-run time; see the cron." />
-                    ) : (
-                      <NotReported field="repositoryReplicationNextRun" />
-                    )}
-                  </span>
-                </div>
-              </td>
-              <td>
-                <Lag at={row.lastReplicated} now={now} />
-              </td>
-              <td>
-                <LastRun row={row} />
-              </td>
-              <td>
-                <RunAction row={row} />
-              </td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
-    </div>
+    <ColumnLedger
+      id="replications"
+      label="Replications"
+      className="replication-table"
+      columns={REPLICATION_COLUMNS}
+      rows={rows}
+      rowKey={(row) => row.id}
+      rowProps={(row) => ({ "data-kind": KIND_META[replicationKind(row)].slug })}
+      cell={(row, id) => replicationCell(row, id, now, lag.max)}
+    />
   );
 }
 
-/** How far behind this copy is; "never" is louder than a dash, and truer. */
-function Lag({ at, now }: { at: string | null | undefined; now: Date }) {
+function replicationCell(
+  row: ReplicationRow,
+  id: ReplicationColumn,
+  now: Date,
+  lagMax: number,
+): ReactNode {
+  switch (id) {
+    case "replication":
+      return (
+        <div className="table__object">
+          <KindChip kind={replicationKind(row)} size="sm" />
+          <div className="replication-table__object">
+            <span className="label-strip">
+              <KindName kind={replicationKind(row)} />
+              <span className="label-strip__name">
+                <InspectLink
+                  className="row-link"
+                  target={{
+                    kind: replicationKind(row),
+                    namespace: row.namespace,
+                    name: row.name,
+                  }}
+                >
+                  {row.name}
+                </InspectLink>
+              </span>
+            </span>
+            <span className="replication-table__namespace mono">{row.namespace}</span>
+          </div>
+        </div>
+      );
+    case "state":
+      return (
+        <HealthBadge
+          health={replicationHealth(row.phase, row.suspended)}
+          label={row.suspended ? "Suspended" : replicationPhaseLabel(row.phase)}
+        />
+      );
+    case "copies":
+      return (
+        <div className="replication-table__route">
+          <span className="replication-table__hops">
+            <span className="mono">{row.source}</span>
+            <span className="replication-table__arrow" aria-hidden="true">
+              →
+            </span>
+            <span className="mono">
+              {row.destination}
+              <span className="visually-hidden"> (destination)</span>
+            </span>
+          </span>
+          <span className="replication-table__note">
+            {row.destinationIsRepository
+              ? "snapshots copied into another repository"
+              : "blobs synced to a bare backend"}
+          </span>
+        </div>
+      );
+    case "schedule":
+      // The next run rides here rather than in a column of its own: it is
+      // "not reported" on every row of both kinds, so a column would spend a
+      // full width saying nothing, and the cron beside it is what actually
+      // answers the question.
+      return (
+        <div className="replication-table__schedule">
+          <span className="mono">{row.cron}</span>
+          <span className="replication-table__note">
+            next run{" "}
+            {row.destinationIsRepository ? (
+              <NotReported reason="SnapshotReplication reports no next-run time; see the cron." />
+            ) : (
+              <NotReported field="repositoryReplicationNextRun" />
+            )}
+          </span>
+        </div>
+      );
+    case "lastReplicated":
+      return <Lag at={row.lastReplicated} now={now} max={lagMax} />;
+    case "lastRun":
+      return <LastRun row={row} />;
+    case "run":
+      return <RunAction row={row} />;
+    default:
+      return id satisfies never;
+  }
+}
+
+/**
+ * How far behind this copy is: the age in words, and under it a bar on the
+ * same axis as every other row's (`charts/lag.ts`), so the stalest copy
+ * stands out down the column. "Never" is louder than a dash, and truer, and
+ * has no bar — there is no age to draw.
+ */
+function Lag({ at, now, max }: { at: string | null | undefined; now: Date; max: number }) {
   const text = replicationLag(at, now);
   if (at === null || at === undefined || at.length === 0) {
     return <span className="replication-table__never">{text}</span>;
   }
-  return <time dateTime={at}>{text}</time>;
+  const ms = new Date(at).getTime();
+  return (
+    <div className="lag">
+      <time dateTime={at}>{text}</time>
+      {Number.isNaN(ms) ? null : (
+        <span className="lag-bar" aria-hidden="true">
+          <span
+            className="lag-bar__fill"
+            style={{
+              width: `${String(Math.round(lagShare(Math.max(0, now.getTime() - ms), max) * 1000) / 10)}%`,
+            }}
+          />
+        </span>
+      )}
+    </div>
+  );
 }
 
 function LastRun({ row }: { row: ReplicationRow }) {
@@ -171,6 +239,7 @@ function RunAction({ row }: { row: ReplicationRow }) {
     <div className="replication-table__run">
       <ActionButton
         disabledReason={sentence}
+        reasonShown={false}
         title={sentence}
         onClick={() => {
           run.mutate({ namespace: row.namespace, name: row.name, kind: row.kindToken });
@@ -181,7 +250,6 @@ function RunAction({ row }: { row: ReplicationRow }) {
         Run now
       </ActionButton>
       {word !== undefined ? <span className="replication-table__note">{word}</span> : null}
-      <ActionResult label={`Run ${row.name}`} receipt={run.data} problem={run.error?.problem} />
     </div>
   );
 }

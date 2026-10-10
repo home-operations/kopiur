@@ -4,6 +4,8 @@ import { useId, useState } from "react";
 import { useMaintenanceRun, useReplicationRun } from "../../api/hooks";
 import type { Capabilities, MaintenanceRunBody, ReplicationRunBody } from "../../api/types";
 import { assertNever } from "../../util/assertNever";
+import { PickerField } from "../PickerField";
+import { MAINTENANCE_MODES } from "../pickerChoices";
 import { ActionPanel } from "./ActionPanel";
 import { useRefusal } from "./reason";
 
@@ -55,6 +57,14 @@ export interface RunDialogProps {
   labelSuffix?: string | undefined;
   open?: boolean | undefined;
   onOpenChange?: ((open: boolean) => void) | undefined;
+  /** How the confirmation opens; see `ActionPanel`. */
+  presentation?: "inline" | "popover" | undefined;
+  /** Shorter trigger words for a table cell; see `ActionPanel.shortLabel`. */
+  shortLabel?: string | undefined;
+  /** For the popover: which edge of the trigger it lines up with. */
+  align?: "start" | "end" | undefined;
+  /** For the popover: `fixed` inside a box that clips, such as a table. */
+  strategy?: "absolute" | "fixed" | undefined;
 }
 
 /** The `/me` flag that decides whether this run may be asked for. */
@@ -79,6 +89,10 @@ export function RunDialog({
   labelSuffix,
   open,
   onOpenChange,
+  presentation,
+  shortLabel,
+  align,
+  strategy,
 }: RunDialogProps) {
   const fieldId = useId();
   const maintenance = useMaintenanceRun();
@@ -98,8 +112,6 @@ export function RunDialog({
   const maintenanceRun = target.kind === "maintenance";
   const label = maintenanceRun ? "Run maintenance" : "Run now";
   const running = maintenanceRun ? maintenance.isPending : replication.isPending;
-  const receipt = maintenanceRun ? maintenance.data : replication.data;
-  const problem = maintenanceRun ? maintenance.error?.problem : replication.error?.problem;
 
   const run = () => {
     if (target.kind === "maintenance") {
@@ -131,10 +143,12 @@ export function RunDialog({
       confirmLabel="Request the run"
       running={running}
       onConfirm={run}
-      receipt={receipt}
-      problem={problem}
       open={open}
       onOpenChange={onOpenChange}
+      presentation={presentation}
+      shortLabel={shortLabel}
+      align={align}
+      strategy={strategy}
     >
       <p>
         This stamps a run request on{" "}
@@ -152,20 +166,14 @@ export function RunDialog({
             compacts indexes and is cheap; <strong>full</strong> also reclaims unused space, and is
             slow.
           </p>
-          <div className="controls__field">
-            <label htmlFor={`${fieldId}-mode`}>Mode</label>
-            <select
-              id={`${fieldId}-mode`}
-              className="controls__input"
-              value={mode}
-              onChange={(event) => {
-                setMode(event.target.value);
-              }}
-            >
-              <option value="quick">quick</option>
-              <option value="full">full</option>
-            </select>
-          </div>
+          <PickerField
+            id={`${fieldId}-mode`}
+            label="Mode"
+            value={mode}
+            onChange={setMode}
+            options={MAINTENANCE_MODES}
+            strategy="fixed"
+          />
         </>
       ) : (
         <p>

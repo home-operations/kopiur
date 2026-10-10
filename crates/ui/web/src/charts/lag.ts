@@ -1,26 +1,28 @@
 /**
- * Replication lag: how long ago each copy last ran.
+ * Replication lag: how long ago each copy last ran, drawn as a bar under each
+ * row's "Last replicated" in the replications ledger, all on one axis so the
+ * stalest copy stands out down the column.
  *
- * Pure, and separate from the SVG, for the same reason `series.ts` is — the
- * decisions that can misinform a reader are the ones about which rows get a
- * bar at all, and those are testable without a DOM.
+ * Pure, and separate from the table, because the decisions that can
+ * misinform a reader are the ones about which rows get a bar at all, and
+ * those are testable without a DOM.
  *
  * **"Never" is not a very long bar.** A replication that has never succeeded
  * has no age to draw; giving it the longest bar would put a measurement on
  * the screen that nobody took, and giving it a zero-length one would file the
  * most alarming row on the page under "fine". Those rows leave the plot and
- * are named in words above it.
+ * keep the loud word "never" in their cell instead.
  *
  * **A future instant is clamped to zero, not drawn backwards.** The cluster's
  * clock and the reader's browser are two different clocks; a few seconds of
  * skew must not draw a bar out of the left of the plot.
  *
- * **There is no "overdue" line on this chart**, and that is a data limit, not
+ * **There is no "overdue" mark on these bars**, and that is a data limit, not
  * an oversight. Overdue means "later than the next scheduled run", and no
  * controller writes one: `RepositoryReplication.status.nextScheduledAt` is in
  * the never-written set and `SnapshotReplication` has no such field at all.
  * Deriving it would mean evaluating the cron a second time, in a second
- * language, against a timezone this bundle does not have — so the chart shows
+ * language, against a timezone this bundle does not have — so the bar shows
  * the age it can measure and the screen says the rest in words.
  */
 
@@ -100,30 +102,14 @@ export function lagSeries(rows: readonly ReplicationRow[], now: Date = new Date(
 }
 
 /**
- * The plot's box, in the SVG's own user units. The height is not here: it
- * grows with the number of bars, so the chart computes it.
+ * A copy's age as a share of the axis, for the bar under it in the ledger.
+ * Clamped to the track, with a visible minimum so a copy made seconds ago is
+ * a sliver rather than nothing at all — an empty bar reads as "no data",
+ * which is a different fact.
  */
-export const LAG = {
-  width: 560,
-  /** Room for a `namespace/name` label to the left of the track. */
-  plotLeft: 190,
-  plotRight: 548,
-  top: 6,
-  /** Space under the last bar for the two axis words. */
-  bottom: 22,
-  rowHeight: 22,
-  barHeight: 14,
-} as const;
-
-/**
- * A bar's drawn width. Clamped to the track, and given a visible minimum so a
- * copy made seconds ago is a sliver rather than nothing at all — a bar of zero
- * width reads as "no data", which is a different fact.
- */
-export function lagWidth(ageMs: number, max: number): number {
-  const track = LAG.plotRight - LAG.plotLeft;
-  if (max <= 0) {
-    return 2;
-  }
-  return Math.max(2, Math.min(track, (ageMs / max) * track));
+export function lagShare(ageMs: number, max: number): number {
+  if (max <= 0) return MIN_SHARE;
+  return Math.max(MIN_SHARE, Math.min(1, ageMs / max));
 }
+
+const MIN_SHARE = 0.02;

@@ -2,6 +2,7 @@ import {
   CircleCheck,
   CircleHelp,
   CirclePause,
+  CirclePlay,
   Clock,
   OctagonX,
   TriangleAlert,
@@ -10,6 +11,14 @@ import {
 
 import type { Health, RepositorySummary } from "../api/types";
 import { unknownVariant } from "../util/assertNever";
+
+/**
+ * The pending colour under a play icon, wearing the phase's own word: a run in
+ * flight reads differently from one still waiting, without a seventh colour.
+ */
+export function inFlightLamp(word: string): Lamp {
+  return { key: "pending", word, icon: CirclePlay };
+}
 
 /** The `data-health` keys the stylesheet colours; every lamp maps onto one. */
 export type HealthKey = "healthy" | "degraded" | "failed" | "suspended" | "pending" | "unknown";

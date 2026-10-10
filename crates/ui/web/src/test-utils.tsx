@@ -23,12 +23,14 @@ import {
   createRootRoute,
   createRouter,
 } from "@tanstack/react-router";
-import { render } from "@testing-library/react";
+import { render, screen, within } from "@testing-library/react";
+import type { UserEvent } from "@testing-library/user-event";
 import type { ReactElement } from "react";
 import { vi } from "vitest";
 import createFetchMock from "vitest-fetch-mock";
 
 import { createQueryClient } from "./api/queryClient";
+import { Toaster } from "./components/toast/Toaster";
 import type { Me, Problem } from "./api/types";
 import { routeTree } from "./routeTree.gen";
 
@@ -212,7 +214,15 @@ export function calledPaths(): string[] {
  * hooks to use.
  */
 export function renderWithClient(element: ReactElement, path = "/") {
-  const root = createRootRoute({ component: () => element });
+  // The toaster rides along: every action answers there, as in the app.
+  const root = createRootRoute({
+    component: () => (
+      <>
+        {element}
+        <Toaster />
+      </>
+    ),
+  });
   const router = createRouter({
     routeTree: root,
     history: createMemoryHistory({ initialEntries: [path] }),
@@ -254,4 +264,48 @@ export function meWith(allowed: Partial<Me["can"]>): Response {
       Object.keys(ME.can).map((key) => [key, allowed[key as keyof Me["can"]] ?? false]),
     ),
   });
+}
+
+/** The field a `PickerField` is, by its label, and its open list. */
+async function openPicker(user: UserEvent, label: string, scope: HTMLElement) {
+  const name = `Choose the ${label.toLowerCase()}`;
+  // A multiple picker stays open between picks; clicking it again would close it.
+  const open = screen.queryByRole("dialog", { name });
+  if (open !== null) return open;
+  await user.click(within(scope).getByLabelText(label));
+  return screen.getByRole("dialog", { name });
+}
+
+/**
+ * Choose `option` (a choice's label) in the `PickerField` labelled `label` —
+ * the picker's stand-in for `user.selectOptions`.
+ */
+export async function pickOption(
+  user: UserEvent,
+  label: string,
+  option: string,
+  scope: HTMLElement = document.body,
+): Promise<void> {
+  const panel = await openPicker(user, label, scope);
+  const escaped = option.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  await user.click(await within(panel).findByRole("button", { name: new RegExp(`^${escaped}`) }));
+}
+
+/** Type `text` into a searchable `PickerField`'s filter and take it with Enter. */
+export async function typeOption(
+  user: UserEvent,
+  label: string,
+  text: string,
+  scope: HTMLElement = document.body,
+): Promise<void> {
+  const panel = await openPicker(user, label, scope);
+  await user.type(within(panel).getByRole("searchbox"), `${text}{Enter}`);
+}
+
+/**
+ * The toaster's region, where every action's answer lands (a receipt as
+ * `status`, a refusal as `alert`) — wherever the action was asked from.
+ */
+export function notifications(): Promise<HTMLElement> {
+  return screen.findByRole("region", { name: "Notifications" });
 }

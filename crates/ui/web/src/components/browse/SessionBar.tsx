@@ -3,7 +3,6 @@ import { KeyRound, PlayCircle, Square } from "lucide-react";
 import { useEndSession, useStartSession } from "../../api/hooks";
 import type { SessionInfo } from "../../api/types";
 import { ActionButton } from "../ActionButton";
-import { ActionResult } from "../ActionResult";
 import { Facts } from "../Facts";
 import { useCapabilityReason } from "../useCapabilityReason";
 import { sessionExpiry } from "./browse";
@@ -80,9 +79,6 @@ export function SessionBar({ namespace, name, session, lapsed = false, now }: Se
             {start.isPending ? "Starting the session…" : "Start a browse session"}
           </ActionButton>
         </div>
-        {start.error !== null ? (
-          <ActionResult label="Start browse session" problem={start.error.problem} />
-        ) : null}
       </section>
     );
   }
@@ -136,9 +132,6 @@ export function SessionBar({ namespace, name, session, lapsed = false, now }: Se
           {stop.isPending ? "Stopping the session…" : "Stop the session"}
         </ActionButton>
       </div>
-      {stop.error !== null ? (
-        <ActionResult label="Stop browse session" problem={stop.error.problem} />
-      ) : null}
     </section>
   );
 }

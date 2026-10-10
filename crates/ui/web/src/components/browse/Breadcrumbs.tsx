@@ -1,7 +1,7 @@
 import { Link } from "@tanstack/react-router";
 import { ChevronRight } from "lucide-react";
 
-import { breadcrumbs } from "./browse";
+import { breadcrumbs, browseSearch } from "./browse";
 
 /**
  * Where in the snapshot the listing is, as a trail back to the root.
@@ -28,7 +28,6 @@ export interface BreadcrumbsProps {
 
 export function Breadcrumbs({ namespace, name, path, rootLabel, scope }: BreadcrumbsProps) {
   const crumbs = breadcrumbs(path, rootLabel);
-  const scoped = scope !== undefined ? { namespace: scope } : {};
   return (
     <nav className="browse-crumbs" aria-label="Path inside the snapshot">
       <ol>
@@ -51,9 +50,8 @@ export function Breadcrumbs({ namespace, name, path, rootLabel, scope }: Breadcr
               ) : (
                 <Link
                   className="mono"
-                  to="/snapshots/$namespace/$name/browse"
-                  params={{ namespace, name }}
-                  search={crumb.path.length > 0 ? { ...scoped, path: crumb.path } : scoped}
+                  to="/browse"
+                  search={browseSearch(namespace, name, { scope, path: crumb.path })}
                 >
                   {crumb.label}
                 </Link>

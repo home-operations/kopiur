@@ -12,6 +12,7 @@ import {
   meWith,
   mockApi,
   mountApp,
+  notifications,
   nth,
   problemResponse,
   sentBody,
@@ -73,10 +74,10 @@ describe("Schedules", () => {
     mockApi({ "/api/v1/schedules": jsonResponse(rows) });
     mountApp("/schedules");
     const body = bodyRows(await table());
-    expect(within(nth(body, 0)).getByRole("link", { name: "nightly" })).toHaveAttribute(
-      "href",
-      "/policies/media/nightly",
-    );
+    const policy = within(nth(body, 0)).getByRole("link", { name: /SnapshotPolicy.*nightly/ });
+    expect(policy.getAttribute("href")).toMatch(/inspect=snapshot-policy%2Fmedia%2Fnightly$/);
+    expect(policy).toHaveAttribute("data-kind", "snapshot-policy");
+    expect(nth(body, 0)).toHaveAttribute("data-kind", "snapshot-schedule");
     expect(nth(body, 1)).toHaveTextContent("tier=gold");
     expect(nth(body, 1)).toHaveTextContent("by selector");
   });
@@ -132,6 +133,51 @@ describe("Schedules", () => {
       suspend: true,
     };
     expect(sentBody(SUSPEND)).toEqual(expected);
+    // The answer is a toast naming the row, and nothing is added to the page.
+    const answer = await within(await notifications()).findByRole("status");
+    expect(answer).toHaveTextContent("Suspend schedule prod/gold-cron requested");
+    expect(answer).toHaveTextContent("is now suspended");
+    expect(document.querySelector("main")?.textContent).not.toContain("requested");
+  });
+
+  it("toasts a resume as a resume", async () => {
+    mockApi({
+      "/api/v1/schedules": jsonResponse([{ ...nth(rows, 0), suspended: true }]),
+      [SUSPEND]: jsonResponse({ ...receipt, note: null }),
+    });
+    mountApp("/schedules");
+    const user = userEvent.setup();
+    const trigger = within(nth(bodyRows(await table()), 0)).getByRole("button", { name: "Resume" });
+    await waitFor(() => {
+      expect(trigger).not.toHaveAttribute("aria-disabled");
+    });
+    await user.click(trigger);
+    await user.click(await screen.findByRole("button", { name: /^Resume / }));
+    expect(await within(await notifications()).findByRole("status")).toHaveTextContent(
+      /^Resume schedule media\/.* requested/,
+    );
+  });
+
+  it("toasts a refusal with its fix, and raises no page banner", async () => {
+    mockApi({
+      "/api/v1/schedules": jsonResponse(rows),
+      [SUSPEND]: problemResponse(forbiddenProblem("Suspending was refused.", SUSPEND)),
+    });
+    mountApp("/schedules");
+    const user = userEvent.setup();
+    const trigger = within(nth(bodyRows(await table()), 1)).getByRole("button", {
+      name: "Suspend",
+    });
+    await waitFor(() => {
+      expect(trigger).not.toHaveAttribute("aria-disabled");
+    });
+    await user.click(trigger);
+    await user.click(await screen.findByRole("button", { name: "Suspend gold-cron" }));
+    const alert = await within(await notifications()).findByRole("alert");
+    expect(alert).toHaveTextContent("Suspend schedule prod/gold-cron");
+    expect(alert.querySelector(".problem__fix")).not.toBeNull();
+    expect(alert.querySelector(".toast__timer")).toBeNull();
+    expect(document.querySelector(".problem--banner")).toBeNull();
   });
 
   it("judges each row's control in the row's own namespace, not the page's scope", async () => {
@@ -263,5 +309,26 @@ describe("Schedules", () => {
     mountApp("/schedules");
     const region = await screen.findByRole("region", { name: "Schedules" });
     expect(within(region).getByRole("status", { busy: true })).toBeInTheDocument();
+  });
+});
+
+describe("Schedules — whole-row link", () => {
+  it("opens the schedule itself in the drawer — it has no page of its own", async () => {
+    mockApi({ "/api/v1/schedules": jsonResponse(rows) });
+    mountApp("/schedules");
+    const link = nth(bodyRows(await table()), 0).querySelector<HTMLElement>("a.row-link");
+    expect(link?.getAttribute("href")).toMatch(/inspect=snapshot-schedule%2Fmedia%2Fnightly-cron$/);
+    if (link === null) throw new Error("no row link");
+    await userEvent.click(link);
+    const dialog = await screen.findByRole("dialog", { name: /nightly-cron/ });
+    expect(
+      dialog.querySelector('a.ref[data-kind="snapshot-policy"]')?.getAttribute("href"),
+    ).toMatch(/inspect=[^&]+%2Csnapshot-policy%2Fmedia%2Fnightly$/);
+  });
+
+  it("links a selector schedule's row too: the drawer names the selector", async () => {
+    mockApi({ "/api/v1/schedules": jsonResponse(rows) });
+    mountApp("/schedules");
+    expect(nth(bodyRows(await table()), 1).querySelector("a.row-link")).not.toBeNull();
   });
 });

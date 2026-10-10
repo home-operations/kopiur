@@ -32,6 +32,8 @@ pub mod gates;
 pub mod graph;
 pub mod maintenance;
 pub mod me;
+pub mod namespaces;
+pub mod overview;
 pub mod policies;
 pub mod problem;
 pub mod replications;
@@ -83,6 +85,8 @@ const DEFAULT_NAMESPACE: &str = "default";
 pub fn router() -> Router<AppState> {
     Router::new()
         .merge(me::router())
+        .merge(namespaces::router())
+        .merge(overview::router())
         .merge(graph::router())
         .merge(status::router())
         .merge(repositories::router())
@@ -1109,6 +1113,9 @@ mod extractor_rejection_tests {
             // NamespaceQuery, on each of the shapes that use it.
             "/repositories?namespce=media",
             "/me?nammespace=media",
+            // NoQuery — an endpoint with no parameters still refuses one.
+            "/namespaces?namespace=media",
+            "/overview?namespce=media",
             // DoctorQuery — the finding that motivated this.
             "/doctor?namesapce=media",
             "/doctor?stuckTreshold=60",

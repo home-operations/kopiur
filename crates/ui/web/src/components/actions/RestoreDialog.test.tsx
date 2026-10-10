@@ -7,6 +7,7 @@ import {
   jsonResponse,
   meWith,
   mockApi,
+  pickOption,
   problemResponse,
   renderWithClient,
   sentBody,
@@ -33,6 +34,17 @@ async function open() {
 }
 
 describe("RestoreDialog", () => {
+  it("marks the answer that destroys data, not the whole question", async () => {
+    mockApi({ [RESTORE]: jsonResponse(receipt) });
+    renderWithClient(<RestoreDialog namespace="media" />);
+    await open();
+    const destroy = screen.getByRole("radio", { name: /Overwrite them/ }).closest("label");
+    const keep = screen.getByRole("radio", { name: /Leave existing files alone/ }).closest("label");
+    expect(destroy).toHaveAttribute("data-danger", "true");
+    expect(keep).not.toHaveAttribute("data-danger");
+    expect(destroy?.closest("fieldset")).not.toHaveAttribute("data-danger");
+  });
+
   it("builds a snapshotRef source into an existing claim, with overwrite said explicitly", async () => {
     mockApi({ [RESTORE]: jsonResponse(receipt) });
     renderWithClient(<RestoreDialog namespace="media" />);
@@ -82,7 +94,7 @@ describe("RestoreDialog", () => {
     await user.type(screen.getByLabelText("Kopia manifest ID (optional)"), "k123");
     await user.type(screen.getByLabelText("Claim name"), "data");
     await user.click(screen.getByRole("radio", { name: /Leave existing files alone/ }));
-    await user.selectOptions(screen.getByLabelText("Repository (optional)"), "ClusterRepository");
+    await pickOption(user, "Repository (optional)", "ClusterRepository");
     await user.type(screen.getByLabelText("Repository name"), "shared");
     await user.click(screen.getByRole("button", { name: "Create the restore" }));
     const expected: RestoreBody = {

@@ -1,9 +1,9 @@
-import { Link } from "@tanstack/react-router";
 import { Pin } from "lucide-react";
 
 import type { RetentionBucket, RetentionCandidate, RetentionPlan } from "../api/types";
 import { formatTimestamp, humanAge, relativeTime } from "../util/format";
 import { LampBadge } from "./HealthBadge";
+import { InspectLink } from "./InspectLink";
 import {
   bucketLabel,
   candidateVerdict,
@@ -158,13 +158,12 @@ function Candidate({ candidate, unbounded, now }: CandidateProps) {
     >
       <td>
         <div className="retention-table__object">
-          <Link
+          <InspectLink
             className="mono"
-            to="/snapshots/$namespace/$name"
-            params={{ namespace: candidate.namespace, name: candidate.name }}
+            target={{ kind: "snapshot", namespace: candidate.namespace, name: candidate.name }}
           >
             {candidate.name}
-          </Link>
+          </InspectLink>
           {candidate.subject ? (
             <span className="retention-table__subject">this snapshot</span>
           ) : null}

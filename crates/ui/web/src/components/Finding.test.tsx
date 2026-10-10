@@ -37,3 +37,15 @@ describe("Finding", () => {
     expect(finding?.querySelector("h3")).toBeNull();
   });
 });
+
+describe("Finding — the look the design system fixes", () => {
+  it("sets the fix on the accent plate and edges the finding in its state's colour", async () => {
+    const { cssRules, readStyles } = await import("../testing/css");
+    const rules = cssRules(readStyles());
+    const body = (selector: string) => rules.find((r) => r.selector === selector)?.body ?? "";
+    expect(body(".finding__fix")).toMatch(/background:\s*var\(--accent-soft\)/);
+    expect(body('.finding[data-health="failed"]')).toMatch(
+      /border-left-color:\s*var\(--health-failed-fg\)/,
+    );
+  });
+});
