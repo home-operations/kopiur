@@ -1052,41 +1052,21 @@ a.object-name:hover {
   overflow-wrap: anywhere;
 }
 
-/* ---- maintenance: one card per object (it has no detail page of its own) ---- */
+/* ---- maintenance: the ledger's name cell -------------------------------------
+   Name, namespace, and who authored it — the one fact that says whether an
+   edit to this object sticks. */
 
-.maintenance-card {
-  padding: 14px 16px;
-  border: 1px solid var(--card-border);
-  border-radius: var(--radius-lg);
-  background: var(--bg-surface);
-  box-shadow: var(--shadow-1);
-}
-
-.maintenance-card.has-stripe {
-  border-left: var(--stripe) solid var(--kc);
-}
-
-.maintenance-card__head {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: var(--space-3);
-}
-
-.maintenance-card__title {
+.maintenance-table__object {
   display: grid;
-  margin: 0;
-  font-size: var(--text-md);
-  line-height: 1.25;
+  gap: 2px;
+  min-width: 0;
 }
 
-.maintenance-card__for {
-  display: inline-flex;
-  align-items: center;
-  gap: var(--space-2);
-  margin-left: auto;
+.maintenance-table__namespace,
+.maintenance-table__note {
+  font-size: var(--text-xs);
   color: var(--fg-muted);
-  font-size: var(--text-sm);
+  overflow-wrap: anywhere;
 }
 
 /* ---- grids step down: facts 4 → 2 ----------------------------------------- */
@@ -4734,15 +4714,6 @@ a.topo-node {
 /* The resource's own coordinate, beside the repository the region is titled
    by — the two differ whenever a ClusterRepository's maintenance lives in the
    operator's namespace rather than the repository's. */
-.maintenance__resource {
-  color: var(--fg-muted);
-  font-size: var(--text-xs);
-  /* A flex item cannot shrink past its content without this pair, and a
-     `kopiur-system/<cluster-repository>-maintenance` name is long enough to
-     push a phone-width page sideways on its own. */
-  min-width: 0;
-  overflow-wrap: anywhere;
-}
 
 /* The refusal at its short length, beside a trigger the reader cannot press.
    Needed wherever `.ledger-scroll` suppresses the floating tooltip: without

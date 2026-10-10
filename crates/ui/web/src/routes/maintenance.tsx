@@ -2,11 +2,13 @@ import { Link, createFileRoute } from "@tanstack/react-router";
 import { Wrench } from "lucide-react";
 import { useState } from "react";
 
-import { useMaintenance } from "../api/hooks";
+import { useMaintenance, useMaintenanceRun } from "../api/hooks";
+import type { MaintenanceRow, MaintenanceRunBody } from "../api/types";
+import { ActionResult } from "../components/ActionResult";
 import { EmptyState } from "../components/EmptyState";
 import { ErrorState } from "../components/ErrorState";
 import { LoadingState } from "../components/LoadingState";
-import { MaintenanceList } from "../components/MaintenanceList";
+import { MaintenanceTable } from "../components/MaintenanceTable";
 import { RunDialog } from "../components/actions/RunDialog";
 import { useCurrentNamespace } from "../util/namespace";
 
@@ -42,6 +44,9 @@ function Maintenance() {
   const namespace = useCurrentNamespace();
   const maintenance = useMaintenance(namespace);
   const [open, setOpen] = useState<OpenRow>(null);
+  // One request for the whole ledger, so its receipt sits once under the
+  // table at full width rather than squeezed into a row's cell.
+  const run = useMaintenanceRun();
   const scope = namespace ?? "all namespaces";
   const search = namespace !== undefined ? { namespace } : {};
 
@@ -82,29 +87,52 @@ function Maintenance() {
           </EmptyState>
         </section>
       ) : (
-        <MaintenanceList
-          rows={maintenance.data}
-          renderAction={(row) => {
-            const id = `${row.namespace}/${row.name}`;
-            return (
-              <RunDialog
-                target={{
-                  kind: "maintenance",
-                  namespace: row.namespace,
-                  name: row.name,
-                  repository: row.repository,
-                }}
-                labelSuffix={row.repository}
-                open={open === id}
-                onOpenChange={(next) => {
-                  // A close from one card must not undo another card opening.
-                  setOpen((current) => (next ? id : current === id ? null : current));
-                }}
-              />
-            );
-          }}
-        />
+        <section className="page__section" aria-label="Maintenance">
+          <MaintenanceTable
+            rows={maintenance.data}
+            renderAction={(row) => {
+              const id = `${row.namespace}/${row.name}`;
+              return (
+                <RunDialog
+                  target={{
+                    kind: "maintenance",
+                    namespace: row.namespace,
+                    name: row.name,
+                    repository: row.repository,
+                  }}
+                  labelSuffix={row.repository}
+                  shortLabel="Run"
+                  inLedger
+                  align="end"
+                  strategy="fixed"
+                  maintenanceMutation={run}
+                  showResult={false}
+                  open={open === id}
+                  onOpenChange={(next) => {
+                    // A close from one row must not undo another row opening.
+                    setOpen((current) => (next ? id : current === id ? null : current));
+                  }}
+                />
+              );
+            }}
+          />
+          <ActionResult
+            label={resultLabel(run.variables, maintenance.data)}
+            receipt={run.data}
+            problem={run.error?.problem}
+          />
+        </section>
       )}
     </div>
   );
+}
+
+/** What the receipt under the ledger answers: the last row asked about. */
+function resultLabel(
+  body: MaintenanceRunBody | undefined,
+  rows: readonly MaintenanceRow[],
+): string {
+  if (body === undefined) return "Run maintenance";
+  const row = rows.find((r) => r.namespace === body.namespace && r.name === body.name);
+  return `Run maintenance for ${row?.repository ?? `${body.namespace}/${body.name}`}`;
 }

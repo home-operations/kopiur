@@ -57,6 +57,19 @@ export interface RunDialogProps {
   onOpenChange?: ((open: boolean) => void) | undefined;
   /** How the confirmation opens; see `ActionPanel`. */
   presentation?: "inline" | "popover" | undefined;
+  /** Shorter trigger words for a table cell; see `ActionPanel.shortLabel`. */
+  shortLabel?: string | undefined;
+  /** For the popover: which edge of the trigger it lines up with. */
+  align?: "start" | "end" | undefined;
+  /** For the popover: `fixed` inside a box that clips, such as a table. */
+  strategy?: "absolute" | "fixed" | undefined;
+  /**
+   * The maintenance request to send through, when the page shows the receipt
+   * itself (a table: one receipt under it, not one per cell). Its own otherwise.
+   */
+  maintenanceMutation?: ReturnType<typeof useMaintenanceRun> | undefined;
+  /** Show the receipt beside the trigger; off when the page shows it. */
+  showResult?: boolean | undefined;
 }
 
 /** The `/me` flag that decides whether this run may be asked for. */
@@ -82,9 +95,15 @@ export function RunDialog({
   open,
   onOpenChange,
   presentation,
+  shortLabel,
+  align,
+  strategy,
+  maintenanceMutation,
+  showResult,
 }: RunDialogProps) {
   const fieldId = useId();
-  const maintenance = useMaintenanceRun();
+  const ownMaintenance = useMaintenanceRun();
+  const maintenance = maintenanceMutation ?? ownMaintenance;
   const replication = useReplicationRun();
   const [mode, setMode] = useState("quick");
 
@@ -139,6 +158,10 @@ export function RunDialog({
       open={open}
       onOpenChange={onOpenChange}
       presentation={presentation}
+      shortLabel={shortLabel}
+      align={align}
+      strategy={strategy}
+      showResult={showResult}
     >
       <p>
         This stamps a run request on{" "}

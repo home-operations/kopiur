@@ -637,7 +637,7 @@ const SNAPSHOT_COLUMNS: readonly ColumnSpec<SnapshotColumn>[] = [
 
 **What:** a small panel floating just below the button that opened it: the
 options for an action (Doctor's namespace and windows), a table's Columns
-menu, a confirmation on a page of cards. `components/Popover.tsx`.
+menu, every action confirmation. `components/Popover.tsx`.
 
 ```tsx
 <Popover

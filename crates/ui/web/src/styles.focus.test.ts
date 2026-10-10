@@ -36,8 +36,6 @@ const NEVER_FOCUSED = new Set([
   // A finding (`<article>`/`<div>`) and a page state are cards, not controls.
   ".finding",
   ".state",
-  // A maintenance card is a labelled region, not a control.
-  ".maintenance-card",
   // Floating panels and the open drawer: containers, not controls.
   ".identity__panel",
   ".search__results",

@@ -52,6 +52,11 @@ import { useConfirmFocus } from "./useConfirmFocus";
 export interface ActionPanelProps {
   /** The action's name: the trigger's words and the result's label. */
   label: string;
+  /**
+   * Shorter words for the trigger, where `label` will not fit (a table's
+   * Action cell); `label` stays its accessible name and the question's.
+   */
+  shortLabel?: string | undefined;
   icon?: LucideIcon | undefined;
   /** `danger` for anything that stops backups or destroys data. */
   variant?: "default" | "danger" | undefined;
@@ -105,6 +110,7 @@ export interface ActionPanelProps {
 
 export function ActionPanel({
   label,
+  shortLabel,
   icon: Icon,
   variant = "default",
   disabledReason,
@@ -153,13 +159,14 @@ export function ActionPanel({
       disabledReason={disabledReason}
       reasonShown={shortReason === undefined}
       aria-expanded={isOpen}
+      aria-label={shortLabel !== undefined ? label : undefined}
       onClick={() => {
         setOpen(!isOpen);
       }}
       {...props}
     >
       {Icon !== undefined ? <Icon size={14} strokeWidth={2} aria-hidden="true" /> : null}
-      {label}
+      {shortLabel ?? label}
     </ActionButton>
   );
   const shortShown =
