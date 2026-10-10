@@ -253,6 +253,16 @@ describe("attention: replications", () => {
     expect(items[0]?.problems[0]?.what).toBe("The last copy from nas to s3 dr-bucket/nas/ failed.");
   });
 
+  it("never dates a failure by the last copy that succeeded", () => {
+    const { items } = attention({
+      replications: {
+        repository: [blobCopy({ lastReplicated: "2026-09-01T05:00:00Z" })],
+        snapshot: [copy({ lastReplicated: "2026-09-01T06:00:00Z" })],
+      },
+    });
+    expect(items.map((i) => i.at)).toEqual([undefined, undefined]);
+  });
+
   it("leaves out a copy that is running, healthy or suspended", () => {
     const { items } = attention({
       replications: {

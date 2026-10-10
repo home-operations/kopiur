@@ -269,8 +269,9 @@ export function attention(sources: AttentionSources): Attention {
       { kind: "repositoryReplication", namespace: r.namespace, name: r.name },
       "failed",
       "Failed",
+      // Undated: `lastReplicated` is the last copy that succeeded, which a
+      // later failure leaves unchanged, so it would make a new failure look old.
       { what: `The last copy from ${r.source} to ${to} failed.` },
-      { at: r.lastReplicated },
     );
   }
   for (const r of sources.replications?.snapshot ?? []) {
@@ -281,7 +282,6 @@ export function attention(sources: AttentionSources): Attention {
       "failed",
       "Failed",
       { what: `The last copy from ${r.source} to ${r.destination} failed.` },
-      { at: r.lastReplicated },
     );
   }
   for (const p of sources.policies ?? []) {
