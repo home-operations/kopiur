@@ -1,4 +1,4 @@
-import { Link, createFileRoute } from "@tanstack/react-router";
+import { createFileRoute } from "@tanstack/react-router";
 import { Database } from "lucide-react";
 
 import { useRepositories } from "../api/hooks";
@@ -20,8 +20,9 @@ import { useCurrentNamespace } from "../util/namespace";
  * route has to accept the key, filter on it, and — when the value is not one
  * of the six lamps — say so rather than 404 or quietly ignore it.
  *
- * The strip is repeated at the top of this page as the filter's own control.
- * Its counts are always the whole fleet's, never the filtered set's: a strip
+ * The strip is repeated at the top of this page as the filter's own control:
+ * choosing a lamp filters to it, choosing the lit one again clears it. Its
+ * counts are always the whole fleet's, never the filtered set's: a strip
  * whose numbers moved with the filter could not be used to get back out of
  * one.
  */
@@ -69,7 +70,6 @@ function Repositories() {
   const scope = namespace ?? "all namespaces";
   const all = repositories.data ?? [];
   const rows = filterByHealth(all, health);
-  const clear = namespace !== undefined ? { namespace } : {};
 
   return (
     <div className="page">
@@ -81,15 +81,7 @@ function Repositories() {
 
       {repositories.data !== undefined && repositories.data.length > 0 ? (
         <section className="page__section" aria-label="Repositories by health">
-          <StatusCards repositories={all} namespace={namespace} />
-          {health !== undefined ? (
-            <p className="page__section-note" role="status">
-              Showing the {healthLamp(health).word.toLowerCase()} repositories in {scope}.{" "}
-              <Link to="/repositories" search={clear}>
-                Show all {all.length}
-              </Link>
-            </p>
-          ) : null}
+          <StatusCards repositories={all} namespace={namespace} active={health} />
         </section>
       ) : null}
 
@@ -118,11 +110,6 @@ function Repositories() {
           <EmptyState
             title={`No ${healthLamp(health ?? "unknown").word.toLowerCase()} repositories in ${scope}`}
             icon={Database}
-            action={
-              <Link className="button" to="/repositories" search={clear}>
-                Show all {all.length}
-              </Link>
-            }
           >
             There {all.length === 1 ? "is" : "are"} {all.length}{" "}
             {all.length === 1 ? "repository" : "repositories"} in this scope, none with this health.

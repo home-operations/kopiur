@@ -1,4 +1,5 @@
 import { screen, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { describe, expect, it } from "vitest";
 
 import type { RepositorySummary } from "../api/types";
@@ -87,20 +88,32 @@ describe("Repositories list", () => {
     expect(nth(rows, 0)).toHaveTextContent("cold");
   });
 
-  it("marks the filtered lamp and offers a way back to the whole fleet", async () => {
+  it("marks the filtered lamp, and clicking it again clears the filter", async () => {
     mockApi({ "/api/v1/repositories": jsonResponse(fleet) });
     mountApp("/repositories?health=failed");
     await list();
     const strip = screen.getByRole("navigation", { name: "Repositories by health" });
-    const failed = within(strip).getByRole("link", { name: "1 failed repository" });
-    // The router marks it: the link's search is a subset of the URL's.
-    expect(failed).toHaveAttribute("aria-current", "page");
-    // The counts stay the whole fleet's, so the strip can be used to leave the filter.
-    expect(within(strip).getByRole("link", { name: "1 healthy repository" })).toBeInTheDocument();
-    expect(screen.getByRole("link", { name: "Show all 3" })).toHaveAttribute(
+    const failed = within(strip).getByRole("link", {
+      name: "1 failed repository, shown — select again to show all",
+    });
+    expect(failed).toHaveAttribute("aria-current", "true");
+    expect(failed).toHaveAttribute("href", "/repositories");
+    // The counts stay the whole fleet's, and the other lamps switch the filter.
+    expect(within(strip).getByRole("link", { name: "1 healthy repository" })).toHaveAttribute(
       "href",
-      "/repositories",
+      "/repositories?health=healthy",
     );
+    // No separate sentence or button to clear it: the lamp is the control.
+    expect(screen.queryByText(/Showing the failed/)).toBeNull();
+    expect(screen.queryByRole("link", { name: /Show all/ })).toBeNull();
+
+    await userEvent.setup().click(failed);
+    expect(bodyRows(await list())).toHaveLength(3);
+    expect(
+      within(screen.getByRole("navigation", { name: "Repositories by health" })).getByRole("link", {
+        name: "1 failed repository",
+      }),
+    ).not.toHaveAttribute("aria-current");
   });
 
   it("keeps a ?health= value it does not know, says so, and filters nothing out", async () => {
@@ -116,7 +129,8 @@ describe("Repositories list", () => {
     mountApp("/repositories?health=failed");
     const region = await screen.findByRole("region", { name: "Repositories" });
     expect(await within(region).findByText(/No failed repositories/)).toBeInTheDocument();
-    expect(within(region).getByRole("link", { name: "Show all 1" })).toBeInTheDocument();
+    // The lit lamp above clears it; the empty state carries no button of its own.
+    expect(within(region).queryByRole("link")).toBeNull();
   });
 
   it("teaches what a repository is when the scope holds none", async () => {

@@ -49,23 +49,24 @@ failure is loud and specific while a healthy fleet is calm.
 
 ## Choosing quickly
 
-| You need to show…                         | Use                                                             |
-| ----------------------------------------- | --------------------------------------------------------------- |
-| a state (health, phase, a failing fact)   | status pill (`HealthBadge` / `LampBadge`)                       |
-| which kind an object is                   | kind mark: stripe + chip + kind name                            |
-| one object pointing at another            | object reference (mini card with the target's pill)             |
-| many objects of one kind                  | table on a card, stripe on the first cell (`ColumnLedger`)      |
-| columns a person resizes, hides, reorders | `ColumnSpec`s + the Columns menu, identity column locked        |
-| objects of mixed kinds that need someone  | attention row (one per object, the fix on its plate)            |
-| what has run lately, across kinds         | activity row (one per run, newest first)                        |
-| two regions whose widths trade off        | split pane (8px gutter, three-dot grip, stacks when narrow)     |
-| a handful of facts about one object       | stat strip                                                      |
-| a missing value                           | the right absence: loud _never …_, faint _not reported_, or `—` |
-| a problem and how to fix it               | finding (what / why / FIX plate)                                |
-| an action                                 | button in the action row → inline confirm → receipt             |
-| something the user may not do             | the button, `aria-disabled`, with the reason beside it          |
-| a trend                                   | one-series line chart with a table twin                         |
-| nothing / loading / failed / forbidden    | the matching page state (skeleton, never a spinner)             |
+| You need to show…                         | Use                                                               |
+| ----------------------------------------- | ----------------------------------------------------------------- |
+| a state (health, phase, a failing fact)   | status pill (`HealthBadge` / `LampBadge`)                         |
+| which kind an object is                   | kind mark: stripe + chip + kind name                              |
+| one object pointing at another            | object reference (mini card with the target's pill)               |
+| many objects of one kind                  | table on a card, stripe on the first cell (`ColumnLedger`)        |
+| columns a person resizes, hides, reorders | `ColumnSpec`s + the Columns menu, identity column locked          |
+| objects of mixed kinds that need someone  | attention row (one per object, the fix on its plate)              |
+| what has run lately, across kinds         | activity row (one per run, newest first)                          |
+| two regions whose widths trade off        | split pane (8px gutter, three-dot grip, stacks when narrow)       |
+| a one-click filter (e.g. by health)       | links that filter; the lit one links back to all, no clear button |
+| a handful of facts about one object       | stat strip                                                        |
+| a missing value                           | the right absence: loud _never …_, faint _not reported_, or `—`   |
+| a problem and how to fix it               | finding (what / why / FIX plate)                                  |
+| an action                                 | button in the action row → inline confirm → receipt               |
+| something the user may not do             | the button, `aria-disabled`, with the reason beside it            |
+| a trend                                   | one-series line chart with a table twin                           |
+| nothing / loading / failed / forbidden    | the matching page state (skeleton, never a spinner)               |
 
 ## Checks to run
 
