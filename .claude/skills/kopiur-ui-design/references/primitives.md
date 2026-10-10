@@ -815,13 +815,19 @@ resource is looked at without leaving the page you are on.
   then **tabs** holding everything else, whose panel is the scroller; then the
   **actions** in the foot — a row of buttons with an open inline confirmation
   above it; answers are toasts. A kind with one tab draws no tab list. A long name wraps in the title, never widens the panel.
-- **The open resource lives in the URL** — `?inspect=<kind-slug>/<namespace>/<name>`
-  (`cluster-repository/<name>` for the cluster-scoped kind). Opening pushes one
-  history entry, so Back closes it; opening another resource from inside replaces
-  that entry; a deep link opens it.
+- **Drawers stack, and the stack lives in the URL** — `?inspect=` holds each
+  open resource as `<kind-slug>/<namespace>/<name>` (`cluster-repository/<name>`
+  for the cluster-scoped kind), bottom first, comma-separated. A resource opened
+  from inside a drawer opens its own drawer on top and pushes one history entry;
+  opening one already lower in the stack backs down to it rather than opening a
+  copy. A deep link opens the whole stack.
+- A covered drawer sits a `--space-4` step further left per drawer over it, so its
+  kind-striped edge shows; its resize handle is hidden, and a stacked drawer's
+  handle is only its tab. Only the bottom drawer darkens the page.
 - Focus moves into the panel on open and returns to the row or reference that
-  opened it. Escape, the close button and a backdrop click close it. An inline
-  confirmation inside the panel owns Escape first.
+  opened it. Escape, the close button, a click outside (the backdrop, or the
+  edge of the drawer beneath) and Back each close the **top** drawer only. An
+  inline confirmation inside the panel owns Escape first.
 - For the kinds on the topology board (Repository, ClusterRepository,
   SnapshotPolicy) the drawer also carries what the board knows: a
   **Relationships** tab (every link both ways, with the link's own pill and
