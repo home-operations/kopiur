@@ -47,8 +47,8 @@ const OVERVIEW: NavItem = { to: "/", label: "Overview", icon: LayoutDashboard };
 
 /**
  * The ten sections in reading order, grouped by the part of the system they
- * list: the health question first, storage, protection, the data itself,
- * then the tools.
+ * list: the health question first, storage, the data itself, the recipes
+ * that protect it, then the tools.
  */
 export const NAV_GROUPS: readonly NavGroup[] = [
   { label: null, items: [OVERVIEW, { to: "/topology", label: "Topology", icon: Waypoints }] },
@@ -66,17 +66,17 @@ export const NAV_GROUPS: readonly NavGroup[] = [
     ],
   },
   {
-    label: "Protection",
-    items: [
-      { to: "/policies", label: "Policies", icon: ScrollText, kind: "snapshotPolicy" },
-      { to: "/schedules", label: "Schedules", icon: CalendarClock, kind: "snapshotSchedule" },
-    ],
-  },
-  {
     label: "Data",
     items: [
       { to: "/snapshots", label: "Snapshots", icon: Camera, kind: "snapshot" },
       { to: "/restores", label: "Restores", icon: ArchiveRestore, kind: "restore" },
+    ],
+  },
+  {
+    label: "Protection",
+    items: [
+      { to: "/policies", label: "Policies", icon: ScrollText, kind: "snapshotPolicy" },
+      { to: "/schedules", label: "Schedules", icon: CalendarClock, kind: "snapshotSchedule" },
     ],
   },
   { label: null, items: [{ to: "/doctor", label: "Doctor", icon: Stethoscope }] },

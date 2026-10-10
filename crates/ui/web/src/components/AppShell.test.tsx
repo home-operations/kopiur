@@ -202,6 +202,9 @@ describe("AppShell", () => {
       const label = within(nav).getByText(group);
       expect(label.closest("a")).toBeNull();
     }
+    // The data itself reads before the recipes that protect it.
+    const labels = [...nav.querySelectorAll(".nav-group__label")].map((label) => label.textContent);
+    expect(labels).toEqual(["Storage", "Data", "Protection"]);
     // A kind section carries its kind's chip, so the nav already teaches the colours.
     const repositories = within(nav).getByRole("link", { name: "Repositories" });
     expect(repositories.querySelector('[data-kind="repository"]')).not.toBeNull();
