@@ -99,14 +99,14 @@ describe("AppShell", () => {
     expect(menu).toHaveFocus();
   });
 
-  it("lists the ten sections, marks the current one, and scopes the header to the namespace", async () => {
+  it("lists the eleven sections, marks the current one, and scopes the header to the namespace", async () => {
     mockShell();
     mountAt("/snapshots?namespace=prod");
 
     const nav = await screen.findByRole("navigation", { name: "Primary" });
     const links = within(nav).getAllByRole("link");
     expect(links.map((link) => link.textContent)).toEqual(NAV_ITEMS.map((item) => item.label));
-    expect(links).toHaveLength(10);
+    expect(links).toHaveLength(11);
     expect(within(nav).getByRole("link", { name: "Snapshots" })).toHaveAttribute(
       "aria-current",
       "page",
@@ -205,6 +205,12 @@ describe("AppShell", () => {
     // The data itself reads before the recipes that protect it.
     const labels = [...nav.querySelectorAll(".nav-group__label")].map((label) => label.textContent);
     expect(labels).toEqual(["Storage", "Data", "Protection"]);
+    const data = within(nav).getByText("Data").closest(".nav-group");
+    expect(
+      within(data as HTMLElement)
+        .getAllByRole("link")
+        .map((link) => link.textContent),
+    ).toEqual(["Snapshots", "Browse", "Restores"]);
     // A kind section carries its kind's chip, so the nav already teaches the colours.
     const repositories = within(nav).getByRole("link", { name: "Repositories" });
     expect(repositories.querySelector('[data-kind="repository"]')).not.toBeNull();

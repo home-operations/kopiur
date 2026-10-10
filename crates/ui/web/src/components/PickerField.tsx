@@ -14,6 +14,8 @@ interface CommonProps {
    * value.
    */
   emptyLabel?: string | undefined;
+  /** What the button says before anything is chosen, for a field with no Clear (no `emptyLabel`). */
+  placeholder?: string | undefined;
   /** A filter over the options, naming them ("policies"); a short fixed list has none. */
   search?: string | undefined;
   /** With `search`: what is typed may be taken when nothing listed matches. */
@@ -61,6 +63,7 @@ export function PickerField(props: PickerFieldProps) {
     label,
     options,
     emptyLabel,
+    placeholder,
     search,
     freeform = false,
     labelFor,
@@ -79,10 +82,11 @@ export function PickerField(props: PickerFieldProps) {
   const name = (value: string) =>
     options.find((option) => option.value === value)?.label ?? labelFor?.(value) ?? value;
   const names = selected.map(name);
+  const none = emptyLabel ?? placeholder ?? "";
   const first = names[0];
   const shown =
     first === undefined
-      ? (emptyLabel ?? "")
+      ? none
       : names.length === 1
         ? first
         : `${first} +${String(names.length - 1)}`;
@@ -112,7 +116,7 @@ export function PickerField(props: PickerFieldProps) {
             data-empty={empty ? "true" : undefined}
             aria-describedby={hint !== undefined ? hintId : undefined}
             {...trigger}
-            aria-label={`${label}: ${empty ? (emptyLabel ?? "") : names.join(", ")}`}
+            aria-label={`${label}: ${empty ? none : names.join(", ")}`}
           >
             <span className="picker-field__value">{shown}</span>
             <ChevronsUpDown size={14} strokeWidth={2} aria-hidden="true" />

@@ -1,6 +1,7 @@
 import { useState } from "react";
 
-import { usePolicies, useRepositories } from "../api/hooks";
+import { usePolicies, useRepositories, useSnapshots } from "../api/hooks";
+import { relativeTime } from "../util/format";
 import { useCurrentNamespace } from "../util/namespace";
 import { KindChip } from "./KindMark";
 import { useNamespaceOptions } from "./namespaceOptions";
@@ -123,6 +124,64 @@ export function RepositoryField({
       // Before the list is fetched, a key still reads as the name.
       labelFor={(key) => key.split("/").at(-1) ?? key}
       onOpen={onOpen}
+    />
+  );
+}
+
+/** The phases whose snapshots hold files: the ones the server lets a session browse. */
+const BROWSABLE_PHASES = "succeeded,discovered";
+
+/**
+ * One snapshot to browse, picked from the newest in the shell's scope that
+ * wrote something. A choice is `namespace/name`, so two snapshots with one
+ * name in different namespaces are never confused.
+ */
+export function SnapshotField({
+  id,
+  label,
+  value,
+  onChange,
+  placeholder,
+  strategy,
+}: {
+  id: string;
+  label: string;
+  value: string;
+  onChange: (value: string) => void;
+  placeholder: string;
+  strategy?: "absolute" | "fixed" | undefined;
+}) {
+  const [opened, onOpen] = useOpened();
+  const scope = useCurrentNamespace();
+  const snapshots = useSnapshots(
+    { namespace: scope, phase: BROWSABLE_PHASES, limit: 200 },
+    { enabled: opened },
+  );
+  const options: PickerOption[] = (snapshots.isSuccess ? snapshots.data.items : []).map((row) => ({
+    value: `${row.namespace}/${row.name}`,
+    label: row.name,
+    icon: <KindChip kind="snapshot" size="sm" />,
+    meta: [
+      scope === undefined ? row.namespace : null,
+      row.policy ?? null,
+      row.endTime != null ? relativeTime(row.endTime) : null,
+    ]
+      .filter((part) => part !== null && part.length > 0)
+      .join(" · "),
+  }));
+  return (
+    <PickerField
+      id={id}
+      label={label}
+      value={value}
+      onChange={onChange}
+      options={options}
+      placeholder={placeholder}
+      search="snapshots"
+      // Before the list is fetched, the chosen key still reads as the name.
+      labelFor={(key) => key.split("/").at(-1) ?? key}
+      onOpen={onOpen}
+      strategy={strategy}
     />
   );
 }

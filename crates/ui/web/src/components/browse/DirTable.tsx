@@ -6,7 +6,7 @@ import { EMPTY_CELL, formatTimestamp, humanBytes } from "../../util/format";
 import { ColumnLedger } from "../ColumnLedger";
 import type { ColumnSpec } from "../tableColumns";
 import { DownloadButton } from "./DownloadButton";
-import { childPath, entryAction, entryKindLabel } from "./browse";
+import { browseSearch, childPath, entryAction, entryKindLabel } from "./browse";
 
 /**
  * One page of a directory inside the snapshot, as a ledger.
@@ -46,7 +46,6 @@ const DIR_COLUMNS: readonly ColumnSpec<DirColumn>[] = [
 ];
 
 export function DirTable({ namespace, name, listing, scope }: DirTableProps) {
-  const scoped = scope !== undefined ? { namespace: scope } : {};
   const caption =
     listing.path.length > 0 ? `Entries in ${listing.path}` : "Entries in the snapshot";
   return (
@@ -68,9 +67,8 @@ export function DirTable({ namespace, name, listing, scope }: DirTableProps) {
                 {action.action === "open" ? (
                   <Link
                     className="mono dir-table__name"
-                    to="/snapshots/$namespace/$name/browse"
-                    params={{ namespace, name }}
-                    search={{ ...scoped, path }}
+                    to="/browse"
+                    search={browseSearch(namespace, name, { scope, path })}
                   >
                     {entry.name}
                   </Link>

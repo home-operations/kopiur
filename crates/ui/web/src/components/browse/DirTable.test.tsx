@@ -79,7 +79,7 @@ describe("DirTable", () => {
     const table = await mount();
     expect(screen.getByRole("link", { name: "log" })).toHaveAttribute(
       "href",
-      "/snapshots/media/nightly-1/browse?path=var%2Flog",
+      "/browse?snapshot=media%2Fnightly-1&path=var%2Flog",
     );
     expect(within(rowFor(table, "log")).queryByText("Download")).toBeNull();
   });

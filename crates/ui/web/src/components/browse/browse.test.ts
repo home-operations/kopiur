@@ -5,12 +5,14 @@ import {
   breadcrumbs,
   browseOffsetParam,
   browsePathParam,
+  browseSearch,
   childPath,
   classifyBrowseFailure,
   entryAction,
   entryKindLabel,
   isDirectory,
   pageWindow,
+  parseSnapshotParam,
   sessionExpiry,
   validateBrowsePath,
 } from "./browse";
@@ -361,5 +363,39 @@ describe("sessionExpiry", () => {
     expect(sessionExpiry({ ...SESSION, expiresAt: null }, now)).toBeNull();
     expect(sessionExpiry({ ...SESSION, expiresAt: "" }, now)).toBeNull();
     expect(sessionExpiry({ ...SESSION, expiresAt: "not a time" }, now)).toBeNull();
+  });
+});
+
+describe("parseSnapshotParam", () => {
+  it("reads a qualified namespace/name", () => {
+    expect(parseSnapshotParam("media/nightly-1")).toEqual({
+      namespace: "media",
+      name: "nightly-1",
+    });
+  });
+
+  it("refuses a value with no namespace, no name, or more than one slash", () => {
+    for (const value of ["nightly-1", "/nightly-1", "media/", "a/b/c", "", 5, undefined]) {
+      expect(parseSnapshotParam(value), String(value)).toBeNull();
+    }
+  });
+});
+
+describe("browseSearch", () => {
+  it("names the snapshot, and only the parts of the address that say something", () => {
+    expect(browseSearch("media", "nightly-1")).toEqual({ snapshot: "media/nightly-1" });
+    expect(browseSearch("media", "nightly-1", { scope: undefined, path: "", offset: 0 })).toEqual({
+      snapshot: "media/nightly-1",
+    });
+  });
+
+  it("carries the scope first, then the path and the page", () => {
+    const search = browseSearch("media", "nightly-1", { scope: "media", path: "var", offset: 500 });
+    expect(Object.entries(search)).toEqual([
+      ["namespace", "media"],
+      ["snapshot", "media/nightly-1"],
+      ["path", "var"],
+      ["offset", 500],
+    ]);
   });
 });

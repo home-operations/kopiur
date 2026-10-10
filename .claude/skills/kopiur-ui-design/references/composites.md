@@ -68,8 +68,13 @@ in three bands:
 
 Old detail addresses (`/policies/<ns>/<name>` and the like) redirect to the
 kind's list with the drawer open on the same object. The snapshot file browser
-stays a page of its own (a workspace, not a detail); the snapshot drawer's
-"Browse files" opens it, and its "Back to <name>" returns to the drawer.
+is a section of its own, **Browse** (a workspace, not a detail), with the
+snapshot in its address (`/browse?snapshot=<ns>/<name>`). Its head is a panel
+naming the snapshot being browsed: a snapshot picker field, a Details button
+that opens the drawer over the page, and the snapshot's facts. The snapshot
+drawer's "Browse files" opens Browse with that snapshot chosen; the tab
+remembers the last one, so Browse from the sidebar returns to it. The old
+`/snapshots/<ns>/<name>/browse` address redirects.
 
 The cross-cluster **Topology** screen keeps its graph board; its plates are
 summary object cards (232px) and every edge keeps a word label for its kind and,

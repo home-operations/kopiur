@@ -4039,16 +4039,50 @@ a.topo-node {
 /* The intro and the way back out, on one line at width and stacked below it.
    The prose is capped like every other `page__prose`; the button does not
    stretch to meet it. */
+/* The snapshot being browsed: the picker that names it, a way to its
+   details, and its facts in one row beneath. A panel on the canvas, like the
+   session panel under it. */
 .browse-head {
+  display: grid;
+  gap: var(--space-3);
+  max-width: 46rem;
+  padding: var(--space-4);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  background: var(--bg-surface);
+}
+
+.browse-head__pick {
   display: flex;
-  align-items: start;
-  justify-content: space-between;
-  gap: var(--space-3) var(--space-5);
+  align-items: end;
+  gap: var(--space-3);
   flex-wrap: wrap;
 }
 
-.browse-head .page__prose {
-  margin: 0;
+.browse-head__pick .picker-field {
+  flex: 1 1 18rem;
+  grid-template-columns: minmax(0, 1fr);
+  min-width: 0;
+}
+
+/* Snapshot names are long: the field takes the row, not the width of its
+   placeholder. */
+.browse-head__pick .picker-field__button {
+  width: 100%;
+  min-width: 0;
+  max-width: 34rem;
+}
+
+.browse-head .facts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2) var(--space-5);
+}
+
+.browse-head .facts__row {
+  display: grid;
+  grid-template-columns: none;
+  gap: var(--space-1);
 }
 
 /* The one panel on this screen, and the one place the cost of browsing is

@@ -28,11 +28,11 @@ describe("Breadcrumbs", () => {
     await mount("var/log");
     expect(screen.getByRole("link", { name: "nightly-1" })).toHaveAttribute(
       "href",
-      "/snapshots/media/nightly-1/browse",
+      "/browse?snapshot=media%2Fnightly-1",
     );
     expect(screen.getByRole("link", { name: "var" })).toHaveAttribute(
       "href",
-      "/snapshots/media/nightly-1/browse?path=var",
+      "/browse?snapshot=media%2Fnightly-1&path=var",
     );
     // A link to the page you are on is a control that does nothing.
     expect(screen.queryByRole("link", { name: "log" })).toBeNull();
@@ -43,11 +43,11 @@ describe("Breadcrumbs", () => {
     await mount("var/log", "media");
     expect(screen.getByRole("link", { name: "nightly-1" })).toHaveAttribute(
       "href",
-      "/snapshots/media/nightly-1/browse?namespace=media",
+      "/browse?namespace=media&snapshot=media%2Fnightly-1",
     );
     expect(screen.getByRole("link", { name: "var" })).toHaveAttribute(
       "href",
-      "/snapshots/media/nightly-1/browse?namespace=media&path=var",
+      "/browse?namespace=media&snapshot=media%2Fnightly-1&path=var",
     );
   });
 

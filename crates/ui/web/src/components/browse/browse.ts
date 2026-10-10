@@ -208,6 +208,59 @@ export function breadcrumbs(path: string, rootLabel = "/"): Crumb[] {
   return crumbs;
 }
 
+// ---- the address ---------------------------------------------------------
+
+/** The snapshot a browse address names. */
+export interface BrowsedSnapshot {
+  namespace: string;
+  name: string;
+}
+
+/**
+ * `?snapshot=` read as `namespace/name`, or `null` when it is not one.
+ *
+ * Neither a namespace nor an object name may contain a slash, so exactly one
+ * slash with something either side is the whole rule.
+ */
+export function parseSnapshotParam(value: unknown): BrowsedSnapshot | null {
+  if (typeof value !== "string") {
+    return null;
+  }
+  const parts = value.split("/");
+  if (parts.length !== 2) {
+    return null;
+  }
+  const [namespace = "", name = ""] = parts;
+  return namespace.length > 0 && name.length > 0 ? { namespace, name } : null;
+}
+
+/** The search of a browse address: what `/browse` reads. */
+export interface BrowseSearchParams {
+  namespace?: string;
+  snapshot: string;
+  path?: string;
+  offset?: number;
+}
+
+/**
+ * The search for one snapshot's browse address, so every link into the
+ * browser — the drawer, a directory row, a crumb, a page step — is built the
+ * same way. An empty path, the first page and an absent scope are left out
+ * rather than written as their defaults.
+ */
+export function browseSearch(
+  namespace: string,
+  name: string,
+  at: { scope?: string | undefined; path?: string | undefined; offset?: number | undefined } = {},
+): BrowseSearchParams {
+  return {
+    ...(at.scope !== undefined ? { namespace: at.scope } : {}),
+    snapshot: `${namespace}/${name}`,
+    ...(at.path !== undefined && at.path.length > 0 ? { path: at.path } : {}),
+    ...(at.offset !== undefined && at.offset > 0 ? { offset: at.offset } : {}),
+  };
+}
+
 // ---- pagination ----------------------------------------------------------
 
 /** A `?offset=` a reader wrote: a non-negative whole number, else the start. */

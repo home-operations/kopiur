@@ -237,7 +237,7 @@ describe("Snapshot drawer", () => {
     expect(calledPaths().filter((p) => p.startsWith("/api/v1/snapshots?"))).toHaveLength(0);
   });
 
-  it("opens the file browser from the action bar, keeping the console's scope", async () => {
+  it("opens Browse from the action bar with this snapshot chosen, keeping the console's scope", async () => {
     mockApi({
       [PATH]: jsonResponse(detail()),
       // No session yet — the browse page's ordinary first state.
@@ -255,13 +255,16 @@ describe("Snapshot drawer", () => {
     });
     const { router } = mountApp(`/doctor?namespace=media&inspect=snapshot/media/nightly-29`);
     const link = await within(await foot()).findByRole("link", { name: /Browse files/ });
-    expect(link).toHaveAttribute("href", "/snapshots/media/nightly-29/browse?namespace=media");
+    expect(link).toHaveAttribute("href", "/browse?namespace=media&snapshot=media%2Fnightly-29");
     await userEvent.click(link);
     await waitFor(() => {
-      expect(router.state.location.pathname).toBe("/snapshots/media/nightly-29/browse");
+      expect(router.state.location.pathname).toBe("/browse");
     });
     expect(await screen.findByText("No browse session is running")).toBeInTheDocument();
-    expect(router.state.location.search).toEqual({ namespace: "media" });
+    expect(router.state.location.search).toEqual({
+      namespace: "media",
+      snapshot: "media/nightly-29",
+    });
   });
 
   it("offers no browse link when the operator says it cannot be browsed, and says why", async () => {

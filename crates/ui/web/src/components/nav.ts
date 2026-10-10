@@ -4,6 +4,7 @@ import {
   CalendarClock,
   Camera,
   Database,
+  FolderOpen,
   LayoutDashboard,
   ScrollText,
   ShieldAlert,
@@ -21,6 +22,7 @@ export type NavPath =
   | "/topology"
   | "/repositories"
   | "/snapshots"
+  | "/browse"
   | "/policies"
   | "/schedules"
   | "/restores"
@@ -46,7 +48,7 @@ export interface NavGroup {
 const OVERVIEW: NavItem = { to: "/", label: "Overview", icon: LayoutDashboard };
 
 /**
- * The ten sections in reading order, grouped by the part of the system they
+ * The eleven sections in reading order, grouped by the part of the system they
  * list: the health question first, storage, the data itself, the recipes
  * that protect it, then the tools.
  */
@@ -69,6 +71,7 @@ export const NAV_GROUPS: readonly NavGroup[] = [
     label: "Data",
     items: [
       { to: "/snapshots", label: "Snapshots", icon: Camera, kind: "snapshot" },
+      { to: "/browse", label: "Browse", icon: FolderOpen },
       { to: "/restores", label: "Restores", icon: ArchiveRestore, kind: "restore" },
     ],
   },
@@ -82,13 +85,13 @@ export const NAV_GROUPS: readonly NavGroup[] = [
   { label: null, items: [{ to: "/doctor", label: "Doctor", icon: Stethoscope }] },
 ];
 
-/** The ten sections, flat, in sidebar order. */
+/** The eleven sections, flat, in sidebar order. */
 export const NAV_ITEMS: readonly NavItem[] = NAV_GROUPS.flatMap((group) => group.items);
 
 /**
  * Pages with a title of their own that are not rail sections: reached from
  * a section (doctor links to the gate registry), named in the header, never
- * counted among the ten.
+ * counted among the eleven.
  */
 export const OFF_RAIL_ITEMS: readonly NavItem[] = [
   { to: "/gates", label: "Gates", icon: ShieldAlert },

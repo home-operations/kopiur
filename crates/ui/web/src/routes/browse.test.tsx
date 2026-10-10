@@ -1,8 +1,17 @@
 import { screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import type { DirEntryView, DirListing, Me, Problem, SessionInfo } from "../api/types";
+import type {
+  DirEntryView,
+  DirListing,
+  Me,
+  Page,
+  Problem,
+  SessionInfo,
+  SnapshotDetail,
+  SnapshotRow,
+} from "../api/types";
 import {
   ME,
   bodyRows,
@@ -12,11 +21,14 @@ import {
   jsonResponse,
   mountApp,
   nth,
+  pickOption,
   problemResponse,
 } from "../test-utils";
 
 const MIB = 1024 * 1024;
-const ROUTE = "/snapshots/media/nightly-1/browse";
+const ROUTE = "/browse?snapshot=media%2Fnightly-1";
+const DETAIL_PATH = "/api/v1/snapshots/media/nightly-1";
+const LIST_PATH = "/api/v1/snapshots";
 const SESSION_PATH = "/api/v1/snapshots/media/nightly-1/session";
 const TREE_PATH = "/api/v1/snapshots/media/nightly-1/tree";
 const FILE_PATH = "/api/v1/snapshots/media/nightly-1/file";
@@ -86,6 +98,51 @@ function sessionRequired(status: number): Problem {
   );
 }
 
+function row(over: Partial<SnapshotRow> = {}): SnapshotRow {
+  return {
+    namespace: "media",
+    name: "nightly-1",
+    phase: "succeeded",
+    origin: "scheduled",
+    policy: "nightly",
+    repository: "nas",
+    kopiaSnapshotId: "k9f2",
+    identity: "kopiur@media:/data",
+    startTime: "2026-09-09T01:00:00Z",
+    endTime: "2026-09-09T01:04:00Z",
+    sizeBytes: 4 * MIB,
+    bytesNew: null,
+    filesTotal: 3,
+    filesFailed: null,
+    pinned: false,
+    deletionPolicy: "Delete",
+    copiedFrom: null,
+    ...over,
+  };
+}
+
+function detail(over: Partial<SnapshotDetail> = {}): SnapshotDetail {
+  return {
+    row: row(),
+    stats: null,
+    durationSeconds: 240,
+    sources: ["/data"],
+    lineage: { copiedFromRepository: null, sourceManifestId: null, copies: [] },
+    retentionPreview: null,
+    failure: null,
+    logTail: [],
+    conditions: [],
+    gates: [],
+    browsable: true,
+    browseBlocker: null,
+    ...over,
+  };
+}
+
+function page(items: SnapshotRow[]): Page<SnapshotRow> {
+  return { items, total: items.length, offset: 0, limit: 200 };
+}
+
 type Method = "GET" | "POST" | "DELETE";
 type Reply = () => Response;
 
@@ -101,6 +158,8 @@ type Reply = () => Response;
 function mockBrowse(routes: {
   session?: Partial<Record<Method, Reply>>;
   tree?: (url: URL) => Response;
+  detail?: () => Response;
+  list?: (url: URL) => Response;
   me?: Me;
 }): void {
   fetchMock.resetMocks();
@@ -113,6 +172,16 @@ function mockBrowse(routes: {
     if (url.pathname === SESSION_PATH) {
       const reply = routes.session?.[method];
       return Promise.resolve(reply === undefined ? problemResponse(sessionRequired(404)) : reply());
+    }
+    if (url.pathname === DETAIL_PATH) {
+      return Promise.resolve(
+        routes.detail === undefined ? jsonResponse(detail()) : routes.detail(),
+      );
+    }
+    if (url.pathname === LIST_PATH) {
+      return Promise.resolve(
+        routes.list === undefined ? jsonResponse(page([row()])) : routes.list(url),
+      );
     }
     if (url.pathname === TREE_PATH) {
       return Promise.resolve(
@@ -310,7 +379,7 @@ describe("Snapshot file browser — the listing", () => {
     expect(within(pager).queryByRole("link", { name: /Previous/ })).toBeNull();
     expect(within(pager).getByRole("link", { name: /Next/ })).toHaveAttribute(
       "href",
-      `${ROUTE}?offset=3`,
+      `${ROUTE}&offset=3`,
     );
   });
 
@@ -322,7 +391,7 @@ describe("Snapshot file browser — the listing", () => {
         return jsonResponse(listing({ offset, total: 12043, limit: 500 }));
       },
     });
-    mountApp(`${ROUTE}?offset=500`);
+    mountApp(`${ROUTE}&offset=500`);
     await table();
     const pager = screen.getByRole("navigation", { name: "Directory pages" });
     expect(pager).toHaveTextContent("501–503 of 12043");
@@ -349,7 +418,7 @@ describe("Snapshot file browser — the listing", () => {
 
   it("refuses a ?path= the server would refuse, naming the value, without asking for it", async () => {
     mockBrowse({ session: running() });
-    mountApp(`${ROUTE}?path=..%2F..%2Fetc`);
+    mountApp(`${ROUTE}&path=..%2F..%2Fetc`);
     expect(await screen.findByText("That path cannot be browsed")).toBeInTheDocument();
     expect(screen.getByText("../../etc")).toBeInTheDocument();
     expect(calledPaths().some((path) => path.startsWith(TREE_PATH))).toBe(false);
@@ -405,13 +474,13 @@ describe("Snapshot file browser — refused reads", () => {
       session: running(),
       tree: () => problemResponse(kopiurProblem("directory-too-large", 422)),
     });
-    mountApp(`${ROUTE}?path=var%2Fspool`);
+    mountApp(`${ROUTE}&path=var%2Fspool`);
     expect(await screen.findByText("a directory-too-large answer")).toBeInTheDocument();
     expect(screen.getByText("how to fix directory-too-large")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
     expect(screen.getByRole("link", { name: /Up one level/ })).toHaveAttribute(
       "href",
-      `${ROUTE}?path=var`,
+      `${ROUTE}&path=var`,
     );
   });
 
@@ -420,7 +489,7 @@ describe("Snapshot file browser — refused reads", () => {
       session: running(),
       tree: () => problemResponse(kopiurProblem("catalog-too-large", 422)),
     });
-    mountApp(`${ROUTE}?path=var`);
+    mountApp(`${ROUTE}&path=var`);
     expect(await screen.findByText("a catalog-too-large answer")).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
     expect(screen.queryByRole("link", { name: /Up one level/ })).toBeNull();
@@ -477,13 +546,125 @@ describe("Snapshot file browser — refused reads", () => {
   });
 });
 
-describe("Snapshot file browser — the way back", () => {
-  it("goes back to the snapshot it browses, in the drawer, keeping the scope", async () => {
-    fetchMock.mockResponse(() => new Promise<Response>(() => undefined));
-    mountApp("/snapshots/media/nightly-29/browse?namespace=media");
-    const back = await screen.findByRole("link", { name: /Back to nightly-29/ });
-    expect(back.getAttribute("href")).toBe(
-      "/snapshots?namespace=media&inspect=snapshot%2Fmedia%2Fnightly-29",
+describe("Browse — the snapshot being browsed", () => {
+  // Every page above browsed nightly-1, and the tab remembers it.
+  beforeEach(() => {
+    window.sessionStorage.clear();
+  });
+  afterEach(() => {
+    window.sessionStorage.clear();
+    vi.restoreAllMocks();
+  });
+
+  it("starts on the picker when no snapshot is named, and asks for no session", async () => {
+    mockBrowse({});
+    mountApp("/browse");
+    expect(await screen.findByText("Pick a snapshot to browse")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Snapshot: Choose a snapshot" })).toBeInTheDocument();
+    expect(calledPaths().some((path) => path.includes("/session"))).toBe(false);
+  });
+
+  it("browses the snapshot picked, naming it in the address and asking for its session", async () => {
+    const user = userEvent.setup();
+    mockBrowse({
+      list: (url) => {
+        // Only snapshots that hold files are offered.
+        expect(url.searchParams.get("phase")).toBe("succeeded,discovered");
+        return jsonResponse(page([row(), row({ name: "nightly-0", policy: "weekly" })]));
+      },
+    });
+    const { router } = mountApp("/browse");
+    await screen.findByText("Pick a snapshot to browse");
+    await pickOption(user, "Snapshot", "nightly-1");
+    expect(router.state.location.pathname).toBe("/browse");
+    expect(router.state.location.search).toEqual({ snapshot: "media/nightly-1" });
+    expect(
+      await screen.findByRole("button", { name: "Start a browse session" }),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Snapshot: nightly-1" })).toBeInTheDocument();
+    expect(calledPaths()).toContain(SESSION_PATH);
+  });
+
+  it("says which snapshot it is: its policy, repository and size, and a way to its details", async () => {
+    mockBrowse({});
+    mountApp(ROUTE);
+    const head = await screen.findByRole("region", { name: "Snapshot being browsed" });
+    await within(head).findByText("nightly", { selector: ".mono" });
+    expect(head.querySelector('dl[aria-label="About this snapshot"]')).toHaveTextContent(
+      "Policynightly",
     );
+    expect(head).toHaveTextContent("Repositorynas");
+    expect(head).toHaveTextContent("4.0 MiB");
+    // The details open in the drawer, over this page.
+    expect(
+      within(head)
+        .getByRole("link", { name: /Details/ })
+        .getAttribute("href"),
+    ).toBe("/browse?snapshot=media%2Fnightly-1&inspect=snapshot%2Fmedia%2Fnightly-1");
+  });
+
+  it("names an address that is not a snapshot rather than dropping it", async () => {
+    mockBrowse({});
+    mountApp("/browse?snapshot=nightly-1");
+    expect(await screen.findByText("That is not a snapshot address")).toBeInTheDocument();
+    expect(screen.getByText("nightly-1", { selector: ".mono" })).toBeInTheDocument();
+    expect(calledPaths().some((path) => path.includes("/session"))).toBe(false);
+  });
+
+  it("says why a snapshot cannot be browsed, and never asks for a session for it", async () => {
+    mockBrowse({
+      detail: () =>
+        jsonResponse(
+          detail({
+            browsable: false,
+            browseBlocker: "This backup failed, so it wrote no snapshot to browse.",
+          }),
+        ),
+    });
+    mountApp(ROUTE);
+    expect(await screen.findByText("nightly-1 cannot be browsed")).toBeInTheDocument();
+    expect(screen.getByText(/wrote no snapshot to browse/)).toBeInTheDocument();
+    expect(calledPaths()).not.toContain(SESSION_PATH);
+  });
+
+  it("comes back to the snapshot it last browsed when opened from the sidebar", async () => {
+    mockBrowse({});
+    window.sessionStorage.setItem("kopiur.browse.snapshot", "media/nightly-1");
+    const { router } = mountApp("/browse?namespace=media");
+    expect(await screen.findByRole("button", { name: "Snapshot: nightly-1" })).toBeInTheDocument();
+    expect(router.state.location.search).toEqual({
+      namespace: "media",
+      snapshot: "media/nightly-1",
+    });
+  });
+
+  it("remembers what it browses for the next visit", async () => {
+    mockBrowse({});
+    mountApp(ROUTE);
+    await screen.findByRole("button", { name: "Snapshot: nightly-1" });
+    expect(window.sessionStorage.getItem("kopiur.browse.snapshot")).toBe("media/nightly-1");
+  });
+
+  it("still starts on the picker when storage refuses to be read", async () => {
+    vi.spyOn(Storage.prototype, "getItem").mockImplementation(() => {
+      throw new Error("blocked");
+    });
+    mockBrowse({});
+    mountApp("/browse");
+    expect(await screen.findByText("Pick a snapshot to browse")).toBeInTheDocument();
+  });
+});
+
+describe("Browse — the old address", () => {
+  it("lands on Browse with the same snapshot, directory and scope", async () => {
+    mockBrowse({ session: running() });
+    const { router } = mountApp("/snapshots/media/nightly-1/browse?path=etc&namespace=media");
+    await screen.findByRole("region", { name: "Snapshot being browsed" });
+    expect(router.state.location.pathname).toBe("/browse");
+    expect(router.state.location.search).toEqual({
+      namespace: "media",
+      snapshot: "media/nightly-1",
+      path: "etc",
+    });
   });
 });
