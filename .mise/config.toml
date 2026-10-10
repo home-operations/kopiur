@@ -33,7 +33,7 @@ config_roots = ["crates/e2e"]
 # worked example: it was landed exactly this way.
 [tools]
 actionlint = "1.7.12"
-rust = { version = "1.98.1", components = "rustfmt,clippy,llvm-tools" }
+rust = { version = "1.99.0", components = "rustfmt,clippy,llvm-tools" }
 lefthook = "2.1.17"
 # `oxfmt` is distributed only via the npm backend (`mise registry oxfmt` →
 # `npm:oxfmt`), which needs a node/npm to install. Pin node explicitly so the
