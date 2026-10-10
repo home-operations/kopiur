@@ -73,6 +73,11 @@ function ToastItem({ toast }: { toast: Toast }) {
   const [hidden, setHidden] = useState(() => document.visibilityState === "hidden");
   const [leaving, setLeaving] = useState(false);
   const [arrived] = useState(() => entered.has(toast.id));
+  // Read once, at mount: a toast remounted part-way (moved into or out of a
+  // drawer) starts its line where its clock is. Read on every render it would
+  // change on each hover, and a changed delay moves a running line forward by
+  // the time already spent.
+  const [startedAt] = useState(() => (ms === null ? 0 : decayElapsed(toast.id, ms)));
   useEffect(() => {
     entered.add(toast.id);
   }, [toast.id]);
@@ -123,7 +128,7 @@ function ToastItem({ toast }: { toast: Toast }) {
           ? ({
               "--toast-ms": `${String(ms)}ms`,
               // A remounted toast's line picks up where its clock is.
-              "--toast-elapsed": `${String(-decayElapsed(toast.id, ms))}ms`,
+              "--toast-elapsed": `${String(-startedAt)}ms`,
             } as CSSProperties)
           : undefined
       }

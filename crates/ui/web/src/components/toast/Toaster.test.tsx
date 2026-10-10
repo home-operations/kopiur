@@ -102,6 +102,23 @@ describe("Toaster", () => {
     expect(within(region).queryByRole("status")).toBeNull();
   });
 
+  it("keeps its line where it was across hovers: the line's start is fixed at mount", async () => {
+    const region = await mount();
+    act(() => {
+      toasts.push({ kind: "receipt", label: "Run", receipt: receipt() });
+    });
+    const toast = within(region).getByRole("status");
+    const start = toast.style.getPropertyValue("--toast-elapsed");
+    advance(3000);
+    fireEvent.pointerEnter(toast);
+    advance(1000);
+    fireEvent.pointerLeave(toast);
+    fireEvent.pointerEnter(toast);
+    fireEvent.pointerLeave(toast);
+    // A changed delay would move the running line by the time already spent.
+    expect(toast.style.getPropertyValue("--toast-elapsed")).toBe(start);
+  });
+
   it("stops the clock while focus is inside it", async () => {
     const region = await mount();
     act(() => {
