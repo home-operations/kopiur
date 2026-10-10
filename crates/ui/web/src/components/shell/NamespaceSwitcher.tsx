@@ -1,8 +1,9 @@
 import { useRouter, useRouterState } from "@tanstack/react-router";
 import { Check, ChevronsUpDown, Search } from "lucide-react";
-import { useEffect, useId, useRef, useState } from "react";
+import { useState } from "react";
 
 import { useNamespaces } from "../../api/hooks";
+import { Popover } from "../Popover";
 import { useCurrentNamespace } from "../../util/namespace";
 
 /** The current search with `namespace` set (or removed for cluster-wide), as a query string. */
@@ -19,6 +20,7 @@ function withNamespace(search: Record<string, unknown>, namespace: string | unde
 
 /**
  * The namespace scope, switched like a workspace: it frames the whole app.
+ * A `Popover` under the button, opening onto its filter field.
  *
  * Lists `/api/v1/namespaces` — only namespaces the caller may see, with their
  * object counts — behind a filter field. Loading, a refusal or an empty list
@@ -32,42 +34,15 @@ export function NamespaceSwitcher() {
   const [open, setOpen] = useState(false);
   const [filter, setFilter] = useState("");
   const namespaces = useNamespaces({ enabled: open });
-  const buttonRef = useRef<HTMLButtonElement>(null);
-  const panelRef = useRef<HTMLDivElement>(null);
-  const filterRef = useRef<HTMLInputElement>(null);
-  const panelId = useId();
-
-  const close = (refocus: boolean) => {
-    setOpen(false);
-    setFilter("");
-    if (refocus) buttonRef.current?.focus();
+  const setOpenState = (next: boolean) => {
+    setOpen(next);
+    if (!next) setFilter("");
   };
-
-  useEffect(() => {
-    if (!open) return undefined;
-    filterRef.current?.focus();
-    const onPointer = (event: MouseEvent) => {
-      const target = event.target as Node;
-      if (!panelRef.current?.contains(target) && !buttonRef.current?.contains(target)) {
-        close(false);
-      }
-    };
-    const onKey = (event: KeyboardEvent) => {
-      if (event.key === "Escape") close(true);
-    };
-    document.addEventListener("mousedown", onPointer);
-    document.addEventListener("keydown", onKey);
-    return () => {
-      document.removeEventListener("mousedown", onPointer);
-      document.removeEventListener("keydown", onKey);
-    };
-  }, [open]);
 
   const choose = (namespace: string | undefined) => {
     void router.navigate({
       href: `${location.pathname}${withNamespace(location.search as Record<string, unknown>, namespace)}`,
     });
-    close(true);
   };
 
   const listed = namespaces.isSuccess ? namespaces.data : [];
@@ -78,95 +53,96 @@ export function NamespaceSwitcher() {
 
   return (
     <div className="ns-switcher">
-      <button
-        ref={buttonRef}
-        type="button"
-        className="ns-switcher__button"
-        aria-label={`Namespace: ${scope}`}
-        aria-expanded={open}
-        aria-controls={open ? panelId : undefined}
-        onClick={() => {
-          if (open) close(false);
-          else setOpen(true);
-        }}
-      >
-        <span
-          className="ns-switcher__avatar"
-          data-initial={current === undefined ? "*" : current.charAt(0)}
-          aria-hidden="true"
-        />
-        <span className="ns-switcher__text">
-          <span className="ns-switcher__scope">{scope}</span>
-          <span className="ns-switcher__hint">namespace scope</span>
-        </span>
-        <ChevronsUpDown size={14} strokeWidth={2} aria-hidden="true" />
-      </button>
-      {open ? (
-        <div
-          id={panelId}
-          ref={panelRef}
-          className="ns-switcher__panel"
-          role="dialog"
-          aria-label="Choose a namespace"
-        >
-          <label className="ns-switcher__filter">
-            <Search size={14} strokeWidth={2} aria-hidden="true" />
-            <input
-              ref={filterRef}
-              type="search"
-              aria-label="Filter namespaces"
-              placeholder="Filter namespaces…"
-              value={filter}
-              onChange={(event) => {
-                setFilter(event.target.value);
-              }}
+      <Popover
+        label="Choose a namespace"
+        open={open}
+        onOpenChange={setOpenState}
+        className="ns-switcher__panel"
+        initialFocus="input[type=search]"
+        trigger={(props) => (
+          <button
+            type="button"
+            className="ns-switcher__button"
+            {...props}
+            aria-label={`Namespace: ${scope}`}
+          >
+            <span
+              className="ns-switcher__avatar"
+              data-initial={current === undefined ? "*" : current.charAt(0)}
+              aria-hidden="true"
             />
-          </label>
-          <ul className="ns-switcher__list">
-            <li>
-              <button
-                type="button"
-                className="ns-switcher__option"
-                aria-current={current === undefined ? "true" : undefined}
-                onClick={() => {
-                  choose(undefined);
+            <span className="ns-switcher__text">
+              <span className="ns-switcher__scope">{scope}</span>
+              <span className="ns-switcher__hint">namespace scope</span>
+            </span>
+            <ChevronsUpDown size={14} strokeWidth={2} aria-hidden="true" />
+          </button>
+        )}
+      >
+        {(close) => (
+          <>
+            <label className="ns-switcher__filter">
+              <Search size={14} strokeWidth={2} aria-hidden="true" />
+              <input
+                type="search"
+                aria-label="Filter namespaces"
+                placeholder="Filter namespaces…"
+                value={filter}
+                onChange={(event) => {
+                  setFilter(event.target.value);
                 }}
-              >
-                <span
-                  className="ns-switcher__avatar ns-switcher__avatar--all"
-                  data-initial="*"
-                  aria-hidden="true"
-                />
-                all namespaces
-                {namespaces.isSuccess ? <span className="ns-switcher__count">{total}</span> : null}
-              </button>
-            </li>
-            {shown.map((ns) => (
-              <li key={ns.name}>
+              />
+            </label>
+            <ul className="ns-switcher__list">
+              <li>
                 <button
                   type="button"
                   className="ns-switcher__option"
-                  aria-current={current === ns.name ? "true" : undefined}
+                  aria-current={current === undefined ? "true" : undefined}
                   onClick={() => {
-                    choose(ns.name);
+                    choose(undefined);
+                    close();
                   }}
                 >
                   <span
-                    className="ns-switcher__avatar"
-                    data-initial={ns.name.charAt(0)}
+                    className="ns-switcher__avatar ns-switcher__avatar--all"
+                    data-initial="*"
                     aria-hidden="true"
                   />
-                  {ns.name}
-                  <span className="ns-switcher__count">{ns.objects}</span>
-                  {current === ns.name ? (
-                    <Check size={14} strokeWidth={2} aria-hidden="true" />
+                  all namespaces
+                  {namespaces.isSuccess ? (
+                    <span className="ns-switcher__count">{total}</span>
                   ) : null}
                 </button>
               </li>
-            ))}
-          </ul>
-        </div>
-      ) : null}
+              {shown.map((ns) => (
+                <li key={ns.name}>
+                  <button
+                    type="button"
+                    className="ns-switcher__option"
+                    aria-current={current === ns.name ? "true" : undefined}
+                    onClick={() => {
+                      choose(ns.name);
+                      close();
+                    }}
+                  >
+                    <span
+                      className="ns-switcher__avatar"
+                      data-initial={ns.name.charAt(0)}
+                      aria-hidden="true"
+                    />
+                    {ns.name}
+                    <span className="ns-switcher__count">{ns.objects}</span>
+                    {current === ns.name ? (
+                      <Check size={14} strokeWidth={2} aria-hidden="true" />
+                    ) : null}
+                  </button>
+                </li>
+              ))}
+            </ul>
+          </>
+        )}
+      </Popover>
     </div>
   );
 }

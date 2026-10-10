@@ -2222,22 +2222,17 @@ html:has(dialog.side-panel[open]) {
   color: var(--fg-muted);
 }
 
+/* The switcher's popover spans the sidebar, like the button it hangs from. */
+.ns-switcher > .popover {
+  display: block;
+}
+
 .ns-switcher__panel {
-  position: absolute;
-  top: calc(100% + 6px);
-  left: 0;
-  z-index: 30;
-  display: grid;
   /* An auto track would size to the filter input's natural width, wider than
      the sidebar; the panel's own width is the limit. */
   grid-template-columns: minmax(0, 1fr);
   gap: 4px;
   width: 100%;
-  padding: 8px;
-  border: 1px solid var(--line);
-  border-radius: var(--radius-lg);
-  background: var(--bg-surface);
-  box-shadow: var(--shadow-2);
 }
 
 .ns-switcher__filter,

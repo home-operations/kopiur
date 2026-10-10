@@ -109,23 +109,24 @@ the degraded state and the `ShieldX` icon and offers no retry.
 ## Action → confirm → receipt
 
 1. **Action row** — buttons in the detail hero (or a table cell's single trigger).
-2. **Confirm** — opens **inline**, directly under the action row, inside the hero
-   (never a modal or drawer). A panel on `--bg-canvas` with a hairline: a title
-   ("Snapshot `app-data` now"), prose saying exactly what will be created and
-   where, any **choice** fieldsets, then primary + quiet Cancel. Opening it moves
-   focus in; Escape or Cancel returns focus to the trigger. Only one confirmation
-   is open at a time. Inside a table, the cell holds only the trigger and the
-   confirmation renders below the table.
-   On a page of cards (Maintenance), where an inline panel would shove every
-   card below it down, the same panel opens as a **popover** anchored to its
-   trigger instead (`ActionPanel presentation="popover"`, see the Popover
-   primitive); it behaves the same, with a click elsewhere also closing it.
+2. **Confirm** — opens in a **popover anchored to its trigger** (`ActionPanel`,
+   the `Popover` primitive), never a modal: prose saying exactly what will be
+   created and where, any **choice** fieldsets, then primary + quiet Cancel.
+   Opening it moves focus in; Escape, Cancel, confirming or a click elsewhere
+   closes it and returns focus to the trigger. Escape inside a drawer closes
+   the question, not the drawer. Only one confirmation is open at a time.
+   Placement follows the trigger: below it on a page, **upward** from a
+   drawer's foot (so the drawer's content keeps its room), and pinned on screen
+   (`strategy="fixed"`) from a table cell, whose card would clip it — the
+   table's one receipt then shows under the table, at full width. A form too
+   long to float (creating a restore) opens **inline** under its trigger
+   instead (`presentation="inline"`).
 3. **Choice** — for a field whose wrong value costs data (`pin`, `overwrite`): a
    fieldset of radio rows, each row the consequence in prose naming the wire field
    (`spec.pin: true`). **Neither starts selected**; the confirm button is blocked
    with the reason until one is chosen. The destructive answer gets a 2px
    `--health-failed-fg` left rule.
-4. **Receipt** — replaces the confirm panel: a `--health-healthy-bg` card with a
+4. **Receipt** — appears beside the trigger once asked: a `--health-healthy-bg` card with a
    healthy-tinted border, a "Requested" pill, the server's `note` (never dropped),
    created objects as references, and the request instant in small mono. Actions
    that answer 202 say **requested**, never **done**. A live region.

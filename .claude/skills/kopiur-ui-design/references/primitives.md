@@ -660,9 +660,14 @@ menu, a confirmation on a page of cards. `components/Popover.tsx`.
   needs Escape for itself (a drag in progress) keeps it with `onEscape`.
 - The trigger is handed `aria-expanded`, `aria-haspopup="dialog"` and
   `aria-controls`; pass them through.
-- Use it for **options or a short question about one control**. A resource's
-  details go in the side panel; a confirmation inside a detail hero stays
-  inline.
+- `side="top"` opens it upward (a drawer's foot does this for every popover
+  in it); `strategy="fixed"` pins it to the trigger on screen, for a trigger
+  inside a box that clips (a table cell). Escape is taken on the popover
+  itself, so a popover inside a drawer closes without closing the drawer.
+- Use it for **options, a short question or a small menu about one control**:
+  every action confirmation, a table's Columns menu, Doctor's options, the
+  namespace switcher. A resource's details go in the side panel; a long form
+  (creating a restore) opens inline.
 
 ---
 

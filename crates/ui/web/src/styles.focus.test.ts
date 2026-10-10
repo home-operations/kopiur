@@ -40,7 +40,6 @@ const NEVER_FOCUSED = new Set([
   ".maintenance-card",
   // Floating panels and the open drawer: containers, not controls.
   ".identity__panel",
-  ".ns-switcher__panel",
   ".search__results",
   // An anchored popover's panel is a container; its controls carry the ring.
   ".popover__panel",
