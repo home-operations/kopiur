@@ -55,6 +55,8 @@ export interface RunDialogProps {
   labelSuffix?: string | undefined;
   open?: boolean | undefined;
   onOpenChange?: ((open: boolean) => void) | undefined;
+  /** How the confirmation opens; see `ActionPanel`. */
+  presentation?: "inline" | "popover" | undefined;
 }
 
 /** The `/me` flag that decides whether this run may be asked for. */
@@ -79,6 +81,7 @@ export function RunDialog({
   labelSuffix,
   open,
   onOpenChange,
+  presentation,
 }: RunDialogProps) {
   const fieldId = useId();
   const maintenance = useMaintenanceRun();
@@ -135,6 +138,7 @@ export function RunDialog({
       problem={problem}
       open={open}
       onOpenChange={onOpenChange}
+      presentation={presentation}
     >
       <p>
         This stamps a run request on{" "}

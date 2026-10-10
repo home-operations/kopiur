@@ -116,6 +116,10 @@ the degraded state and the `ShieldX` icon and offers no retry.
    focus in; Escape or Cancel returns focus to the trigger. Only one confirmation
    is open at a time. Inside a table, the cell holds only the trigger and the
    confirmation renders below the table.
+   On a page of cards (Maintenance), where an inline panel would shove every
+   card below it down, the same panel opens as a **popover** anchored to its
+   trigger instead (`ActionPanel presentation="popover"`, see the Popover
+   primitive); it behaves the same, with a click elsewhere also closing it.
 3. **Choice** — for a field whose wrong value costs data (`pin`, `overwrite`): a
    fieldset of radio rows, each row the consequence in prose naming the wire field
    (`spec.pin: true`). **Neither starts selected**; the confirm button is blocked

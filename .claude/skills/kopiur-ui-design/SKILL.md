@@ -1,6 +1,6 @@
 ---
 name: kopiur-ui-design
-description: The canonical design system for Kopiur's web console (kopiur-ui, crates/ui/web). Use for ANY visual or UI work in crates/ui/web — new or changed routes, components, styles.css, charts, topology, empty/loading/error states, actions and dialogs — and whenever you need to know how an object (Repository, ClusterRepository, SnapshotPolicy, SnapshotSchedule, Snapshot, Restore, Maintenance, RepositoryReplication, SnapshotReplication) should look. Encodes the "Mission dashboard" direction, the light-dark() token set with verified contrast, the per-kind identity (colour, glyph, stripe + tinted chip), the primitives (status pill, kind mark, object reference, button with refusal, stat strip, attention row, split pane, table (with adjustable columns), side panel, tabs), the composites (overview, resource drawer, finding, inline action/receipt, page states, charts), the sidebar-only shell, and the non-negotiable behaviour rules with the tests that enforce them. Replaces crates/ui/web/DESIGN.md. Backend/CRD work belongs to kopiur-design instead.
+description: The canonical design system for Kopiur's web console (kopiur-ui, crates/ui/web). Use for ANY visual or UI work in crates/ui/web — new or changed routes, components, styles.css, charts, topology, empty/loading/error states, actions and dialogs — and whenever you need to know how an object (Repository, ClusterRepository, SnapshotPolicy, SnapshotSchedule, Snapshot, Restore, Maintenance, RepositoryReplication, SnapshotReplication) should look. Encodes the "Mission dashboard" direction, the light-dark() token set with verified contrast, the per-kind identity (colour, glyph, stripe + tinted chip), the primitives (status pill, kind mark, object reference, button with refusal, stat strip, attention row, split pane, table (with adjustable columns), popover, side panel, tabs), the composites (overview, resource drawer, finding, inline action/receipt, page states, charts), the sidebar-only shell, and the non-negotiable behaviour rules with the tests that enforce them. Replaces crates/ui/web/DESIGN.md. Backend/CRD work belongs to kopiur-design instead.
 ---
 
 # Kopiur console design system
@@ -59,6 +59,7 @@ failure is loud and specific while a healthy fleet is calm.
 | objects of mixed kinds that need someone  | attention row (one per object, the fix on its plate)              |
 | what has run lately, across kinds         | activity row (one per run, newest first)                          |
 | two regions whose widths trade off        | split pane (8px gutter, three-dot grip, stacks when narrow)       |
+| options for one button, a small menu      | popover anchored to the button (`Popover`)                        |
 | a one-click filter (e.g. by health)       | links that filter; the lit one links back to all, no clear button |
 | a handful of facts about one object       | stat strip                                                        |
 | a missing value                           | the right absence: loud _never …_, faint _not reported_, or `—`   |
@@ -81,7 +82,7 @@ mise run ui-build     # bundle budget (entry ≤ 480 kB)
 - `references/rules.md` — the non-negotiable behaviour rules and their enforcing tests
 - `references/tokens.md` — the token block (single source) and measured contrast
 - `references/kinds.md` — the nine kinds: identity, status source, card facts, relationships
-- `references/primitives.md` — status pill, kind mark, reference, button, stat strip, time, attention row, split pane, table, side panel, tabs
+- `references/primitives.md` — status pill, kind mark, reference, button, stat strip, time, attention row, split pane, table, popover, side panel, tabs
 - `references/composites.md` — overview, resource drawer, finding, action/confirm/receipt, page states, charts, derived screens
 - `references/shell.md` — sidebar, namespace switcher, search, nav, user chip, responsive
 - `references/gallery.html` — the approved mockups, light and dark

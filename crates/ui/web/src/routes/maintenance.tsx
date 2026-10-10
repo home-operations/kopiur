@@ -97,8 +97,10 @@ function Maintenance() {
                 labelSuffix={row.repository}
                 open={open === id}
                 onOpenChange={(next) => {
-                  setOpen(next ? id : null);
+                  // A close from one card must not undo another card opening.
+                  setOpen((current) => (next ? id : current === id ? null : current));
                 }}
+                presentation="popover"
               />
             );
           }}

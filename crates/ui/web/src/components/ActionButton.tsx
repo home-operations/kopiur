@@ -1,5 +1,5 @@
 import { Lock } from "lucide-react";
-import { type ButtonHTMLAttributes, type MouseEvent, useId } from "react";
+import { type ButtonHTMLAttributes, type MouseEvent, type Ref, useId } from "react";
 
 /**
  * A button that can be disabled *with a reason*.
@@ -25,6 +25,8 @@ import { type ButtonHTMLAttributes, type MouseEvent, useId } from "react";
  * ledger shows the short word in the cell instead (`actions/reason.ts`).
  */
 export interface ActionButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
+  /** The button element, for a popover that anchors to it and refocuses it. */
+  ref?: Ref<HTMLButtonElement> | undefined;
   variant?: "default" | "primary" | "quiet" | "danger" | undefined;
   /** When set, the button is disabled and this is shown as the reason. */
   disabledReason?: string | undefined;

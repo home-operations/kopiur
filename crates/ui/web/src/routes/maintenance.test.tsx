@@ -189,6 +189,38 @@ describe("Maintenance", () => {
     expect(sentBody(RUN)).toEqual(expected);
   });
 
+  it("asks in a popover anchored to its button, one at a time, and Escape hands focus back", async () => {
+    mockApi({ "/api/v1/maintenance": jsonResponse(rows), [RUN]: jsonResponse(receipt) });
+    mountApp("/maintenance");
+    const user = userEvent.setup();
+    const name = "Run maintenance for Repository/media/nas";
+    const trigger = await screen.findByRole("button", { name });
+    await waitFor(() => {
+      expect(trigger).not.toHaveAttribute("aria-disabled");
+    });
+    await user.click(trigger);
+    const popover = screen.getByRole("dialog", { name });
+    expect(popover).toHaveClass("popover__panel");
+    expect(popover.closest(".popover")).toContainElement(trigger);
+    expect(trigger).toHaveAttribute("aria-expanded", "true");
+    expect(within(popover).getByLabelText("Mode")).toHaveFocus();
+
+    // Opening the other card's run closes this one.
+    const other = screen.getByRole("button", {
+      name: /Run maintenance for ClusterRepository/,
+    });
+    await waitFor(() => {
+      expect(other).not.toHaveAttribute("aria-disabled");
+    });
+    await user.click(other);
+    expect(screen.queryByRole("dialog", { name })).toBeNull();
+    expect(screen.getAllByRole("dialog")).toHaveLength(1);
+
+    await user.keyboard("{Escape}");
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(other).toHaveFocus();
+  });
+
   it("judges each run in the Maintenance's own namespace, not the repository's", async () => {
     mockApi({
       "/api/v1/maintenance": jsonResponse(rows),
@@ -214,28 +246,6 @@ describe("Maintenance", () => {
     );
     expect(calledPaths()).toContain("/api/v1/me?namespace=media");
     expect(calledPaths()).toContain("/api/v1/me?namespace=kopiur-system");
-  });
-
-  it("keeps one confirmation open at a time", async () => {
-    mockApi({ "/api/v1/maintenance": jsonResponse(rows), [RUN]: jsonResponse(receipt) });
-    mountApp("/maintenance");
-    const user = userEvent.setup();
-    const first = await screen.findByRole("button", {
-      name: "Run maintenance for Repository/media/nas",
-    });
-    await waitFor(() => {
-      expect(first).not.toHaveAttribute("aria-disabled");
-    });
-    await user.click(first);
-    expect(
-      screen.getByRole("group", { name: "Run maintenance for Repository/media/nas" }),
-    ).toBeInTheDocument();
-    await user.click(
-      screen.getByRole("button", { name: "Run maintenance for ClusterRepository/shared" }),
-    );
-    expect(
-      screen.queryByRole("group", { name: "Run maintenance for Repository/media/nas" }),
-    ).toBeNull();
   });
 
   it("says an empty page is a risk rather than a quiet state", async () => {

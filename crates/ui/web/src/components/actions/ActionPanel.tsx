@@ -4,6 +4,7 @@ import { type ReactNode, useState } from "react";
 import type { ActionReceipt, Problem } from "../../api/types";
 import { ActionButton } from "../ActionButton";
 import { ActionResult } from "../ActionResult";
+import { Popover } from "../Popover";
 import { useConfirmFocus } from "./useConfirmFocus";
 
 /**
@@ -94,6 +95,13 @@ export interface ActionPanelProps {
    * ledger at full width. `open` must then be controlled.
    */
   hideTrigger?: boolean | undefined;
+  /**
+   * `inline` (the default) opens the confirmation under its trigger, in the
+   * flow of the page. `popover` floats it over the page, anchored to the
+   * trigger (`Popover`) — for a page of cards, where an inline panel would
+   * push the rest of the card and every card under it down.
+   */
+  presentation?: "inline" | "popover" | undefined;
 }
 
 export function ActionPanel({
@@ -112,6 +120,7 @@ export function ActionPanel({
   open,
   onOpenChange,
   hideTrigger = false,
+  presentation = "inline",
 }: ActionPanelProps) {
   const [ownOpen, setOwnOpen] = useState(false);
   const controlled = open !== undefined;
@@ -127,7 +136,8 @@ export function ActionPanel({
 
   // Managed focus and Escape — the same implementation the two bespoke action
   // bars use, so a confirmation cannot behave one way here and another there.
-  const panelRef = useConfirmFocus(isOpen, () => {
+  const floating = presentation === "popover" && !hideTrigger;
+  const panelRef = useConfirmFocus(isOpen && !floating, () => {
     setOpen(false);
   });
 
@@ -136,26 +146,76 @@ export function ActionPanel({
   const confirmReason = running ? "The request is in flight." : (disabledReason ?? blockedReason);
   const blocked = disabledReason !== undefined && disabledReason.length > 0;
 
+  const trigger = (props: object = {}) => (
+    <ActionButton
+      variant={variant}
+      disabledReason={disabledReason}
+      reasonShown={shortReason === undefined}
+      aria-expanded={isOpen}
+      onClick={() => {
+        setOpen(!isOpen);
+      }}
+      {...props}
+    >
+      {Icon !== undefined ? <Icon size={14} strokeWidth={2} aria-hidden="true" /> : null}
+      {label}
+    </ActionButton>
+  );
+  const shortShown =
+    blocked && shortReason !== undefined ? (
+      <span className="action__short">{shortReason}</span>
+    ) : null;
+  const questions = (close: () => void) => (
+    <>
+      <div className="action__prose">{children}</div>
+      <div className="action__actions">
+        <ActionButton
+          variant="primary"
+          disabledReason={confirmReason}
+          reasonKind={
+            disabledReason !== undefined && disabledReason.length > 0 ? "refused" : "blocked"
+          }
+          onClick={() => {
+            onConfirm();
+            close();
+          }}
+        >
+          {confirmLabel}
+        </ActionButton>
+        <ActionButton variant="quiet" onClick={close}>
+          Cancel
+        </ActionButton>
+      </div>
+    </>
+  );
+
+  if (floating) {
+    // The popover owns focus and dismissal: it opens onto its first control,
+    // and Escape, a click elsewhere, Cancel and confirming all close it and
+    // hand focus back to the trigger.
+    return (
+      <div className="action">
+        <Popover
+          label={label}
+          open={isOpen}
+          onOpenChange={setOpen}
+          className="action__popover"
+          trigger={(props) => trigger(props)}
+        >
+          {questions}
+        </Popover>
+        {shortShown}
+        <ActionResult label={label} receipt={receipt} problem={problem} />
+      </div>
+    );
+  }
+
   return (
     <div className="action">
       {hideTrigger ? null : (
         <>
-          <ActionButton
-            variant={variant}
-            disabledReason={disabledReason}
-            reasonShown={shortReason === undefined}
-            aria-expanded={isOpen}
-            onClick={() => {
-              setOpen(!isOpen);
-            }}
-          >
-            {Icon !== undefined ? <Icon size={14} strokeWidth={2} aria-hidden="true" /> : null}
-            {label}
-          </ActionButton>
-
-          {blocked && shortReason !== undefined ? (
-            <span className="action__short">{shortReason}</span>
-          ) : null}
+          {trigger()}
+          {shortShown}
         </>
       )}
 
@@ -167,30 +227,9 @@ export function ActionPanel({
           ref={panelRef}
           tabIndex={-1}
         >
-          <div className="action__prose">{children}</div>
-          <div className="action__actions">
-            <ActionButton
-              variant="primary"
-              disabledReason={confirmReason}
-              reasonKind={
-                disabledReason !== undefined && disabledReason.length > 0 ? "refused" : "blocked"
-              }
-              onClick={() => {
-                onConfirm();
-                setOpen(false);
-              }}
-            >
-              {confirmLabel}
-            </ActionButton>
-            <ActionButton
-              variant="quiet"
-              onClick={() => {
-                setOpen(false);
-              }}
-            >
-              Cancel
-            </ActionButton>
-          </div>
+          {questions(() => {
+            setOpen(false);
+          })}
         </div>
       ) : null}
 

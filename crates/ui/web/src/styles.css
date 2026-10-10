@@ -2847,6 +2847,37 @@ html:has(dialog.side-panel[open]) {
   border-bottom: 1px solid var(--line);
 }
 
+/* Doctor: the verdict, and under it on the left the one Run doctor button
+   whose options open in a popover. The pair shares the verdict's rule. */
+.doctor-head {
+  display: grid;
+  justify-items: start;
+  gap: var(--space-2);
+  padding-bottom: var(--space-4);
+  border-bottom: 1px solid var(--line);
+}
+
+.doctor-head > .verdict {
+  justify-self: stretch;
+  padding-bottom: 0;
+  border-bottom: 0;
+}
+
+.doctor-options {
+  width: 22rem;
+  padding: var(--space-4);
+}
+
+.doctor-options__form {
+  display: grid;
+  gap: var(--space-3);
+}
+
+.doctor-options__actions {
+  display: flex;
+  justify-content: flex-end;
+}
+
 .verdict__lamp {
   display: inline-flex;
   align-items: center;
@@ -3639,7 +3670,17 @@ a.topo-node {
   background: var(--bg-canvas);
 }
 
-.action__confirm .controls__field {
+/* The same question floating over a page of cards (`presentation="popover"`):
+   the popover is the enclosure, so it gets the panel's spacing, not its
+   border and fill. */
+.action__popover {
+  gap: var(--space-3);
+  width: 26rem;
+  padding: var(--space-4);
+}
+
+.action__confirm .controls__field,
+.action__popover .controls__field {
   max-width: 12rem;
 }
 

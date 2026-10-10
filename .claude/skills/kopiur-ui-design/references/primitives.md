@@ -633,6 +633,39 @@ const SNAPSHOT_COLUMNS: readonly ColumnSpec<SnapshotColumn>[] = [
 
 ---
 
+## Popover (anchored panel)
+
+**What:** a small panel floating just below the button that opened it: the
+options for an action (Doctor's namespace and windows), a table's Columns
+menu, a confirmation on a page of cards. `components/Popover.tsx`.
+
+```tsx
+<Popover
+  label="Doctor options"            // the panel's accessible name (role="dialog")
+  open={open}
+  onOpenChange={setOpen}
+  align="start"                     // or "end": which edge of the trigger it lines up with
+  trigger={(props) => <ActionButton variant="primary" {...props}>Run doctor</ActionButton>}
+>
+  {(close) => <form …>…</form>}     // close() also returns focus to the trigger
+</Popover>
+```
+
+- `.popover` wraps trigger and panel; `.popover__panel` is the card: surface,
+  `--line` border, `--radius-lg`, `--shadow-2`, 8px padding, kept inside a
+  phone-width viewport. A caller adds its own class for width and padding.
+- **Not modal.** Opening moves focus to the first control it can take (or
+  `initialFocus`); Escape closes it and returns focus to the trigger; a click
+  anywhere else closes it; a second click on the trigger closes it. Content that
+  needs Escape for itself (a drag in progress) keeps it with `onEscape`.
+- The trigger is handed `aria-expanded`, `aria-haspopup="dialog"` and
+  `aria-controls`; pass them through.
+- Use it for **options or a short question about one control**. A resource's
+  details go in the side panel; a confirmation inside a detail hero stays
+  inline.
+
+---
+
 ## Side panel (the resource drawer)
 
 **What:** a resource's details, floating over the right edge of the page. Every
