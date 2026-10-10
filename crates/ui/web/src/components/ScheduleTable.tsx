@@ -47,8 +47,8 @@ const SCHEDULE_COLUMNS_WITH_ACTION: readonly ColumnSpec<ScheduleColumn>[] = [
   {
     id: "action",
     label: "Action",
-    width: 170,
-    min: 120,
+    width: 150,
+    min: 150,
     locked: true,
     resizable: false,
     className: "schedule-table__action",

@@ -86,16 +86,10 @@ export interface ActionPanelProps {
   open?: boolean | undefined;
   onOpenChange?: ((open: boolean) => void) | undefined;
   /**
-   * Render the confirmation and the result without a trigger of their own.
-   *
-   * For a ledger: a table cell is a column, and a column squeezes a
-   * paragraph into a tall thin ribbon that shoves every other column narrow —
-   * the row version of the defect that moved the repository action bar's
-   * confirmation out of its trigger. The caller puts a bare `ActionButton` in
-   * the cell, keeps the open row in state, and renders this once *below* the
-   * ledger at full width. `open` must then be controlled.
+   * Leave the receipt to the caller — for a table, where a receipt in a cell
+   * would be squeezed into a ribbon; the page shows it at full width instead.
    */
-  hideTrigger?: boolean | undefined;
+  showResult?: boolean | undefined;
   /**
    * `popover` (the default) floats the confirmation over the page, anchored
    * to its trigger (`Popover`), so asking never shoves the page around it.
@@ -124,7 +118,7 @@ export function ActionPanel({
   children,
   open,
   onOpenChange,
-  hideTrigger = false,
+  showResult = true,
   presentation = "popover",
   align,
   strategy,
@@ -143,7 +137,7 @@ export function ActionPanel({
 
   // Managed focus and Escape — the same implementation the two bespoke action
   // bars use, so a confirmation cannot behave one way here and another there.
-  const floating = presentation === "popover" && !hideTrigger;
+  const floating = presentation === "popover";
   const panelRef = useConfirmFocus(isOpen && !floating, () => {
     setOpen(false);
   });
@@ -214,19 +208,15 @@ export function ActionPanel({
           {questions}
         </Popover>
         {shortShown}
-        <ActionResult label={label} receipt={receipt} problem={problem} />
+        {showResult ? <ActionResult label={label} receipt={receipt} problem={problem} /> : null}
       </div>
     );
   }
 
   return (
     <div className="action">
-      {hideTrigger ? null : (
-        <>
-          {trigger()}
-          {shortShown}
-        </>
-      )}
+      {trigger()}
+      {shortShown}
 
       {isOpen ? (
         <div
@@ -242,7 +232,7 @@ export function ActionPanel({
         </div>
       ) : null}
 
-      <ActionResult label={label} receipt={receipt} problem={problem} />
+      {showResult ? <ActionResult label={label} receipt={receipt} problem={problem} /> : null}
     </div>
   );
 }

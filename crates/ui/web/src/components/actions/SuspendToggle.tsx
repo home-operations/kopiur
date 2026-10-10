@@ -42,11 +42,16 @@ export interface SuspendToggleProps {
    */
   inLedger?: boolean | undefined;
   /**
-   * Render the confirmation and the result with no trigger — for a ledger,
-   * where the trigger lives in the row's cell and the panel below the table.
-   * See `ActionPanel.hideTrigger`.
+   * The request to send through, when the page shows the receipt itself (a
+   * table: one receipt under it, not one per cell). Its own otherwise.
    */
-  hideTrigger?: boolean | undefined;
+  mutation?: ReturnType<typeof useSuspend> | undefined;
+  /** Show the receipt beside the trigger; off when `mutation`'s owner shows it. */
+  showResult?: boolean | undefined;
+  /** For the popover: which edge of the trigger it lines up with. */
+  align?: "start" | "end" | undefined;
+  /** For the popover: `fixed` inside a box that clips, such as a table. */
+  strategy?: "absolute" | "fixed" | undefined;
   /** Controlled open state, for a bar that allows one open question at a time. */
   open?: boolean | undefined;
   onOpenChange?: ((open: boolean) => void) | undefined;
@@ -59,12 +64,16 @@ export function SuspendToggle({
   suspended,
   consequence,
   inLedger = false,
-  hideTrigger = false,
+  mutation,
+  showResult = true,
+  align,
+  strategy,
   open,
   onOpenChange,
 }: SuspendToggleProps) {
   const meta = suspendable(kind);
-  const suspend = useSuspend();
+  const own = useSuspend();
+  const suspend = mutation ?? own;
   const refusal = useRefusal(suspendReviewNamespace(kind, namespace), meta.capability);
   const reason = refusal?.full;
 
@@ -98,7 +107,9 @@ export function SuspendToggle({
       problem={suspend.error?.problem}
       open={open}
       onOpenChange={onOpenChange}
-      hideTrigger={hideTrigger}
+      showResult={showResult}
+      align={align}
+      strategy={strategy}
     >
       <p>
         This sets <span className="mono">{meta.path}</span> to{" "}

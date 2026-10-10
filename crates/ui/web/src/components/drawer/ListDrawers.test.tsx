@@ -150,9 +150,9 @@ describe("the drawer for a kind with no page of its own", () => {
       .join("\n");
     expect(foot).not.toMatch(/overflow(-y)?:\s*(auto|scroll)/);
     expect(foot).not.toMatch(/max-height/);
-    const confirm = rules.find((r) => r.selector === ".side-panel__foot .action__confirm");
-    expect(confirm?.body).toMatch(/max-height/);
-    expect(confirm?.body).toMatch(/overflow-y:\s*auto/);
+    const question = rules.find((r) => r.selector === ".side-panel__foot .popover__panel");
+    expect(question?.body).toMatch(/max-height/);
+    expect(question?.body).toMatch(/overflow-y:\s*auto/);
   });
 
   it("leaves no gap above the buttons for a receipt that has not arrived", () => {
@@ -160,11 +160,13 @@ describe("the drawer for a kind with no page of its own", () => {
     expect(rule?.body).toMatch(/display:\s*none/);
   });
 
-  it("stacks an open confirmation and its receipt above the action buttons", () => {
+  it("opens a question upward from its button, and stacks a receipt above the buttons", () => {
     const rules = cssRules(readStyles());
-    const confirm = rules.find(
-      (r) => r.selector === ".side-panel__foot .action-bar > .action > .action__confirm",
+    const question = rules.find((r) => r.selector === ".side-panel__foot .popover__panel");
+    expect(question?.body).toMatch(/bottom:\s*calc\(100%/);
+    const receipt = rules.find((r) =>
+      r.selector.includes(".side-panel__foot .action-bar > .action > .receipt"),
     );
-    expect(confirm?.body).toMatch(/order:\s*-/);
+    expect(receipt?.body).toMatch(/order:\s*-/);
   });
 });
