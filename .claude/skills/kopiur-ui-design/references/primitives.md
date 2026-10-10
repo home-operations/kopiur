@@ -671,6 +671,33 @@ menu, every action confirmation. `components/Popover.tsx`.
   namespace switcher. A resource's details go in the side panel; a long form
   (creating a restore) opens inline.
 
+### Namespace field
+
+A form never takes a namespace as free text. `components/NamespaceField.tsx`
+is a field-shaped button (`.controls__input`, the value in mono, the empty
+meaning muted) that opens a popover onto `NamespaceOptions`, the same list the
+sidebar's namespace switcher shows: the namespaces the caller may see with
+their counts, behind a filter, under the empty choice.
+
+```tsx
+<NamespaceField
+  id="doctor-namespace"
+  label="Namespace"
+  value={ns}
+  onChange={setNs}
+  emptyLabel="all namespaces"
+  hint="empty runs the whole installation"
+/>
+```
+
+- Its accessible name says the value: "Namespace: media".
+- What is typed into the filter can be taken as it is ("not listed"), since a
+  field may name a namespace the caller cannot list. Enter takes the single
+  match or the typed text and never submits the surrounding form.
+- A field that would repeat the shell's scope (`?namespace=`) is left out; the
+  switcher is that field. A field that does not apply (a ClusterRepository's
+  namespace) is hidden, not explained.
+
 ---
 
 ## Side panel (the resource drawer)

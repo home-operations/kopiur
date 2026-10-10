@@ -8,6 +8,7 @@ import { DoctorChecks } from "../components/DoctorChecks";
 import { EmptyState } from "../components/EmptyState";
 import { ErrorState } from "../components/ErrorState";
 import { LoadingState } from "../components/LoadingState";
+import { NamespaceField } from "../components/NamespaceField";
 import { Popover } from "../components/Popover";
 import { DOCTOR_DEFAULTS, summarizeDoctor } from "../components/doctor";
 import { type HealthKey, healthLamp } from "../components/health";
@@ -350,25 +351,14 @@ function DoctorOptions({
 
   return (
     <form className="doctor-options__form" onSubmit={submit} aria-label="Doctor options">
-      <div className="controls__field">
-        <label htmlFor="doctor-namespace">Namespace</label>
-        <input
-          id="doctor-namespace"
-          className="controls__input"
-          name="namespace"
-          value={ns}
-          onChange={(event) => {
-            setNs(event.target.value);
-          }}
-          placeholder="all namespaces"
-          aria-describedby="doctor-namespace-hint"
-          autoComplete="off"
-          spellCheck={false}
-        />
-        <span className="controls__hint" id="doctor-namespace-hint">
-          empty runs the whole installation
-        </span>
-      </div>
+      <NamespaceField
+        id="doctor-namespace"
+        label="Namespace"
+        value={ns}
+        onChange={setNs}
+        emptyLabel="all namespaces"
+        hint="empty runs the whole installation"
+      />
       <div className="controls__field">
         <label htmlFor="doctor-stuck">Stuck threshold</label>
         <input

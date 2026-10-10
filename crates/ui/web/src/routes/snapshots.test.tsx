@@ -97,6 +97,48 @@ describe("Snapshots list", () => {
     }
   });
 
+  it("picks the repository namespace from the namespace list, keeps the shell's scope, and has no namespace field of its own", async () => {
+    mockApi({
+      "/api/v1/snapshots": jsonResponse(page([row()])),
+      "/api/v1/namespaces": jsonResponse([{ name: "infra", objects: 4 }]),
+    });
+    const { router } = mountApp("/snapshots?namespace=media");
+    await list();
+    const filters = screen.getByRole("form", { name: "Snapshot filters" });
+    // The scope is the sidebar's switcher; the bar does not repeat it.
+    expect(within(filters).queryByRole("button", { name: /^Namespace:/ })).toBeNull();
+    expect(within(filters).queryByText(/ignored for a ClusterRepository/)).toBeNull();
+    const user = userEvent.setup();
+    await user.click(
+      within(filters).getByRole("button", {
+        name: "Repository namespace: the listing's namespace",
+      }),
+    );
+    const picker = screen.getByRole("dialog", { name: "Choose the repository namespace" });
+    await user.click(await within(picker).findByRole("button", { name: /^infra/ }));
+    await user.click(within(filters).getByRole("button", { name: /Apply filters/ }));
+    expect(router.state.location.search).toMatchObject({
+      namespace: "media",
+      repositoryNamespace: "infra",
+    });
+  });
+
+  it("drops the repository namespace for a ClusterRepository, which has none", async () => {
+    mockApi({ "/api/v1/snapshots": jsonResponse(page([row()])) });
+    const { router } = mountApp("/snapshots?repositoryNamespace=infra");
+    await list();
+    const filters = screen.getByRole("form", { name: "Snapshot filters" });
+    const user = userEvent.setup();
+    await user.selectOptions(
+      within(filters).getByLabelText("Repository kind"),
+      "cluster-repository",
+    );
+    expect(within(filters).queryByRole("button", { name: /^Repository namespace/ })).toBeNull();
+    await user.click(within(filters).getByRole("button", { name: /Apply filters/ }));
+    expect(router.state.location.search).toMatchObject({ repositoryKind: "cluster-repository" });
+    expect(router.state.location.search).not.toHaveProperty("repositoryNamespace");
+  });
+
   it("round-trips a filter through the address bar when the form is submitted", async () => {
     mockApi({ "/api/v1/snapshots": jsonResponse(page([row()])) });
     const { router } = mountApp("/snapshots");

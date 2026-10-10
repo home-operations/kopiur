@@ -2293,6 +2293,48 @@ html:has(dialog.side-panel[open]) {
   font-size: var(--text-xs);
 }
 
+/* A form's namespace: a field-shaped button opening the switcher's list. */
+.namespace-field > .popover {
+  display: block;
+}
+
+.namespace-field__button {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  text-align: left;
+}
+
+.namespace-field__button[aria-expanded="true"] {
+  border-color: var(--accent);
+}
+
+.namespace-field__button > svg {
+  flex: none;
+  margin-left: auto;
+  color: var(--fg-muted);
+}
+
+.namespace-field__value {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.namespace-field__button[data-empty="true"] .namespace-field__value {
+  color: var(--fg-muted);
+}
+
+.namespace-field__panel {
+  width: 16rem;
+}
+
+/* Long lists scroll inside the panel rather than past the page. */
+.namespace-field__panel .ns-switcher__list {
+  max-height: 16rem;
+  overflow-y: auto;
+}
+
 /* Object search. */
 .search {
   position: relative;

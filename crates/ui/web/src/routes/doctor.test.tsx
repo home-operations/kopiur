@@ -88,9 +88,10 @@ describe("Doctor", () => {
 
     // The options are behind the one Run doctor button, and reflect the URL,
     // which is the state.
-    expect(screen.queryByRole("textbox", { name: "Namespace" })).toBeNull();
+    expect(screen.queryByRole("dialog", { name: "Doctor options" })).toBeNull();
     const options = await openOptions(userEvent.setup({ advanceTimers: vi.advanceTimersByTime }));
-    expect(within(options).getByRole("textbox", { name: "Namespace" })).toHaveValue("media");
+    // The namespace is picked, like the shell's scope, not typed blind.
+    expect(within(options).getByRole("button", { name: "Namespace: media" })).toBeInTheDocument();
     expect(within(options).getByRole("textbox", { name: "Stuck threshold" })).toHaveValue("2h");
     expect(within(options).getByRole("textbox", { name: "Failure lookback" })).toHaveValue("24h");
 
@@ -164,7 +165,12 @@ describe("Doctor", () => {
 
     await user.clear(stuck);
     await user.type(stuck, "30m");
-    await user.type(within(options).getByRole("textbox", { name: "Namespace" }), "prod");
+    await user.click(within(options).getByRole("button", { name: "Namespace: all namespaces" }));
+    const picker = screen.getByRole("dialog", { name: "Choose the namespace" });
+    await user.type(within(picker).getByRole("searchbox", { name: "Filter namespaces" }), "prod");
+    await user.click(within(picker).getByRole("button", { name: /^prod/ }));
+    // Choosing closes the picker only; the options stay open to run.
+    expect(screen.getByRole("dialog", { name: "Doctor options" })).toBeInTheDocument();
     await user.click(within(options).getByRole("button", { name: "Run" }));
     await vi.waitFor(() => {
       expect(calledPaths()).toContain("/api/v1/doctor?namespace=prod&stuckThreshold=1800");

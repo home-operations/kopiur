@@ -9,6 +9,7 @@ import type {
   RestoreTargetBody,
 } from "../../api/types";
 import { assertNever } from "../../util/assertNever";
+import { NamespaceField } from "../NamespaceField";
 import { useCapabilityReason } from "../useCapabilityReason";
 import { ActionPanel } from "./ActionPanel";
 
@@ -200,12 +201,12 @@ export function RestoreDialog({ namespace, snapshot, open, onOpenChange }: Resto
             value={snapshotName}
             set={setSnapshotName}
           />
-          <Field
+          <NamespaceField
             id={`${fieldId}-snap-ns`}
-            label="Snapshot namespace (optional)"
+            label="Snapshot namespace"
             value={snapshotNamespace}
-            set={setSnapshotNamespace}
-            placeholder={namespace}
+            onChange={setSnapshotNamespace}
+            emptyLabel={`${namespace} (the restore's)`}
           />
         </>
       ) : null}
@@ -213,12 +214,12 @@ export function RestoreDialog({ namespace, snapshot, open, onOpenChange }: Resto
       {sourceKind === "fromPolicy" ? (
         <>
           <Field id={`${fieldId}-pol`} label="Policy name" value={policyName} set={setPolicyName} />
-          <Field
+          <NamespaceField
             id={`${fieldId}-pol-ns`}
-            label="Policy namespace (optional)"
+            label="Policy namespace"
             value={policyNamespace}
-            set={setPolicyNamespace}
-            placeholder={namespace}
+            onChange={setPolicyNamespace}
+            emptyLabel={`${namespace} (the restore's)`}
           />
           <Field
             id={`${fieldId}-asof`}
@@ -382,12 +383,12 @@ export function RestoreDialog({ namespace, snapshot, open, onOpenChange }: Resto
             set={setRepositoryName}
           />
           {repositoryKind === "Repository" ? (
-            <Field
+            <NamespaceField
               id={`${fieldId}-repo-ns`}
-              label="Repository namespace (optional)"
+              label="Repository namespace"
               value={repositoryNamespace}
-              set={setRepositoryNamespace}
-              placeholder={namespace}
+              onChange={setRepositoryNamespace}
+              emptyLabel={`${namespace} (the restore's)`}
             />
           ) : null}
         </>

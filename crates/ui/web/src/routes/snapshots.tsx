@@ -10,6 +10,7 @@ import { EmptyState } from "../components/EmptyState";
 import { ErrorState } from "../components/ErrorState";
 import { Finding } from "../components/Finding";
 import { LoadingState } from "../components/LoadingState";
+import { NamespaceField } from "../components/NamespaceField";
 import { SnapshotTable } from "../components/SnapshotTable";
 import { healthLamp } from "../components/health";
 import {
@@ -364,7 +365,7 @@ interface FiltersProps {
 }
 
 /**
- * The seven filters, submitted into the URL.
+ * The six filters, submitted into the URL beside the shell's namespace.
  *
  * Submitting always resets `offset`: a page-3 window over the old filter is
  * meaningless under a new one, and leaving it would show an empty page that
@@ -372,7 +373,6 @@ interface FiltersProps {
  */
 function Filters({ search, namespace, limit }: FiltersProps) {
   const navigate = useNavigate();
-  const [ns, setNs] = useState(namespace ?? "");
   const [repository, setRepository] = useState(search.repository ?? "");
   const [repositoryKind, setRepositoryKind] = useState(search.repositoryKind ?? "");
   const [repositoryNamespace, setRepositoryNamespace] = useState(search.repositoryNamespace ?? "");
@@ -389,10 +389,14 @@ function Filters({ search, namespace, limit }: FiltersProps) {
         next[key] = text;
       }
     };
-    put("namespace", ns);
+    // The namespace is the shell's scope, chosen in the sidebar's switcher;
+    // the filters keep it.
+    put("namespace", namespace ?? "");
     put("repository", repository);
     put("repositoryKind", repositoryKind);
-    put("repositoryNamespace", repositoryNamespace);
+    // A ClusterRepository has no namespace; the field is hidden for one, and
+    // a value left in it from before is not sent.
+    if (repositoryKind !== "cluster-repository") put("repositoryNamespace", repositoryNamespace);
     put("policy", policy);
     put("origin", origin);
     put("phase", phase);
@@ -404,21 +408,6 @@ function Filters({ search, namespace, limit }: FiltersProps) {
 
   return (
     <form className="controls snapshot-filters" onSubmit={submit} aria-label="Snapshot filters">
-      <div className="controls__field">
-        <label htmlFor="snapshots-namespace">Namespace</label>
-        <input
-          id="snapshots-namespace"
-          className="controls__input"
-          name="namespace"
-          value={ns}
-          onChange={(event) => {
-            setNs(event.target.value);
-          }}
-          placeholder="all namespaces"
-          autoComplete="off"
-          spellCheck={false}
-        />
-      </div>
       <div className="controls__field">
         <label htmlFor="snapshots-policy">Policy</label>
         <input
@@ -468,25 +457,15 @@ function Filters({ search, namespace, limit }: FiltersProps) {
           ))}
         </select>
       </div>
-      <div className="controls__field">
-        <label htmlFor="snapshots-repository-namespace">Repository namespace</label>
-        <input
+      {repositoryKind === "cluster-repository" ? null : (
+        <NamespaceField
           id="snapshots-repository-namespace"
-          className="controls__input"
-          name="repositoryNamespace"
+          label="Repository namespace"
           value={repositoryNamespace}
-          onChange={(event) => {
-            setRepositoryNamespace(event.target.value);
-          }}
-          placeholder="the listing's namespace"
-          aria-describedby="snapshots-repository-namespace-hint"
-          autoComplete="off"
-          spellCheck={false}
+          onChange={setRepositoryNamespace}
+          emptyLabel="the listing's namespace"
         />
-        <span className="controls__hint" id="snapshots-repository-namespace-hint">
-          where a namespaced Repository lives; ignored for a ClusterRepository
-        </span>
-      </div>
+      )}
       <div className="controls__field">
         <label htmlFor="snapshots-origin">Origin</label>
         <select
@@ -530,7 +509,11 @@ function Filters({ search, namespace, limit }: FiltersProps) {
           <Filter size={14} strokeWidth={2} aria-hidden="true" />
           Apply filters
         </ActionButton>
-        <Link className="button button--quiet" to="/snapshots" search={{}}>
+        <Link
+          className="button button--quiet"
+          to="/snapshots"
+          search={namespace === undefined ? {} : { namespace }}
+        >
           Clear
         </Link>
       </div>
