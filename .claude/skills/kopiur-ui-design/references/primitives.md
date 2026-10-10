@@ -671,32 +671,45 @@ menu, every action confirmation. `components/Popover.tsx`.
   namespace switcher. A resource's details go in the side panel; a long form
   (creating a restore) opens inline.
 
-### Namespace field
+### Picker field (every choice in a form)
 
-A form never takes a namespace as free text. `components/NamespaceField.tsx`
-is a field-shaped button (`.controls__input`, the value in mono, the empty
-meaning muted) that opens a popover onto `NamespaceOptions`, the same list the
-sidebar's namespace switcher shows: the namespaces the caller may see with
-their counts, behind a filter, under the empty choice.
+A form never takes a choice as free text or a native `<select>`.
+`components/PickerField.tsx` is a field-shaped button (`.controls__input`, the
+value in mono, the empty meaning muted, a chevron) that opens a popover onto
+`PickerOptions` — the same list the sidebar's namespace switcher shows.
 
 ```tsx
-<NamespaceField
-  id="doctor-namespace"
-  label="Namespace"
-  value={ns}
-  onChange={setNs}
-  emptyLabel="all namespaces"
-  hint="empty runs the whole installation"
+<PickerField
+  id="snapshots-phase"
+  label="Phase"
+  value={phase}
+  onChange={setPhase}
+  options={PHASE_FILTERS}
+  emptyLabel="any phase"
 />
 ```
 
-- Its accessible name says the value: "Namespace: media".
-- What is typed into the filter can be taken as it is ("not listed"), since a
-  field may name a namespace the caller cannot list. Enter takes the single
-  match or the typed text and never submits the surrounding form.
+- **With search** (`search="policies"`): a filter field over the list, for
+  lists that grow. `components/ResourceFields.tsx` wraps it for the three
+  object lists: `NamespaceField` (the switcher's list, avatars and counts),
+  `PolicyField` (one row per name, the namespaces that have it), and
+  `RepositoryField` (both kinds with their kind chips; picking one sets the
+  name, kind and namespace together). Each fetches its list only once opened.
+  `freeform` lets what is typed be taken when nothing listed matches
+  ("not listed"), since a field may name something the caller cannot list.
+- **Without search**: the same dropdown for a short fixed list (a mode, a
+  phase, an origin). Focus opens on the current choice.
+- Its accessible name says the value: "Phase: Failed". Arrow keys walk the
+  choices; Enter in the filter takes the one match (or the typed text) and
+  never submits the surrounding form. `emptyLabel` adds the empty choice first;
+  a field without it always holds a value.
+- Inside another popover or a drawer foot, pass `strategy="fixed"` so the list
+  is not clipped by the panel's own scroll.
 - A field that would repeat the shell's scope (`?namespace=`) is left out; the
   switcher is that field. A field that does not apply (a ClusterRepository's
   namespace) is hidden, not explained.
+- Tests pick with `pickOption(user, label, choiceLabel)` and type with
+  `typeOption(user, label, text)` from `test-utils`.
 
 ---
 

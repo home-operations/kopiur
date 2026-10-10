@@ -5,6 +5,8 @@ import { useMaintenanceRun, useScanCatalog, useSuspend } from "../api/hooks";
 import type { RepositoryDetail as RepositoryDetailData } from "../api/types";
 import { ActionButton } from "./ActionButton";
 import { Popover } from "./Popover";
+import { PickerField } from "./PickerField";
+import { MAINTENANCE_MODES } from "./pickerChoices";
 import { ActionResult } from "./ActionResult";
 import {
   actionNamespace,
@@ -143,20 +145,14 @@ export function RepositoryActions({ detail }: RepositoryActionsProps) {
             . <strong>Quick</strong> compacts kopia&apos;s indexes and is cheap;{" "}
             <strong>full</strong> also reclaims unused space, and is slow.
           </p>
-          <div className="controls__field">
-            <label htmlFor="maintenance-mode">Mode</label>
-            <select
-              id="maintenance-mode"
-              className="controls__input"
-              value={mode}
-              onChange={(event) => {
-                setMode(event.target.value);
-              }}
-            >
-              <option value="quick">quick</option>
-              <option value="full">full</option>
-            </select>
-          </div>
+          <PickerField
+            id="maintenance-mode"
+            label="Mode"
+            value={mode}
+            onChange={setMode}
+            options={MAINTENANCE_MODES}
+            strategy="fixed"
+          />
         </>
       ),
       running: maintenanceRun.isPending,

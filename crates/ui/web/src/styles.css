@@ -2180,6 +2180,7 @@ html:has(dialog.side-panel[open]) {
 }
 
 .ns-switcher__avatar,
+.picker__avatar,
 .user-chip__avatar {
   display: inline-grid;
   place-items: center;
@@ -2193,11 +2194,13 @@ html:has(dialog.side-panel[open]) {
 }
 
 .ns-switcher__avatar::before,
+.picker__avatar::before,
 .user-chip__avatar::before {
   content: attr(data-initial);
 }
 
-.ns-switcher__avatar--all {
+.ns-switcher__avatar--all,
+.picker__avatar--all {
   background: var(--bg-inset);
   color: var(--fg-muted);
 }
@@ -2215,7 +2218,7 @@ html:has(dialog.side-panel[open]) {
   width: 100%;
 }
 
-.ns-switcher__filter,
+.picker__filter,
 .search__field {
   display: flex;
   align-items: center;
@@ -2227,7 +2230,7 @@ html:has(dialog.side-panel[open]) {
   color: var(--fg-muted);
 }
 
-.ns-switcher__filter input,
+.picker__filter input,
 .search__field input {
   flex: 1;
   min-width: 0;
@@ -2243,17 +2246,17 @@ html:has(dialog.side-panel[open]) {
 /* A text field is focus-visible on a mouse click too, so the global tab ring
    would light on every click. The field's own border takes the accent
    instead: quieter, and still a visible focus for the keyboard. */
-.ns-switcher__filter input:focus-visible,
+.picker__filter input:focus-visible,
 .search__field input:focus-visible {
   box-shadow: none;
 }
 
-.ns-switcher__filter:focus-within,
+.picker__filter:focus-within,
 .search__field:focus-within {
   border-color: var(--accent);
 }
 
-.ns-switcher__list,
+.picker__list,
 .search__results {
   display: grid;
   gap: 2px;
@@ -2262,7 +2265,7 @@ html:has(dialog.side-panel[open]) {
   list-style: none;
 }
 
-.ns-switcher__option {
+.picker__option {
   display: flex;
   align-items: center;
   gap: var(--space-2);
@@ -2277,61 +2280,85 @@ html:has(dialog.side-panel[open]) {
   text-align: left;
 }
 
-.ns-switcher__option:hover {
+.picker__option:hover {
   background: var(--bg-hover);
 }
 
-.ns-switcher__option[aria-current="true"] {
+.picker__option[aria-current="true"] {
   background: var(--accent-soft);
   color: var(--accent-ink);
 }
 
-.ns-switcher__count {
+.picker__meta {
   margin-left: auto;
   color: var(--fg-muted);
   font-family: var(--font-sans);
   font-size: var(--text-xs);
 }
 
-/* A form's namespace: a field-shaped button opening the switcher's list. */
-.namespace-field > .popover {
+/* Every picker's body: a list of choices under an optional filter. */
+.picker {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 4px;
+}
+
+.picker__label {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.picker__option > svg:last-child {
+  flex: none;
+  color: var(--accent-ink);
+}
+
+/* A picker in a form: a field-shaped button opening the list under it. */
+.picker-field > .popover {
   display: block;
 }
 
-.namespace-field__button {
+.picker-field__button {
   display: flex;
   align-items: center;
   gap: var(--space-2);
   text-align: left;
 }
 
-.namespace-field__button[aria-expanded="true"] {
+.picker-field__button[aria-expanded="true"] {
   border-color: var(--accent);
 }
 
-.namespace-field__button > svg {
+.picker-field__button > svg {
   flex: none;
   margin-left: auto;
   color: var(--fg-muted);
 }
 
-.namespace-field__value {
+.picker-field__value {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.namespace-field__button[data-empty="true"] .namespace-field__value {
+.picker-field__button[data-empty="true"] .picker-field__value {
   color: var(--fg-muted);
 }
 
-.namespace-field__panel {
-  width: 16rem;
+.picker-field__panel {
+  width: 18rem;
+}
+
+/* In the page's flow it is at least as wide as its field; pinned to the
+   screen, a percentage would be of the viewport. */
+.picker-field__panel:not([data-strategy="fixed"]) {
+  min-width: 100%;
 }
 
 /* Long lists scroll inside the panel rather than past the page. */
-.namespace-field__panel .ns-switcher__list {
-  max-height: 16rem;
+.picker-field__panel .picker__list {
+  max-height: 20rem;
   overflow-y: auto;
 }
 

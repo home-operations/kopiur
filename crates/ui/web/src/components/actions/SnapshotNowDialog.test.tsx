@@ -7,6 +7,7 @@ import {
   jsonResponse,
   meWith,
   mockApi,
+  pickOption,
   problemResponse,
   renderWithClient,
   sentBody,
@@ -117,7 +118,7 @@ describe("SnapshotNowDialog", () => {
     await user.click(screen.getByRole("radio", { name: /Prune it under/ }));
     // The server matches the restriction by bare name, not by the display key
     // the row carries (`kopiur_ops::actions::snapshot::planned_cells`).
-    await user.selectOptions(screen.getByLabelText("Repository"), "shared");
+    await pickOption(user, "Repository", "shared");
     await user.click(screen.getByRole("button", { name: "Take the snapshot" }));
     const expected: SnapshotNowBody = {
       namespace: "media",

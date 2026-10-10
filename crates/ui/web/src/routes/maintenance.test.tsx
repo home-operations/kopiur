@@ -12,6 +12,7 @@ import {
   meWith,
   mockApi,
   mountApp,
+  pickOption,
   problemResponse,
   sentBody,
   unletteredLamps,
@@ -210,7 +211,7 @@ describe("Maintenance", () => {
       expect(trigger).not.toHaveAttribute("aria-disabled");
     });
     await user.click(trigger);
-    await user.selectOptions(screen.getByLabelText("Mode"), "full");
+    await pickOption(user, "Mode", "full");
     await user.click(screen.getByRole("button", { name: "Request the run" }));
     const expected: MaintenanceRunBody = {
       namespace: "media",

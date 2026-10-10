@@ -5,6 +5,7 @@ import { useSnapshotNow } from "../../api/hooks";
 import type { SnapshotNowBody } from "../../api/types";
 import { useCapabilityReason } from "../useCapabilityReason";
 import { repositoryName } from "../policy";
+import { PickerField } from "../PickerField";
 import { ActionPanel } from "./ActionPanel";
 
 /**
@@ -143,24 +144,15 @@ export function SnapshotNowDialog({
       </fieldset>
 
       {multi ? (
-        <div className="controls__field">
-          <label htmlFor={`${fieldId}-repo`}>Repository</label>
-          <select
-            id={`${fieldId}-repo`}
-            className="controls__input"
-            value={repository}
-            onChange={(event) => {
-              setRepository(event.target.value);
-            }}
-          >
-            <option value="">Every repository the policy names ({choices.length})</option>
-            {choices.map((choice) => (
-              <option key={choice} value={choice}>
-                {choice}
-              </option>
-            ))}
-          </select>
-        </div>
+        <PickerField
+          id={`${fieldId}-repo`}
+          label="Repository"
+          value={repository}
+          onChange={setRepository}
+          options={choices.map((choice) => ({ value: choice, label: choice }))}
+          emptyLabel={`Every repository the policy names (${String(choices.length)})`}
+          strategy="fixed"
+        />
       ) : null}
 
       <div className="controls__field">

@@ -12,7 +12,9 @@ import {
   mockApi,
   mountApp,
   nth,
+  pickOption,
   problemResponse,
+  typeOption,
 } from "../test-utils";
 
 function row(over: Partial<SnapshotRow> = {}): SnapshotRow {
@@ -129,10 +131,7 @@ describe("Snapshots list", () => {
     await list();
     const filters = screen.getByRole("form", { name: "Snapshot filters" });
     const user = userEvent.setup();
-    await user.selectOptions(
-      within(filters).getByLabelText("Repository kind"),
-      "cluster-repository",
-    );
+    await pickOption(user, "Repository kind", "ClusterRepository", filters);
     expect(within(filters).queryByRole("button", { name: /^Repository namespace/ })).toBeNull();
     await user.click(within(filters).getByRole("button", { name: /Apply filters/ }));
     expect(router.state.location.search).toMatchObject({ repositoryKind: "cluster-repository" });
@@ -144,8 +143,8 @@ describe("Snapshots list", () => {
     const { router } = mountApp("/snapshots");
     await list();
     const user = userEvent.setup();
-    await user.selectOptions(screen.getByLabelText("Phase"), "failed");
-    await user.type(screen.getByLabelText("Policy"), "nightly");
+    await pickOption(user, "Phase", "Failed");
+    await typeOption(user, "Policy", "nightly");
     await user.click(screen.getByRole("button", { name: /Apply filters/ }));
     // The URL is the state: the filter is in the address bar, so the view is a
     // link a colleague can open.

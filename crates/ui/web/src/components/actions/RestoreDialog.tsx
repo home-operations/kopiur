@@ -9,7 +9,8 @@ import type {
   RestoreTargetBody,
 } from "../../api/types";
 import { assertNever } from "../../util/assertNever";
-import { NamespaceField } from "../NamespaceField";
+import { PickerField } from "../PickerField";
+import { NamespaceField } from "../ResourceFields";
 import { useCapabilityReason } from "../useCapabilityReason";
 import { ActionPanel } from "./ActionPanel";
 
@@ -359,21 +360,18 @@ export function RestoreDialog({ namespace, snapshot, open, onOpenChange }: Resto
         />
       )}
 
-      <div className="controls__field">
-        <label htmlFor={`${fieldId}-repo-kind`}>Repository (optional)</label>
-        <select
-          id={`${fieldId}-repo-kind`}
-          className="controls__input"
-          value={repositoryKind}
-          onChange={(event) => {
-            setRepositoryKind(event.target.value);
-          }}
-        >
-          <option value="">Infer it from the source</option>
-          <option value="Repository">Repository</option>
-          <option value="ClusterRepository">ClusterRepository</option>
-        </select>
-      </div>
+      <PickerField
+        id={`${fieldId}-repo-kind`}
+        label="Repository (optional)"
+        value={repositoryKind}
+        onChange={setRepositoryKind}
+        options={[
+          { value: "Repository", label: "Repository" },
+          { value: "ClusterRepository", label: "ClusterRepository" },
+        ]}
+        emptyLabel="Infer it from the source"
+        strategy="fixed"
+      />
       {repositoryKind.length > 0 ? (
         <>
           <Field

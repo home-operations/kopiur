@@ -4,7 +4,12 @@ import { useState } from "react";
 import { describe, expect, it, vi } from "vitest";
 
 import { jsonResponse, mockApi, renderWithClient } from "../test-utils";
-import { NamespaceField } from "./NamespaceField";
+import {
+  NamespaceField,
+  PolicyField,
+  RepositoryField,
+  type RepositoryChoice,
+} from "./ResourceFields";
 
 const NAMESPACES = jsonResponse([
   { name: "billing", objects: 3 },
@@ -89,5 +94,119 @@ describe("NamespaceField", () => {
     await within(panel).findByRole("button", { name: /^billing/ });
     await user.type(within(panel).getByRole("searchbox"), "bil{Enter}");
     expect(screen.getByLabelText("value")).toHaveTextContent("billing");
+  });
+});
+
+describe("PolicyField", () => {
+  it("lists each policy name once, with the namespaces that have it", async () => {
+    mockApi({
+      "/api/v1/policies": jsonResponse([
+        {
+          namespace: "media",
+          name: "nightly",
+          repositories: [],
+          multiRepo: false,
+          suspended: false,
+        },
+        {
+          namespace: "infra",
+          name: "nightly",
+          repositories: [],
+          multiRepo: false,
+          suspended: false,
+        },
+        {
+          namespace: "media",
+          name: "hourly",
+          repositories: [],
+          multiRepo: false,
+          suspended: false,
+        },
+      ]),
+    });
+    function Policy() {
+      const [value, setValue] = useState("");
+      return (
+        <PolicyField
+          id="p"
+          label="Policy"
+          value={value}
+          onChange={setValue}
+          emptyLabel="any policy"
+        />
+      );
+    }
+    renderWithClient(<Policy />);
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole("button", { name: "Policy: any policy" }));
+    const panel = screen.getByRole("dialog", { name: "Choose the policy" });
+    const nightly = await within(panel).findByRole("button", { name: /^nightly/ });
+    expect(nightly).toHaveTextContent("media, infra");
+    expect(within(panel).getAllByRole("button", { name: /^nightly/ })).toHaveLength(1);
+    await user.click(nightly);
+    expect(screen.getByRole("button", { name: "Policy: nightly" })).toBeInTheDocument();
+  });
+});
+
+describe("RepositoryField", () => {
+  const REPOS = jsonResponse([
+    {
+      kind: "Repository",
+      kindPath: "repository",
+      name: "nas",
+      namespace: "media",
+      health: "healthy",
+      mode: "direct",
+      serverBacked: false,
+      suspended: false,
+    },
+    {
+      kind: "ClusterRepository",
+      kindPath: "cluster-repository",
+      name: "shared",
+      health: "healthy",
+      mode: "direct",
+      serverBacked: false,
+      suspended: false,
+    },
+  ]);
+
+  function Repo() {
+    const [value, setValue] = useState<RepositoryChoice>({ name: "", kind: "", namespace: "" });
+    return (
+      <>
+        <RepositoryField
+          id="r"
+          label="Repository"
+          value={value}
+          onChange={setValue}
+          emptyLabel="any repository"
+        />
+        <output aria-label="choice">{JSON.stringify(value)}</output>
+      </>
+    );
+  }
+
+  it("sets the kind and namespace with the name, since a name alone may be ambiguous", async () => {
+    mockApi({ "/api/v1/repositories": REPOS });
+    renderWithClient(<Repo />);
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole("button", { name: "Repository: any repository" }));
+    const panel = screen.getByRole("dialog");
+    await user.click(await within(panel).findByRole("button", { name: /^shared/ }));
+    expect(JSON.parse(screen.getByLabelText("choice").textContent)).toEqual({
+      name: "shared",
+      kind: "cluster-repository",
+      namespace: "",
+    });
+    await user.click(screen.getByRole("button", { name: "Repository: shared" }));
+    await user.click(
+      await within(screen.getByRole("dialog")).findByRole("button", { name: /^nas/ }),
+    );
+    expect(JSON.parse(screen.getByLabelText("choice").textContent)).toEqual({
+      name: "nas",
+      kind: "repository",
+      namespace: "media",
+    });
   });
 });

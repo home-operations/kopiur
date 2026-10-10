@@ -4,6 +4,8 @@ import { useId, useState } from "react";
 import { useMaintenanceRun, useReplicationRun } from "../../api/hooks";
 import type { Capabilities, MaintenanceRunBody, ReplicationRunBody } from "../../api/types";
 import { assertNever } from "../../util/assertNever";
+import { PickerField } from "../PickerField";
+import { MAINTENANCE_MODES } from "../pickerChoices";
 import { ActionPanel } from "./ActionPanel";
 import { useRefusal } from "./reason";
 
@@ -179,20 +181,14 @@ export function RunDialog({
             compacts indexes and is cheap; <strong>full</strong> also reclaims unused space, and is
             slow.
           </p>
-          <div className="controls__field">
-            <label htmlFor={`${fieldId}-mode`}>Mode</label>
-            <select
-              id={`${fieldId}-mode`}
-              className="controls__input"
-              value={mode}
-              onChange={(event) => {
-                setMode(event.target.value);
-              }}
-            >
-              <option value="quick">quick</option>
-              <option value="full">full</option>
-            </select>
-          </div>
+          <PickerField
+            id={`${fieldId}-mode`}
+            label="Mode"
+            value={mode}
+            onChange={setMode}
+            options={MAINTENANCE_MODES}
+            strategy="fixed"
+          />
         </>
       ) : (
         <p>

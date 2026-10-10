@@ -10,7 +10,8 @@ import { EmptyState } from "../components/EmptyState";
 import { ErrorState } from "../components/ErrorState";
 import { Finding } from "../components/Finding";
 import { LoadingState } from "../components/LoadingState";
-import { NamespaceField } from "../components/NamespaceField";
+import { PickerField } from "../components/PickerField";
+import { NamespaceField, PolicyField, RepositoryField } from "../components/ResourceFields";
 import { SnapshotTable } from "../components/SnapshotTable";
 import { healthLamp } from "../components/health";
 import {
@@ -408,55 +409,32 @@ function Filters({ search, namespace, limit }: FiltersProps) {
 
   return (
     <form className="controls snapshot-filters" onSubmit={submit} aria-label="Snapshot filters">
-      <div className="controls__field">
-        <label htmlFor="snapshots-policy">Policy</label>
-        <input
-          id="snapshots-policy"
-          className="controls__input"
-          name="policy"
-          value={policy}
-          onChange={(event) => {
-            setPolicy(event.target.value);
-          }}
-          placeholder="any policy"
-          autoComplete="off"
-          spellCheck={false}
-        />
-      </div>
-      <div className="controls__field">
-        <label htmlFor="snapshots-repository">Repository</label>
-        <input
-          id="snapshots-repository"
-          className="controls__input"
-          name="repository"
-          value={repository}
-          onChange={(event) => {
-            setRepository(event.target.value);
-          }}
-          placeholder="any repository"
-          autoComplete="off"
-          spellCheck={false}
-        />
-      </div>
-      <div className="controls__field">
-        <label htmlFor="snapshots-repository-kind">Repository kind</label>
-        <select
-          id="snapshots-repository-kind"
-          className="controls__input"
-          name="repositoryKind"
-          value={repositoryKind}
-          onChange={(event) => {
-            setRepositoryKind(event.target.value);
-          }}
-        >
-          <option value="">Repository (default)</option>
-          {KIND_FILTERS.map((kind) => (
-            <option value={kind.value} key={kind.value}>
-              {kind.label}
-            </option>
-          ))}
-        </select>
-      </div>
+      <PolicyField
+        id="snapshots-policy"
+        label="Policy"
+        value={policy}
+        onChange={setPolicy}
+        emptyLabel="any policy"
+      />
+      <RepositoryField
+        id="snapshots-repository"
+        label="Repository"
+        value={{ name: repository, kind: repositoryKind, namespace: repositoryNamespace }}
+        onChange={(choice) => {
+          setRepository(choice.name);
+          setRepositoryKind(choice.kind);
+          setRepositoryNamespace(choice.namespace);
+        }}
+        emptyLabel="any repository"
+      />
+      <PickerField
+        id="snapshots-repository-kind"
+        label="Repository kind"
+        value={repositoryKind}
+        onChange={setRepositoryKind}
+        options={KIND_FILTERS}
+        emptyLabel="Repository (default)"
+      />
       {repositoryKind === "cluster-repository" ? null : (
         <NamespaceField
           id="snapshots-repository-namespace"
@@ -466,44 +444,22 @@ function Filters({ search, namespace, limit }: FiltersProps) {
           emptyLabel="the listing's namespace"
         />
       )}
-      <div className="controls__field">
-        <label htmlFor="snapshots-origin">Origin</label>
-        <select
-          id="snapshots-origin"
-          className="controls__input"
-          name="origin"
-          value={origin}
-          onChange={(event) => {
-            setOrigin(event.target.value);
-          }}
-        >
-          <option value="">any origin</option>
-          {ORIGIN_FILTERS.map((option) => (
-            <option value={option.value} key={option.value}>
-              {option.label}
-            </option>
-          ))}
-        </select>
-      </div>
-      <div className="controls__field">
-        <label htmlFor="snapshots-phase">Phase</label>
-        <select
-          id="snapshots-phase"
-          className="controls__input"
-          name="phase"
-          value={phase}
-          onChange={(event) => {
-            setPhase(event.target.value);
-          }}
-        >
-          <option value="">any phase</option>
-          {PHASE_FILTERS.map((option) => (
-            <option value={option.value} key={option.value}>
-              {option.label}
-            </option>
-          ))}
-        </select>
-      </div>
+      <PickerField
+        id="snapshots-origin"
+        label="Origin"
+        value={origin}
+        onChange={setOrigin}
+        options={ORIGIN_FILTERS}
+        emptyLabel="any origin"
+      />
+      <PickerField
+        id="snapshots-phase"
+        label="Phase"
+        value={phase}
+        onChange={setPhase}
+        options={PHASE_FILTERS}
+        emptyLabel="any phase"
+      />
       <div className="controls__actions">
         <ActionButton variant="primary" type="submit">
           <Filter size={14} strokeWidth={2} aria-hidden="true" />

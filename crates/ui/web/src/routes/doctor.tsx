@@ -8,7 +8,7 @@ import { DoctorChecks } from "../components/DoctorChecks";
 import { EmptyState } from "../components/EmptyState";
 import { ErrorState } from "../components/ErrorState";
 import { LoadingState } from "../components/LoadingState";
-import { NamespaceField } from "../components/NamespaceField";
+import { NamespaceField } from "../components/ResourceFields";
 import { Popover } from "../components/Popover";
 import { DOCTOR_DEFAULTS, summarizeDoctor } from "../components/doctor";
 import { type HealthKey, healthLamp } from "../components/health";

@@ -2,7 +2,8 @@ import { useRouter, useRouterState } from "@tanstack/react-router";
 import { ChevronsUpDown } from "lucide-react";
 import { useState } from "react";
 
-import { NamespaceOptions } from "../NamespaceOptions";
+import { PickerOptions } from "../PickerOptions";
+import { useNamespaceOptions } from "../namespaceOptions";
 import { Popover } from "../Popover";
 import { useCurrentNamespace } from "../../util/namespace";
 
@@ -22,8 +23,8 @@ function withNamespace(search: Record<string, unknown>, namespace: string | unde
  * The namespace scope, switched like a workspace: it frames the whole app.
  * A `Popover` under the button, opening onto its filter field.
  *
- * The list is `NamespaceOptions`, the same one every namespace field in a form
- * opens. Choosing one keeps the current page and its filters (but not its
+ * The list is `PickerOptions` over `useNamespaceOptions`, the same one every
+ * namespace field in a form opens. Choosing one keeps the current page and its filters (but not its
  * page offset).
  */
 export function NamespaceSwitcher() {
@@ -31,6 +32,7 @@ export function NamespaceSwitcher() {
   const location = useRouterState({ select: (s) => s.location });
   const current = useCurrentNamespace();
   const [open, setOpen] = useState(false);
+  const { options, total } = useNamespaceOptions(open);
 
   const choose = (namespace: string | undefined) => {
     void router.navigate({
@@ -69,9 +71,11 @@ export function NamespaceSwitcher() {
         )}
       >
         {(close) => (
-          <NamespaceOptions
+          <PickerOptions
+            options={options}
             current={current}
-            emptyLabel="all namespaces"
+            empty={{ label: "all namespaces", meta: total, initial: "*" }}
+            search={{ noun: "namespaces" }}
             onChoose={(namespace) => {
               choose(namespace);
               close();

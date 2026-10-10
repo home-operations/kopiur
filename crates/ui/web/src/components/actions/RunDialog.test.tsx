@@ -12,6 +12,7 @@ import {
   jsonResponse,
   meWith,
   mockApi,
+  pickOption,
   problemResponse,
   renderWithClient,
   sentBody,
@@ -74,7 +75,7 @@ describe("RunDialog", () => {
       />,
     );
     const user = await open("Run maintenance");
-    await user.selectOptions(screen.getByLabelText("Mode"), "full");
+    await pickOption(user, "Mode", "full");
     await user.click(screen.getByRole("button", { name: "Request the run" }));
     const expected: MaintenanceRunBody = {
       namespace: "media",

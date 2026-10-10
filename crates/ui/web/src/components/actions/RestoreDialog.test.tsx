@@ -7,6 +7,7 @@ import {
   jsonResponse,
   meWith,
   mockApi,
+  pickOption,
   problemResponse,
   renderWithClient,
   sentBody,
@@ -93,7 +94,7 @@ describe("RestoreDialog", () => {
     await user.type(screen.getByLabelText("Kopia manifest ID (optional)"), "k123");
     await user.type(screen.getByLabelText("Claim name"), "data");
     await user.click(screen.getByRole("radio", { name: /Leave existing files alone/ }));
-    await user.selectOptions(screen.getByLabelText("Repository (optional)"), "ClusterRepository");
+    await pickOption(user, "Repository (optional)", "ClusterRepository");
     await user.type(screen.getByLabelText("Repository name"), "shared");
     await user.click(screen.getByRole("button", { name: "Create the restore" }));
     const expected: RestoreBody = {

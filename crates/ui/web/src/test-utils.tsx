@@ -23,7 +23,8 @@ import {
   createRootRoute,
   createRouter,
 } from "@tanstack/react-router";
-import { render } from "@testing-library/react";
+import { render, screen, within } from "@testing-library/react";
+import type { UserEvent } from "@testing-library/user-event";
 import type { ReactElement } from "react";
 import { vi } from "vitest";
 import createFetchMock from "vitest-fetch-mock";
@@ -254,4 +255,36 @@ export function meWith(allowed: Partial<Me["can"]>): Response {
       Object.keys(ME.can).map((key) => [key, allowed[key as keyof Me["can"]] ?? false]),
     ),
   });
+}
+
+/** The field a `PickerField` is, by its label, and its open list. */
+async function openPicker(user: UserEvent, label: string, scope: HTMLElement) {
+  await user.click(within(scope).getByLabelText(label));
+  return screen.getByRole("dialog", { name: `Choose the ${label.toLowerCase()}` });
+}
+
+/**
+ * Choose `option` (a choice's label) in the `PickerField` labelled `label` —
+ * the picker's stand-in for `user.selectOptions`.
+ */
+export async function pickOption(
+  user: UserEvent,
+  label: string,
+  option: string,
+  scope: HTMLElement = document.body,
+): Promise<void> {
+  const panel = await openPicker(user, label, scope);
+  const escaped = option.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  await user.click(await within(panel).findByRole("button", { name: new RegExp(`^${escaped}`) }));
+}
+
+/** Type `text` into a searchable `PickerField`'s filter and take it with Enter. */
+export async function typeOption(
+  user: UserEvent,
+  label: string,
+  text: string,
+  scope: HTMLElement = document.body,
+): Promise<void> {
+  const panel = await openPicker(user, label, scope);
+  await user.type(within(panel).getByRole("searchbox"), `${text}{Enter}`);
 }

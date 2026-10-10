@@ -133,6 +133,6 @@ describe("ObjectSearch — focus", () => {
     expect(input?.body).toMatch(/box-shadow:\s*none/);
     const field = rules.find((r) => r.selector.includes(".search__field:focus-within"));
     expect(field?.body).toMatch(/border-color:\s*var\(--accent\)/);
-    expect(input?.selector).toContain(".ns-switcher__filter input:focus-visible");
+    expect(input?.selector).toContain(".picker__filter input:focus-visible");
   });
 });
