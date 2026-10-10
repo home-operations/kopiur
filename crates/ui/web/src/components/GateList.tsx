@@ -32,7 +32,7 @@ const GATE_COLUMNS: readonly ColumnSpec<GateColumn>[] = [
     min: 130,
     className: "mono gate-list__status",
   },
-  { id: "reason", label: "Reason", width: "auto", min: 180, className: "mono" },
+  { id: "reason", label: "Reason", width: 300, min: 180, className: "mono" },
   { id: "appliesTo", label: "Applies to", width: 260, min: 150 },
 ];
 

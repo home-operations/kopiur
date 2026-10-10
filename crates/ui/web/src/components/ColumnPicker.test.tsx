@@ -7,7 +7,7 @@ import { COLUMNS_KEY, forgetColumnPrefs, setHidden, tablePrefs } from "./columnP
 import type { ColumnSpec } from "./tableColumns";
 
 const COLUMNS: readonly ColumnSpec[] = [
-  { id: "name", label: "Snapshot", width: "auto", min: 200, locked: true },
+  { id: "name", label: "Snapshot", width: 260, min: 200, locked: true },
   { id: "phase", label: "Phase", width: 130, min: 90 },
   { id: "origin", label: "Origin", width: 120, min: 80 },
   { id: "size", label: "Size", width: 100, min: 70 },
@@ -239,7 +239,7 @@ describe("ColumnPicker", () => {
   });
 
   it("is not offered when nothing about the table can change", () => {
-    mount([{ id: "name", label: "Name", width: "auto", min: 100, locked: true }]);
+    mount([{ id: "name", label: "Name", width: 260, min: 100, locked: true }]);
     expect(screen.queryByRole("button", { name: /^Columns/ })).toBeNull();
   });
 });

@@ -37,7 +37,7 @@ type PolicyColumn =
   | "snapshots";
 
 const POLICY_COLUMNS: readonly ColumnSpec<PolicyColumn>[] = [
-  { id: "policy", label: "Policy", width: "auto", min: 220, locked: true, stripe: true },
+  { id: "policy", label: "Policy", width: 300, min: 220, locked: true, stripe: true },
   { id: "writesInto", label: "Writes into", width: 260, min: 220 },
   { id: "state", label: "State", width: 140, min: 140 },
   { id: "lastSnapshot", label: "Last snapshot", width: 180, min: 180 },

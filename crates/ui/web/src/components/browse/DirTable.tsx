@@ -37,7 +37,7 @@ export interface DirTableProps {
 type DirColumn = "entry" | "kind" | "size" | "modified" | "mode" | "file";
 
 const DIR_COLUMNS: readonly ColumnSpec<DirColumn>[] = [
-  { id: "entry", label: "Entry", width: "auto", min: 240, locked: true },
+  { id: "entry", label: "Entry", width: 360, min: 240, locked: true },
   { id: "kind", label: "Kind", width: 110, min: 70 },
   { id: "size", label: "Size", width: 110, min: 96, numeric: true },
   { id: "modified", label: "Modified", width: 200, min: 110 },

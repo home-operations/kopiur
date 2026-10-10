@@ -90,7 +90,7 @@ const DOCTOR_COLUMNS: readonly ColumnSpec<DoctorColumn>[] = [
   { id: "outcome", label: "Outcome", width: 130, min: 130, locked: true },
   { id: "check", label: "Check", width: 240, min: 140, locked: true },
   { id: "scope", label: "Scope", width: 200, min: 160, className: "doctor-checks__scope" },
-  { id: "finding", label: "Finding", width: "auto", min: 260 },
+  { id: "finding", label: "Finding", width: 400, min: 260 },
 ];
 
 export function DoctorChecks({ checks, namespace }: DoctorChecksProps) {

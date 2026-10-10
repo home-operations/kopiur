@@ -28,8 +28,10 @@ export interface ColumnLedgerProps<Row, Id extends string> {
  * layout remembered per table, per browser (`columnPrefs.ts`).
  *
  * The table is laid out fixed: the `colgroup` says how wide each column is,
- * the flexible one takes what is left, and when the columns add up to more
- * than the card the table scrolls inside it rather than squeezing them. Text
+ * the last one takes what is left, and when the columns add up to more than
+ * the card the table scrolls inside it rather than squeezing them. Dragging a
+ * column's edge changes that column and nothing else; the ones after it move
+ * along, and the last gives or takes the difference. Text
  * in a cell still wraps (names break at `/` and `-`); nothing is cut off.
  */
 export function ColumnLedger<Row, Id extends string>({
@@ -47,10 +49,6 @@ export function ColumnLedger<Row, Id extends string>({
   const [card, setCard] = useState<HTMLDivElement | null>(null);
   const widths = fitWidths(visible, prefs, useCardWidth(card));
   const floor = tableMinWidth(visible, widths);
-  // Fixed layout spreads any room the columns leave over across all of them,
-  // so a column would stop following its handle. With a flexible column that
-  // column takes it; with none, the table is exactly as wide as its columns.
-  const flexible = widths.some((w) => w === null);
   const classes = ["ledger", "ledger--fixed", className].filter(Boolean).join(" ");
   return (
     <div className="ledger-frame">
@@ -61,19 +59,18 @@ export function ColumnLedger<Row, Id extends string>({
         <table
           className={classes}
           aria-label={label}
-          style={
-            flexible
-              ? { width: "100%", minWidth: `${String(floor)}px` }
-              : { width: `${String(floor)}px` }
-          }
+          style={{ width: "100%", minWidth: `${String(floor)}px` }}
         >
           <colgroup>
             {visible.map((spec, i) => {
-              const width = widths[i] ?? null;
+              // The last column has no width of its own: it takes the room
+              // the others leave, so the table always meets the card's edge
+              // and a drag never pulls on a column it was not made on.
+              const last = i === visible.length - 1;
               return (
                 <col
                   key={spec.id}
-                  style={width === null ? undefined : { width: `${String(width)}px` }}
+                  style={last ? undefined : { width: `${String(widths[i] ?? spec.width)}px` }}
                 />
               );
             })}
@@ -81,7 +78,13 @@ export function ColumnLedger<Row, Id extends string>({
           <thead>
             <tr>
               {visible.map((spec, i) => (
-                <ColumnHeader key={spec.id} table={id} spec={spec} width={widths[i] ?? null} />
+                <ColumnHeader
+                  key={spec.id}
+                  table={id}
+                  spec={spec}
+                  width={widths[i] ?? spec.width}
+                  last={i === visible.length - 1}
+                />
               ))}
             </tr>
           </thead>

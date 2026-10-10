@@ -586,7 +586,7 @@ and draws each cell from a `switch` over its column-id union ending in
 
 ```ts
 const SNAPSHOT_COLUMNS: readonly ColumnSpec<SnapshotColumn>[] = [
-  { id: "snapshot", label: "Snapshot", width: "auto", min: 200, locked: true, stripe: true },
+  { id: "snapshot", label: "Snapshot", width: 240, min: 200, locked: true, stripe: true },
   { id: "phase", label: "Phase", width: 130, min: 90 },
   { id: "size", label: "Size", width: 90, min: 70, numeric: true },
   // …
@@ -597,21 +597,23 @@ const SNAPSHOT_COLUMNS: readonly ColumnSpec<SnapshotColumn>[] = [
   the chip and the `row-link`, so it can never be hidden or moved off the left
   edge. A column of buttons (Run, Action, File) is locked at the right and not
   resizable.
-- **One `"auto"` column** takes the room left over, usually the identity column or
-  the prose one (Finding, Reason). Every other column has a default width in px.
+- **The last visible column takes the room left over** and has no resize
+  handle — its right edge is the table's. Every other column has a width in px
+  (declared, or dragged). A drag changes that one column; the columns after
+  it move along and the last gives or takes the difference, so a handle always
+  follows the pointer and never pulls on a neighbour.
 - **`min` is what the column holds**, not just the header word: a reference
   column's floor fits the widest kind name it can show (`CLUSTERREPOSITORY`), so
   a reference never wraps inside its chip, a status column fits its widest
   pill, and a "never …" absence fits on one line. The defaults of a table add
   up to less than a 1600px window with the sidebar.
-- **Layout is fixed** (`.ledger--fixed`, widths in a `colgroup`), so the browser
-  stops guessing from content. The columns nobody resized give up their slack
-  evenly, toward their floors, as the card narrows (`fitWidths`); only past the
-  floors does the table scroll inside its card. Once no visible column is
-  flexible (the `auto` one was resized or hidden), the table is exactly as wide
-  as its columns, so the leftover room is not spread across them and a column
-  keeps following its handle. Only a header word too long for a narrowed
-  column is cut, with the full word in its title.
+- **Layout is fixed** (`.ledger--fixed`, widths in a `colgroup`, none on the
+  last column). Columns nobody resized give up their slack evenly, toward
+  their floors, as the card narrows (`fitWidths`) — worked out from the card's
+  width and the declared widths only, never from what was dragged, so resizing
+  one column cannot move another. Past the floors the table scrolls inside its
+  card. Only a header word too long for a narrowed column is cut, with the
+  full word in its title.
 - **Resize** is a focusable `role="separator"` on the header's right edge
   (`.ledger__resize`, a hairline that turns accent when held or focused), like
   the drawer grip and the split gutter: drag it, or arrow keys ±16px; Home or a

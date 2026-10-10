@@ -57,7 +57,7 @@ type MaintenanceColumn =
   | "action";
 
 const MAINTENANCE_COLUMNS: readonly ColumnSpec<MaintenanceColumn>[] = [
-  { id: "maintenance", label: "Maintenance", width: "auto", min: 220, locked: true, stripe: true },
+  { id: "maintenance", label: "Maintenance", width: 240, min: 220, locked: true, stripe: true },
   { id: "repository", label: "Repository", width: 220, min: 210 },
   { id: "quickLast", label: "Quick last run", width: 140, min: 140 },
   { id: "quickNext", label: "Quick next run", width: 140, min: 140, defaultHidden: true },

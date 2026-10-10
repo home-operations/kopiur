@@ -30,7 +30,7 @@ export interface RestoreTableProps {
 type RestoreColumn = "restore" | "phase" | "route" | "repository" | "restored" | "started";
 
 const RESTORE_COLUMNS: readonly ColumnSpec<RestoreColumn>[] = [
-  { id: "restore", label: "Restore", width: "auto", min: 220, locked: true, stripe: true },
+  { id: "restore", label: "Restore", width: 300, min: 220, locked: true, stripe: true },
   { id: "phase", label: "Phase", width: 140, min: 130 },
   { id: "route", label: "Reads → writes", width: 220, min: 140 },
   { id: "repository", label: "Repository", width: 240, min: 220 },

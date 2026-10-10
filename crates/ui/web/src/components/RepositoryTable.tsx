@@ -51,7 +51,7 @@ type RepositoryColumn =
   | "lastObserved";
 
 const REPOSITORY_COLUMNS: readonly ColumnSpec<RepositoryColumn>[] = [
-  { id: "repository", label: "Repository", width: "auto", min: 240, locked: true, stripe: true },
+  { id: "repository", label: "Repository", width: 240, min: 240, locked: true, stripe: true },
   { id: "health", label: "Health", width: 130, min: 130 },
   { id: "phase", label: "Phase", width: 120, min: 80 },
   { id: "access", label: "Access", width: 180, min: 150 },

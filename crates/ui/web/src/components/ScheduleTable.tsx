@@ -33,7 +33,7 @@ export interface ScheduleTableProps {
 type ScheduleColumn = "schedule" | "cron" | "fires" | "state" | "lastFire" | "nextFire" | "action";
 
 const SCHEDULE_COLUMNS: readonly ColumnSpec<ScheduleColumn>[] = [
-  { id: "schedule", label: "Schedule", width: "auto", min: 220, locked: true, stripe: true },
+  { id: "schedule", label: "Schedule", width: 240, min: 220, locked: true, stripe: true },
   { id: "cron", label: "Cron", width: 200, min: 200, className: "mono schedule-table__cron" },
   { id: "fires", label: "Fires", width: 220, min: 160 },
   { id: "state", label: "State", width: 150, min: 140 },

@@ -17,7 +17,7 @@ import {
 } from "./tableColumns";
 
 const SPECS: ColumnSpec[] = [
-  { id: "name", label: "Snapshot", width: "auto", min: 200, locked: true },
+  { id: "name", label: "Snapshot", width: 260, min: 200, locked: true },
   { id: "phase", label: "Phase", width: 130, min: 90 },
   { id: "origin", label: "Origin", width: 120, min: 80 },
   { id: "size", label: "Size", width: 100, min: 70, numeric: true },
@@ -145,20 +145,20 @@ describe("column width", () => {
     expect(clampWidth(phase, Number.NaN)).toBe(90);
   });
 
-  it("is the stored width, else the declared one, else none for the flexible column", () => {
+  it("is the stored width, else the declared one", () => {
     expect(columnWidth(phase, {})).toBe(130);
     expect(columnWidth(phase, { width: { phase: 200 } })).toBe(200);
     expect(columnWidth(phase, { width: { phase: 5 } })).toBe(90);
-    expect(columnWidth(name, {})).toBeNull();
+    expect(columnWidth(name, {})).toBe(260);
     expect(columnWidth(name, { width: { name: 320 } })).toBe(320);
   });
 
-  it("adds the visible columns up, so a wide layout scrolls instead of squeezing", () => {
+  it("adds the columns up, the last at its floor, so a wide layout scrolls instead of squeezing", () => {
     const visible = visibleColumns(SPECS, {});
-    // name (floor 200) + phase 130 + origin 120 + size 100 + run 90
-    expect(tableMinWidth(visible, fitWidths(visible, {}, null))).toBe(640);
+    // name 260 + phase 130 + origin 120 + size 100, and run (last) at its floor 90.
+    expect(tableMinWidth(visible, fitWidths(visible, {}, null))).toBe(700);
     const wider = { width: { origin: 300 } };
-    expect(tableMinWidth(visible, fitWidths(visible, wider, null))).toBe(820);
+    expect(tableMinWidth(visible, fitWidths(visible, wider, null))).toBe(880);
   });
 });
 
@@ -191,21 +191,23 @@ describe("stored preferences", () => {
 
 describe("fitting the columns to the card", () => {
   const visible = visibleColumns(SPECS, {});
-  // name (flexible, floor 200), phase 130/90, origin 120/80, size 100/70, run 90/90
+  // name 260/200, phase 130/90, origin 120/80, size 100/70, run 90/90:
+  // declared 700, floors 530.
 
   it("draws the declared widths when there is room, or when the room is not known", () => {
-    expect(fitWidths(visible, {}, 2000)).toEqual([null, 130, 120, 100, 90]);
-    expect(fitWidths(visible, {}, null)).toEqual([null, 130, 120, 100, 90]);
+    expect(fitWidths(visible, {}, 2000)).toEqual([260, 130, 120, 100, 90]);
+    expect(fitWidths(visible, {}, null)).toEqual([260, 130, 120, 100, 90]);
   });
 
   it("shrinks the columns nobody sized toward their floors before the table scrolls", () => {
-    // Declared: 200 + 130 + 120 + 100 + 90 = 640; floors: 200 + 90 + 80 + 70 + 90 = 530.
-    // 585 is halfway between, so every column gives up half of its slack.
-    expect(fitWidths(visible, {}, 585)).toEqual([null, 110, 100, 85, 90]);
-    expect(fitWidths(visible, {}, 400)).toEqual([null, 90, 80, 70, 90]);
+    // 615 is halfway between floors and declared: each gives up half its slack.
+    expect(fitWidths(visible, {}, 615)).toEqual([230, 110, 100, 85, 90]);
+    expect(fitWidths(visible, {}, 400)).toEqual([200, 90, 80, 70, 90]);
   });
 
-  it("never shrinks a width someone chose", () => {
-    expect(fitWidths(visible, { width: { origin: 300 } }, 600)).toEqual([null, 90, 300, 70, 90]);
+  it("never moves one column because another was sized", () => {
+    // Origin was dragged; every other column is drawn exactly as before.
+    expect(fitWidths(visible, { width: { origin: 300 } }, 615)).toEqual([230, 110, 300, 85, 90]);
+    expect(fitWidths(visible, { width: { origin: 90 } }, 615)).toEqual([230, 110, 90, 85, 90]);
   });
 });

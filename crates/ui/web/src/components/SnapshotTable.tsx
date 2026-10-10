@@ -57,7 +57,7 @@ type SnapshotColumn =
   | "took";
 
 const SNAPSHOT_COLUMNS: readonly ColumnSpec<SnapshotColumn>[] = [
-  { id: "snapshot", label: "Snapshot", width: "auto", min: 200, locked: true, stripe: true },
+  { id: "snapshot", label: "Snapshot", width: 240, min: 200, locked: true, stripe: true },
   { id: "phase", label: "Phase", width: 130, min: 130 },
   { id: "origin", label: "Origin", width: 110, min: 80 },
   { id: "policy", label: "Policy", width: 210, min: 200 },

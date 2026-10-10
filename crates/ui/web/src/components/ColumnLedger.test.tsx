@@ -10,7 +10,7 @@ import type { ColumnSpec } from "./tableColumns";
 type Id = "name" | "phase" | "size" | "run";
 
 const COLUMNS: readonly ColumnSpec<Id>[] = [
-  { id: "name", label: "Snapshot", width: "auto", min: 200, locked: true, stripe: true },
+  { id: "name", label: "Snapshot", width: 260, min: 200, locked: true, stripe: true },
   { id: "phase", label: "Phase", width: 130, min: 90 },
   { id: "size", label: "Size", width: 100, min: 70, numeric: true },
   { id: "run", label: "Run", width: 90, min: 90, locked: true, resizable: false },
@@ -40,13 +40,13 @@ function cell(row: Row, id: Id) {
   }
 }
 
-function mount() {
+function mount(columns: readonly ColumnSpec<Id>[] = COLUMNS) {
   render(
     <ColumnLedger
       id="test"
       label="Test table"
       className="test-table"
-      columns={COLUMNS}
+      columns={columns}
       rows={ROWS}
       rowKey={(r) => r.name}
       rowProps={() => ({ "data-kind": "snapshot" })}
@@ -86,12 +86,32 @@ describe("ColumnLedger", () => {
     expect(menu.compareDocumentPosition(table) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });
 
-  it("sizes each column through a colgroup, leaving the flexible one free", () => {
+  it("sizes every column through a colgroup but the last, which takes the room left", () => {
     const table = mount();
     const cols = Array.from(table.querySelectorAll<HTMLElement>("colgroup col"));
-    expect(cols.map((c) => c.style.width)).toEqual(["", "130px", "100px", "90px"]);
-    // Every column at its width, the flexible one at its floor: 200 + 130 + 100 + 90.
-    expect(table.style.minWidth).toBe("520px");
+    expect(cols.map((c) => c.style.width)).toEqual(["260px", "130px", "100px", ""]);
+    // Every column at its width, the last at its floor: 260 + 130 + 100 + 90.
+    expect(table.style.minWidth).toBe("580px");
+    expect(table.style.width).toBe("100%");
+  });
+
+  it("has no handle on the last column, whose right edge is the table's", () => {
+    mount(COLUMNS.slice(0, 3));
+    expect(screen.getByRole("separator", { name: "Resize Phase" })).toBeInTheDocument();
+    expect(screen.queryByRole("separator", { name: "Resize Size" })).toBeNull();
+  });
+
+  it("changes only the column being resized", async () => {
+    const table = mount();
+    const widths = () =>
+      Array.from(table.querySelectorAll<HTMLElement>("colgroup col")).map((c) => c.style.width);
+    const user = userEvent.setup();
+    screen.getByRole("separator", { name: "Resize Phase" }).focus();
+    await user.keyboard("{ArrowRight}{ArrowRight}{ArrowRight}");
+    expect(widths()).toEqual(["260px", "178px", "100px", ""]);
+    screen.getByRole("separator", { name: "Resize Snapshot" }).focus();
+    await user.keyboard("{ArrowLeft}");
+    expect(widths()).toEqual(["244px", "178px", "100px", ""]);
   });
 
   it("drops a hidden column from the header and every row together", () => {
@@ -159,20 +179,6 @@ describe("ColumnLedger", () => {
     expect(stored()).toEqual({});
     fireEvent.pointerUp(handle, { clientX: 360, pointerId: 1 });
     expect(stored()).toEqual({ test: { width: { phase: 190 } } });
-  });
-
-  it("keeps to its columns' widths once none of them is flexible, rather than stretching them", () => {
-    window.localStorage.setItem(COLUMNS_KEY, JSON.stringify({ test: { width: { name: 260 } } }));
-    forgetColumnPrefs();
-    const table = mount();
-    // 260 + 130 + 100 + 90: the card's spare room stays empty.
-    expect(table.style.width).toBe("580px");
-    window.localStorage.clear();
-    forgetColumnPrefs();
-  });
-
-  it("fills the card while a column is flexible", () => {
-    expect(mount().style.width).toBe("100%");
   });
 
   it("opens with the widths it was left at", () => {

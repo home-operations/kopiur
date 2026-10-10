@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef } from "react";
 
 import { commitWidths, resetWidth, setWidth } from "./columnPrefs";
 import { COLUMN_STEP, type ColumnSpec, MAX_COLUMN_WIDTH, clampWidth } from "./tableColumns";
@@ -12,36 +12,29 @@ import { COLUMN_STEP, type ColumnSpec, MAX_COLUMN_WIDTH, clampWidth } from "./ta
  * it started (the width then plus how far the pointer has gone), so a column
  * never creeps; the width is stored when the drag ends, and on each key.
  *
- * The flexible column has no width of its own until someone drags it, so a
- * drag starts from the width it is drawn at.
+ * The last column has no handle: its right edge is the table's, and it takes
+ * whatever room the others leave.
  */
 export function ColumnHeader({
   table,
   spec,
-  width: fitted,
+  width,
+  last = false,
 }: {
   table: string;
   spec: ColumnSpec;
-  /** What the table draws it at; `null` for the flexible column left alone. */
-  width: number | null;
+  /** What the table draws it at. */
+  width: number;
+  /** The last column on screen, which takes the room left and has no handle. */
+  last?: boolean;
 }) {
   const header = useRef<HTMLTableCellElement | null>(null);
   const handle = useRef<HTMLDivElement | null>(null);
-  const [drawn, setDrawn] = useState<number | null>(null);
-  const width = fitted ?? drawn ?? spec.min;
   const widthRef = useRef(width);
   useLayoutEffect(() => {
     widthRef.current = width;
   }, [width]);
-  const resizable = spec.resizable !== false;
-
-  // The flexible column's drawn width, so the handle can say what it is.
-  useLayoutEffect(() => {
-    const node = header.current;
-    if (node === null || fitted !== null) return;
-    const measured = Math.round(node.getBoundingClientRect().width);
-    if (measured > 0 && measured !== drawn) setDrawn(measured);
-  }, [fitted, drawn]);
+  const resizable = spec.resizable !== false && !last;
 
   useEffect(() => {
     const node = handle.current;
