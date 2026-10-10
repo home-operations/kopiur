@@ -4,6 +4,7 @@ import { usePolicies, useRepositories } from "../api/hooks";
 import { useCurrentNamespace } from "../util/namespace";
 import { KindChip } from "./KindMark";
 import { useNamespaceOptions } from "./namespaceOptions";
+import { repositoryKey } from "./pickerChoices";
 import { PickerField } from "./PickerField";
 import type { PickerOption } from "./PickerOptions";
 
@@ -21,9 +22,7 @@ function useOpened(): [boolean, () => void] {
 interface FieldProps {
   id: string;
   label: string;
-  value: string;
-  onChange: (value: string) => void;
-  /** What leaving it empty means. */
+  /** What choosing nothing means; the list then has a Clear button. */
   emptyLabel: string;
   hint?: string | undefined;
   strategy?: "absolute" | "fixed" | undefined;
@@ -34,47 +33,35 @@ interface FieldProps {
  * cannot list can still be typed into the filter and taken as it is.
  */
 export function NamespaceField({
-  id,
-  label,
   value,
   onChange,
-  emptyLabel,
-  hint,
-  strategy,
-}: FieldProps) {
+  ...field
+}: FieldProps & { value: string; onChange: (value: string) => void }) {
   const [opened, onOpen] = useOpened();
   const { options } = useNamespaceOptions(opened);
   return (
     <PickerField
-      id={id}
-      label={label}
+      {...field}
       value={value}
       onChange={onChange}
       options={options}
-      emptyLabel={emptyLabel}
-      emptyInitial="*"
       search="namespaces"
       freeform
       onOpen={onOpen}
-      hint={hint}
-      strategy={strategy}
     />
   );
 }
 
 /**
- * A `SnapshotPolicy` by name, picked from the policies in the shell's scope.
- * One name may exist in several namespaces; it is listed once, with where.
+ * `SnapshotPolicy` names, any number, picked from the policies in the shell's
+ * scope. One name may exist in several namespaces; it is listed once, with
+ * where.
  */
 export function PolicyField({
-  id,
-  label,
   value,
   onChange,
-  emptyLabel,
-  hint,
-  strategy,
-}: FieldProps) {
+  ...field
+}: FieldProps & { value: readonly string[]; onChange: (value: string[]) => void }) {
   const [opened, onOpen] = useOpened();
   const policies = usePolicies(useCurrentNamespace(), { enabled: opened });
   const where = new Map<string, string[]>();
@@ -89,91 +76,53 @@ export function PolicyField({
   }));
   return (
     <PickerField
-      id={id}
-      label={label}
+      {...field}
+      multiple
       value={value}
       onChange={onChange}
       options={options}
-      emptyLabel={emptyLabel}
       search="policies"
       freeform
       onOpen={onOpen}
-      hint={hint}
-      strategy={strategy}
     />
   );
 }
 
-/** A repository as a snapshot filter names it: its name, kind and namespace. */
-export interface RepositoryChoice {
-  name: string;
-  /** `repository` / `cluster-repository`, or `""` for not said. */
-  kind: string;
-  /** `""` for not said (and always for a ClusterRepository). */
-  namespace: string;
-}
-
-const KEY_SEP = "\u0000";
-
-function repositoryKey(kind: string, namespace: string, name: string): string {
-  return [kind, namespace, name].join(KEY_SEP);
-}
-
 /**
- * A repository, picked from the ones in the shell's scope — namespaced and
- * cluster-scoped together. Picking one sets
- * its kind and namespace too, since a name alone may be ambiguous; a typed
- * name sets the name only.
+ * Repositories, any number, picked from the ones in the shell's scope —
+ * namespaced and cluster-scoped together, each with its kind chip. A choice
+ * is the repository's qualified key, which carries its kind and namespace, so
+ * two repositories with one name are never confused; a typed name is sent
+ * bare and located in the listing's namespace.
  */
 export function RepositoryField({
-  id,
-  label,
   value,
   onChange,
-  emptyLabel,
-  hint,
-  strategy,
-}: Omit<FieldProps, "value" | "onChange"> & {
-  value: RepositoryChoice;
-  onChange: (value: RepositoryChoice) => void;
-}) {
+  ...field
+}: FieldProps & { value: readonly string[]; onChange: (value: string[]) => void }) {
   const [opened, onOpen] = useOpened();
   const repositories = useRepositories(useCurrentNamespace(), { enabled: opened });
-  // Every kind is listed, even when one is chosen: picking sets the kind, so
-  // narrowing to it would leave no way back to the other.
-  const listed = repositories.isSuccess ? repositories.data : [];
-  const options: PickerOption[] = listed.map((repo) => {
+  const options: PickerOption[] = (repositories.isSuccess ? repositories.data : []).map((repo) => {
     const cluster = repo.kindPath === "cluster-repository";
     return {
-      value: repositoryKey(repo.kindPath, cluster ? "" : (repo.namespace ?? ""), repo.name),
+      value: repositoryKey(repo.kindPath, repo.namespace, repo.name),
       label: repo.name,
       icon: <KindChip kind={cluster ? "clusterRepository" : "repository"} size="sm" />,
       meta: cluster ? "cluster" : (repo.namespace ?? undefined),
     };
   });
-  const exact = repositoryKey(value.kind, value.namespace, value.name);
-  const current = options.some((option) => option.value === exact) ? exact : value.name;
   return (
     <PickerField
-      id={id}
-      label={label}
-      value={current}
-      valueLabel={value.name}
-      onChange={(next, option) => {
-        if (option === undefined) {
-          onChange({ ...value, name: next });
-          return;
-        }
-        const [kind = "", namespace = "", name = ""] = option.value.split(KEY_SEP);
-        onChange({ kind, namespace, name });
-      }}
+      {...field}
+      multiple
+      value={value}
+      onChange={onChange}
       options={options}
-      emptyLabel={emptyLabel}
       search="repositories"
       freeform
+      // Before the list is fetched, a key still reads as the name.
+      labelFor={(key) => key.split("/").at(-1) ?? key}
       onOpen={onOpen}
-      hint={hint}
-      strategy={strategy}
     />
   );
 }

@@ -99,43 +99,75 @@ describe("Snapshots list", () => {
     }
   });
 
-  it("picks the repository namespace from the namespace list, keeps the shell's scope, and has no namespace field of its own", async () => {
+  it("takes several values per filter, comma-separated, with no kind or namespace field beside the repository", async () => {
     mockApi({
       "/api/v1/snapshots": jsonResponse(page([row()])),
-      "/api/v1/namespaces": jsonResponse([{ name: "infra", objects: 4 }]),
+      "/api/v1/repositories": jsonResponse([
+        {
+          kind: "Repository",
+          kindPath: "repository",
+          name: "nas",
+          namespace: "media",
+          health: "healthy",
+          mode: "direct",
+          serverBacked: false,
+          suspended: false,
+        },
+        {
+          kind: "ClusterRepository",
+          kindPath: "cluster-repository",
+          name: "shared",
+          health: "healthy",
+          mode: "direct",
+          serverBacked: false,
+          suspended: false,
+        },
+      ]),
     });
     const { router } = mountApp("/snapshots?namespace=media");
     await list();
     const filters = screen.getByRole("form", { name: "Snapshot filters" });
-    // The scope is the sidebar's switcher; the bar does not repeat it.
+    expect(within(filters).queryByText("Repository kind")).toBeNull();
+    expect(within(filters).queryByText("Repository namespace")).toBeNull();
     expect(within(filters).queryByRole("button", { name: /^Namespace:/ })).toBeNull();
-    expect(within(filters).queryByText(/ignored for a ClusterRepository/)).toBeNull();
     const user = userEvent.setup();
-    await user.click(
-      within(filters).getByRole("button", {
-        name: "Repository namespace: the listing's namespace",
-      }),
-    );
-    const picker = screen.getByRole("dialog", { name: "Choose the repository namespace" });
-    await user.click(await within(picker).findByRole("button", { name: /^infra/ }));
+    await pickOption(user, "Phase", "Failed", filters);
+    await pickOption(user, "Phase", "Running", filters);
+    await pickOption(user, "Repository", "nas", filters);
+    await pickOption(user, "Repository", "shared", filters);
     await user.click(within(filters).getByRole("button", { name: /Apply filters/ }));
     expect(router.state.location.search).toMatchObject({
       namespace: "media",
-      repositoryNamespace: "infra",
+      phase: "failed,running",
+      repository: "Repository/media/nas,ClusterRepository/shared",
     });
+    expect(router.state.location.search).not.toHaveProperty("repositoryKind");
+    expect(snapshotRequest()).toContain(
+      `repository=${encodeURIComponent("Repository/media/nas,ClusterRepository/shared")}`,
+    );
   });
 
-  it("drops the repository namespace for a ClusterRepository, which has none", async () => {
+  it("reads an older single-repository link as one qualified choice", async () => {
     mockApi({ "/api/v1/snapshots": jsonResponse(page([row()])) });
-    const { router } = mountApp("/snapshots?repositoryNamespace=infra");
+    const { router } = mountApp(
+      "/snapshots?repository=nas&repositoryKind=repository&repositoryNamespace=infra",
+    );
     await list();
     const filters = screen.getByRole("form", { name: "Snapshot filters" });
+    expect(within(filters).getByRole("button", { name: "Repository: nas" })).toBeInTheDocument();
     const user = userEvent.setup();
-    await pickOption(user, "Repository kind", "ClusterRepository", filters);
-    expect(within(filters).queryByRole("button", { name: /^Repository namespace/ })).toBeNull();
     await user.click(within(filters).getByRole("button", { name: /Apply filters/ }));
-    expect(router.state.location.search).toMatchObject({ repositoryKind: "cluster-repository" });
+    expect(router.state.location.search).toMatchObject({ repository: "Repository/infra/nas" });
     expect(router.state.location.search).not.toHaveProperty("repositoryNamespace");
+  });
+
+  it("sends the values of a list the server accepts and names the one it would refuse", async () => {
+    mockApi({ "/api/v1/snapshots": jsonResponse(page([row()])) });
+    mountApp("/snapshots?phase=failed,bogus");
+    await list();
+    expect(snapshotRequest()).toContain("phase=failed");
+    expect(snapshotRequest()).not.toContain("bogus");
+    expect(screen.getAllByText(/bogus/).length).toBeGreaterThan(0);
   });
 
   it("round-trips a filter through the address bar when the form is submitted", async () => {

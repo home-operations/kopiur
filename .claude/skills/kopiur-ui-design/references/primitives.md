@@ -682,34 +682,44 @@ value in mono, the empty meaning muted, a chevron) that opens a popover onto
 <PickerField
   id="snapshots-phase"
   label="Phase"
-  value={phase}
-  onChange={setPhase}
+  multiple
+  value={phases}
+  onChange={setPhases}
   options={PHASE_FILTERS}
   emptyLabel="any phase"
 />
 ```
 
+- **Choosing nothing is a Clear button**, at the top right of the list (beside
+  the filter field, or beside "2 chosen"). There is no "any" row. A field
+  without `emptyLabel` must hold a value and has no Clear. The one exception is
+  the namespace switcher, whose "all namespaces" row is a scope with its own
+  count.
+- **`multiple`**: every filter. A pick toggles (`aria-pressed`), the list stays
+  open, and the button shows the first choice and "+N"; its accessible name
+  lists them all ("Phase: Failed, Running"). Clear empties every value and keeps
+  the list open. A single field (a mode, a form's namespace) closes on a pick.
 - **With search** (`search="policies"`): a filter field over the list, for
-  lists that grow. `components/ResourceFields.tsx` wraps it for the three
-  object lists: `NamespaceField` (the switcher's list, avatars and counts),
-  `PolicyField` (one row per name, the namespaces that have it), and
-  `RepositoryField` (both kinds with their kind chips; picking one sets the
-  name, kind and namespace together). Each fetches its list only once opened.
-  `freeform` lets what is typed be taken when nothing listed matches
-  ("not listed"), since a field may name something the caller cannot list.
-- **Without search**: the same dropdown for a short fixed list (a mode, a
-  phase, an origin). Focus opens on the current choice.
-- Its accessible name says the value: "Phase: Failed". Arrow keys walk the
-  choices; Enter in the filter takes the one match (or the typed text) and
-  never submits the surrounding form. `emptyLabel` adds the empty choice first;
-  a field without it always holds a value.
+  lists that grow. `components/ResourceFields.tsx` wraps the object lists:
+  `NamespaceField` (single, the switcher's list), `PolicyField` (multiple, one
+  row per name with the namespaces that have it) and `RepositoryField`
+  (multiple, both kinds with their kind chips). A repository is chosen by its
+  qualified key, `Repository/<ns>/<name>` or `ClusterRepository/<name>`, the
+  form rows display, so it carries its kind and namespace and no separate kind
+  or namespace field is needed. Each fetches its list only once opened.
+  `freeform` lets what is typed be taken when nothing listed matches ("not
+  listed"); a chosen value that is not listed still shows, so it can be unticked.
+- **Without search**: the same dropdown for a short fixed list. Focus opens on
+  the current choice; arrow keys walk the choices; Enter in the filter takes the
+  one match (or the typed text) and never submits the surrounding form.
+- A list filter goes on the wire comma-separated and matches any of its values
+  (`?phase=failed,running`).
 - Inside another popover or a drawer foot, pass `strategy="fixed"` so the list
   is not clipped by the panel's own scroll.
 - A field that would repeat the shell's scope (`?namespace=`) is left out; the
-  switcher is that field. A field that does not apply (a ClusterRepository's
-  namespace) is hidden, not explained.
-- Tests pick with `pickOption(user, label, choiceLabel)` and type with
-  `typeOption(user, label, text)` from `test-utils`.
+  switcher is that field.
+- Tests pick with `pickOption(user, label, choiceLabel)` (an open multiple list
+  is reused) and type with `typeOption(user, label, text)` from `test-utils`.
 
 ---
 

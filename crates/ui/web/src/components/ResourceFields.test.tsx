@@ -4,12 +4,7 @@ import { useState } from "react";
 import { describe, expect, it, vi } from "vitest";
 
 import { jsonResponse, mockApi, renderWithClient } from "../test-utils";
-import {
-  NamespaceField,
-  PolicyField,
-  RepositoryField,
-  type RepositoryChoice,
-} from "./ResourceFields";
+import { NamespaceField, PolicyField, RepositoryField } from "./ResourceFields";
 
 const NAMESPACES = jsonResponse([
   { name: "billing", objects: 3 },
@@ -62,11 +57,11 @@ describe("NamespaceField", () => {
     const button = screen.getByRole("button", { name: "Namespace: media" });
     expect(button).toHaveFocus();
 
-    // The empty choice clears it.
+    // Clear empties it; there is no "all namespaces" row to pick.
     await user.click(button);
-    await user.click(
-      within(screen.getByRole("dialog")).getByRole("button", { name: /^all namespaces/ }),
-    );
+    const again = screen.getByRole("dialog");
+    expect(within(again).queryByRole("button", { name: /^all namespaces/ })).toBeNull();
+    await user.click(within(again).getByRole("button", { name: "Clear" }));
     expect(screen.getByLabelText("value")).toBeEmptyDOMElement();
   });
 
@@ -98,7 +93,7 @@ describe("NamespaceField", () => {
 });
 
 describe("PolicyField", () => {
-  it("lists each policy name once, with the namespaces that have it", async () => {
+  it("lists each policy name once, with the namespaces that have it, and takes several", async () => {
     mockApi({
       "/api/v1/policies": jsonResponse([
         {
@@ -125,7 +120,7 @@ describe("PolicyField", () => {
       ]),
     });
     function Policy() {
-      const [value, setValue] = useState("");
+      const [value, setValue] = useState<string[]>([]);
       return (
         <PolicyField
           id="p"
@@ -144,7 +139,8 @@ describe("PolicyField", () => {
     expect(nightly).toHaveTextContent("media, infra");
     expect(within(panel).getAllByRole("button", { name: /^nightly/ })).toHaveLength(1);
     await user.click(nightly);
-    expect(screen.getByRole("button", { name: "Policy: nightly" })).toBeInTheDocument();
+    await user.click(within(panel).getByRole("button", { name: /^hourly/ }));
+    expect(screen.getByRole("button", { name: "Policy: nightly, hourly" })).toBeInTheDocument();
   });
 });
 
@@ -171,8 +167,8 @@ describe("RepositoryField", () => {
     },
   ]);
 
-  function Repo() {
-    const [value, setValue] = useState<RepositoryChoice>({ name: "", kind: "", namespace: "" });
+  function Repo({ initial = [] }: { initial?: string[] }) {
+    const [value, setValue] = useState(initial);
     return (
       <>
         <RepositoryField
@@ -182,31 +178,28 @@ describe("RepositoryField", () => {
           onChange={setValue}
           emptyLabel="any repository"
         />
-        <output aria-label="choice">{JSON.stringify(value)}</output>
+        <output aria-label="choice">{value.join(" | ")}</output>
       </>
     );
   }
 
-  it("sets the kind and namespace with the name, since a name alone may be ambiguous", async () => {
+  it("chooses each repository by the key that carries its kind and namespace", async () => {
     mockApi({ "/api/v1/repositories": REPOS });
     renderWithClient(<Repo />);
     const user = userEvent.setup();
     await user.click(await screen.findByRole("button", { name: "Repository: any repository" }));
     const panel = screen.getByRole("dialog");
     await user.click(await within(panel).findByRole("button", { name: /^shared/ }));
-    expect(JSON.parse(screen.getByLabelText("choice").textContent)).toEqual({
-      name: "shared",
-      kind: "cluster-repository",
-      namespace: "",
-    });
-    await user.click(screen.getByRole("button", { name: "Repository: shared" }));
-    await user.click(
-      await within(screen.getByRole("dialog")).findByRole("button", { name: /^nas/ }),
+    await user.click(within(panel).getByRole("button", { name: /^nas/ }));
+    expect(screen.getByLabelText("choice")).toHaveTextContent(
+      "ClusterRepository/shared | Repository/media/nas",
     );
-    expect(JSON.parse(screen.getByLabelText("choice").textContent)).toEqual({
-      name: "nas",
-      kind: "repository",
-      namespace: "media",
-    });
+    expect(screen.getByRole("button", { name: "Repository: shared, nas" })).toBeInTheDocument();
+  });
+
+  it("reads a chosen key as its name before the list is fetched", async () => {
+    mockApi({ "/api/v1/repositories": REPOS });
+    renderWithClient(<Repo initial={["Repository/media/nas"]} />);
+    expect(await screen.findByRole("button", { name: "Repository: nas" })).toBeInTheDocument();
   });
 });

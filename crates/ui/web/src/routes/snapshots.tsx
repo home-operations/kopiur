@@ -11,7 +11,8 @@ import { ErrorState } from "../components/ErrorState";
 import { Finding } from "../components/Finding";
 import { LoadingState } from "../components/LoadingState";
 import { PickerField } from "../components/PickerField";
-import { NamespaceField, PolicyField, RepositoryField } from "../components/ResourceFields";
+import { PolicyField, RepositoryField } from "../components/ResourceFields";
+import { repositoryKey } from "../components/pickerChoices";
 import { SnapshotTable } from "../components/SnapshotTable";
 import { healthLamp } from "../components/health";
 import {
@@ -76,6 +77,37 @@ function textParam(value: unknown): string | undefined {
     return text.length > 0 ? text : undefined;
   }
   return typeof value === "number" || typeof value === "boolean" ? String(value) : undefined;
+}
+
+/** A comma-separated list filter's values: trimmed, blanks dropped, each once. */
+function listParam(value: string | undefined): string[] {
+  return [
+    ...new Set(
+      (value ?? "")
+        .split(",")
+        .map((part) => part.trim())
+        .filter((part) => part.length > 0),
+    ),
+  ];
+}
+
+/**
+ * The repositories a URL names, as the filter's qualified keys. A bare name
+ * from an older link is qualified with its `repositoryKind` and
+ * `repositoryNamespace` (else the listing's namespace) where those say where
+ * it is; one they cannot place is kept bare, for the server to locate.
+ */
+function repositoryEntries(
+  search: Record<string, string | undefined>,
+  namespace: string | undefined,
+): string[] {
+  const cluster = search.repositoryKind === "cluster-repository";
+  const home = search.repositoryNamespace ?? namespace;
+  return listParam(search.repository).map((entry) => {
+    if (entry.includes("/")) return entry;
+    if (cluster) return repositoryKey("cluster-repository", undefined, entry);
+    return home === undefined ? entry : repositoryKey("repository", home, entry);
+  });
 }
 
 /** A non-negative whole number, or `undefined` for anything else. */
@@ -150,24 +182,26 @@ function Snapshots() {
   const limit = countParam(search.limit) ?? DEFAULT_LIMIT;
 
   const ignored: IgnoredFilter[] = [];
+  // Each value of a list is judged on its own: one the server would refuse is
+  // named and left out, and the rest are still sent.
   const usable = (key: "origin" | "phase" | "repositoryKind"): string | undefined => {
-    const value = asked[key];
-    if (value === undefined) {
-      return undefined;
-    }
     const accepts =
       key === "origin" ? isOriginFilter : key === "phase" ? isPhaseFilter : isKindFilter;
-    if (accepts(value)) {
-      return value;
-    }
     const vocabulary =
       key === "origin"
         ? ORIGIN_FILTERS.map((f) => f.value)
         : key === "phase"
           ? PHASE_FILTERS.map((f) => f.value)
           : KIND_FILTERS.map((f) => f.value);
-    ignored.push({ key, value, accepted: vocabulary.join(", ") });
-    return undefined;
+    const kept: string[] = [];
+    for (const value of listParam(asked[key])) {
+      if (accepts(value)) {
+        kept.push(value);
+      } else {
+        ignored.push({ key, value, accepted: vocabulary.join(", ") });
+      }
+    }
+    return kept.length > 0 ? kept.join(",") : undefined;
   };
 
   const params: SnapshotListParams = {
@@ -366,7 +400,12 @@ interface FiltersProps {
 }
 
 /**
- * The six filters, submitted into the URL beside the shell's namespace.
+ * The four filters, submitted into the URL beside the shell's namespace. Each
+ * takes any number of values (sent comma-separated, matching any of them);
+ * choosing none is the Clear button in its list.
+ *
+ * A repository is chosen with its kind and namespace in one key, so the bar
+ * has no separate kind or namespace field to keep in step with it.
  *
  * Submitting always resets `offset`: a page-3 window over the old filter is
  * meaningless under a new one, and leaving it would show an empty page that
@@ -374,33 +413,26 @@ interface FiltersProps {
  */
 function Filters({ search, namespace, limit }: FiltersProps) {
   const navigate = useNavigate();
-  const [repository, setRepository] = useState(search.repository ?? "");
-  const [repositoryKind, setRepositoryKind] = useState(search.repositoryKind ?? "");
-  const [repositoryNamespace, setRepositoryNamespace] = useState(search.repositoryNamespace ?? "");
-  const [policy, setPolicy] = useState(search.policy ?? "");
-  const [origin, setOrigin] = useState(search.origin ?? "");
-  const [phase, setPhase] = useState(search.phase ?? "");
+  const [repositories, setRepositories] = useState(() => repositoryEntries(search, namespace));
+  const [policies, setPolicies] = useState(() => listParam(search.policy));
+  const [origins, setOrigins] = useState(() => listParam(search.origin));
+  const [phases, setPhases] = useState(() => listParam(search.phase));
 
   const submit = (event: SubmitEvent<HTMLFormElement>) => {
     event.preventDefault();
     const next: Record<string, string | number> = {};
-    const put = (key: string, value: string) => {
-      const text = value.trim();
-      if (text.length > 0) {
-        next[key] = text;
+    const put = (key: string, values: readonly string[]) => {
+      if (values.length > 0) {
+        next[key] = values.join(",");
       }
     };
     // The namespace is the shell's scope, chosen in the sidebar's switcher;
     // the filters keep it.
-    put("namespace", namespace ?? "");
-    put("repository", repository);
-    put("repositoryKind", repositoryKind);
-    // A ClusterRepository has no namespace; the field is hidden for one, and
-    // a value left in it from before is not sent.
-    if (repositoryKind !== "cluster-repository") put("repositoryNamespace", repositoryNamespace);
-    put("policy", policy);
-    put("origin", origin);
-    put("phase", phase);
+    if (namespace !== undefined) next.namespace = namespace;
+    put("repository", repositories);
+    put("policy", policies);
+    put("origin", origins);
+    put("phase", phases);
     if (limit !== DEFAULT_LIMIT) {
       next.limit = limit;
     }
@@ -412,51 +444,32 @@ function Filters({ search, namespace, limit }: FiltersProps) {
       <PolicyField
         id="snapshots-policy"
         label="Policy"
-        value={policy}
-        onChange={setPolicy}
+        value={policies}
+        onChange={setPolicies}
         emptyLabel="any policy"
       />
       <RepositoryField
         id="snapshots-repository"
         label="Repository"
-        value={{ name: repository, kind: repositoryKind, namespace: repositoryNamespace }}
-        onChange={(choice) => {
-          setRepository(choice.name);
-          setRepositoryKind(choice.kind);
-          setRepositoryNamespace(choice.namespace);
-        }}
+        value={repositories}
+        onChange={setRepositories}
         emptyLabel="any repository"
       />
       <PickerField
-        id="snapshots-repository-kind"
-        label="Repository kind"
-        value={repositoryKind}
-        onChange={setRepositoryKind}
-        options={KIND_FILTERS}
-        emptyLabel="Repository (default)"
-      />
-      {repositoryKind === "cluster-repository" ? null : (
-        <NamespaceField
-          id="snapshots-repository-namespace"
-          label="Repository namespace"
-          value={repositoryNamespace}
-          onChange={setRepositoryNamespace}
-          emptyLabel="the listing's namespace"
-        />
-      )}
-      <PickerField
         id="snapshots-origin"
         label="Origin"
-        value={origin}
-        onChange={setOrigin}
+        multiple
+        value={origins}
+        onChange={setOrigins}
         options={ORIGIN_FILTERS}
         emptyLabel="any origin"
       />
       <PickerField
         id="snapshots-phase"
         label="Phase"
-        value={phase}
-        onChange={setPhase}
+        multiple
+        value={phases}
+        onChange={setPhases}
         options={PHASE_FILTERS}
         emptyLabel="any phase"
       />

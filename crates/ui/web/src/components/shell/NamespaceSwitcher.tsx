@@ -73,8 +73,13 @@ export function NamespaceSwitcher() {
         {(close) => (
           <PickerOptions
             options={options}
-            current={current}
+            selected={current === undefined ? [] : [current]}
             empty={{ label: "all namespaces", meta: total, initial: "*" }}
+            emptyChosen={current === undefined}
+            onEmpty={() => {
+              choose(undefined);
+              close();
+            }}
             search={{ noun: "namespaces" }}
             onChoose={(namespace) => {
               choose(namespace);

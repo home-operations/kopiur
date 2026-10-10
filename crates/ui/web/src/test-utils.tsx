@@ -259,8 +259,12 @@ export function meWith(allowed: Partial<Me["can"]>): Response {
 
 /** The field a `PickerField` is, by its label, and its open list. */
 async function openPicker(user: UserEvent, label: string, scope: HTMLElement) {
+  const name = `Choose the ${label.toLowerCase()}`;
+  // A multiple picker stays open between picks; clicking it again would close it.
+  const open = screen.queryByRole("dialog", { name });
+  if (open !== null) return open;
   await user.click(within(scope).getByLabelText(label));
-  return screen.getByRole("dialog", { name: `Choose the ${label.toLowerCase()}` });
+  return screen.getByRole("dialog", { name });
 }
 
 /**

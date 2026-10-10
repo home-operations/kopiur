@@ -2303,6 +2303,55 @@ html:has(dialog.side-panel[open]) {
   gap: 4px;
 }
 
+/* The picker's top row: the filter (or a count of what is chosen), and Clear
+   at the right. */
+.picker__head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.picker__head > .picker__filter {
+  flex: 1;
+  min-width: 0;
+}
+
+.picker__summary {
+  flex: 1;
+  padding: 0 4px;
+  color: var(--fg-muted);
+  font-size: var(--text-xs);
+}
+
+.picker__clear {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 4px;
+  min-height: 28px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--accent-ink);
+  font-size: var(--text-xs);
+  font-weight: var(--weight-medium);
+}
+
+.picker__clear:hover:not(:disabled) {
+  background: var(--bg-hover);
+}
+
+.picker__clear:disabled {
+  color: var(--fg-muted);
+  cursor: default;
+}
+
+.picker__option[aria-pressed="true"] {
+  background: var(--accent-soft);
+  color: var(--accent-ink);
+}
+
 .picker__label {
   flex: 1;
   min-width: 0;
