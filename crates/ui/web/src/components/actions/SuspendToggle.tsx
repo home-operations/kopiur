@@ -41,13 +41,6 @@ export interface SuspendToggleProps {
    * short word in the cell. See `reason.ts`.
    */
   inLedger?: boolean | undefined;
-  /**
-   * The request to send through, when the page shows the receipt itself (a
-   * table: one receipt under it, not one per cell). Its own otherwise.
-   */
-  mutation?: ReturnType<typeof useSuspend> | undefined;
-  /** Show the receipt beside the trigger; off when `mutation`'s owner shows it. */
-  showResult?: boolean | undefined;
   /** For the popover: which edge of the trigger it lines up with. */
   align?: "start" | "end" | undefined;
   /** For the popover: `fixed` inside a box that clips, such as a table. */
@@ -64,16 +57,13 @@ export function SuspendToggle({
   suspended,
   consequence,
   inLedger = false,
-  mutation,
-  showResult = true,
   align,
   strategy,
   open,
   onOpenChange,
 }: SuspendToggleProps) {
   const meta = suspendable(kind);
-  const own = useSuspend();
-  const suspend = mutation ?? own;
+  const suspend = useSuspend();
   const refusal = useRefusal(suspendReviewNamespace(kind, namespace), meta.capability);
   const reason = refusal?.full;
 
@@ -103,11 +93,8 @@ export function SuspendToggle({
           ...(scope !== undefined ? { namespace: scope } : {}),
         });
       }}
-      receipt={suspend.data}
-      problem={suspend.error?.problem}
       open={open}
       onOpenChange={onOpenChange}
-      showResult={showResult}
       align={align}
       strategy={strategy}
     >

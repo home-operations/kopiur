@@ -20,6 +20,7 @@ import {
 } from "./drawerWidth";
 import { KindChip, KindName } from "./KindMark";
 import { KIND_META } from "./kind";
+import { toastHost } from "./toast/toastHost";
 
 /**
  * The side panel: a resource's details, floating over the right edge of the
@@ -168,6 +169,8 @@ export function SidePanel({
     node.addEventListener("cancel", onCancel);
     node.addEventListener("close", onNativeClose);
     if (!node.open) node.showModal();
+    // Toasts render inside the open dialog; outside it they would be inert.
+    toastHost.set(node);
     node.focus({ preventScroll: true });
     return () => {
       unmounting = true;
@@ -175,6 +178,7 @@ export function SidePanel({
       node.removeEventListener("click", onClick);
       node.removeEventListener("cancel", onCancel);
       node.removeEventListener("close", onNativeClose);
+      toastHost.release(node);
       if (node.open) node.close();
       if (opener?.isConnected) opener.focus({ preventScroll: true });
     };

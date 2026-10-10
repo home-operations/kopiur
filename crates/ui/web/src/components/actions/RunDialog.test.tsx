@@ -1,4 +1,4 @@
-import { screen, waitFor } from "@testing-library/react";
+import { screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it } from "vitest";
 
@@ -12,6 +12,7 @@ import {
   jsonResponse,
   meWith,
   mockApi,
+  notifications,
   pickOption,
   problemResponse,
   renderWithClient,
@@ -216,7 +217,9 @@ describe("RunDialog", () => {
       "watch the object's status for the outcome",
     );
     await user.click(screen.getByRole("button", { name: "Request the run" }));
-    expect(await screen.findByRole("status")).toHaveTextContent("Run maintenance requested");
+    expect(await within(await notifications()).findByRole("status")).toHaveTextContent(
+      "Run quick maintenance on media/nas-maintenance requested",
+    );
   });
 
   it("renders the problem's what, why and fix when the run is refused", async () => {

@@ -147,8 +147,6 @@ export function RestoreDialog({ namespace, snapshot, open, onOpenChange }: Resto
           restore.mutate(body);
         }
       }}
-      receipt={restore.data}
-      problem={restore.error?.problem}
       open={open}
       onOpenChange={onOpenChange}
     >

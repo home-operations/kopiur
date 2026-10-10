@@ -30,6 +30,7 @@ import { vi } from "vitest";
 import createFetchMock from "vitest-fetch-mock";
 
 import { createQueryClient } from "./api/queryClient";
+import { Toaster } from "./components/toast/Toaster";
 import type { Me, Problem } from "./api/types";
 import { routeTree } from "./routeTree.gen";
 
@@ -213,7 +214,15 @@ export function calledPaths(): string[] {
  * hooks to use.
  */
 export function renderWithClient(element: ReactElement, path = "/") {
-  const root = createRootRoute({ component: () => element });
+  // The toaster rides along: every action answers there, as in the app.
+  const root = createRootRoute({
+    component: () => (
+      <>
+        {element}
+        <Toaster />
+      </>
+    ),
+  });
   const router = createRouter({
     routeTree: root,
     history: createMemoryHistory({ initialEntries: [path] }),
@@ -291,4 +300,12 @@ export async function typeOption(
 ): Promise<void> {
   const panel = await openPicker(user, label, scope);
   await user.type(within(panel).getByRole("searchbox"), `${text}{Enter}`);
+}
+
+/**
+ * The toaster's region, where every action's answer lands (a receipt as
+ * `status`, a refusal as `alert`) — wherever the action was asked from.
+ */
+export function notifications(): Promise<HTMLElement> {
+  return screen.findByRole("region", { name: "Notifications" });
 }

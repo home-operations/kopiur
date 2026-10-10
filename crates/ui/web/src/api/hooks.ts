@@ -270,6 +270,14 @@ export interface ApiMutationOptions<TData, TVariables> {
    */
   invalidates: (variables: TVariables) => readonly QueryKey[];
   onSuccess?: ((data: TData, variables: TVariables) => void) | undefined;
+  /**
+   * The action, worded for the toast that answers it: "Suspend schedule
+   * media/nightly". Every mutation is answered by a toast from the query
+   * client's cache (`queryClient.ts`), so every mutation names itself.
+   */
+  describe: (variables: TVariables) => string;
+  /** `errors`: only a refusal toasts; the success shows where it was asked. */
+  announce?: "receipt" | "errors" | undefined;
 }
 
 /**
@@ -291,6 +299,10 @@ export function useApiMutation<TData, TVariables>(
   const mutationOptions: UseMutationOptions<TData, ApiProblemError, TVariables> = {
     mutationFn: (variables) => options.mutationFn(variables, {}),
     onSettled: (_data, _error, variables) => invalidate(variables),
+    meta: {
+      describe: (variables) => options.describe(variables as TVariables),
+      ...(options.announce !== undefined ? { announce: options.announce } : {}),
+    },
   };
   if (options.onSuccess !== undefined) {
     mutationOptions.onSuccess = options.onSuccess;
@@ -563,6 +575,7 @@ export function useSnapshotTree(
 export function useSnapshotNow() {
   return useApiMutation<ActionReceipt, SnapshotNowBody>({
     mutationFn: (body, init) => apiPost<ActionReceipt>(paths.actions.snapshotNow, body, init),
+    describe: (body) => `Take a snapshot of ${body.namespace}/${body.policy}`,
     invalidates: (body) => [
       ["snapshots"],
       queryKeys.policy(body.namespace, body.policy),
@@ -576,6 +589,7 @@ export function useSnapshotNow() {
 export function useCreateRestore() {
   return useApiMutation<ActionReceipt, RestoreBody>({
     mutationFn: (body, init) => apiPost<ActionReceipt>(paths.actions.restore, body, init),
+    describe: (body) => `Create a restore in ${body.namespace}`,
     invalidates: (body) => [
       ["restores"],
       queryKeys.status(body.namespace),
@@ -584,12 +598,21 @@ export function useCreateRestore() {
   });
 }
 
+/** A suspend body's `kind` token (`suspendable.ts`), in the words a sentence uses. */
+function suspendNoun(kind: string): string {
+  return kind.replaceAll("-", " ");
+}
+
 /** `POST /actions/suspend` → 200. Explicit `suspend: true|false`, never a toggle. */
 export function useSuspend() {
   return useApiMutation<ActionReceipt, SuspendBody>({
     mutationFn: (body, init) => apiPost<ActionReceipt>(paths.actions.suspend, body, init),
     // Which list a suspend touches depends on `kind`; a kind this bundle does
     // not know still invalidates every candidate rather than none.
+    describe: (body) =>
+      `${body.suspend ? "Suspend" : "Resume"} ${suspendNoun(body.kind)} ${
+        body.namespace !== null && body.namespace !== undefined ? `${body.namespace}/` : ""
+      }${body.name}`,
     invalidates: () => [
       ["policies"],
       ["schedules"],
@@ -605,6 +628,8 @@ export function useSuspend() {
 export function useMaintenanceRun() {
   return useApiMutation<ActionReceipt, MaintenanceRunBody>({
     mutationFn: (body, init) => apiPost<ActionReceipt>(paths.actions.maintenanceRun, body, init),
+    describe: (body) =>
+      `Run ${body.mode} maintenance on ${body.namespace}/${body.name ?? "its repository"}`,
     invalidates: () => [["maintenance"], ["status"]],
   });
 }
@@ -613,6 +638,7 @@ export function useMaintenanceRun() {
 export function useReplicationRun() {
   return useApiMutation<ActionReceipt, ReplicationRunBody>({
     mutationFn: (body, init) => apiPost<ActionReceipt>(paths.actions.replicationRun, body, init),
+    describe: (body) => `Run replication ${body.namespace}/${body.name}`,
     invalidates: () => [["replications"], ["graph"], ["status"]],
   });
 }
@@ -621,6 +647,10 @@ export function useReplicationRun() {
 export function useScanCatalog() {
   return useApiMutation<ActionReceipt, ScanCatalogBody>({
     mutationFn: (body, init) => apiPost<ActionReceipt>(paths.actions.scanCatalog, body, init),
+    describe: (body) =>
+      `Scan the catalog of ${
+        body.namespace !== null && body.namespace !== undefined ? `${body.namespace}/` : ""
+      }${body.name}`,
     invalidates: () => [["repositories"], ["snapshots"], ["status"]],
   });
 }
@@ -634,6 +664,7 @@ export function useDeleteSnapshot() {
   return useApiMutation<ActionReceipt, { namespace: string; name: string }>({
     mutationFn: ({ namespace, name }, init) =>
       apiDelete<ActionReceipt>(paths.snapshot(namespace, name), init),
+    describe: ({ namespace, name }) => `Delete snapshot ${namespace}/${name}`,
     invalidates: ({ namespace, name }) => [
       ["snapshots"],
       queryKeys.snapshot(namespace, name),
@@ -647,6 +678,8 @@ export function useStartSession() {
   return useApiMutation<SessionInfo, { namespace: string; name: string; body: SessionCreateBody }>({
     mutationFn: ({ namespace, name, body }, init) =>
       apiPost<SessionInfo>(paths.snapshotSession(namespace, name), body, init),
+    describe: ({ namespace, name }) => `Start a browse session on ${namespace}/${name}`,
+    announce: "errors",
     invalidates: ({ namespace, name }) => [queryKeys.snapshotSession(namespace, name)],
   });
 }
@@ -656,6 +689,8 @@ export function useEndSession() {
   return useApiMutation<undefined, { namespace: string; name: string }>({
     mutationFn: ({ namespace, name }, init) =>
       apiDelete(paths.snapshotSession(namespace, name), init),
+    describe: ({ namespace, name }) => `Stop the browse session on ${namespace}/${name}`,
+    announce: "errors",
     invalidates: ({ namespace, name }) => [
       queryKeys.snapshotSession(namespace, name),
       ["repositories"],
@@ -679,6 +714,8 @@ export function useEndRepositorySession() {
         withQuery(paths.repositorySession(kindPath, name), { namespace, sessionNamespace }),
         init,
       ),
+    describe: ({ name }) => `Stop the repository session on ${name}`,
+    announce: "errors",
     invalidates: ({ kindPath, name, namespace }) => [
       queryKeys.repository(kindPath, name, namespace),
       ["snapshots"],

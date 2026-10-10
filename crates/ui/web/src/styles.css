@@ -1679,8 +1679,7 @@ html:has(dialog.side-panel[open]) {
   gap: var(--space-5);
 }
 
-/* The actions: a row of buttons at the very bottom, with any receipt stacked
-   above it. */
+/* The actions: a row of buttons at the very bottom. Their answers are toasts. */
 .drawer-actions {
   display: flex;
   flex-direction: column;
@@ -1690,18 +1689,10 @@ html:has(dialog.side-panel[open]) {
 .drawer-actions > .action-bar {
   order: 2;
 }
-/* A receipt's slot before anything has been asked: no box, so no gap. */
+/* An empty slot (a bar with nothing to offer): no box, so no gap. */
 .drawer-actions > :empty {
   display: none;
 }
-/* In the foot, an answer stacks above the buttons, nearest the content it is
-   about; the buttons stay on the bottom line. (A question floats above them in
-   a popover.) */
-.side-panel__foot .action-bar > .action > .receipt,
-.side-panel__foot .action-bar > .action > .problem {
-  order: -1;
-}
-
 /* A named region of a tab: a small heading, then its facts or table. */
 .drawer__region {
   display: grid;
@@ -3806,43 +3797,92 @@ a.topo-node {
   gap: var(--space-2);
 }
 
-/* ---- receipt: what a mutating action answered ----------------------------- */
+/* ---- toasts: what every action answered ---------------------------------- */
 
-.receipt {
+/* A stack at the bottom right, newest at the bottom. The region itself lets
+   the pointer through; only the toasts take it. */
+.toaster {
+  position: fixed;
+  right: var(--space-4);
+  bottom: var(--space-4);
+  z-index: 70;
+  /* A fixed box's percentage is of the viewport without its scrollbar; 100vw
+     would put the left gutter under it at phone width. */
+  width: min(22rem, calc(100% - 2 * var(--space-4)));
+  pointer-events: none;
+}
+
+.toaster__list {
   display: grid;
-  grid-template-columns: auto minmax(0, 1fr);
+  gap: var(--space-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.toast {
+  position: relative;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
   align-items: start;
   gap: var(--space-3);
-  max-width: 34rem;
-  padding: var(--space-3) var(--space-4);
-  border: 1px solid var(--health-healthy-fg);
+  overflow: hidden;
+  padding: var(--space-3) var(--space-3) calc(var(--space-3) + 2px) var(--space-4);
+  border: 1px solid var(--line);
   border-radius: var(--radius-lg);
-  background: var(--health-healthy-bg);
+  background: var(--bg-surface);
+  color: var(--fg);
+  box-shadow: var(--shadow-2);
+  pointer-events: auto;
+  animation: toast-in var(--dur-base) cubic-bezier(0.2, 0, 0, 1);
 }
 
-.receipt__pill {
-  display: flex;
+/* Already on screen when the toaster moved into or out of a drawer. */
+.toast[data-arrived="true"] {
+  animation: none;
 }
 
-.receipt__body {
+.toast[data-leaving="true"] {
+  animation: toast-out 140ms var(--ease-out) forwards;
+}
+
+.toast__icon {
+  display: inline-flex;
+  padding-top: 2px;
+}
+
+.toast[data-tone="healthy"] .toast__icon {
+  color: var(--health-healthy-fg);
+}
+
+.toast[data-tone="failed"] {
+  border-color: var(--health-failed-fg);
+}
+
+.toast[data-tone="failed"] .toast__icon {
+  color: var(--health-failed-fg);
+}
+
+.toast__body {
   display: grid;
   gap: var(--space-1);
   min-width: 0;
 }
 
-.receipt__what {
+.toast__what {
   margin: 0;
   font-weight: var(--weight-semibold);
+  overflow-wrap: anywhere;
 }
 
-.receipt__note {
+.toast__note {
   margin: 0;
   color: var(--fg-muted);
   line-height: var(--leading-prose);
   overflow-wrap: anywhere;
 }
 
-.receipt__created {
+.toast__created {
   display: flex;
   flex-wrap: wrap;
   gap: var(--space-2);
@@ -3851,10 +3891,80 @@ a.topo-node {
   list-style: none;
 }
 
-.receipt__meta {
+.toast__meta {
   margin: 0;
   font-size: var(--text-xs);
   color: var(--fg-muted);
+}
+
+.toast__close {
+  display: inline-grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--fg-muted);
+}
+
+.toast__close:hover {
+  background: var(--bg-hover);
+  color: var(--fg);
+}
+
+.toast__close:focus-visible {
+  box-shadow: var(--focus-ring);
+}
+
+/* The time left, running down along the foot. It stops with the clock: the
+   pointer on the toast, focus inside it, the tab hidden (`data-paused`). A
+   toast remounted part-way starts its line part-way (`--toast-elapsed`). */
+.toast__timer {
+  position: absolute;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  height: 2px;
+  background: var(--health-healthy-fg);
+  transform-origin: left center;
+  animation: toast-decay var(--toast-ms) linear var(--toast-elapsed, 0ms) forwards;
+}
+
+.toast[data-paused="true"] .toast__timer {
+  animation-play-state: paused;
+}
+
+@keyframes toast-in {
+  from {
+    opacity: 0;
+    transform: translateY(12px);
+  }
+}
+
+@keyframes toast-out {
+  to {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+}
+
+@keyframes toast-decay {
+  from {
+    transform: scaleX(1);
+  }
+  to {
+    transform: scaleX(0);
+  }
+}
+
+/* With less motion the line would only jump to empty; the toast still lasts
+   its time and still pauses, on the JS clock. */
+@media (prefers-reduced-motion: reduce) {
+  .toast__timer {
+    display: none;
+  }
 }
 
 /* ---- replication ledger --------------------------------------------------- */
@@ -4852,15 +4962,15 @@ a.topo-node {
 }
 
 /* An open confirmation must not move the other triggers.
-   `ActionPanel` keeps its trigger, panel and result in one wrapper so a dialog
+   `ActionPanel` keeps its trigger and panel in one wrapper so a dialog
    drops anywhere as a single element — but inside an `action-bar` that wrapper
    is a flex item, and an open 34rem panel grew it and shoved every other
    trigger across the row. (Task 5 hit the same thing and moved the panel below
    the bar; this is that, without splitting the component.)
 
    `display: contents` takes the wrapper out of the layout, so the trigger is a
-   flex item of the bar and keeps its place, while the panel and the receipt
-   become full-width rows *after* every trigger. The short refusal stays beside
+   flex item of the bar and keeps its place, while an inline panel becomes a
+   full-width row *after* every trigger. The short refusal stays beside
    its own button in source order. */
 .action-bar > .action {
   display: contents;
@@ -4869,10 +4979,4 @@ a.topo-node {
 .action-bar > .action > .action__confirm {
   flex: 1 0 100%;
   order: 2;
-}
-
-.action-bar > .action > .receipt,
-.action-bar > .action > .problem {
-  flex: 1 0 100%;
-  order: 3;
 }

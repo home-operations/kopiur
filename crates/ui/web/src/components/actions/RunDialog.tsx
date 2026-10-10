@@ -65,13 +65,6 @@ export interface RunDialogProps {
   align?: "start" | "end" | undefined;
   /** For the popover: `fixed` inside a box that clips, such as a table. */
   strategy?: "absolute" | "fixed" | undefined;
-  /**
-   * The maintenance request to send through, when the page shows the receipt
-   * itself (a table: one receipt under it, not one per cell). Its own otherwise.
-   */
-  maintenanceMutation?: ReturnType<typeof useMaintenanceRun> | undefined;
-  /** Show the receipt beside the trigger; off when the page shows it. */
-  showResult?: boolean | undefined;
 }
 
 /** The `/me` flag that decides whether this run may be asked for. */
@@ -100,12 +93,9 @@ export function RunDialog({
   shortLabel,
   align,
   strategy,
-  maintenanceMutation,
-  showResult,
 }: RunDialogProps) {
   const fieldId = useId();
-  const ownMaintenance = useMaintenanceRun();
-  const maintenance = maintenanceMutation ?? ownMaintenance;
+  const maintenance = useMaintenanceRun();
   const replication = useReplicationRun();
   const [mode, setMode] = useState("quick");
 
@@ -122,8 +112,6 @@ export function RunDialog({
   const maintenanceRun = target.kind === "maintenance";
   const label = maintenanceRun ? "Run maintenance" : "Run now";
   const running = maintenanceRun ? maintenance.isPending : replication.isPending;
-  const receipt = maintenanceRun ? maintenance.data : replication.data;
-  const problem = maintenanceRun ? maintenance.error?.problem : replication.error?.problem;
 
   const run = () => {
     if (target.kind === "maintenance") {
@@ -155,15 +143,12 @@ export function RunDialog({
       confirmLabel="Request the run"
       running={running}
       onConfirm={run}
-      receipt={receipt}
-      problem={problem}
       open={open}
       onOpenChange={onOpenChange}
       presentation={presentation}
       shortLabel={shortLabel}
       align={align}
       strategy={strategy}
-      showResult={showResult}
     >
       <p>
         This stamps a run request on{" "}

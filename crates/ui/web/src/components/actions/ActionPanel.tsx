@@ -1,15 +1,13 @@
 import type { LucideIcon } from "lucide-react";
 import { type ReactNode, useState } from "react";
 
-import type { ActionReceipt, Problem } from "../../api/types";
 import { ActionButton } from "../ActionButton";
-import { ActionResult } from "../ActionResult";
 import { Popover } from "../Popover";
 import { useConfirmFocus } from "./useConfirmFocus";
 
 /**
  * The shell every mutating control on this console is built from: a trigger,
- * the question it opens, and the answer the server gave.
+ * and the question it opens. The server's answer is a toast.
  *
  * It is a confirmation *panel*, not a modal. The design system's
  * action pattern (`kopiur-ui-design` skill, `references/composites.md`) opens
@@ -44,13 +42,14 @@ import { useConfirmFocus } from "./useConfirmFocus";
  * **Asked before it runs.** Opening the trigger shows what the action will
  * do, in the terms the API uses, before anything is sent.
  *
- * **Answered by the server.** The outcome is the `ActionReceipt` — `note`
- * included, which is where an accepted-but-not-performed action explains
- * itself — or the problem's what / why / fix. Never a word of this component's
- * own.
+ * **Answered by the server, in a toast.** The outcome — the `ActionReceipt`,
+ * `note` included, or the problem's what / why / fix — is toasted by the query
+ * client's mutation cache (`api/queryClient.ts`), never beside this trigger:
+ * it arrives even if this panel is gone by then, and never in a word of this
+ * component's own.
  */
 export interface ActionPanelProps {
-  /** The action's name: the trigger's words and the result's label. */
+  /** The action's name: the trigger's words and the question's. */
   label: string;
   /**
    * Shorter words for the trigger, where `label` will not fit (a table's
@@ -80,8 +79,6 @@ export interface ActionPanelProps {
   /** True while the request is in flight. */
   running: boolean;
   onConfirm: () => void;
-  receipt?: ActionReceipt | undefined;
-  problem?: Problem | undefined;
   /** What the action will do, and the fields it needs. */
   children: ReactNode;
   /**
@@ -90,11 +87,6 @@ export interface ActionPanelProps {
    */
   open?: boolean | undefined;
   onOpenChange?: ((open: boolean) => void) | undefined;
-  /**
-   * Leave the receipt to the caller — for a table, where a receipt in a cell
-   * would be squeezed into a ribbon; the page shows it at full width instead.
-   */
-  showResult?: boolean | undefined;
   /**
    * `popover` (the default) floats the confirmation over the page, anchored
    * to its trigger (`Popover`), so asking never shoves the page around it.
@@ -119,12 +111,9 @@ export function ActionPanel({
   blockedReason,
   running,
   onConfirm,
-  receipt,
-  problem,
   children,
   open,
   onOpenChange,
-  showResult = true,
   presentation = "popover",
   align,
   strategy,
@@ -215,7 +204,6 @@ export function ActionPanel({
           {questions}
         </Popover>
         {shortShown}
-        {showResult ? <ActionResult label={label} receipt={receipt} problem={problem} /> : null}
       </div>
     );
   }
@@ -238,8 +226,6 @@ export function ActionPanel({
           })}
         </div>
       ) : null}
-
-      {showResult ? <ActionResult label={label} receipt={receipt} problem={problem} /> : null}
     </div>
   );
 }

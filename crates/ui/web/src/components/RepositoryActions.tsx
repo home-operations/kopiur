@@ -7,7 +7,6 @@ import { ActionButton } from "./ActionButton";
 import { Popover } from "./Popover";
 import { PickerField } from "./PickerField";
 import { MAINTENANCE_MODES } from "./pickerChoices";
-import { ActionResult } from "./ActionResult";
 import {
   actionNamespace,
   isClusterScoped,
@@ -63,7 +62,6 @@ interface ActionSpec {
   prose: ReactNode;
   running: boolean;
   run: () => void;
-  result: ReactNode;
 }
 
 export function RepositoryActions({ detail }: RepositoryActionsProps) {
@@ -120,13 +118,6 @@ export function RepositoryActions({ detail }: RepositoryActionsProps) {
           ...(namespace !== undefined ? { namespace } : {}),
         });
       },
-      result: (
-        <ActionResult
-          label={suspendLabel}
-          receipt={suspend.data}
-          problem={suspend.error?.problem}
-        />
-      ),
     },
     {
       id: "maintenance",
@@ -166,13 +157,6 @@ export function RepositoryActions({ detail }: RepositoryActionsProps) {
           mode,
         });
       },
-      result: (
-        <ActionResult
-          label="Run maintenance"
-          receipt={maintenanceRun.data}
-          problem={maintenanceRun.error?.problem}
-        />
-      ),
     },
     {
       id: "scan",
@@ -198,9 +182,6 @@ export function RepositoryActions({ detail }: RepositoryActionsProps) {
           ...(namespace !== undefined ? { namespace } : {}),
         });
       },
-      result: (
-        <ActionResult label="Scan catalog" receipt={scan.data} problem={scan.error?.problem} />
-      ),
     },
   ];
 
@@ -249,10 +230,6 @@ export function RepositoryActions({ detail }: RepositoryActionsProps) {
           );
         })}
       </div>
-
-      {actions.map((action) => (
-        <div key={action.id}>{action.result}</div>
-      ))}
     </>
   );
 }

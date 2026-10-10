@@ -98,8 +98,6 @@ export function SnapshotNowDialog({
       onConfirm={() => {
         snapshotNow.mutate(body);
       }}
-      receipt={snapshotNow.data}
-      problem={snapshotNow.error?.problem}
       open={open}
       onOpenChange={onOpenChange}
     >

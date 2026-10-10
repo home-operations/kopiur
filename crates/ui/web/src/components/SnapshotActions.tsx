@@ -4,7 +4,6 @@ import { type ReactNode, useState } from "react";
 import { useDeleteSnapshot, useSnapshotNow } from "../api/hooks";
 import type { SnapshotRow } from "../api/types";
 import { ActionButton } from "./ActionButton";
-import { ActionResult } from "./ActionResult";
 import { Popover } from "./Popover";
 import { deletionConsequence, deletionPolicyLabel } from "./snapshot";
 import { useCapabilityReason } from "./useCapabilityReason";
@@ -200,7 +199,7 @@ export function SnapshotActions({ row, extra }: SnapshotActionsProps) {
                 </p>
                 <p>
                   The deletion is <em>requested</em>, not done yet. If the repository&apos;s
-                  mass-deletion breaker holds it, the receipt below says so.
+                  mass-deletion breaker holds it, the answer says so.
                 </p>
               </div>
               <div className="action__actions">
@@ -228,13 +227,6 @@ export function SnapshotActions({ row, extra }: SnapshotActionsProps) {
         </Popover>
         {extra}
       </div>
-
-      <ActionResult
-        label="Snapshot now"
-        receipt={snapshotNow.data}
-        problem={snapshotNow.error?.problem}
-      />
-      <ActionResult label="Delete" receipt={remove.data} problem={remove.error?.problem} />
     </>
   );
 }

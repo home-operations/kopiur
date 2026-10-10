@@ -12,6 +12,7 @@ import {
   meWith,
   mockApi,
   mountApp,
+  notifications,
   nth,
   problemResponse,
   sentBody,
@@ -300,7 +301,7 @@ describe("Policy drawer", () => {
       suspend: true,
     };
     expect(sentBody("/api/v1/actions/suspend")).toEqual(expected);
-    expect(await within(bar).findByText(/is now suspended/)).toBeInTheDocument();
+    expect(await within(await notifications()).findByText(/is now suspended/)).toBeInTheDocument();
   });
 
   it("asks only one question at a time", async () => {

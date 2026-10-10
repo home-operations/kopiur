@@ -5,13 +5,14 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { problemBanner } from "../../../api/problem";
 import type { ActionReceipt, Capabilities, RepositoryDetail } from "../../../api/types";
 import {
-  ME,
   calledPaths,
   fetchMock,
   forbiddenProblem,
   jsonResponse,
+  ME,
   mockApi,
   mountApp,
+  notifications,
   problemResponse,
 } from "../../../test-utils";
 
@@ -294,7 +295,7 @@ describe("Repository drawer", () => {
     expect(confirm).toHaveTextContent("No new backups run here");
     await user.click(within(confirm).getByRole("button", { name: "Suspend this repository" }));
 
-    expect(await within(bar).findByText(/is now suspended/)).toBeInTheDocument();
+    expect(await within(await notifications()).findByText(/is now suspended/)).toBeInTheDocument();
     expect(sentBody("/api/v1/actions/suspend")).toEqual({
       kind: "repository",
       name: "nas",
@@ -316,7 +317,9 @@ describe("Repository drawer", () => {
     await user.click(await within(bar).findByRole("button", { name: /Scan catalog/ }));
     const confirm = within(bar).getByRole("dialog", { name: "Scan catalog" });
     await user.click(within(confirm).getByRole("button", { name: "Request a scan" }));
-    expect(await within(bar).findByText(/Scan catalog requested/)).toBeInTheDocument();
+    expect(
+      await within(await notifications()).findByText(/Scan the catalog of .*nas requested/),
+    ).toBeInTheDocument();
     expect(sentBody("/api/v1/actions/scan-catalog")).toEqual({
       kind: "repository",
       name: "nas",

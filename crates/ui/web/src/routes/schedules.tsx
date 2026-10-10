@@ -2,9 +2,8 @@ import { createFileRoute } from "@tanstack/react-router";
 import { CalendarClock } from "lucide-react";
 import { useState } from "react";
 
-import { useSchedules, useSuspend } from "../api/hooks";
-import type { ScheduleRow, SuspendBody } from "../api/types";
-import { ActionResult } from "../components/ActionResult";
+import { useSchedules } from "../api/hooks";
+import type { ScheduleRow } from "../api/types";
 import { EmptyState } from "../components/EmptyState";
 import { ErrorState } from "../components/ErrorState";
 import { LoadingState } from "../components/LoadingState";
@@ -27,7 +26,7 @@ import { useCurrentNamespace } from "../util/namespace";
  * questions in a table of near-identical rows is how the wrong schedule gets
  * suspended. It opens in a popover pinned to the row's button (the table's
  * card clips, so it is pinned on screen rather than hung inside it), and the
- * answer appears once, under the table, at full width.
+ * answer is a toast.
  */
 export const Route = createFileRoute("/schedules")({
   component: Schedules,
@@ -40,9 +39,6 @@ function Schedules() {
   const namespace = useCurrentNamespace();
   const schedules = useSchedules(namespace);
   const [open, setOpen] = useState<OpenRow>(null);
-  // One request for the whole ledger, so its receipt sits once under the
-  // table at full width rather than squeezed into a row's cell.
-  const suspend = useSuspend();
   const scope = namespace ?? "all namespaces";
 
   return (
@@ -79,8 +75,6 @@ function Schedules() {
                   suspended={schedule.suspended}
                   consequence="this cron is not evaluated at all, so the policy it fires goes unrun"
                   inLedger
-                  mutation={suspend}
-                  showResult={false}
                   align="end"
                   strategy="fixed"
                   open={open === rowId(schedule)}
@@ -91,11 +85,6 @@ function Schedules() {
                   }}
                 />
               )}
-            />
-            <ActionResult
-              label={resultLabel(suspend.variables)}
-              receipt={suspend.data}
-              problem={suspend.error?.problem}
             />
           </>
         )}
@@ -112,10 +101,4 @@ function Schedules() {
 /** The row's stable key, and the value `open` holds while its panel is up. */
 function rowId(schedule: ScheduleRow): string {
   return `${schedule.namespace}/${schedule.name}`;
-}
-
-/** What the receipt under the ledger answers: the last row asked about. */
-function resultLabel(body: SuspendBody | undefined): string {
-  if (body === undefined) return "Suspend";
-  return `${body.suspend ? "Suspend" : "Resume"} ${body.name}`;
 }

@@ -11,7 +11,7 @@ import type {
   SuspendBody,
 } from "../../api/types";
 import { cssRules, readStyles } from "../../testing/css";
-import { jsonResponse, mockApi, mountApp, sentBody } from "../../test-utils";
+import { jsonResponse, mockApi, mountApp, notifications, sentBody } from "../../test-utils";
 
 const schedule: ScheduleRow = {
   namespace: "media",
@@ -104,7 +104,9 @@ describe("the drawer for a kind with no page of its own", () => {
       suspend: true,
     };
     expect(sentBody("/api/v1/actions/suspend")).toEqual(expected);
-    expect(await within(foot).findByRole("status")).toHaveTextContent(/Requested/);
+    expect(await within(await notifications()).findByRole("status")).toHaveTextContent(
+      "Suspend schedule media/nightly-cron requested",
+    );
   });
 
   it("asks for a maintenance run from the drawer", async () => {
@@ -155,18 +157,14 @@ describe("the drawer for a kind with no page of its own", () => {
     expect(question?.body).toMatch(/overflow-y:\s*auto/);
   });
 
-  it("leaves no gap above the buttons for a receipt that has not arrived", () => {
+  it("leaves no gap above the buttons for an empty slot", () => {
     const rule = cssRules(readStyles()).find((r) => r.selector === ".drawer-actions > :empty");
     expect(rule?.body).toMatch(/display:\s*none/);
   });
 
-  it("opens a question upward from its button, and stacks a receipt above the buttons", () => {
+  it("opens a question upward from its button", () => {
     const rules = cssRules(readStyles());
     const question = rules.find((r) => r.selector === ".side-panel__foot .popover__panel");
     expect(question?.body).toMatch(/bottom:\s*calc\(100%/);
-    const receipt = rules.find((r) =>
-      r.selector.includes(".side-panel__foot .action-bar > .action > .receipt"),
-    );
-    expect(receipt?.body).toMatch(/order:\s*-/);
   });
 });

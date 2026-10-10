@@ -41,6 +41,8 @@ const NEVER_FOCUSED = new Set([
   ".search__results",
   // An anchored popover's panel is a container; its controls carry the ring.
   ".popover__panel",
+  // A toast is a card; its close button carries the ring.
+  ".toast",
   // The lifted copy of a dragged row: a picture, `aria-hidden`, never focused.
   ".column-picker__ghost",
   '.shell[data-nav-open="true"] .sidebar',

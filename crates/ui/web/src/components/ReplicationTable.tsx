@@ -4,7 +4,6 @@ import type { ReactNode } from "react";
 import { useReplicationRun } from "../api/hooks";
 import { lagSeries, lagShare } from "../charts/lag";
 import { ActionButton } from "./ActionButton";
-import { ActionResult } from "./ActionResult";
 import { ColumnLedger } from "./ColumnLedger";
 import { HealthBadge } from "./HealthBadge";
 import {
@@ -251,7 +250,6 @@ function RunAction({ row }: { row: ReplicationRow }) {
         Run now
       </ActionButton>
       {word !== undefined ? <span className="replication-table__note">{word}</span> : null}
-      <ActionResult label={`Run ${row.name}`} receipt={run.data} problem={run.error?.problem} />
     </div>
   );
 }

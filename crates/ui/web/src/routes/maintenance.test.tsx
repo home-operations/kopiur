@@ -12,6 +12,7 @@ import {
   meWith,
   mockApi,
   mountApp,
+  notifications,
   pickOption,
   problemResponse,
   sentBody,
@@ -219,13 +220,9 @@ describe("Maintenance", () => {
       mode: "full",
     };
     expect(sentBody(RUN)).toEqual(expected);
-    // The answer is said once, under the table, not squeezed into the row.
-    const answer = await waitFor(() => {
-      const found = document.querySelector<HTMLElement>(".receipt");
-      if (found === null) throw new Error("no receipt yet");
-      return found;
-    });
-    expect(answer).toHaveTextContent("Run maintenance for Repository/media/nas requested");
+    // The answer is a toast, not squeezed into the row.
+    const answer = await within(await notifications()).findByRole("status");
+    expect(answer).toHaveTextContent("Run full maintenance on media/nas-maintenance requested");
     expect(answer.closest("table")).toBeNull();
   });
 

@@ -1,4 +1,4 @@
-import { screen, waitFor } from "@testing-library/react";
+import { screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it } from "vitest";
 
@@ -9,6 +9,7 @@ import {
   jsonResponse,
   meWith,
   mockApi,
+  notifications,
   problemResponse,
   renderWithClient,
 } from "../../test-utils";
@@ -85,8 +86,8 @@ describe("ConfirmDelete", () => {
       "Check the snapshot's conditions to be sure.",
     );
     await user.click(screen.getByRole("button", { name: "Request the deletion" }));
-    const answer = await screen.findByRole("status");
-    expect(answer).toHaveTextContent("Delete requested");
+    const answer = await within(await notifications()).findByRole("status");
+    expect(answer).toHaveTextContent("Delete snapshot media/nightly-1 requested");
     expect(answer).toHaveTextContent("mass-deletion breaker");
   });
 

@@ -6,6 +6,7 @@ import { useCurrentNamespace } from "../util/namespace";
 import { ResourceDrawer } from "./drawer/ResourceDrawer";
 import { sectionFor } from "./nav";
 import { GlobalProblemBanner } from "./ProblemBanner";
+import { Toaster } from "./toast/Toaster";
 import { Sidebar } from "./shell/Sidebar";
 
 export { ThemeSwitch } from "./shell/ThemeSwitch";
@@ -76,6 +77,7 @@ export function AppShell({ children }: AppShellProps) {
         <div className="content">{children}</div>
       </main>
       <ResourceDrawer />
+      <Toaster />
     </div>
   );
 }

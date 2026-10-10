@@ -10,14 +10,15 @@ import type {
   SnapshotRow,
 } from "../../../api/types";
 import {
-  ME,
   bodyRows,
   calledPaths,
   fetchMock,
   forbiddenProblem,
   jsonResponse,
+  ME,
   mockApi,
   mountApp,
+  notifications,
   nth,
   problemResponse,
 } from "../../../test-utils";
@@ -505,11 +506,14 @@ describe("Snapshot drawer", () => {
     const bar = await foot();
     await user.click(await within(bar).findByRole("button", { name: /^Delete/ }));
     await user.click(within(bar).getByRole("button", { name: "Request deletion" }));
-    await waitFor(() => {
-      expect(within(bar).getByText(/mass-deletion breaker/)).toBeInTheDocument();
-    });
+    const toasts = await notifications();
+    // Inside the open drawer's dialog: outside it the page is inert.
+    expect(toasts.closest("dialog")).not.toBeNull();
+    expect(await within(toasts).findByText(/mass-deletion breaker/)).toBeInTheDocument();
     // "requested", never "deleted".
-    expect(within(bar).getByText(/Delete requested/)).toBeInTheDocument();
+    expect(
+      within(toasts).getByText(/Delete snapshot media\/nightly-29 requested/),
+    ).toBeInTheDocument();
   });
 
   it("asks for the pin explicitly and says that it is permanent", async () => {

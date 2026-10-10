@@ -2,9 +2,7 @@ import { Link, createFileRoute } from "@tanstack/react-router";
 import { Wrench } from "lucide-react";
 import { useState } from "react";
 
-import { useMaintenance, useMaintenanceRun } from "../api/hooks";
-import type { MaintenanceRow, MaintenanceRunBody } from "../api/types";
-import { ActionResult } from "../components/ActionResult";
+import { useMaintenance } from "../api/hooks";
 import { EmptyState } from "../components/EmptyState";
 import { ErrorState } from "../components/ErrorState";
 import { LoadingState } from "../components/LoadingState";
@@ -44,9 +42,6 @@ function Maintenance() {
   const namespace = useCurrentNamespace();
   const maintenance = useMaintenance(namespace);
   const [open, setOpen] = useState<OpenRow>(null);
-  // One request for the whole ledger, so its receipt sits once under the
-  // table at full width rather than squeezed into a row's cell.
-  const run = useMaintenanceRun();
   const scope = namespace ?? "all namespaces";
   const search = namespace !== undefined ? { namespace } : {};
 
@@ -105,8 +100,6 @@ function Maintenance() {
                   inLedger
                   align="end"
                   strategy="fixed"
-                  maintenanceMutation={run}
-                  showResult={false}
                   open={open === id}
                   onOpenChange={(next) => {
                     // A close from one row must not undo another row opening.
@@ -116,23 +109,8 @@ function Maintenance() {
               );
             }}
           />
-          <ActionResult
-            label={resultLabel(run.variables, maintenance.data)}
-            receipt={run.data}
-            problem={run.error?.problem}
-          />
         </section>
       )}
     </div>
   );
-}
-
-/** What the receipt under the ledger answers: the last row asked about. */
-function resultLabel(
-  body: MaintenanceRunBody | undefined,
-  rows: readonly MaintenanceRow[],
-): string {
-  if (body === undefined) return "Run maintenance";
-  const row = rows.find((r) => r.namespace === body.namespace && r.name === body.name);
-  return `Run maintenance for ${row?.repository ?? `${body.namespace}/${body.name}`}`;
 }

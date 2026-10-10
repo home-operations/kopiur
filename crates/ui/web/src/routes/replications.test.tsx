@@ -5,14 +5,15 @@ import { beforeEach, describe, expect, it } from "vitest";
 import { problemBanner } from "../api/problem";
 import type { ActionReceipt, Capabilities, ReplicationsView } from "../api/types";
 import {
-  ME,
   bodyRows,
   calledPaths,
   fetchMock,
   forbiddenProblem,
   jsonResponse,
+  ME,
   mockApi,
   mountApp,
+  notifications,
   nth,
   problemResponse,
 } from "../test-utils";
@@ -173,6 +174,9 @@ describe("Replications", () => {
       name: "blobsync",
       kind: "replication",
     });
+    expect(await within(await notifications()).findByRole("status")).toHaveTextContent(
+      "Run replication media/blobsync requested",
+    );
   });
 
   it("judges each row's run against the row's own namespace, not the page's scope", async () => {
