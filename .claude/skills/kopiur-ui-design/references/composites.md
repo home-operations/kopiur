@@ -61,8 +61,8 @@ in three bands:
    Lineage, Log, Conditions for a snapshot; Source, Target, Log, Conditions for a
    restore). The panel is the scroller; a tab that reads something (a snapshot's
    retention plan) reads it when opened. A kind with one tab draws no tab list.
-3. **Actions** in the foot: the kind's controls in a row, an open inline
-   confirmation and any receipt stacked above them. The buttons never scroll out
+3. **Actions** in the foot: the kind's controls in a row, with an open inline
+   confirmation above them; the answer is a toast. The buttons never scroll out
    of view; a tall confirmation scrolls inside itself. A kind with nothing to act
    on (a Restore) has no foot.
 
@@ -106,7 +106,7 @@ the degraded state and the `ShieldX` icon and offers no retry.
 
 ---
 
-## Action → confirm → receipt
+## Action → confirm → toast
 
 1. **Action row** — buttons in the detail hero (or a table cell's single trigger).
 2. **Confirm** — opens in a **popover anchored to its trigger** (`ActionPanel`,
@@ -117,8 +117,7 @@ the degraded state and the `ShieldX` icon and offers no retry.
    the question, not the drawer. Only one confirmation is open at a time.
    Placement follows the trigger: below it on a page, **upward** from a
    drawer's foot (so the drawer's content keeps its room), and pinned on screen
-   (`strategy="fixed"`) from a table cell, whose card would clip it — the
-   table's one receipt then shows under the table, at full width. A form too
+   (`strategy="fixed"`) from a table cell, whose card would clip it. A form too
    long to float (creating a restore) opens **inline** under its trigger
    instead (`presentation="inline"`).
 3. **Choice** — for a field whose wrong value costs data (`pin`, `overwrite`): a
@@ -126,10 +125,13 @@ the degraded state and the `ShieldX` icon and offers no retry.
    (`spec.pin: true`). **Neither starts selected**; the confirm button is blocked
    with the reason until one is chosen. The destructive answer gets a 2px
    `--health-failed-fg` left rule.
-4. **Receipt** — appears beside the trigger once asked: a `--health-healthy-bg` card with a
-   healthy-tinted border, a "Requested" pill, the server's `note` (never dropped),
-   created objects as references, and the request instant in small mono. Actions
-   that answer 202 say **requested**, never **done**. A live region.
+4. **Toast** — the answer, never beside the trigger: the query client's mutation
+   cache toasts every mutation (see the Toast primitive). Accepted: "{action}
+   requested." with the server's `note` (never dropped), created objects as
+   references and the request instant; it decays. Refused: the problem's what /
+   why / fix; it stays until closed. Actions that answer 202 say **requested**,
+   never **done**. Each mutation hook names itself with `describe` ("Suspend
+   schedule media/nightly"), so no surface words its own answer.
 
 ---
 

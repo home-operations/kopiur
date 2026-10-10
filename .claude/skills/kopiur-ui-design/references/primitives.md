@@ -728,6 +728,42 @@ value in mono, the empty meaning muted, a chevron) that opens a popover onto
 
 ---
 
+## Toast (an action's answer)
+
+**What:** every mutating action's answer, as a card that slides up at the
+bottom right of the screen. `components/toast/` — `toasts` (the store),
+`Toaster` (mounted once in `AppShell`), `useDecay` (the clock).
+
+- **One source.** `api/queryClient.ts`'s `MutationCache` pushes a toast for
+  every mutation: a receipt on success, the problem on failure. A mutation hook
+  names its action with `describe(variables)` and may set `announce: "errors"`
+  when its success already shows where it was asked (a browse session). No
+  component renders an action's answer itself, and a failed mutation no longer
+  raises the page banner (that banner is left for the identity failure).
+- **Accepted** (`role="status"`): a healthy check, "{action} requested.", the
+  receipt's `note`, created objects as references, the request time. It
+  decays: 6s, or 10s with a note. A 2px line along its foot runs down with the
+  time.
+- **Refused** (`role="alert"`): failed border and icon, the problem's what /
+  why / Fix plate and meta line (`ProblemBody`, shared with the banner). **No
+  timer**: it stays until closed, since the fix is the thing to read.
+- **The clock pauses** while the pointer is over the toast, while focus is
+  inside it, and while the tab is hidden; the line stops with it
+  (`data-paused` → `animation-play-state: paused`). The clock is JS, not
+  `animationend`: the reduced-motion rule collapses animations, and under it
+  the line is hidden but the toast still lasts its time.
+- **Never takes focus**; a close button ("Dismiss notification") on each. The
+  stack is newest at the bottom, at most five; past that the oldest _timed_
+  toast goes, never a refusal.
+- **Inside an open drawer.** The side panel is a modal `<dialog>`, which makes
+  the page inert; while it is open it registers itself as the toast host
+  (`toastHost.ts`) and the toaster portals into it. A toast keeps its clock
+  and does not slide in again when it moves between the page and a drawer.
+- 22rem wide, 16px from the edges; at phone width it spans the viewport less
+  the gutters. Tests find answers with `notifications()` from `test-utils`.
+
+---
+
 ## Side panel (the resource drawer)
 
 **What:** a resource's details, floating over the right edge of the page. Every
@@ -777,8 +813,8 @@ resource is looked at without leaving the page you are on.
   lamp and one sentence, then the **chain** — what feeds it → this → what it
   feeds — then three or four headline stats, then any gate or failure finding);
   then **tabs** holding everything else, whose panel is the scroller; then the
-  **actions** in the foot — a row of buttons with an open inline confirmation and
-  any receipt stacked above it. A kind with one tab draws no tab list. A long name wraps in the title, never widens the panel.
+  **actions** in the foot — a row of buttons with an open inline confirmation
+  above it; answers are toasts. A kind with one tab draws no tab list. A long name wraps in the title, never widens the panel.
 - **The open resource lives in the URL** — `?inspect=<kind-slug>/<namespace>/<name>`
   (`cluster-repository/<name>` for the cluster-scoped kind). Opening pushes one
   history entry, so Back closes it; opening another resource from inside replaces
