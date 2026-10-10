@@ -11,8 +11,8 @@ import { type GraphContext, nodeTarget } from "./graphFacts";
 /**
  * Every relationship the topology graph draws for a resource, both ways: what
  * kind of link it is, what is at the other end, the link's own state (a
- * failing replication is a failed link between two healthy repositories) and
- * its label. A resource at the other end opens in the drawer; a backend, a
+ * failing replication is a failed link between two healthy repositories,
+ * drawn when the far end's own badge does not already say it) and its label. A resource at the other end opens in the drawer; a backend, a
  * namespace or a selector is named as what it is.
  */
 export function GraphRelationships({ context }: { context: GraphContext }) {
@@ -58,11 +58,17 @@ export function EdgeList({ heading, empty, edges, other, model, namespace }: Edg
           {edges.map((edge) => {
             const id = other(edge);
             const end = model.byId.get(id);
+            // A resource at the other end wears its own badge in its chip. The
+            // link's badge is drawn beside it only when it says something
+            // else (a failing replication between healthy repositories); an
+            // end with no chip (a backend, a namespace) always keeps it.
+            const endLamp = end !== undefined && nodeTarget(end.node) !== null ? end.lamp : null;
+            const linkSaysMore = endLamp?.key !== edge.lamp.key || endLamp.word !== edge.lamp.word;
             return (
               <li key={edge.id} data-edge={edge.style.key}>
                 <span className="drawer__edge-kind">{edge.style.word}</span>
                 <EdgeEnd end={end} id={id} namespace={namespace} />
-                <LampBadge lamp={edge.lamp} />
+                {linkSaysMore ? <LampBadge lamp={edge.lamp} /> : null}
                 {/* A selector's label is the selector itself: said once, as the end. */}
                 {edge.edge.label !== undefined &&
                 edge.edge.label !== null &&

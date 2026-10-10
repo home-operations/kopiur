@@ -97,6 +97,21 @@ describe("the resource drawer, with what the board knows", () => {
     expect(within(into).getByRole("link", { name: /nightly/ })).toBeInTheDocument();
   });
 
+  it("states a link's own state only when its end does not already say it", async () => {
+    mockApi({ ...GRAPH, "/api/v1/repositories/repository/nas": jsonResponse(repo({})) });
+    mountApp(`${PAGE}?inspect=repository/media/nas`);
+    const tab = await openTab("Relationships");
+    // A healthy policy's healthy membership: the policy's own badge says it once.
+    const into = within(tab).getByRole("region", { name: "Pointed at by" });
+    const membership = within(into).getByText("Policy membership").closest("li");
+    expect(membership?.querySelectorAll(".health")).toHaveLength(1);
+    expect(membership?.querySelector("a .health")).not.toBeNull();
+    // A healthy seed into a mirror whose state is unknown: two different facts.
+    const out = within(tab).getByRole("region", { name: "Points at" });
+    const seed = within(out).getByText("Seed").closest("li");
+    expect(seed?.querySelectorAll(".health")).toHaveLength(2);
+  });
+
   it("says in one line what the kind is", async () => {
     mockApi({ ...GRAPH, "/api/v1/repositories/repository/nas": jsonResponse(repo({})) });
     mountApp(`${PAGE}?inspect=repository/media/nas`);
