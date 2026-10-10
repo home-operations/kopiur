@@ -88,7 +88,7 @@ export function Sidebar({ namespace }: { namespace: string | undefined }) {
                       </span>
                     )}
                     <span className="nav-item__label">{item.label}</span>
-                    {tally !== null ? <NavTallyMarks tally={tally} /> : null}
+                    {tally !== null && !tally.refused ? <NavTallyMarks tally={tally} /> : null}
                     {isBrowse ? <BrowseLine status={browse} /> : null}
                   </Link>
                   {describedBy !== undefined ? (

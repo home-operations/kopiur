@@ -18,4 +18,10 @@ total: number,
  * Non-zero states only, worst first: failed, degraded, pending, unknown,
  * suspended, healthy.
  */
-byHealth: Array<HealthCount>, };
+byHealth: Array<HealthCount>,
+/**
+ * The caller may not list this kind in scope, so it was not counted:
+ * `total` is 0 because nothing was read, not because there is nothing.
+ * The other kinds are counted all the same.
+ */
+refused: boolean, };

@@ -15,6 +15,8 @@ export interface NavTally {
   failing: number;
   /** "4 in the last 24h: 1 failed, 2 ok" — the bar as a sentence. */
   words: string;
+  /** The caller may list none of the section's kinds here: no count is drawn. */
+  refused: boolean;
 }
 
 /**
@@ -53,7 +55,13 @@ export function navTally(overview: OverviewView | undefined, to: NavPath): NavTa
   if (counts === undefined || overview === undefined || !Array.isArray(overview.kinds)) {
     return null;
   }
-  const tallies = overview.kinds.filter((k) => counts.includes(k.kind));
+  const all = overview.kinds.filter((k) => counts.includes(k.kind));
+  // A refused kind was not read, so its zero is no count at all.
+  const tallies = all.filter((k) => k.refused !== true);
+  if (all.length > 0 && tallies.length === 0) {
+    return { total: 0, parts: [], failing: 0, words: "not permitted to list here", refused: true };
+  }
+  const partly = tallies.length < all.length ? "; some not permitted to list here" : "";
   const total = tallies.reduce((sum, t) => sum + t.total, 0);
   const byKey = new Map<HealthKey, number>();
   for (const t of tallies) {
@@ -68,8 +76,9 @@ export function navTally(overview: OverviewView | undefined, to: NavPath): NavTa
   });
   const window = to === "/snapshots" ? ` in the last ${String(overview.snapshotWindowHours)}h` : "";
   const words =
-    parts.length === 0
+    (parts.length === 0
       ? "none in scope"
-      : `${String(total)}${window}: ${parts.map((p) => `${String(p.n)} ${WORD[p.key]}`).join(", ")}`;
-  return { total, parts, failing: byKey.get("failed") ?? 0, words };
+      : `${String(total)}${window}: ${parts.map((p) => `${String(p.n)} ${WORD[p.key]}`).join(", ")}`) +
+    partly;
+  return { total, parts, failing: byKey.get("failed") ?? 0, words, refused: false };
 }

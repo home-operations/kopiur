@@ -3,7 +3,8 @@
 //!
 //! The overview's "fleet by kind" tiles. Every kind is listed through
 //! [`Source::list`](crate::cache::Source::list), so the counts are exactly what
-//! the caller may see. Only repositories publish a health of their own; every
+//! the caller may see, and a kind the caller may not list is reported as
+//! refused rather than failing the rest. Only repositories publish a health of their own; every
 //! other kind is bucketed here from its phase or its facts, by exhaustive
 //! matches, so an unrecognised phase is `Unknown` and never healthy.
 
@@ -27,6 +28,7 @@ use crate::api::problem::ApiError;
 use crate::api::repositories::{view_cluster_repository, view_repository};
 use crate::api::{NamespaceQuery, UiQuery, client_for, gate_hits};
 use crate::auth::CurrentIdentity;
+use kopiur_ops::{OpsError, OpsErrorKind};
 
 /// Snapshots are counted over this many trailing hours.
 pub const SNAPSHOT_WINDOW_HOURS: u32 = 24;
@@ -169,6 +171,28 @@ pub fn kind_tally(kind: ObjectKind, states: impl IntoIterator<Item = Health>) ->
         kind,
         total: u32::try_from(states.len()).unwrap_or(u32::MAX),
         by_health,
+        refused: false,
+    }
+}
+
+/// **Pure.** One kind's tally from its list read. A kind the caller may not
+/// list is a refused tally rather than a failed overview: someone who may read
+/// repositories but not replications still sees every count they are allowed.
+/// Any other failure still fails the whole response.
+pub fn tally_or_refused<K>(
+    kind: ObjectKind,
+    listed: Result<Vec<Arc<K>>, OpsError>,
+    health: impl Fn(&Arc<K>) -> Health,
+) -> Result<KindTally, ApiError> {
+    match listed {
+        Ok(objects) => Ok(kind_tally(kind, objects.iter().map(health))),
+        Err(error) if error.kind() == OpsErrorKind::Forbidden => Ok(KindTally {
+            kind,
+            total: 0,
+            by_health: Vec::new(),
+            refused: true,
+        }),
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -197,60 +221,56 @@ async fn handler(
     let src = &app.source;
     let now = Utc::now();
 
-    let repositories = src.list::<Repository>(&id, &client, ns).await?;
-    let cluster_repositories = src.list::<ClusterRepository>(&id, &client, ns).await?;
-    let maintenances = src.list::<Maintenance>(&id, &client, ns).await?;
-    let policies = src.list::<SnapshotPolicy>(&id, &client, ns).await?;
-    let schedules = src.list::<SnapshotSchedule>(&id, &client, ns).await?;
-    let snapshots = src.list::<Snapshot>(&id, &client, ns).await?;
-    let restores = src.list::<Restore>(&id, &client, ns).await?;
-    let repository_replications = src.list::<RepositoryReplication>(&id, &client, ns).await?;
-    let snapshot_replications = src.list::<SnapshotReplication>(&id, &client, ns).await?;
-
     let kinds = vec![
-        kind_tally(
+        tally_or_refused(
             ObjectKind::Repository,
-            repositories.iter().map(|r| view_repository(r).health),
-        ),
-        kind_tally(
+            src.list::<Repository>(&id, &client, ns).await,
+            |r| view_repository(r).health,
+        )?,
+        tally_or_refused(
             ObjectKind::ClusterRepository,
-            cluster_repositories
-                .iter()
-                .map(|r| view_cluster_repository(r).health),
-        ),
-        kind_tally(
+            src.list::<ClusterRepository>(&id, &client, ns).await,
+            |r| view_cluster_repository(r).health,
+        )?,
+        tally_or_refused(
             ObjectKind::Maintenance,
-            maintenances.iter().map(|m| maintenance_health(m)),
-        ),
-        kind_tally(
+            src.list::<Maintenance>(&id, &client, ns).await,
+            |m| maintenance_health(m),
+        )?,
+        tally_or_refused(
             ObjectKind::SnapshotPolicy,
-            policies.iter().map(|p| policy_health(p)),
-        ),
-        kind_tally(
+            src.list::<SnapshotPolicy>(&id, &client, ns).await,
+            |p| policy_health(p),
+        )?,
+        tally_or_refused(
             ObjectKind::SnapshotSchedule,
-            schedules.iter().map(|s| schedule_health(s)),
-        ),
-        kind_tally(
+            src.list::<SnapshotSchedule>(&id, &client, ns).await,
+            |s| schedule_health(s),
+        )?,
+        tally_or_refused(
             ObjectKind::Snapshot,
-            within_window(&snapshots, now, i64::from(SNAPSHOT_WINDOW_HOURS))
-                .map(|s| snapshot_health(s)),
-        ),
-        kind_tally(
+            src.list::<Snapshot>(&id, &client, ns).await.map(|all| {
+                within_window(&all, now, i64::from(SNAPSHOT_WINDOW_HOURS))
+                    .cloned()
+                    .collect()
+            }),
+            |s| snapshot_health(s),
+        )?,
+        tally_or_refused(
             ObjectKind::Restore,
-            restores.iter().map(|r| restore_health(r)),
-        ),
-        kind_tally(
+            src.list::<Restore>(&id, &client, ns).await,
+            |r| restore_health(r),
+        )?,
+        tally_or_refused(
             ObjectKind::RepositoryReplication,
-            repository_replications.iter().map(|r| {
-                repository_replication_health(r.status.as_ref().and_then(|st| st.phase.as_ref()))
-            }),
-        ),
-        kind_tally(
+            src.list::<RepositoryReplication>(&id, &client, ns).await,
+            |r| repository_replication_health(r.status.as_ref().and_then(|st| st.phase.as_ref())),
+        )?,
+        tally_or_refused(
             ObjectKind::SnapshotReplication,
-            snapshot_replications.iter().map(|r| {
-                snapshot_replication_health(r.status.as_ref().and_then(|st| st.phase.as_ref()))
-            }),
-        ),
+            src.list::<SnapshotReplication>(&id, &client, ns).await,
+            |r| snapshot_replication_health(r.status.as_ref().and_then(|st| st.phase.as_ref())),
+        )?,
     ];
 
     Ok(Json(OverviewView {
@@ -378,6 +398,54 @@ status: { quick: { consecutiveFailures: 0 } }
             Health::Healthy,
             "a full track that has never run is a loud card fact, not a tile failure"
         );
+    }
+
+    fn forbidden() -> kopiur_ops::OpsError {
+        kopiur_ops::OpsError::Forbidden {
+            verb: "list",
+            resource: "repositoryreplications",
+            scope: " in namespace media".into(),
+            source: Box::new(kube::Error::Api(
+                kube::core::Status::failure("denied", "Forbidden")
+                    .with_code(403)
+                    .into(),
+            )),
+        }
+    }
+
+    #[test]
+    fn a_kind_the_caller_may_not_list_is_refused_not_a_failure_of_the_whole() {
+        let listed: Result<Vec<Arc<Snapshot>>, _> = Err(forbidden());
+        let t = tally_or_refused(ObjectKind::RepositoryReplication, listed, |_| {
+            Health::Healthy
+        })
+        .expect("a refusal is a tally, not an error");
+        assert_eq!(t.kind, ObjectKind::RepositoryReplication);
+        assert!(t.refused);
+        assert_eq!(t.total, 0);
+        assert!(t.by_health.is_empty());
+    }
+
+    #[test]
+    fn a_kind_that_lists_is_counted_and_not_refused() {
+        let listed = Ok(vec![snap("a", "Succeeded", "2026-01-01T00:00:00Z")]);
+        let t =
+            tally_or_refused(ObjectKind::Snapshot, listed, |s| snapshot_health(s)).expect("listed");
+        assert!(!t.refused);
+        assert_eq!(t.total, 1);
+    }
+
+    #[test]
+    fn any_other_failure_still_fails_the_overview() {
+        let listed: Result<Vec<Arc<Snapshot>>, _> = Err(kopiur_ops::OpsError::KindNotInstalled {
+            kind: "Snapshot",
+            source: Box::new(kube::Error::Api(
+                kube::core::Status::failure("missing", "NotFound")
+                    .with_code(404)
+                    .into(),
+            )),
+        });
+        assert!(tally_or_refused(ObjectKind::Snapshot, listed, |_| Health::Healthy).is_err());
     }
 
     #[test]

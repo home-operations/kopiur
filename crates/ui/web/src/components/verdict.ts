@@ -79,6 +79,22 @@ export function tallyPhrases(tallies: readonly KindTally[]): {
   return { failed, worrying };
 }
 
+/** The kinds the caller may not list in scope, as the sentence names them, once each. */
+export function refusedNouns(tallies: readonly KindTally[]): string[] {
+  const nouns: string[] = [];
+  for (const tally of tallies) {
+    const noun = tallyNoun(tally.kind);
+    if (tally.refused !== true || noun === null || nouns.includes(noun[1])) continue;
+    nouns.push(noun[1]);
+  }
+  return nouns;
+}
+
+function orList(parts: readonly string[]): string {
+  if (parts.length <= 1) return parts.join("");
+  return `${parts.slice(0, -1).join(", ")} or ${parts[parts.length - 1] ?? ""}`;
+}
+
 export interface Verdict {
   health: HealthKey;
   text: string;
@@ -145,7 +161,12 @@ export function overviewVerdict({
   // the overview keeps warning detail off the screen — so a count with no
   // words beside it would leave the operator no way to learn what it meant.
   const blockedSentence = `${plural(doctor.rbac, "doctor check")} could not run with your permissions.`;
-  const blocked = doctor.rbac > 0 ? ` ${blockedSentence}` : "";
+  // A kind the caller may not list was not counted: its zero says nothing, so
+  // the verdict cannot be green over it, and names it like a blocked check.
+  const refused = refusedNouns(tallies);
+  const refusedSentence = `You may not list ${orList(refused)} here.`;
+  const refusedTail = refused.length > 0 ? ` ${refusedSentence}` : "";
+  const blocked = (doctor.rbac > 0 ? ` ${blockedSentence}` : "") + refusedTail;
 
   const failed =
     repositories.failed > 0 || stalled > 0 || doctor.fail > 0 || fleet.failed.length > 0;
@@ -162,7 +183,13 @@ export function overviewVerdict({
     return { health: "degraded", text: `Mostly healthy: ${lit.join(", ")}.${blocked}` };
   }
   if (doctor.rbac > 0) {
-    return { health: "unknown", text: `Cannot fully check: ${blockedSentence}` };
+    return { health: "unknown", text: `Cannot fully check: ${blockedSentence}${refusedTail}` };
+  }
+  if (refused.length > 0) {
+    return {
+      health: "unknown",
+      text: `Cannot fully check: you may not list ${orList(refused)} here.`,
+    };
   }
 
   const total = Object.values(repositories).reduce((sum, count) => sum + count, 0);

@@ -69,4 +69,29 @@ describe("navTally", () => {
   it("has nothing when the overview has not been read", () => {
     expect(navTally(undefined, "/repositories")).toBeNull();
   });
+
+  it("draws no count for a section whose kinds the caller may not list", () => {
+    const refused: OverviewView = {
+      ...overview,
+      kinds: overview.kinds.map((k) =>
+        k.kind === "restore" ? { ...k, total: 0, byHealth: [], refused: true } : k,
+      ),
+    };
+    const tally = navTally(refused, "/restores");
+    expect(tally?.refused).toBe(true);
+    expect(tally?.words).toBe("not permitted to list here");
+  });
+
+  it("counts what it may read when only one of a section's kinds is refused", () => {
+    const refused: OverviewView = {
+      ...overview,
+      kinds: overview.kinds.map((k) =>
+        k.kind === "repositoryReplication" ? { ...k, total: 0, byHealth: [], refused: true } : k,
+      ),
+    };
+    const tally = navTally(refused, "/replications");
+    expect(tally?.refused).toBe(false);
+    expect(tally?.total).toBe(1);
+    expect(tally?.words).toBe("1: 1 ok; some not permitted to list here");
+  });
 });

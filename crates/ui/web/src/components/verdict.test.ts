@@ -166,4 +166,44 @@ describe("overviewVerdict", () => {
     expect(verdict.health).toBe("unknown");
     expect(verdict.text).toBe("No repositories in scope, nothing stalled, no failing checks.");
   });
+
+  it("is never green while a kind could not be listed, and says which", () => {
+    const verdict = overviewVerdict({
+      ...quiet,
+      tallies: [
+        { kind: "repositoryReplication", total: 0, byHealth: [], refused: true },
+        { kind: "snapshotReplication", total: 0, byHealth: [], refused: true },
+        { kind: "restore", total: 0, byHealth: [], refused: true },
+      ],
+    });
+    expect(verdict).toEqual({
+      health: "unknown",
+      text: "Cannot fully check: you may not list replications or restores here.",
+    });
+  });
+
+  it("names a refused kind beside what failed", () => {
+    const verdict = overviewVerdict({
+      ...quiet,
+      tallies: [
+        { kind: "snapshot", total: 1, byHealth: [{ health: "failed", count: 1 }] },
+        { kind: "restore", total: 0, byHealth: [], refused: true },
+      ],
+    });
+    expect(verdict).toEqual({
+      health: "failed",
+      text: "Needs attention: 1 snapshot failed. You may not list restores here.",
+    });
+  });
+
+  it("names both a blocked check and a refused kind, each its own sentence", () => {
+    const verdict = overviewVerdict({
+      ...quiet,
+      doctor: { ...quiet.doctor, rbac: 1 },
+      tallies: [{ kind: "restore", total: 0, byHealth: [], refused: true }],
+    });
+    expect(verdict.text).toBe(
+      "Cannot fully check: 1 doctor check could not run with your permissions. You may not list restores here.",
+    );
+  });
 });
