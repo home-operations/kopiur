@@ -22,6 +22,10 @@ export interface InspectLinkProps {
  * `?inspect=`. Opened from the page it pushes one history entry, so Back
  * closes the drawer; opened from inside an open drawer it replaces that entry,
  * so walking from one resource to the next never piles up history.
+ *
+ * The page stays where it is: the router scrolls to the top on a navigation
+ * by default, and a drawer opened from halfway down a list must not throw the
+ * reader back to its head.
  */
 export function InspectLink({
   target,
@@ -41,6 +45,7 @@ export function InspectLink({
       search={{ ...search, inspect: inspectToken(target) } as never}
       state={(prev) => ({ ...prev, inspect: true })}
       replace={drawerOpen}
+      resetScroll={false}
       className={className}
       aria-label={ariaLabel}
       data-kind={dataKind}

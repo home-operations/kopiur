@@ -54,7 +54,9 @@ export function parseInspect(raw: unknown): InspectTarget | null {
  * Closing undoes the opening: when the drawer was opened onto this history
  * entry (a link marked it), close steps back over it, so the entry is gone and
  * Back afterwards leaves the page as it would have before. A deep link has no
- * such entry to step over, so it drops the parameter in place.
+ * such entry to step over, so it drops the parameter in place. Neither moves
+ * the page: stepping back restores where it was (the router's scroll
+ * restoration, `main.tsx`), and dropping the parameter does not scroll.
  */
 export function useInspect(): { target: InspectTarget | null; close: () => void } {
   const router = useRouter();
@@ -67,7 +69,12 @@ export function useInspect(): { target: InspectTarget | null; close: () => void 
       return;
     }
     const rest = Object.fromEntries(Object.entries(search).filter(([key]) => key !== "inspect"));
-    void router.navigate({ to: location.pathname, search: rest as never, replace: true });
+    void router.navigate({
+      to: location.pathname,
+      search: rest as never,
+      replace: true,
+      resetScroll: false,
+    });
   };
   return { target, close };
 }

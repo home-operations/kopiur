@@ -6,7 +6,7 @@ import {
   createRootRoute,
   createRouter,
 } from "@tanstack/react-router";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { renderWithRouter } from "../test-utils";
 import { InspectLink } from "./InspectLink";
@@ -64,6 +64,41 @@ describe("InspectLink and useInspect", () => {
     await user.click(screen.getByRole("button", { name: "close" }));
     await screen.findByText("none");
     expect(router.state.location.pathname).toBe("/policies");
+  });
+});
+
+describe("opening and closing the drawer leaves the page where it was", () => {
+  // The router scrolls the window to the top on a navigation unless told not
+  // to, and opening or closing the drawer is a navigation.
+  const toTop = (spy: { mock: { calls: unknown[][] } }) =>
+    spy.mock.calls.filter(
+      ([arg]) => typeof arg === "object" && (arg as { top?: number }).top === 0,
+    );
+
+  it("does not scroll to the top when a drawer opens, or when another replaces it", async () => {
+    const scroll = vi.spyOn(window, "scrollTo").mockImplementation(() => undefined);
+    renderHarness("/policies?namespace=a");
+    const user = userEvent.setup();
+    const link = await screen.findByRole("link", { name: "app-data" });
+    // Landing on a page starts it at the top; only what follows counts.
+    scroll.mockClear();
+    await user.click(link);
+    await screen.findByText("snapshotPolicy:app-data");
+    await user.click(screen.getByRole("link", { name: "nas" }));
+    await screen.findByText("repository:nas");
+    expect(toTop(scroll)).toEqual([]);
+    scroll.mockRestore();
+  });
+
+  it("does not scroll to the top when a deep-linked drawer closes in place", async () => {
+    const scroll = vi.spyOn(window, "scrollTo").mockImplementation(() => undefined);
+    renderHarness("/policies?inspect=snapshot-policy%2Fa%2Fapp-data");
+    await screen.findByText("snapshotPolicy:app-data");
+    scroll.mockClear();
+    await userEvent.setup().click(screen.getByRole("button", { name: "close" }));
+    await screen.findByText("none");
+    expect(toTop(scroll)).toEqual([]);
+    scroll.mockRestore();
   });
 });
 
