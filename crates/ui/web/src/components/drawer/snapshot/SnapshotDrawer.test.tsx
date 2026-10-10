@@ -369,7 +369,7 @@ describe("Snapshot drawer", () => {
     const user = userEvent.setup();
     const bar = await foot();
     await user.click(await within(bar).findByRole("button", { name: /^Delete/ }));
-    const confirm = within(bar).getByRole("group", { name: "Delete" });
+    const confirm = within(bar).getByRole("dialog", { name: "Delete" });
     expect(confirm).toHaveTextContent("Delete");
     expect(confirm).toHaveTextContent(/deleted from the repository/);
     expect(confirm).toHaveTextContent(/cannot be restored from afterwards/);
@@ -385,10 +385,13 @@ describe("Snapshot drawer", () => {
     const bar = await foot();
     const trigger = await within(bar).findByRole("button", { name: /^Delete/ });
     await user.click(trigger);
-    expect(within(bar).getByRole("group", { name: "Delete" })).toHaveFocus();
+    // Focus moves into the question, which floats above the bar.
+    expect(within(bar).getByRole("dialog", { name: "Delete" })).toContainElement(
+      document.activeElement as HTMLElement,
+    );
 
     await user.keyboard("{Escape}");
-    expect(within(bar).queryByRole("group", { name: "Delete" })).not.toBeInTheDocument();
+    expect(within(bar).queryByRole("dialog", { name: "Delete" })).not.toBeInTheDocument();
     expect(trigger).toHaveFocus();
     expect(screen.getByRole("dialog")).toBeInTheDocument();
   });
@@ -416,7 +419,7 @@ describe("Snapshot drawer", () => {
     await user.click(trigger);
     await user.click(within(bar).getByRole("button", { name: "Request deletion" }));
     await waitFor(() => {
-      expect(within(bar).queryByRole("group", { name: "Delete" })).not.toBeInTheDocument();
+      expect(within(bar).queryByRole("dialog", { name: "Delete" })).not.toBeInTheDocument();
     });
     expect(trigger).toHaveFocus();
   });
@@ -427,7 +430,7 @@ describe("Snapshot drawer", () => {
     const user = userEvent.setup();
     const bar = await foot();
     await user.click(await within(bar).findByRole("button", { name: /^Delete/ }));
-    const confirm = within(bar).getByRole("group", { name: "Delete" });
+    const confirm = within(bar).getByRole("dialog", { name: "Delete" });
     expect(confirm).toHaveTextContent("not set (the operator decides)");
     expect(confirm).toHaveTextContent(/cannot tell which applies/);
     expect(confirm.querySelector('[data-consequence="unknown"]')).not.toBeNull();
@@ -481,7 +484,7 @@ describe("Snapshot drawer", () => {
     const confirm = within(bar).getByRole("button", { name: "Take a snapshot" });
     expect(confirm).toHaveAttribute("aria-disabled", "true");
     expect(confirm).toHaveAccessibleDescription("Choose whether to pin it first.");
-    expect(within(bar).getByRole("group", { name: "Snapshot now" })).toHaveTextContent(
+    expect(within(bar).getByRole("dialog", { name: "Snapshot now" })).toHaveTextContent(
       /permanent: retention never removes a pinned snapshot/,
     );
     await user.click(prune);

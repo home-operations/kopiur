@@ -290,7 +290,7 @@ describe("Repository drawer", () => {
     const bar = await foot();
     await user.click(await within(bar).findByRole("button", { name: /Suspend/ }));
     // The confirmation says what suspending does before it is done.
-    const confirm = within(bar).getByRole("group", { name: "Suspend" });
+    const confirm = within(bar).getByRole("dialog", { name: "Suspend" });
     expect(confirm).toHaveTextContent("No new backups run here");
     await user.click(within(confirm).getByRole("button", { name: "Suspend this repository" }));
 
@@ -314,7 +314,7 @@ describe("Repository drawer", () => {
     const user = userEvent.setup();
     const bar = await foot();
     await user.click(await within(bar).findByRole("button", { name: /Scan catalog/ }));
-    const confirm = within(bar).getByRole("group", { name: "Scan catalog" });
+    const confirm = within(bar).getByRole("dialog", { name: "Scan catalog" });
     await user.click(within(confirm).getByRole("button", { name: "Request a scan" }));
     expect(await within(bar).findByText(/Scan catalog requested/)).toBeInTheDocument();
     expect(sentBody("/api/v1/actions/scan-catalog")).toEqual({

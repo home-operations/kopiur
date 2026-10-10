@@ -5,7 +5,7 @@ import { useDeleteSnapshot, useSnapshotNow } from "../api/hooks";
 import type { SnapshotRow } from "../api/types";
 import { ActionButton } from "./ActionButton";
 import { ActionResult } from "./ActionResult";
-import { useConfirmFocus } from "./actions/useConfirmFocus";
+import { Popover } from "./Popover";
 import { deletionConsequence, deletionPolicyLabel } from "./snapshot";
 import { useCapabilityReason } from "./useCapabilityReason";
 
@@ -54,15 +54,12 @@ export function SnapshotActions({ row, extra }: SnapshotActionsProps) {
   // Unanswered until the reader chooses: a pin is permanent, so neither
   // answer is a default (rule 7 of the kopiur-ui-design skill).
   const [pin, setPin] = useState<"" | "pin" | "prune">("");
-  // This bar is hand-rolled rather than built from `ActionPanel` (it predates
-  // it), so it borrows the shared focus behaviour directly: opening moves
-  // focus into the panel, Escape closes it, and closing returns focus to the
-  // trigger instead of dropping the reader on `<body>`.
-  const close = () => {
-    setOpen(null);
+  // Each question is a popover on its button: opening moves focus into it,
+  // Escape or a click elsewhere closes it, and closing hands focus back to
+  // the button. Only one is open at a time.
+  const openChange = (id: ActionId) => (next: boolean) => {
+    setOpen((was) => (next ? id : was === id ? null : was));
   };
-  const snapshotNowRef = useConfirmFocus(open === "snapshot-now", close);
-  const deleteRef = useConfirmFocus(open === "delete", close);
 
   const policy = row.policy;
   const hasPolicy = policy !== null && policy !== undefined && policy.length > 0;
@@ -82,162 +79,155 @@ export function SnapshotActions({ row, extra }: SnapshotActionsProps) {
   return (
     <>
       <div className="action-bar">
-        <ActionButton
-          disabledReason={noPolicy ?? createReason}
-          aria-expanded={open === "snapshot-now"}
-          onClick={() => {
-            setOpen((was) => (was === "snapshot-now" ? null : "snapshot-now"));
-          }}
+        <Popover
+          label="Snapshot now"
+          open={open === "snapshot-now" && hasPolicy}
+          onOpenChange={openChange("snapshot-now")}
+          className="action__popover"
+          trigger={(props) => (
+            <ActionButton disabledReason={noPolicy ?? createReason} {...props}>
+              <Camera size={14} strokeWidth={2} aria-hidden="true" />
+              Snapshot now
+            </ActionButton>
+          )}
         >
-          <Camera size={14} strokeWidth={2} aria-hidden="true" />
-          Snapshot now
-        </ActionButton>
-        <ActionButton
-          variant="danger"
-          disabledReason={deleteReason}
-          aria-expanded={open === "delete"}
-          onClick={() => {
-            setOpen((was) => (was === "delete" ? null : "delete"));
-          }}
+          {(close) => (
+            <>
+              <div className="action__prose">
+                <p>
+                  This creates a new <span className="mono">Snapshot</span> under SnapshotPolicy{" "}
+                  <span className="mono">
+                    {row.namespace}/{policy}
+                  </span>
+                  . It does not touch this snapshot.
+                </p>
+                <fieldset className="action__choice">
+                  <legend>Retention</legend>
+                  <label htmlFor="snapshot-now-prune">
+                    <input
+                      type="radio"
+                      id="snapshot-now-prune"
+                      name="snapshot-now-pin"
+                      value="prune"
+                      checked={pin === "prune"}
+                      onChange={() => {
+                        setPin("prune");
+                      }}
+                    />
+                    <span>
+                      Prune it under the policy&apos;s retention, like any other snapshot (
+                      <span className="mono">spec.pin</span> unset).
+                    </span>
+                  </label>
+                  <label htmlFor="snapshot-now-pin" data-danger="true">
+                    <input
+                      type="radio"
+                      id="snapshot-now-pin"
+                      name="snapshot-now-pin"
+                      value="pin"
+                      checked={pin === "pin"}
+                      onChange={() => {
+                        setPin("pin");
+                      }}
+                    />
+                    <span>
+                      Pin it — a pin is <strong>permanent</strong>: retention never removes a pinned
+                      snapshot (<span className="mono">spec.pin: true</span>).
+                    </span>
+                  </label>
+                </fieldset>
+              </div>
+              <div className="action__actions">
+                <ActionButton
+                  variant="primary"
+                  disabledReason={
+                    snapshotNow.isPending
+                      ? "The request is in flight."
+                      : (createReason ??
+                        (pin === "" ? "Choose whether to pin it first." : undefined))
+                  }
+                  reasonKind={createReason !== undefined ? "refused" : "blocked"}
+                  onClick={() => {
+                    if (policy === null || policy === undefined) return;
+                    snapshotNow.mutate({
+                      namespace: row.namespace,
+                      policy,
+                      tags: [],
+                      pin: pin === "pin",
+                    });
+                    close();
+                  }}
+                >
+                  {pin === "pin" ? "Take a pinned snapshot" : "Take a snapshot"}
+                </ActionButton>
+                <ActionButton
+                  variant="quiet"
+                  onClick={() => {
+                    close();
+                  }}
+                >
+                  Cancel
+                </ActionButton>
+              </div>
+            </>
+          )}
+        </Popover>
+        <Popover
+          label="Delete"
+          open={open === "delete"}
+          onOpenChange={openChange("delete")}
+          className="action__popover"
+          trigger={(props) => (
+            <ActionButton variant="danger" disabledReason={deleteReason} {...props}>
+              <Trash2 size={14} strokeWidth={2} aria-hidden="true" />
+              Delete
+            </ActionButton>
+          )}
         >
-          <Trash2 size={14} strokeWidth={2} aria-hidden="true" />
-          Delete
-        </ActionButton>
+          {(close) => (
+            <>
+              <div className="action__prose">
+                <p>
+                  This requests deletion of the <span className="mono">Snapshot</span> resource{" "}
+                  <span className="mono">
+                    {row.namespace}/{row.name}
+                  </span>
+                  . Its deletion policy is{" "}
+                  <span className="mono">{deletionPolicyLabel(row.deletionPolicy)}</span>.
+                </p>
+                <p data-consequence={consequence.known ? "known" : "unknown"}>
+                  {consequence.destroys ? <strong>{consequence.text}</strong> : consequence.text}
+                </p>
+                <p>
+                  The deletion is <em>requested</em>, not done yet. If the repository&apos;s
+                  mass-deletion breaker holds it, the receipt below says so.
+                </p>
+              </div>
+              <div className="action__actions">
+                <ActionButton
+                  variant="danger"
+                  disabledReason={remove.isPending ? "The request is in flight." : deleteReason}
+                  onClick={() => {
+                    remove.mutate({ namespace: row.namespace, name: row.name });
+                    close();
+                  }}
+                >
+                  Request deletion
+                </ActionButton>
+                <ActionButton
+                  variant="quiet"
+                  onClick={() => {
+                    close();
+                  }}
+                >
+                  Cancel
+                </ActionButton>
+              </div>
+            </>
+          )}
+        </Popover>
         {extra}
       </div>
-
-      {open === "snapshot-now" && hasPolicy ? (
-        <div
-          className="action__confirm"
-          role="group"
-          aria-label="Snapshot now"
-          ref={snapshotNowRef}
-          tabIndex={-1}
-        >
-          <div className="action__prose">
-            <p>
-              This creates a new <span className="mono">Snapshot</span> under SnapshotPolicy{" "}
-              <span className="mono">
-                {row.namespace}/{policy}
-              </span>
-              . It does not touch this snapshot.
-            </p>
-            <fieldset className="action__choice">
-              <legend>Retention</legend>
-              <label htmlFor="snapshot-now-prune">
-                <input
-                  type="radio"
-                  id="snapshot-now-prune"
-                  name="snapshot-now-pin"
-                  value="prune"
-                  checked={pin === "prune"}
-                  onChange={() => {
-                    setPin("prune");
-                  }}
-                />
-                <span>
-                  Prune it under the policy&apos;s retention, like any other snapshot (
-                  <span className="mono">spec.pin</span> unset).
-                </span>
-              </label>
-              <label htmlFor="snapshot-now-pin" data-danger="true">
-                <input
-                  type="radio"
-                  id="snapshot-now-pin"
-                  name="snapshot-now-pin"
-                  value="pin"
-                  checked={pin === "pin"}
-                  onChange={() => {
-                    setPin("pin");
-                  }}
-                />
-                <span>
-                  Pin it — a pin is <strong>permanent</strong>: retention never removes a pinned
-                  snapshot (<span className="mono">spec.pin: true</span>).
-                </span>
-              </label>
-            </fieldset>
-          </div>
-          <div className="action__actions">
-            <ActionButton
-              variant="primary"
-              disabledReason={
-                snapshotNow.isPending
-                  ? "The request is in flight."
-                  : (createReason ?? (pin === "" ? "Choose whether to pin it first." : undefined))
-              }
-              reasonKind={createReason !== undefined ? "refused" : "blocked"}
-              onClick={() => {
-                snapshotNow.mutate({
-                  namespace: row.namespace,
-                  policy,
-                  tags: [],
-                  pin: pin === "pin",
-                });
-                setOpen(null);
-              }}
-            >
-              {pin === "pin" ? "Take a pinned snapshot" : "Take a snapshot"}
-            </ActionButton>
-            <ActionButton
-              variant="quiet"
-              onClick={() => {
-                setOpen(null);
-              }}
-            >
-              Cancel
-            </ActionButton>
-          </div>
-        </div>
-      ) : null}
-
-      {open === "delete" ? (
-        <div
-          className="action__confirm"
-          role="group"
-          aria-label="Delete"
-          ref={deleteRef}
-          tabIndex={-1}
-        >
-          <div className="action__prose">
-            <p>
-              This requests deletion of the <span className="mono">Snapshot</span> resource{" "}
-              <span className="mono">
-                {row.namespace}/{row.name}
-              </span>
-              . Its deletion policy is{" "}
-              <span className="mono">{deletionPolicyLabel(row.deletionPolicy)}</span>.
-            </p>
-            <p data-consequence={consequence.known ? "known" : "unknown"}>
-              {consequence.destroys ? <strong>{consequence.text}</strong> : consequence.text}
-            </p>
-            <p>
-              The deletion is <em>requested</em>, not done yet. If the repository&apos;s
-              mass-deletion breaker holds it, the receipt below says so.
-            </p>
-          </div>
-          <div className="action__actions">
-            <ActionButton
-              variant="danger"
-              disabledReason={remove.isPending ? "The request is in flight." : deleteReason}
-              onClick={() => {
-                remove.mutate({ namespace: row.namespace, name: row.name });
-                setOpen(null);
-              }}
-            >
-              Request deletion
-            </ActionButton>
-            <ActionButton
-              variant="quiet"
-              onClick={() => {
-                setOpen(null);
-              }}
-            >
-              Cancel
-            </ActionButton>
-          </div>
-        </div>
-      ) : null}
 
       <ActionResult
         label="Snapshot now"

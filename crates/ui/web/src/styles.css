@@ -1636,9 +1636,8 @@ html:has(dialog.side-panel[open]) {
   padding: 0;
 }
 /* The foot holds the actions, and is always as tall as its buttons: they
-   never scroll out of view. A confirmation that opens grows it upwards, and
-   a tall one scrolls inside itself (below) rather than pushing the buttons
-   off the panel. */
+   never scroll out of view. A question opens upward from its button, over
+   the body, in a popover. */
 .side-panel__foot {
   display: flex;
   justify-content: flex-end;
@@ -1700,8 +1699,8 @@ html:has(dialog.side-panel[open]) {
   gap: var(--space-5);
 }
 
-/* The actions: a row of buttons at the very bottom, with an open
-   confirmation and any receipt stacked above it. */
+/* The actions: a row of buttons at the very bottom, with any receipt stacked
+   above it. */
 .drawer-actions {
   display: flex;
   flex-direction: column;
@@ -1715,17 +1714,9 @@ html:has(dialog.side-panel[open]) {
 .drawer-actions > :empty {
   display: none;
 }
-/* A tall question (a fan-out snapshot-now form) scrolls inside itself, so the
-   buttons below it stay on screen and the body above keeps its room. */
-.side-panel__foot .action__confirm {
-  max-height: 45vh;
-  overflow-y: auto;
-}
-/* In the foot, a question and its answer stack above the buttons, nearest the
-   content they are about; the buttons stay on the bottom line. */
-.side-panel__foot .action-bar > .action > .action__confirm {
-  order: -2;
-}
+/* In the foot, an answer stacks above the buttons, nearest the content it is
+   about; the buttons stay on the bottom line. (A question floats above them in
+   a popover.) */
 .side-panel__foot .action-bar > .action > .receipt,
 .side-panel__foot .action-bar > .action > .problem {
   order: -1;
