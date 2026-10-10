@@ -41,6 +41,7 @@ import {
   isApiProblemError,
   withQuery,
 } from "./client";
+import { browsed } from "../components/browse/browsed";
 import { isSessionRequired } from "./problem";
 import type {
   ActionReceipt,
@@ -270,6 +271,7 @@ export interface ApiMutationOptions<TData, TVariables> {
    */
   invalidates: (variables: TVariables) => readonly QueryKey[];
   onSuccess?: ((data: TData, variables: TVariables) => void) | undefined;
+  onError?: ((error: ApiProblemError, variables: TVariables) => void) | undefined;
   /**
    * The action, worded for the toast that answers it: "Suspend schedule
    * media/nightly". Every mutation is answered by a toast from the query
@@ -306,6 +308,9 @@ export function useApiMutation<TData, TVariables>(
   };
   if (options.onSuccess !== undefined) {
     mutationOptions.onSuccess = options.onSuccess;
+  }
+  if (options.onError !== undefined) {
+    mutationOptions.onError = options.onError;
   }
   return useMutation(mutationOptions);
 }
@@ -681,6 +686,13 @@ export function useStartSession() {
     describe: ({ namespace, name }) => `Start a browse session on ${namespace}/${name}`,
     announce: "errors",
     invalidates: ({ namespace, name }) => [queryKeys.snapshotSession(namespace, name)],
+    // The sidebar's Browse line turns red on a failed start, green once one runs.
+    onSuccess: (_session, { namespace, name }) => {
+      browsed.started(`${namespace}/${name}`, true);
+    },
+    onError: (_error, { namespace, name }) => {
+      browsed.started(`${namespace}/${name}`, false);
+    },
   });
 }
 

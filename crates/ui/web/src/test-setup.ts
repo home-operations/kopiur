@@ -3,12 +3,16 @@ import "@testing-library/jest-dom/vitest";
 import { cleanup } from "@testing-library/react";
 import { afterEach } from "vitest";
 
+import { browsed } from "./components/browse/browsed";
 import { toasts } from "./components/toast/toasts";
 
 afterEach(() => {
   cleanup();
   // The toast list is module state; one test's answers must not reach the next.
   toasts.clear();
+  // So is what Browse is on, and the tab's storage behind it.
+  browsed.reset();
+  window.sessionStorage.clear();
 });
 
 // jsdom has no modal dialogs. Stand in for the two calls the side panel makes:

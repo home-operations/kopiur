@@ -1,6 +1,6 @@
 import { QueryClientProvider } from "@tanstack/react-query";
 import { RouterProvider, createMemoryHistory, createRouter } from "@tanstack/react-router";
-import { act, render, screen, within } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import createFetchMock from "vitest-fetch-mock";
@@ -11,6 +11,7 @@ import type { Me } from "../api/types";
 import { routeTree } from "../routeTree.gen";
 import { setThemePreference } from "../util/theme";
 import { CAPABILITY_KEYS, capabilityReason } from "./capabilities";
+import { browsed } from "./browse/browsed";
 import { NAV_ITEMS, sectionFor } from "./nav";
 
 const fetchMock = createFetchMock(vi);
@@ -192,6 +193,97 @@ describe("AppShell", () => {
       within(nav).getByRole("link", { name: "Repositories" }),
     ).not.toHaveAccessibleDescription();
     expect(nav.querySelector(".nav-item__count")).toBeNull();
+  });
+
+  describe("the Browse line", () => {
+    const SESSION = "/api/v1/snapshots/media/nightly-1/session";
+
+    /** The shell, with the session read answering `session`. */
+    function mockSession(session: () => Response) {
+      mockShell();
+      fetchMock.mockResponse((request) => {
+        const url = new URL(request.url, "http://localhost");
+        if (url.pathname === SESSION) return Promise.resolve(session());
+        const body = url.pathname === "/api/v1/me" ? JSON.stringify(alice) : "[]";
+        return Promise.resolve(
+          new Response(body, { status: 200, headers: { "content-type": "application/json" } }),
+        );
+      });
+    }
+
+    const json = (body: unknown, status = 200) =>
+      new Response(JSON.stringify(body), {
+        status,
+        headers: { "content-type": "application/json" },
+      });
+    const none = () =>
+      json(
+        {
+          type: "urn:kopiur:problem:session-required",
+          title: "Session required",
+          status: 404,
+          detail: "none",
+          what: "none",
+          why: "none",
+          fix: "start one",
+          instance: null,
+          kubeReason: null,
+        },
+        404,
+      );
+
+    async function line() {
+      const nav = await screen.findByRole("navigation", { name: "Primary" });
+      const link = within(nav).getByRole("link", { name: "Browse" });
+      return { link, bar: link.querySelector(".status-bar--nav > span") };
+    }
+
+    it("is grey while nothing is browsed", async () => {
+      mockShell();
+      mountAt("/");
+      const { link, bar } = await line();
+      expect(bar).toHaveAttribute("data-browse", "idle");
+      expect(link).toHaveAccessibleDescription("No session running");
+    });
+
+    it("is green while a session runs on the snapshot Browse is on", async () => {
+      browsed.browse("media/nightly-1");
+      mockSession(() =>
+        json({
+          namespace: "media",
+          job: "kopiur-browse-nas",
+          pod: "kopiur-browse-nas-abcde",
+          reused: true,
+          expiresAt: null,
+          downloadMaxBytes: 1,
+          manifestMaxBytes: 1,
+        }),
+      );
+      mountAt("/");
+      const { link } = await line();
+      await waitFor(() => {
+        expect(link.querySelector(".status-bar--nav > span")).toHaveAttribute(
+          "data-browse",
+          "active",
+        );
+      });
+      expect(link).toHaveAccessibleDescription("A browse session is running on media/nightly-1");
+    });
+
+    it("is red when the last start on it failed", async () => {
+      browsed.browse("media/nightly-1");
+      browsed.started("media/nightly-1", false);
+      mockSession(none);
+      mountAt("/");
+      const { link } = await line();
+      await waitFor(() => {
+        expect(link.querySelector(".status-bar--nav > span")).toHaveAttribute(
+          "data-browse",
+          "failed",
+        );
+      });
+      expect(link).toHaveAccessibleDescription("The last browse session on media/nightly-1 failed");
+    });
   });
 
   it("groups the sections by family, and the group names are not links", async () => {

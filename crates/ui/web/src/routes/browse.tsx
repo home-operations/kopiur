@@ -1,6 +1,6 @@
 import { Link, createFileRoute, redirect, useNavigate } from "@tanstack/react-router";
 import { Camera, ChevronLeft, ChevronRight, FolderOpen, FolderX, Info } from "lucide-react";
-import { useEffect } from "react";
+import { type ReactNode, useEffect } from "react";
 
 import { useBrowseSession, useSnapshot, useSnapshotTree } from "../api/hooks";
 import type { Problem } from "../api/types";
@@ -13,6 +13,7 @@ import { SnapshotField } from "../components/ResourceFields";
 import { Breadcrumbs } from "../components/browse/Breadcrumbs";
 import { DirTable } from "../components/browse/DirTable";
 import { SessionBar } from "../components/browse/SessionBar";
+import { browsed } from "../components/browse/browsed";
 import {
   breadcrumbs,
   browseOffsetParam,
@@ -60,27 +61,6 @@ export interface BrowseSearch {
   offset?: number;
 }
 
-/** Where the tab keeps the snapshot it last browsed. */
-const REMEMBERED = "kopiur.browse.snapshot";
-
-function remembered(): string | null {
-  try {
-    const value = window.sessionStorage.getItem(REMEMBERED);
-    return parseSnapshotParam(value) !== null ? value : null;
-  } catch {
-    return null;
-  }
-}
-
-function remember(value: string): void {
-  try {
-    window.sessionStorage.setItem(REMEMBERED, value);
-  } catch {
-    // Storage refused (a private window, blocked site data): the page still
-    // works, it just starts on the picker next time.
-  }
-}
-
 export const Route = createFileRoute("/browse")({
   validateSearch: (search: Record<string, unknown>): BrowseSearch => {
     const out: BrowseSearch = {};
@@ -106,7 +86,7 @@ export const Route = createFileRoute("/browse")({
     if (raw.snapshot !== undefined) {
       return;
     }
-    const last = remembered();
+    const last = browsed.stored();
     if (last === null) {
       return;
     }
@@ -133,7 +113,7 @@ function BrowseRoute() {
 
   useEffect(() => {
     if (key !== null) {
-      remember(key);
+      browsed.browse(key);
     }
   }, [key]);
 
@@ -143,31 +123,31 @@ function BrowseRoute() {
         The files inside a snapshot, read from the repository through a browse session. Sizes and
         times are as they were when the snapshot was taken.
       </p>
-      <ActiveSnapshot target={target} value={key ?? ""} scope={scope} />
       {target === null ? (
-        asked.length > 0 ? (
-          <EmptyState title="That is not a snapshot address" icon={FolderX}>
-            The address asked for <span className="mono">{asked}</span>. A snapshot is named as{" "}
-            <span className="mono">namespace/name</span>. Pick one above.
-          </EmptyState>
-        ) : (
-          <EmptyState
-            title="Pick a snapshot to browse"
-            icon={FolderOpen}
-            action={
-              <Link
-                className="button"
-                to="/snapshots"
-                search={scope !== undefined ? { namespace: scope } : {}}
-              >
-                <Camera size={14} strokeWidth={2} aria-hidden="true" />
-                Snapshots
-              </Link>
-            }
-          >
-            Choose one above, or open a snapshot from the list and use its Browse files button.
-          </EmptyState>
-        )
+        <ActiveSnapshot target={null} value="" scope={scope}>
+          {asked.length > 0 ? (
+            <BrowseNote title="That is not a snapshot address">
+              The address asked for <span className="mono">{asked}</span>. A snapshot is named as{" "}
+              <span className="mono">namespace/name</span>. Pick one above.
+            </BrowseNote>
+          ) : (
+            <BrowseNote
+              title="Pick a snapshot to browse"
+              action={
+                <Link
+                  className="button"
+                  to="/snapshots"
+                  search={scope !== undefined ? { namespace: scope } : {}}
+                >
+                  <Camera size={14} strokeWidth={2} aria-hidden="true" />
+                  Snapshots
+                </Link>
+              }
+            >
+              Choose one above, or open a snapshot from the list and use its Browse files button.
+            </BrowseNote>
+          )}
+        </ActiveSnapshot>
       ) : (
         <Browser
           // A new snapshot is a new browser: nothing of the last one's
@@ -187,10 +167,16 @@ interface ActiveSnapshotProps {
   target: { namespace: string; name: string } | null;
   value: string;
   scope: string | undefined;
+  /** The session, or what stands in for it, under the snapshot's facts. */
+  children: ReactNode;
 }
 
-/** The head of the page: which snapshot this is, a way to pick another, and its facts. */
-function ActiveSnapshot({ target, value, scope }: ActiveSnapshotProps) {
+/**
+ * The page's one card: which snapshot this is, a way to pick another, its
+ * facts, and under them the browse session that reads it — the two halves of
+ * one question, "what am I looking at, and can I look yet".
+ */
+function ActiveSnapshot({ target, value, scope, children }: ActiveSnapshotProps) {
   const navigate = useNavigate();
   const detail = useSnapshot(target?.namespace ?? "", target?.name ?? "", {
     enabled: target !== null,
@@ -247,7 +233,27 @@ function ActiveSnapshot({ target, value, scope }: ActiveSnapshotProps) {
         ) : null}
       </div>
       {facts.length > 0 ? <Facts label="About this snapshot" facts={facts} /> : null}
+      <div className="browse-head__body">{children}</div>
     </section>
+  );
+}
+
+/** A state of the card's lower half that is not a session: a title, a line, maybe a way on. */
+function BrowseNote({
+  title,
+  action,
+  children,
+}: {
+  title: string;
+  action?: ReactNode;
+  children: ReactNode;
+}) {
+  return (
+    <div className="browse-session">
+      <h2 className="browse-session__title">{title}</h2>
+      <p className="browse-session__prose">{children}</p>
+      {action !== undefined ? <div className="action-bar">{action}</div> : null}
+    </div>
   );
 }
 
@@ -285,23 +291,29 @@ function Browser({ namespace, name, scope, search }: BrowserProps) {
   const lapsed = treeFailure?.state === "sessionRequired";
   const live = lapsed ? null : (session.data ?? null);
 
+  const card = (body: ReactNode) => (
+    <ActiveSnapshot target={{ namespace, name }} value={`${namespace}/${name}`} scope={scope}>
+      {body}
+    </ActiveSnapshot>
+  );
+
   if (detail.isSuccess && !detail.data.browsable) {
-    return (
-      <EmptyState title={`${name} cannot be browsed`} icon={FolderX}>
+    return card(
+      <BrowseNote title={`${name} cannot be browsed`}>
         {blocker ?? "The operator did not say why."}
-      </EmptyState>
+      </BrowseNote>,
     );
   }
 
   if (session.isPending) {
-    return <LoadingState what={`the browse session for ${name}`} rows={3} />;
+    return card(<LoadingState what={`the browse session for ${name}`} rows={3} />);
   }
 
   // A failure the hook did not fold to `null` — a 403 on the session read, a
   // gateway's 502. The prompt would be a lie here: nothing was asked and
   // refused, the question itself could not be put.
   if (session.isError) {
-    return (
+    return card(
       <ErrorState
         problem={session.error.problem}
         what={`the browse session for ${name}`}
@@ -310,13 +322,13 @@ function Browser({ namespace, name, scope, search }: BrowserProps) {
             ? undefined
             : () => void session.refetch()
         }
-      />
+      />,
     );
   }
 
   return (
     <>
-      <SessionBar namespace={namespace} name={name} session={live} lapsed={lapsed} />
+      {card(<SessionBar namespace={namespace} name={name} session={live} lapsed={lapsed} />)}
       {live === null ? null : (
         <section className="page__section" aria-label="Snapshot contents">
           {path === null ? (

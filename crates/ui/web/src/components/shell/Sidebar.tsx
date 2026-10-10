@@ -5,6 +5,8 @@ import { useOverview } from "../../api/hooks";
 import { KIND_META } from "../kind";
 import { NAV_GROUPS } from "../nav";
 import { navTally } from "../navTally";
+import { useBrowseStatus } from "../browse/useBrowseStatus";
+import { BrowseLine } from "./BrowseLine";
 import { NavTallyMarks } from "./NavTally";
 import { NamespaceSwitcher } from "./NamespaceSwitcher";
 import { ObjectSearch } from "./ObjectSearch";
@@ -27,10 +29,13 @@ function BrandMark() {
  * bar of their health (`navTally`), from the same overview read the overview
  * page's verdict uses. The section's name stays its link's name; the count in
  * words is the link's description, so the bar is never the only account.
+ * Browse, which lists no kind, has a line of its own: whether a browse
+ * session is running on the snapshot it is on (`BrowseLine`).
  */
 export function Sidebar({ namespace }: { namespace: string | undefined }) {
   const search = namespace !== undefined ? { namespace } : {};
   const overview = useOverview(namespace);
+  const browse = useBrowseStatus();
   return (
     <aside id="sidebar" className="sidebar" aria-label="Sections">
       <Link to="/" className="sidebar__brand" search={search}>
@@ -52,7 +57,9 @@ export function Sidebar({ namespace }: { namespace: string | undefined }) {
             {group.items.map((item) => {
               const Icon = item.icon;
               const tally = navTally(overview.data, item.to);
-              const describedBy = tally !== null ? `nav-tally-${item.to.slice(1)}` : undefined;
+              const isBrowse = item.to === "/browse";
+              const words = isBrowse ? browse.words : tally?.words;
+              const describedBy = words !== undefined ? `nav-tally-${item.to.slice(1)}` : undefined;
               const to =
                 item.to === "/repositories" && tally !== null && tally.failing > 0
                   ? { health: "failed", ...search }
@@ -82,10 +89,11 @@ export function Sidebar({ namespace }: { namespace: string | undefined }) {
                     )}
                     <span className="nav-item__label">{item.label}</span>
                     {tally !== null ? <NavTallyMarks tally={tally} /> : null}
+                    {isBrowse ? <BrowseLine status={browse} /> : null}
                   </Link>
-                  {describedBy !== undefined && tally !== null ? (
+                  {describedBy !== undefined ? (
                     <span id={describedBy} hidden>
-                      {tally.words}
+                      {words}
                     </span>
                   ) : null}
                 </Fragment>

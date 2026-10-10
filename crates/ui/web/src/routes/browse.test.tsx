@@ -1,4 +1,4 @@
-import { screen, within } from "@testing-library/react";
+import { screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -24,6 +24,7 @@ import {
   pickOption,
   problemResponse,
 } from "../test-utils";
+import { browsed } from "../components/browse/browsed";
 
 const MIB = 1024 * 1024;
 const ROUTE = "/browse?snapshot=media%2Fnightly-1";
@@ -276,6 +277,30 @@ describe("Snapshot file browser — the session", () => {
     await userEvent.click(await screen.findByRole("button", { name: /Start a browse session/ }));
     expect(await screen.findByText("A browse session is running")).toBeInTheDocument();
     expect(await table()).toBeInTheDocument();
+  });
+
+  it("tells the sidebar when a start fails, and when the next one succeeds", async () => {
+    let fail = true;
+    mockBrowse({
+      session: {
+        GET: () => (fail ? problemResponse(sessionRequired(404)) : jsonResponse(SESSION)),
+        POST: () => {
+          if (fail) return problemResponse(forbiddenProblem("create jobs in media", SESSION_PATH));
+          return jsonResponse(SESSION, 201);
+        },
+      },
+    });
+    mountApp(ROUTE);
+    await userEvent.click(await screen.findByRole("button", { name: /Start a browse session/ }));
+    expect(browsed.get().snapshot).toBe("media/nightly-1");
+    await waitFor(() => {
+      expect(browsed.get().failedStart).toBe("media/nightly-1");
+    });
+    fail = false;
+    await userEvent.click(screen.getByRole("button", { name: /Start a browse session/ }));
+    await waitFor(() => {
+      expect(browsed.get().failedStart).toBeNull();
+    });
   });
 
   it("stops a session on a 204 with an empty body without throwing", async () => {
@@ -611,7 +636,7 @@ describe("Browse — the snapshot being browsed", () => {
     expect(calledPaths().some((path) => path.includes("/session"))).toBe(false);
   });
 
-  it("says why a snapshot cannot be browsed, and never asks for a session for it", async () => {
+  it("says why a snapshot cannot be browsed, and never offers a session for it", async () => {
     mockBrowse({
       detail: () =>
         jsonResponse(
@@ -624,7 +649,9 @@ describe("Browse — the snapshot being browsed", () => {
     mountApp(ROUTE);
     expect(await screen.findByText("nightly-1 cannot be browsed")).toBeInTheDocument();
     expect(screen.getByText(/wrote no snapshot to browse/)).toBeInTheDocument();
-    expect(calledPaths()).not.toContain(SESSION_PATH);
+    // The sidebar may still read whether a session runs; the page offers none.
+    expect(screen.queryByRole("button", { name: /Start a browse session/ })).toBeNull();
+    expect(screen.queryByText("No browse session is running")).toBeNull();
   });
 
   it("comes back to the snapshot it last browsed when opened from the sidebar", async () => {

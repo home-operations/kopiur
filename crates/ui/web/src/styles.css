@@ -747,7 +747,8 @@ a.object-name:hover {
   background: var(--health-unknown-fg);
 }
 
-.status-bar > span[data-health="failed"] {
+.status-bar > span[data-health="failed"],
+.status-bar > span[data-browse="failed"] {
   background: var(--health-failed-fg);
 }
 
@@ -759,7 +760,8 @@ a.object-name:hover {
   background: var(--health-pending-fg);
 }
 
-.status-bar > span[data-health="healthy"] {
+.status-bar > span[data-health="healthy"],
+.status-bar > span[data-browse="active"] {
   background: var(--health-healthy-fg);
 }
 
@@ -4039,9 +4041,9 @@ a.topo-node {
 /* The intro and the way back out, on one line at width and stacked below it.
    The prose is capped like every other `page__prose`; the button does not
    stretch to meet it. */
-/* The snapshot being browsed: the picker that names it, a way to its
-   details, and its facts in one row beneath. A panel on the canvas, like the
-   session panel under it. */
+/* The page's one card: the snapshot being browsed (the picker that names it,
+   a way to its details, its facts in one row) and, under a rule, the browse
+   session that reads it. */
 .browse-head {
   display: grid;
   gap: var(--space-3);
@@ -4071,6 +4073,20 @@ a.topo-node {
   width: 100%;
   min-width: 0;
   max-width: 34rem;
+}
+
+.browse-head__body {
+  padding-top: var(--space-4);
+  border-top: 1px solid var(--line);
+}
+
+/* Inside the card the session is a half of it, not a panel of its own. */
+.browse-head .browse-session {
+  max-width: none;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: none;
 }
 
 .browse-head .facts {
