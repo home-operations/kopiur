@@ -1449,12 +1449,13 @@ html:has(dialog.side-panel[open]) {
   overflow: hidden;
 }
 .side-panel {
-  position: fixed;
-  inset: var(--space-3) var(--space-3) var(--space-3) auto;
-  width: min(
+  --panel-w: min(
     clamp(min(var(--drawer-min), var(--drawer-max)), var(--drawer-width), var(--drawer-max)),
     calc(100vw - 2 * var(--space-3))
   );
+  position: fixed;
+  inset: var(--space-3) var(--space-3) var(--space-3) auto;
+  width: var(--panel-w);
   height: auto;
   max-width: none;
   max-height: none;
@@ -1490,15 +1491,18 @@ html:has(dialog.side-panel[open]) {
   background: var(--scrim);
   animation: side-panel-fade var(--dur-base) var(--ease-out);
 }
-/* Past the right edge by the inset and the handle, so neither peeks in. */
+/* Past the right edge by the inset and the handle, so neither peeks in.
+   The slide moves the right edge, not a transform: a transformed dialog would
+   become the box the toasts inside it are placed in, and they would ride in
+   and out with the panel instead of holding their corner. */
 @keyframes side-panel-in {
   from {
-    transform: translateX(calc(100% + 4rem));
+    right: calc(var(--space-3) - var(--panel-w) - 4rem);
   }
 }
 @keyframes side-panel-out {
   to {
-    transform: translateX(calc(100% + 4rem));
+    right: calc(var(--space-3) - var(--panel-w) - 4rem);
   }
 }
 @keyframes side-panel-fade-out {

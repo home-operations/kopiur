@@ -4,7 +4,9 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ActionReceipt, Problem } from "../../api/types";
 import { renderWithRouter } from "../../test-utils";
 import { Toaster } from "./Toaster";
+import { readStyles } from "../../testing/css";
 import { EXIT_MS } from "./durations";
+import { toastHost } from "./toastHost";
 import { RECEIPT_MS, RECEIPT_WITH_NOTE_MS, toasts } from "./index";
 
 function receipt(over: Partial<ActionReceipt> = {}): ActionReceipt {
@@ -45,6 +47,7 @@ function settle() {
 afterEach(() => {
   act(() => {
     toasts.clear();
+    toastHost.set(null);
   });
   vi.useRealTimers();
 });
@@ -117,6 +120,47 @@ describe("Toaster", () => {
     fireEvent.pointerLeave(toast);
     // A changed delay would move the running line by the time already spent.
     expect(toast.style.getPropertyValue("--toast-elapsed")).toBe(start);
+  });
+
+  it("moves into an open drawer without arriving again or restarting its line", async () => {
+    const region = await mount();
+    act(() => {
+      toasts.push({ kind: "receipt", label: "Run", receipt: receipt() });
+    });
+    advance(2000);
+    const dialog = document.createElement("dialog");
+    document.body.append(dialog);
+    dialog.showModal();
+    act(() => {
+      toastHost.set(dialog);
+    });
+    const moved = within(dialog).getByRole("status");
+    expect(region.isConnected).toBe(false);
+    expect(moved).toHaveAttribute("data-arrived", "true");
+    // Its line picks up where its clock is, not from the start.
+    expect(moved.style.getPropertyValue("--toast-elapsed")).toBe("-2000ms");
+    act(() => {
+      toastHost.release(dialog);
+    });
+    dialog.remove();
+    expect(screen.getByRole("status")).toHaveAttribute("data-arrived", "true");
+    // And only the time that was left runs out.
+    advance(RECEIPT_MS - 2000 - 100);
+    expect(screen.queryByRole("status")).not.toBeNull();
+    advance(200);
+    settle();
+    expect(screen.queryByRole("status")).toBeNull();
+  });
+
+  it("slides the drawer without a transform, so a toast inside it stays in its corner", () => {
+    // A transformed ancestor becomes the box a fixed element is placed in: the
+    // toasts inside the drawer would ride along as it slides in and out.
+    const css = readStyles();
+    for (const frames of ["side-panel-in", "side-panel-out"]) {
+      const body = new RegExp(`@keyframes ${frames} \\{([\\s\\S]*?)\\n\\}`).exec(css)?.[1];
+      expect(body, frames).toBeDefined();
+      expect(body, frames).not.toMatch(/transform|translate/);
+    }
   });
 
   it("stops the clock while focus is inside it", async () => {
