@@ -610,6 +610,7 @@ mod tests {
         Identity {
             user: user.to_owned(),
             groups: groups.iter().map(|g| (*g).to_owned()).collect(),
+            dropped_groups: Vec::new(),
             email: None,
             extra: BTreeMap::new(),
             source: IdentitySource::TrustedHeaders,

@@ -374,12 +374,14 @@ The optional in-cluster web console, off by default. `ui.enabled: true` needs `i
 | --- | --- | --- |
 | `ui.enabled` | `false` | Deploy the console. |
 | `ui.auth.userHeader` / `groupsHeader` / `emailHeader` | `""` | Headers your proxy sets. Setting `userHeader` selects header mode. `emailHeader` is display only — never impersonated. |
-| `ui.auth.groupsSeparator` | `,` | What the groups header is split on. |
+| `ui.auth.groupsFormat` | `delimited` | How the groups header is encoded: `delimited` (oauth2-proxy), `base64Json` (Envoy Gateway `claimToHeaders`), or `json`. See [Step 1](ui.md#step-1-tell-the-console-how-your-proxy-sends-identity). |
+| `ui.auth.groupsSeparator` | `,` | What the groups header is split on, when `groupsFormat` is `delimited`. |
 | `ui.auth.proxySecret.existingSecret` / `.key` | `""` / `token` | Secret holding the shared token the proxy sends as `X-Kopiur-Proxy-Token`. **Required in header mode.** |
 | `ui.auth.acknowledgeNoProxySecret` | `false` | Deploy header mode without that token. Only when a mesh or `NetworkPolicy` genuinely admits nothing but your proxy. |
-| `ui.auth.allowedGroups` | `[]` | Restrict impersonatable groups. Enforced twice — by the console, and as `resourceNames` on its impersonate rule. |
+| `ui.auth.allowedGroups` | `[]` | **Restricts** which groups are forwarded; never grants access. Enforced twice — by the console, and as `resourceNames` on its impersonate rule. |
 | `ui.auth.anonymous.*` | disabled | Run every request as one fixed identity. `fallback: true` additionally serves header-less requests that way. |
-| `ui.rbac.userRoles` | `true` | Render `kopiur-ui-viewer`/`-editor`/`-user` and the namespaced `-doctor` Role. No bindings — you write those. |
+| `ui.rbac.userRoles` | `true` | Render `kopiur-ui-viewer`/`-editor`/`-user` and the namespaced `-doctor` Role. |
+| `ui.rbac.bindings` | `[]` | **Grants** access: a list of `{role, groups, users}` entries, where `role` is `user`, `viewer` or `editor` — one ClusterRoleBinding each. Empty binds nobody. See [Step 3](ui.md#step-3-grant-access). |
 | `ui.rbac.browseRole` | `false` | Render `kopiur-ui-browse`. **Read [what it grants](ui.md#granting-browse-grants-that-namespaces-repository-credentials) first.** |
 | `ui.rbac.execPolicy.*` | disabled | A `ValidatingAdmissionPolicy` narrowing browse `pods/exec` to `kopiur-browse-*` pods running kopia. |
 | `ui.networkPolicy.enabled` + `proxySelector` | `false` | Admit the app port only from your proxy, the ops port only from monitoring. |

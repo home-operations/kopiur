@@ -293,7 +293,7 @@ Kopiur ships an optional in-cluster web console, `kopiur-ui`, off by default. It
 2. An identity source — the header your authenticating proxy sets, or an explicit anonymous identity.
 3. In header mode, a **proxy shared secret**, so the console can tell your proxy's requests from anything else in the cluster that can reach its Service.
 
-The chart renders the console, its Service and its roles. It does **not** render an Ingress and it creates **no** role bindings, so a freshly-enabled console reports `Forbidden` on every screen until you bind someone — which is the correct first experience, not a broken install.
+The chart renders the console, its Service and its roles. It does **not** render an Ingress, and it binds **nobody** unless you list them in `ui.rbac.bindings`, so a freshly-enabled console reports `Forbidden` on every screen until you bind someone — which is the correct first experience, not a broken install.
 
 ```bash
 # You create the shared token first; the chart only mounts it.
@@ -304,10 +304,14 @@ helm upgrade kopiur oci://ghcr.io/home-operations/charts/kopiur -n kopiur-system
   --set ui.enabled=true \
   --set ui.auth.userHeader=X-Forwarded-User \
   --set ui.auth.groupsHeader=X-Forwarded-Groups \
-  --set ui.auth.proxySecret.existingSecret=kopiur-ui-proxy-token
+  --set ui.auth.proxySecret.existingSecret=kopiur-ui-proxy-token \
+  --set 'ui.rbac.bindings[0].role=user' \
+  --set 'ui.rbac.bindings[0].groups[0]=platform'
 ```
 
-Read [Web console (kopiur-ui)](ui.md) before exposing it: it covers the trust model, the four roles, what granting the file browser really hands over, and a worked oauth2-proxy deployment.
+The last two lines grant the `platform` group full use of the console. The header names are oauth2-proxy's. Behind **Envoy Gateway**, use the names from your `claimToHeaders` instead and also set `ui.auth.groupsFormat=base64Json` — Envoy base64-encodes the groups claim. [With Envoy Gateway](ui.md#with-envoy-gateway) has the complete wiring.
+
+Read [Web console (kopiur-ui)](ui.md) before exposing it: [Identity and access](ui.md#identity-and-access) walks through getting a group from your IdP to a role step by step, and the page also covers the trust model, the four roles, what granting the file browser really hands over, and worked oauth2-proxy and Envoy Gateway deployments.
 
 ## Upgrade / uninstall
 

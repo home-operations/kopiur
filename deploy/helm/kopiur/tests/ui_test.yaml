@@ -9,6 +9,7 @@ templates:
   - ui-clusterrole.tpl
   - ui-clusterrolebinding.tpl
   - ui-user-clusterroles.tpl
+  - ui-user-bindings.tpl
   - ui-browse-clusterrole.tpl
   - ui-doctor-role.tpl
   - ui-networkpolicy.tpl
@@ -409,6 +410,110 @@ tests:
             - apiGroups: [apps]
               resources: [deployments]
               verbs: [get, list]
+
+  # =========================================================================
+  # ui.rbac.bindings: opt-in grants. Nobody is bound unless listed.
+  # =========================================================================
+
+  - it: binds nobody by default
+    set:
+      ui.enabled: true
+      ui.auth.userHeader: X-Forwarded-User
+      ui.auth.proxySecret.existingSecret: kopiur-ui-proxy
+    template: ui-user-bindings.tpl
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: renders one ClusterRoleBinding per entry, to the named role, with the exact subjects
+    set:
+      ui.enabled: true
+      ui.auth.userHeader: x-user-name
+      ui.auth.proxySecret.existingSecret: kopiur-ui-proxy
+      ui.rbac.bindings:
+        - role: user
+          groups: [Admins]
+        - role: viewer
+          name: staff
+          groups: [Domain Users]
+          users: [alice]
+    template: ui-user-bindings.tpl
+    asserts:
+      - hasDocuments:
+          count: 2
+      - isKind:
+          of: ClusterRoleBinding
+      - equal:
+          path: metadata.name
+          value: kopiur-ui-user-0
+        documentIndex: 0
+      - equal:
+          path: roleRef
+          value:
+            apiGroup: rbac.authorization.k8s.io
+            kind: ClusterRole
+            name: kopiur-ui-user
+        documentIndex: 0
+      - equal:
+          path: subjects
+          value:
+            - apiGroup: rbac.authorization.k8s.io
+              kind: Group
+              name: Admins
+        documentIndex: 0
+      - equal:
+          path: metadata.name
+          value: kopiur-ui-viewer-staff
+        documentIndex: 1
+      - equal:
+          path: subjects
+          value:
+            - apiGroup: rbac.authorization.k8s.io
+              kind: Group
+              name: Domain Users
+            - apiGroup: rbac.authorization.k8s.io
+              kind: User
+              name: alice
+        documentIndex: 1
+
+  - it: renders no bindings while the console itself is disabled
+    set:
+      ui.rbac.bindings:
+        - role: user
+          groups: [Admins]
+    template: ui-user-bindings.tpl
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: wires groupsFormat, defaulting to delimited
+    set:
+      ui.enabled: true
+      ui.auth.userHeader: x-user-name
+      ui.auth.groupsHeader: x-user-groups
+      ui.auth.proxySecret.existingSecret: kopiur-ui-proxy
+    template: ui-deployment.tpl
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: KOPIUR_UI_GROUPS_FORMAT
+            value: delimited
+
+  - it: wires groupsFormat base64Json for Envoy Gateway's claimToHeaders
+    set:
+      ui.enabled: true
+      ui.auth.userHeader: x-user-name
+      ui.auth.groupsHeader: x-user-groups
+      ui.auth.groupsFormat: base64Json
+      ui.auth.proxySecret.existingSecret: kopiur-ui-proxy
+    template: ui-deployment.tpl
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: KOPIUR_UI_GROUPS_FORMAT
+            value: base64Json
 
   # =========================================================================
   # The Deployment: the env contract with crates/ui/src/config.rs.

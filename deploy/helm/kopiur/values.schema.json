@@ -833,7 +833,7 @@
           "type": "object"
         },
         "auth": {
-          "description": "Identity: how the console learns who is calling. Exactly one of header mode\n(auth.userHeader) or anonymous-only mode (auth.anonymous) must be\nconfigured, or the chart refuses to render — a console with no identity\nsource would run every request as its own ServiceAccount, which can\nimpersonate anyone.",
+          "description": "Identity: how the console learns who is calling. Exactly one of header mode\n(auth.userHeader) or anonymous-only mode (auth.anonymous) must be\nconfigured, or the chart refuses to render — a console with no identity\nsource would run every request as its own ServiceAccount, which can\nimpersonate anyone.\n\nThree separate jobs, three separate settings — the usual source of confusion:\n  1. Read the groups:     groupsHeader + groupsFormat (+ groupsSeparator)\n  2. Restrict the groups: allowedGroups (optional; it never grants anything)\n  3. Grant access:        ui.rbac.bindings, or your own ClusterRoleBinding\nWalkthrough with per-proxy recipes: https://kopiur.home-operations.com/ui/#identity-and-access",
           "properties": {
             "acknowledgeNoProxySecret": {
               "default": false,
@@ -842,7 +842,7 @@
               "type": "boolean"
             },
             "allowedGroups": {
-              "description": "Allow-list of groups the console may impersonate. Empty means \"whatever\ngroups the proxy asserts\". Set, it is enforced TWICE: the console filters\ninbound groups, and the same list is pinned as `resourceNames` on the\nimpersonate rule so the apiserver enforces it even if the console did not.",
+              "description": "Optional allow-list of groups the console may impersonate. It only\nrestricts, it never grants: listing `Admins` here gives Admins no access\n— bind a role for that (ui.rbac.bindings). Empty (the\ndefault) means \"whatever groups the proxy asserts\". Set, every other\ngroup the proxy sends is dropped before it reaches Kubernetes (the user\nmenu lists them under \"Not forwarded\"), and the list is enforced twice:\nthe console filters inbound groups, and the same list is pinned as\n`resourceNames` on the impersonate rule so the apiserver enforces it even\nif the console did not. Use it when your IdP sends many groups and only a\nfew matter. Names are exact and case-sensitive, and may not contain a\ncomma.",
               "items": {
                 "required": []
               },
@@ -888,15 +888,26 @@
               "title": "emailHeader",
               "type": "string"
             },
+            "groupsFormat": {
+              "default": "delimited",
+              "description": "How the groups header is encoded. `delimited`: a plain list split on\ngroupsSeparator, e.g. `admins,dev` (oauth2-proxy, most header-auth\nproxies). `json`: a JSON array, e.g. `[\"admins\",\"dev\"]`.\n`base64Json`: a base64-encoded JSON array, e.g. `WyJhZG1pbnMiXQ==` — what\nEnvoy Gateway's SecurityPolicy `claimToHeaders` sends for a list claim\nlike `groups`, and Envoy cannot be told otherwise. Wrong format symptom:\nthe user menu shows one long unreadable group (and the console logs a\nwarning naming this setting), or every request fails with\n`invalid-header-value`.",
+              "enum": [
+                "delimited",
+                "json",
+                "base64Json"
+              ],
+              "required": [],
+              "title": "groupsFormat"
+            },
             "groupsHeader": {
               "default": "",
-              "description": "Header carrying the caller's groups (e.g. X-Forwarded-Groups). Optional\n— an identity with no groups is valid, it just matches fewer RoleBindings.",
+              "description": "Header carrying the caller's groups (e.g. X-Forwarded-Groups). Optional\n— an identity with no groups is valid, it just matches fewer bindings.\nCheck what arrived: the user menu at the bottom of the console's sidebar\nlists the groups the console read.",
               "title": "groupsHeader",
               "type": "string"
             },
             "groupsSeparator": {
               "default": ",",
-              "description": "Separator the groups header uses. oauth2-proxy emits \",\".",
+              "description": "Separator the groups header uses when groupsFormat is `delimited`\n(ignored otherwise). oauth2-proxy emits \",\". Surrounding spaces are\ntrimmed; spaces inside a name (`Domain Users`) are kept.",
               "title": "groupsSeparator",
               "type": "string"
             },
@@ -929,7 +940,7 @@
             },
             "userHeader": {
               "default": "",
-              "description": "Header the proxy puts the authenticated username in (e.g.\nX-Forwarded-User). Setting it selects header mode; a request without it\ngets a 401 unless auth.anonymous.fallback is on.",
+              "description": "Header the proxy puts the authenticated username in (e.g.\nX-Forwarded-User for oauth2-proxy, or whatever name you gave the `sub` /\n`preferred_username` claim in Envoy Gateway's claimToHeaders). Setting it\nselects header mode; a request without it gets a 401 unless\nauth.anonymous.fallback is on. Header names are case-insensitive.",
               "title": "userHeader",
               "type": "string"
             }
@@ -1211,6 +1222,14 @@
         },
         "rbac": {
           "properties": {
+            "bindings": {
+              "description": "Opt-in ClusterRoleBindings from your people to the human roles. Empty by\ndefault: nobody gets access until you say so. Each entry binds ONE role\n(`role: user|viewer|editor`) to any mix of `groups` and `users`, written\nexactly as your proxy sends them (case-sensitive; spaces allowed). E.g.\n`[{role: user, groups: [Admins]}, {role: viewer, groups: [\"Domain Users\"], users: [alice]}]`.\n`user` = viewer + editor (operate backups); `viewer` = read-only;\n`editor` = the action buttons alone. Requires userRoles. `browse` is\ndeliberately not offered: it grants repository credentials, so bind\nkopiur-ui-browse yourself, per namespace (see browseRole). An optional\n`name` suffixes the ClusterRoleBinding's name (default: the entry index).\nIf you set allowedGroups, every group named here must be in it too, or\nthe console drops that group before Kubernetes can match the binding.",
+              "items": {
+                "required": []
+              },
+              "title": "bindings",
+              "type": "array"
+            },
             "browseRole": {
               "default": false,
               "description": "Render `kopiur-ui-browse`, the role behind the in-snapshot file browser.\n\nREAD THIS BEFORE ENABLING. Browsing runs a session pod and `pods/exec`s\nkopia into it, and that pod loads the repository credentials from its own\nenvironment — so anyone who can exec in that namespace can print them with\n`env`. `pods/exec create` cannot be narrowed to one pod by RBAC. Granting\nbrowse in a namespace therefore GRANTS THAT NAMESPACE'S REPOSITORY\nCREDENTIALS. It is deliberately NOT aggregated into `kopiur-ui-user`: bind\nit on purpose, ideally with a namespaced RoleBinding, and see execPolicy\nbelow for the enforcement RBAC cannot express.",
@@ -1248,7 +1267,7 @@
             },
             "userRoles": {
               "default": true,
-              "description": "Render the human roles: `kopiur-ui-viewer` (read-only) and\n`kopiur-ui-editor` (the console's action buttons), which aggregate into\n`kopiur-ui-user`, plus the namespaced `kopiur-ui-doctor` Role. Bind\n`kopiur-ui-user` to your people — the chart creates no bindings, because\nwho may operate your backups is not a chart decision.\n\nThese render only while `ui.enabled` is also true, so an install that does\nnot run the console gains no ClusterRoles for a component it does not have.\nThe consequence: setting `ui.enabled: false` DELETES these roles, and any\n(Cluster)RoleBinding you made to them is left with a dangling roleRef and\ngrants nothing until you re-enable the console (bindings survive, so access\nreturns by itself — nothing needs re-creating). That is only ever true\nwhile there is no console to use, which is why the roles stay gated rather\nthan appearing in every install that has never heard of the UI.",
+              "description": "Render the human roles: `kopiur-ui-viewer` (read-only) and\n`kopiur-ui-editor` (the console's action buttons), which aggregate into\n`kopiur-ui-user`, plus the namespaced `kopiur-ui-doctor` Role. Bind\n`kopiur-ui-user` to your people — either list them in `ui.rbac.bindings`\nbelow or write your own ClusterRoleBinding. The chart binds nobody on its\nown, because who may operate your backups is not a chart decision.\n\nThese render only while `ui.enabled` is also true, so an install that does\nnot run the console gains no ClusterRoles for a component it does not have.\nThe consequence: setting `ui.enabled: false` DELETES these roles, and any\n(Cluster)RoleBinding you made to them is left with a dangling roleRef and\ngrants nothing until you re-enable the console (bindings survive, so access\nreturns by itself — nothing needs re-creating). That is only ever true\nwhile there is no console to use, which is why the roles stay gated rather\nthan appearing in every install that has never heard of the UI.",
               "title": "userRoles",
               "type": "boolean"
             }

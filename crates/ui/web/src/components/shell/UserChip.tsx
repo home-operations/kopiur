@@ -66,6 +66,18 @@ export function UserChip({ namespace }: { namespace: string | undefined }) {
           <dd>{data.user}</dd>
           <dt>Groups</dt>
           <dd>{data.groups.length > 0 ? data.groups.join(", ") : "—"}</dd>
+          {data.droppedGroups.length > 0 ? (
+            <>
+              <dt>Not forwarded</dt>
+              <dd>
+                {data.droppedGroups.join(", ")}
+                <span className="identity__note">
+                  Your proxy sent these, but they are not in ui.auth.allowedGroups, so they grant
+                  nothing here.
+                </span>
+              </dd>
+            </>
+          ) : null}
           {data.email ? (
             <>
               <dt>Email</dt>

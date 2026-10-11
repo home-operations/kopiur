@@ -73,6 +73,7 @@ fn header_mode_config() -> UiConfig {
                 anonymous_fallback: None,
             },
             groups_separator: DEFAULT_GROUPS_SEPARATOR.to_string(),
+            groups_format: kopiur_ui::config::GroupsFormat::Delimited,
             email_header: None,
             extra_keys: Vec::new(),
             allowed_groups: None,

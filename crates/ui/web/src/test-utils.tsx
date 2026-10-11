@@ -97,6 +97,7 @@ export function forbiddenProblem(what: string, instance: string): Problem {
 export const ME: Me = {
   user: "alice",
   groups: ["platform"],
+  droppedGroups: [],
   email: null,
   source: "trustedHeaders",
   namespace: null,

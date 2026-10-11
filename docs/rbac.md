@@ -154,7 +154,7 @@ There is **no `secrets` rule and no `pods/exec` rule**, in any mode. The console
 
 ### The four human roles
 
-You bind these; the chart creates no bindings, because who may operate your backups is not a chart decision. Until you write one, every console screen reports `Forbidden` — which is correct, not a broken install.
+You bind these — list your groups in `ui.rbac.bindings`, or write the ClusterRoleBinding yourself. The chart binds nobody on its own, because who may operate your backups is not a chart decision. Until you bind someone, every console screen reports `Forbidden` — which is correct, not a broken install.
 
 | Role | Rules | Bind it as |
 | --- | --- | --- |

@@ -38,7 +38,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use clap::{ArgAction, Parser};
+use clap::{ArgAction, Parser, ValueEnum};
 use http::header::HeaderName;
 
 /// OTLP + logging env var names, owned by the telemetry crate so `kopiur-ui`'s
@@ -91,6 +91,44 @@ pub const GROUPS_SEPARATOR_ENV: &str = "KOPIUR_UI_GROUPS_SEPARATOR";
 
 /// Default for [`GROUPS_SEPARATOR_ENV`].
 pub const DEFAULT_GROUPS_SEPARATOR: &str = ",";
+
+/// How the groups header's value is encoded: [`GroupsFormat`]. Envoy Gateway's
+/// `claimToHeaders` base64-encodes an array claim and cannot be told not to, so
+/// it needs `base64Json`; oauth2-proxy needs the default `delimited`.
+pub const GROUPS_FORMAT_ENV: &str = "KOPIUR_UI_GROUPS_FORMAT";
+
+/// How the groups header carries its list.
+///
+/// Explicit, never sniffed: the groups header is a trust boundary, and a format
+/// guessed per request would let a group name that happens to be valid base64
+/// change meaning. A misconfiguration is instead reported loudly (a startup-
+/// independent warning in [`crate::auth::identity`]) when the default format
+/// sees a value that looks like Envoy's encoding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
+pub enum GroupsFormat {
+    /// A plain list split on [`GROUPS_SEPARATOR_ENV`], e.g. `admins,dev`.
+    /// What oauth2-proxy and most header-auth proxies emit.
+    #[default]
+    #[value(name = "delimited")]
+    Delimited,
+    /// A JSON array of strings, e.g. `["admins","dev"]`.
+    #[value(name = "json")]
+    Json,
+    /// A base64-encoded JSON array of strings, e.g. `WyJhZG1pbnMiXQ==`. What
+    /// Envoy Gateway's `claimToHeaders` emits for an array claim like `groups`.
+    #[value(name = "base64Json", alias = "base64-json")]
+    Base64Json,
+}
+
+impl fmt::Display for GroupsFormat {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Delimited => "delimited",
+            Self::Json => "json",
+            Self::Base64Json => "base64Json",
+        })
+    }
+}
 
 /// Header carrying the caller's email address. Display only — never
 /// impersonated, never used for authorization.
@@ -379,6 +417,10 @@ pub struct UiArgs {
     #[arg(long, env = GROUPS_SEPARATOR_ENV, default_value = DEFAULT_GROUPS_SEPARATOR)]
     pub groups_separator: String,
 
+    /// How the groups header is encoded: delimited, json, or base64Json.
+    #[arg(long, env = GROUPS_FORMAT_ENV, value_enum, default_value_t = GroupsFormat::Delimited)]
+    pub groups_format: GroupsFormat,
+
     /// Header carrying the caller's email address (display only).
     #[arg(long, env = EMAIL_HEADER_ENV)]
     pub email_header: Option<String>,
@@ -611,8 +653,11 @@ fn wire_bytes(bytes: u64) -> i64 {
 pub struct AuthConfig {
     /// Header mode or anonymous-only mode.
     pub mode: AuthMode,
-    /// Separator splitting the groups header's value.
+    /// Separator splitting the groups header's value. Only read when
+    /// `groups_format` is [`GroupsFormat::Delimited`].
     pub groups_separator: String,
+    /// How the groups header's value is encoded.
+    pub groups_format: GroupsFormat,
     /// Header carrying the caller's email address, when configured.
     pub email_header: Option<HeaderName>,
     /// `userextras` keys the UI may impersonate. Exactly the keys named here
@@ -631,6 +676,7 @@ impl fmt::Debug for AuthConfig {
         f.debug_struct("AuthConfig")
             .field("mode", &self.mode)
             .field("groups_separator", &self.groups_separator)
+            .field("groups_format", &self.groups_format)
             .field("email_header", &self.email_header)
             .field("extra_keys", &self.extra_keys)
             .field("allowed_groups", &self.allowed_groups)
@@ -1016,6 +1062,7 @@ impl UiArgs {
             auth: AuthConfig {
                 mode,
                 groups_separator,
+                groups_format: self.groups_format,
                 email_header,
                 extra_keys: csv(self.impersonate_extra_keys.as_deref()),
                 allowed_groups,
@@ -1680,6 +1727,30 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    #[serial]
+    fn the_groups_format_defaults_to_delimited_and_accepts_the_charts_spelling() {
+        let cfg = resolve(&header_mode(&[])).expect("default config");
+        assert_eq!(cfg.auth.groups_format, GroupsFormat::Delimited);
+
+        for (spelling, want) in [
+            ("delimited", GroupsFormat::Delimited),
+            ("json", GroupsFormat::Json),
+            // The Helm value is camelCase; the kebab form is accepted too.
+            ("base64Json", GroupsFormat::Base64Json),
+            ("base64-json", GroupsFormat::Base64Json),
+        ] {
+            let cfg = resolve(&header_mode(&["--groups-format", spelling]))
+                .unwrap_or_else(|e| panic!("{spelling}: {e}"));
+            assert_eq!(cfg.auth.groups_format, want, "{spelling}");
+        }
+
+        assert!(
+            UiArgs::try_parse_from(["kopiur-ui", "--groups-format", "base64"]).is_err(),
+            "an unknown format is a startup error, not a silent default"
+        );
     }
 
     /// An EMPTY allowed-group list still means "unset" — the repo-wide

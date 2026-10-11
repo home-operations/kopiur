@@ -2582,6 +2582,11 @@ html:has(dialog.side-panel[open]) {
   overflow-wrap: anywhere;
 }
 
+.identity__note {
+  display: block;
+  color: var(--fg-muted);
+}
+
 .identity__count {
   margin: 0;
   color: var(--fg-muted);

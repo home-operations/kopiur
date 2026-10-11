@@ -184,3 +184,105 @@ tests:
       # would render a policy matching nobody.
       - failedTemplate:
           errorPattern: "has no namespace"
+
+  - it: refuses a comma inside an allowedGroups name — the env is comma-joined
+    set:
+      ui.enabled: true
+      ui.auth.userHeader: x-user-name
+      ui.auth.proxySecret.existingSecret: kopiur-ui-proxy
+      ui.auth.allowedGroups: ["a,b"]
+    asserts:
+      - failedTemplate:
+          errorPattern: "may not contain a comma"
+
+  - it: refuses a browse binding — it grants repository credentials
+    set:
+      ui.enabled: true
+      ui.auth.userHeader: x-user-name
+      ui.auth.proxySecret.existingSecret: kopiur-ui-proxy
+      ui.rbac.bindings:
+        - role: browse
+          groups: [Admins]
+    asserts:
+      - failedTemplate:
+          errorPattern: "deliberately does not offer"
+      - failedTemplate:
+          errorPattern: "namespaced RoleBinding"
+
+  - it: refuses an unknown binding role
+    set:
+      ui.enabled: true
+      ui.auth.userHeader: x-user-name
+      ui.auth.proxySecret.existingSecret: kopiur-ui-proxy
+      ui.rbac.bindings:
+        - role: admin
+          groups: [Admins]
+    asserts:
+      - failedTemplate:
+          errorPattern: 'bindings\[0\] has role: "admin"'
+      - failedTemplate:
+          errorPattern: 'user \(view \+ operate'
+
+  - it: refuses a binding with no subjects
+    set:
+      ui.enabled: true
+      ui.auth.userHeader: x-user-name
+      ui.auth.proxySecret.existingSecret: kopiur-ui-proxy
+      ui.rbac.bindings:
+        - role: user
+    asserts:
+      - failedTemplate:
+          errorPattern: "names no groups and no users"
+
+  - it: refuses a binding to a system principal
+    set:
+      ui.enabled: true
+      ui.auth.userHeader: x-user-name
+      ui.auth.proxySecret.existingSecret: kopiur-ui-proxy
+      ui.rbac.bindings:
+        - role: user
+          groups: ["system:authenticated"]
+    asserts:
+      - failedTemplate:
+          errorPattern: "never impersonates a system: principal"
+
+  - it: refuses a binding name that cannot be part of an object name
+    set:
+      ui.enabled: true
+      ui.auth.userHeader: x-user-name
+      ui.auth.proxySecret.existingSecret: kopiur-ui-proxy
+      ui.rbac.bindings:
+        - role: user
+          name: Ops Team
+          groups: [Admins]
+    asserts:
+      - failedTemplate:
+          errorPattern: "must be lowercase"
+
+  - it: refuses a binding to a group allowedGroups would drop
+    set:
+      ui.enabled: true
+      ui.auth.userHeader: x-user-name
+      ui.auth.proxySecret.existingSecret: kopiur-ui-proxy
+      ui.auth.allowedGroups: [Admins]
+      ui.rbac.bindings:
+        - role: viewer
+          groups: [Qsync]
+    asserts:
+      - failedTemplate:
+          errorPattern: 'binds group "Qsync"'
+      - failedTemplate:
+          errorPattern: 'Add "Qsync" to ui.auth.allowedGroups'
+
+  - it: refuses bindings when the roles they point at are not rendered
+    set:
+      ui.enabled: true
+      ui.auth.userHeader: x-user-name
+      ui.auth.proxySecret.existingSecret: kopiur-ui-proxy
+      ui.rbac.userRoles: false
+      ui.rbac.bindings:
+        - role: user
+          groups: [Admins]
+    asserts:
+      - failedTemplate:
+          errorPattern: "ui.rbac.userRoles is false"

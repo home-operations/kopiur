@@ -990,6 +990,7 @@ mod extractor_rejection_tests {
                 groups: Vec::new(),
             }),
             groups_separator: DEFAULT_GROUPS_SEPARATOR.to_string(),
+            groups_format: crate::config::GroupsFormat::Delimited,
             email_header: None,
             extra_keys: Vec::new(),
             allowed_groups: None,

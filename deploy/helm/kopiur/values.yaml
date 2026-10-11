@@ -711,15 +711,40 @@ ui:
   # configured, or the chart refuses to render — a console with no identity
   # source would run every request as its own ServiceAccount, which can
   # impersonate anyone.
+  #
+  # Three separate jobs, three separate settings — the usual source of confusion:
+  #   1. Read the groups:     groupsHeader + groupsFormat (+ groupsSeparator)
+  #   2. Restrict the groups: allowedGroups (optional; it never grants anything)
+  #   3. Grant access:        ui.rbac.bindings, or your own ClusterRoleBinding
+  # Walkthrough with per-proxy recipes: https://kopiur.home-operations.com/ui/#identity-and-access
   auth:
     # -- Header the proxy puts the authenticated username in (e.g.
-    # X-Forwarded-User). Setting it selects header mode; a request without it
-    # gets a 401 unless auth.anonymous.fallback is on.
+    # X-Forwarded-User for oauth2-proxy, or whatever name you gave the `sub` /
+    # `preferred_username` claim in Envoy Gateway's claimToHeaders). Setting it
+    # selects header mode; a request without it gets a 401 unless
+    # auth.anonymous.fallback is on. Header names are case-insensitive.
     userHeader: ""
     # -- Header carrying the caller's groups (e.g. X-Forwarded-Groups). Optional
-    # — an identity with no groups is valid, it just matches fewer RoleBindings.
+    # — an identity with no groups is valid, it just matches fewer bindings.
+    # Check what arrived: the user menu at the bottom of the console's sidebar
+    # lists the groups the console read.
     groupsHeader: ""
-    # -- Separator the groups header uses. oauth2-proxy emits ",".
+    # @schema
+    # enum: [delimited, json, base64Json]
+    # @schema
+    # -- How the groups header is encoded. `delimited`: a plain list split on
+    # groupsSeparator, e.g. `admins,dev` (oauth2-proxy, most header-auth
+    # proxies). `json`: a JSON array, e.g. `["admins","dev"]`.
+    # `base64Json`: a base64-encoded JSON array, e.g. `WyJhZG1pbnMiXQ==` — what
+    # Envoy Gateway's SecurityPolicy `claimToHeaders` sends for a list claim
+    # like `groups`, and Envoy cannot be told otherwise. Wrong format symptom:
+    # the user menu shows one long unreadable group (and the console logs a
+    # warning naming this setting), or every request fails with
+    # `invalid-header-value`.
+    groupsFormat: delimited
+    # -- Separator the groups header uses when groupsFormat is `delimited`
+    # (ignored otherwise). oauth2-proxy emits ",". Surrounding spaces are
+    # trimmed; spaces inside a name (`Domain Users`) are kept.
     groupsSeparator: ","
     # -- Header carrying the caller's email. Display only: never impersonated,
     # never used for authorization.
@@ -729,10 +754,17 @@ ui:
     # Kubernetes RBAC has no wildcard there, so a `userextras/*` would authorize
     # nothing and fail at the first request instead of at install.
     impersonateExtraKeys: []
-    # -- Allow-list of groups the console may impersonate. Empty means "whatever
-    # groups the proxy asserts". Set, it is enforced TWICE: the console filters
-    # inbound groups, and the same list is pinned as `resourceNames` on the
-    # impersonate rule so the apiserver enforces it even if the console did not.
+    # -- Optional allow-list of groups the console may impersonate. It only
+    # restricts, it never grants: listing `Admins` here gives Admins no access
+    # — bind a role for that (ui.rbac.bindings). Empty (the
+    # default) means "whatever groups the proxy asserts". Set, every other
+    # group the proxy sends is dropped before it reaches Kubernetes (the user
+    # menu lists them under "Not forwarded"), and the list is enforced twice:
+    # the console filters inbound groups, and the same list is pinned as
+    # `resourceNames` on the impersonate rule so the apiserver enforces it even
+    # if the console did not. Use it when your IdP sends many groups and only a
+    # few matter. Names are exact and case-sensitive, and may not contain a
+    # comma.
     allowedGroups: []
     proxySecret:
       # -- Name of an existing Secret holding the shared token the proxy must
@@ -819,8 +851,9 @@ ui:
     # -- Render the human roles: `kopiur-ui-viewer` (read-only) and
     # `kopiur-ui-editor` (the console's action buttons), which aggregate into
     # `kopiur-ui-user`, plus the namespaced `kopiur-ui-doctor` Role. Bind
-    # `kopiur-ui-user` to your people — the chart creates no bindings, because
-    # who may operate your backups is not a chart decision.
+    # `kopiur-ui-user` to your people — either list them in `ui.rbac.bindings`
+    # below or write your own ClusterRoleBinding. The chart binds nobody on its
+    # own, because who may operate your backups is not a chart decision.
     #
     # These render only while `ui.enabled` is also true, so an install that does
     # not run the console gains no ClusterRoles for a component it does not have.
@@ -831,6 +864,19 @@ ui:
     # while there is no console to use, which is why the roles stay gated rather
     # than appearing in every install that has never heard of the UI.
     userRoles: true
+    # -- Opt-in ClusterRoleBindings from your people to the human roles. Empty by
+    # default: nobody gets access until you say so. Each entry binds ONE role
+    # (`role: user|viewer|editor`) to any mix of `groups` and `users`, written
+    # exactly as your proxy sends them (case-sensitive; spaces allowed). E.g.
+    # `[{role: user, groups: [Admins]}, {role: viewer, groups: ["Domain Users"], users: [alice]}]`.
+    # `user` = viewer + editor (operate backups); `viewer` = read-only;
+    # `editor` = the action buttons alone. Requires userRoles. `browse` is
+    # deliberately not offered: it grants repository credentials, so bind
+    # kopiur-ui-browse yourself, per namespace (see browseRole). An optional
+    # `name` suffixes the ClusterRoleBinding's name (default: the entry index).
+    # If you set allowedGroups, every group named here must be in it too, or
+    # the console drops that group before Kubernetes can match the binding.
+    bindings: []
     # -- Render `kopiur-ui-browse`, the role behind the in-snapshot file browser.
     #
     # READ THIS BEFORE ENABLING. Browsing runs a session pod and `pods/exec`s

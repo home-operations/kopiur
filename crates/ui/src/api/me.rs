@@ -192,6 +192,7 @@ pub fn view_me(id: &Identity, namespace: Option<&str>, can: Capabilities) -> Me 
     Me {
         user: id.user.clone(),
         groups: id.groups.clone(),
+        dropped_groups: id.dropped_groups.clone(),
         email: id.email.clone(),
         source: id.source.clone(),
         namespace: namespace.map(str::to_string),
@@ -352,6 +353,7 @@ mod tests {
         Identity {
             user: "alice@example.com".to_string(),
             groups: vec!["platform".to_string(), "sre".to_string()],
+            dropped_groups: Vec::new(),
             email: Some("alice@example.com".to_string()),
             extra: BTreeMap::new(),
             source: IdentitySource::TrustedHeaders,
@@ -437,6 +439,7 @@ mod tests {
         let anonymous = Identity {
             user: "kopiur-ui-viewer".to_string(),
             groups: Vec::new(),
+            dropped_groups: Vec::new(),
             email: None,
             extra: BTreeMap::new(),
             source: IdentitySource::Anonymous,

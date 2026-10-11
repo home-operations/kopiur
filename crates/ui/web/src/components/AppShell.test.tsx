@@ -20,6 +20,7 @@ fetchMock.enableMocks();
 const alice: Me = {
   user: "alice",
   groups: ["platform", "oncall"],
+  droppedGroups: [],
   email: "alice@example.test",
   source: "trustedHeaders",
   namespace: null,
@@ -52,11 +53,11 @@ const alice: Me = {
  * tests about the shell rather than about whichever route happens to be
  * mounted under it.
  */
-function mockShell() {
+function mockShell(me: Me = alice) {
   fetchMock.resetMocks();
   fetchMock.mockResponse((request) => {
     const url = new URL(request.url, "http://localhost");
-    const body = url.pathname === "/api/v1/me" ? JSON.stringify(alice) : "[]";
+    const body = url.pathname === "/api/v1/me" ? JSON.stringify(me) : "[]";
     return Promise.resolve(
       new Response(body, { status: 200, headers: { "content-type": "application/json" } }),
     );
@@ -333,6 +334,23 @@ describe("AppShell", () => {
       return input instanceof URL ? input.href : input.url;
     });
     expect(called).toContain("/api/v1/me?namespace=prod");
+  });
+
+  it("names the groups allowedGroups dropped, and says nothing when none were", async () => {
+    mockShell({ ...alice, droppedGroups: ["Domain Users", "Qsync"] });
+    mountAt("/maintenance");
+    await screen.findByText("alice", { selector: ".identity__user" });
+    const term = screen.getByText("Not forwarded");
+    expect(term.closest(".identity")).not.toBeNull();
+    expect(term.nextElementSibling).toHaveTextContent("Domain Users, Qsync");
+    expect(term.nextElementSibling).toHaveTextContent("ui.auth.allowedGroups");
+  });
+
+  it("has no 'Not forwarded' row when every asserted group was kept", async () => {
+    mockShell();
+    mountAt("/maintenance");
+    await screen.findByText("alice", { selector: ".identity__user" });
+    expect(screen.queryByText("Not forwarded")).toBeNull();
   });
 
   it("lists every capability with a check or a cross and the word", async () => {

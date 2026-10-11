@@ -17,10 +17,18 @@
 # who you are by reading a header, so anything that can reach it and set that
 # header is that person. Your proxy is the trust boundary; the chart cannot be.
 #
-# The oauth2-proxy half of this file is therefore an EXAMPLE OF YOUR WIRING, not
-# a Kopiur API. Its field names belong to oauth2-proxy (and the alpha config
-# below is explicitly alpha, so check it against the version you run). Any proxy
-# that authenticates a user and sets the two headers works just as well.
+# The proxy halves of this file are therefore EXAMPLES OF YOUR WIRING, not a
+# Kopiur API. Two complete variants are shown — pick ONE:
+#
+#   A. oauth2-proxy           sections: values, proxy-secret, oauth2-proxy,
+#                             ingress | httproute, bindings
+#   B. Envoy Gateway (OIDC)   sections: envoy-values, envoy-proxy-secret,
+#                             envoy-gateway
+#
+# Their field names belong to oauth2-proxy / Envoy Gateway (oauth2-proxy's
+# alpha config is explicitly alpha; Envoy Gateway's SecurityPolicy is
+# v1alpha1), so check them against the versions you run. Any proxy that
+# authenticates a user and sets the headers works just as well.
 #
 # THIS FILE IS NOT ONE `kubectl apply`. The first document is Helm values
 # (`helm upgrade -f`); everything after it is cluster objects. The docs page
@@ -38,6 +46,8 @@ ui:
     # itself from the authenticated session.
     userHeader: X-Forwarded-User
     groupsHeader: X-Forwarded-Groups
+    # oauth2-proxy sends groups as a plain comma-joined list: `admins,dev`.
+    groupsFormat: delimited
     groupsSeparator: ","
     # Display only — never impersonated, never used for authorization.
     emailHeader: X-Forwarded-Email
@@ -316,3 +326,181 @@ subjects:
     kind: Group
     name: media-admins
 # --8<-- [end:bindings]
+
+# ===========================================================================
+# VARIANT B — Envoy Gateway SecurityPolicy (OIDC) in front of the console.
+#
+# Envoy itself is the proxy here: the SecurityPolicy logs the user in against
+# your OIDC provider (Authelia in this example; any OIDC IdP works), then copies
+# claims from the ID token into request headers with `claimToHeaders`. There
+# is no oauth2-proxy Deployment — the HTTPRoute points straight at the console.
+#
+# THE ONE THING THAT DIFFERS: Envoy base64-encodes any claim that is a list or
+# an object, and cannot be told not to. Authelia's `groups` claim is a list, so
+# the console receives
+#     x-user-groups: WyJEb21haW4gVXNlcnMiLCJBZG1pbnMiXQ==
+# which is base64 for ["Domain Users","Admins"]. `groupsFormat: base64Json`
+# tells the console to decode it. Leave it at `delimited` and the console sees
+# ONE group named "WyJEb21h…" that matches no binding.
+# ===========================================================================
+
+# --8<-- [start:envoy-values]
+ui:
+  enabled: true
+
+  auth:
+    # The header names are whatever you choose in claimToHeaders below; these
+    # must match them. Case does not matter.
+    userHeader: x-user-username
+    groupsHeader: x-user-groups
+    # Envoy sends list claims base64-encoded. See the note above.
+    groupsFormat: base64Json
+    emailHeader: x-user-email
+
+    # The HTTPRoute below sets X-Kopiur-Proxy-Token on every request it
+    # forwards, from this same value.
+    proxySecret:
+      existingSecret: kopiur-ui-proxy-token
+      key: token
+
+    # OPTIONAL. Only these groups are forwarded to Kubernetes; the rest are
+    # dropped (the user menu lists them under "Not forwarded"). This RESTRICTS —
+    # it grants nothing. Leave it empty to forward every group.
+    allowedGroups: [Admins, Domain Users]
+
+  rbac:
+    userRoles: true
+    # WHO MAY DO WHAT. This is the step that grants access: each entry becomes
+    # one ClusterRoleBinding. Group names exactly as your IdP sends them.
+    bindings:
+      # Admins operate backups: view everything, take snapshots, restore,
+      # suspend, request maintenance.
+      - role: user
+        groups: [Admins]
+      # Everyone else in the directory may look, not touch.
+      - role: viewer
+        groups: [Domain Users]
+
+  # Only the Envoy proxy pods may reach the console's app port. This selector
+  # matches Envoy Gateway's default: proxy pods in `envoy-gateway-system`. If
+  # you run Envoy Gateway in gateway-namespace mode, the proxies run in the
+  # Gateway's own namespace instead — select that, or every request times out.
+  # (No monitoringSelector here, so the ops port — /metrics, /healthz,
+  # /readyz — stays reachable cluster-wide; it serves no user data.)
+  networkPolicy:
+    enabled: true
+    proxySelector:
+      namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: envoy-gateway-system
+      podSelector:
+        matchLabels:
+          app.kubernetes.io/component: proxy
+# --8<-- [end:envoy-values]
+
+# --8<-- [start:envoy-proxy-secret]
+---
+# The OIDC client credentials Envoy uses to log users in — the client you
+# register in your IdP (see the Authelia note in docs/ui.md). Envoy Gateway
+# reads `client-id` and `client-secret` from this Secret.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: kopiur-ui-oidc
+  namespace: kopiur-system
+type: Opaque
+stringData:
+  client-id: kopiur-ui
+  client-secret: REPLACE_ME
+---
+# The shared token, in the console's namespace. Generate it with
+# `openssl rand -hex 32`. Envoy does not read Secrets for header values, so the
+# SAME value also appears in the HTTPRoute below — keep that file encrypted
+# (SOPS) or templated from your secret store, like any other credential in Git.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: kopiur-ui-proxy-token
+  namespace: kopiur-system
+type: Opaque
+stringData:
+  token: REPLACE_ME
+# --8<-- [end:envoy-proxy-secret]
+
+# --8<-- [start:envoy-gateway]
+---
+# The route: your Gateway → the console Service directly (Envoy is the proxy).
+# The RequestHeaderModifier `set` REPLACES any X-Kopiur-Proxy-Token a browser
+# sent, so only requests that went through this route carry the right one.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: kopiur-ui
+  namespace: kopiur-system
+spec:
+  parentRefs:
+    - name: external
+      namespace: gateway
+      sectionName: https
+  hostnames:
+    - backups.example.com
+  rules:
+    - backendRefs:
+        - name: kopiur-ui
+          port: 8090
+      filters:
+        - type: RequestHeaderModifier
+          requestHeaderModifier:
+            set:
+              - name: X-Kopiur-Proxy-Token
+                value: REPLACE_ME # the same token as the Secret above
+---
+# The login and the identity headers.
+#
+# `oidc` sends anyone without a session to your IdP and stores the ID token in a
+# cookie. `jwt` then validates that cookie on every request and copies claims
+# into headers with `claimToHeaders` — each header the console reads must come
+# from here.
+#
+# Envoy writes a header only for a claim the token actually contains — and if
+# a claim is missing, a header of that name sent by the BROWSER is not
+# replaced. So make sure the ID token always carries `preferred_username`,
+# `groups` and `email` (for Authelia: a claims_policy, see docs/ui.md).
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: SecurityPolicy
+metadata:
+  name: kopiur-ui-oidc
+  namespace: kopiur-system
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      name: kopiur-ui
+  oidc:
+    provider:
+      issuer: https://auth.example.com
+    clientIDRef:
+      name: kopiur-ui-oidc # the Secret above, key client-id
+    clientSecret:
+      name: kopiur-ui-oidc # the Secret above, key client-secret
+    redirectURL: https://backups.example.com/oauth2/callback
+    cookieNames:
+      idToken: IdToken-kopiur-ui
+    scopes: [openid, profile, email, groups]
+  jwt:
+    providers:
+      - name: authelia
+        issuer: https://auth.example.com
+        remoteJWKS:
+          uri: https://auth.example.com/jwks.json
+        # Validate the ID token the oidc block stored, from its cookie.
+        extractFrom:
+          cookies: [IdToken-kopiur-ui]
+        claimToHeaders:
+          - claim: preferred_username # → ui.auth.userHeader
+            header: x-user-username
+          - claim: groups # a list → base64-encoded → groupsFormat: base64Json
+            header: x-user-groups
+          - claim: email # → ui.auth.emailHeader (display only)
+            header: x-user-email
+# --8<-- [end:envoy-gateway]

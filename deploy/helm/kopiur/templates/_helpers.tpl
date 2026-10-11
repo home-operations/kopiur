@@ -376,6 +376,23 @@ into a failed `helm upgrade`.
 {{- fail "ui.networkPolicy.enabled is true but ui.networkPolicy.proxySelector is empty, so the rendered policy would name no peer allowed to reach the app port — the console would be unreachable, and a reader would believe it was protected. Set ui.networkPolicy.proxySelector to a NetworkPolicy peer for your authenticating proxy, e.g. {namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: auth}}, podSelector: {matchLabels: {app.kubernetes.io/name: oauth2-proxy}}}." -}}
 {{- end -}}
 
+{{/* The groups-header encoding. The binary would refuse an unknown value at
+     startup too, but a CrashLoopBackOff is a worse place to learn it. */}}
+{{- $format := $auth.groupsFormat | default "delimited" -}}
+{{- if not (has $format (list "delimited" "json" "base64Json")) -}}
+{{- fail (printf "ui.auth.groupsFormat is %q, which is not a format kopiur-ui reads. Use delimited (a separator-joined list, e.g. oauth2-proxy), json (a JSON array), or base64Json (a base64-encoded JSON array — what Envoy Gateway's claimToHeaders sends for a list claim like groups)." $format) -}}
+{{- end -}}
+
+{{/* allowedGroups travels to the console as one comma-joined env var, so a
+     comma inside a name would silently split it into two groups. */}}
+{{- range $auth.allowedGroups -}}
+{{- if contains "," . -}}
+{{- fail (printf "ui.auth.allowedGroups contains %q, but a group name in allowedGroups may not contain a comma (the list is passed to the console comma-separated, so it would become two different groups). Rename the group in your IdP, or leave allowedGroups empty." .) -}}
+{{- end -}}
+{{- end -}}
+
+{{- include "kopiur.ui.validateBindings" . -}}
+
 {{/* An admission policy that matches nobody enforces nothing. */}}
 {{- if .Values.ui.rbac.execPolicy.enabled -}}
 {{- if not .Values.ui.rbac.execPolicy.subjects -}}
@@ -385,6 +402,49 @@ into a failed `helm upgrade`.
      install, not just the policy template. Assigned, never emitted — an
      `include` writes its result, and this one's result is CEL. */}}
 {{- $_ := include "kopiur.ui.execSubjectExpr" . -}}
+{{- end -}}
+{{- end -}}
+{{- end }}
+
+{{/*
+Refusals for ui.rbac.bindings. Each one is a binding that would render, apply
+cleanly, and then quietly grant nobody (or the wrong thing) — so it stops the
+install with the value to change instead.
+*/}}
+{{- define "kopiur.ui.validateBindings" -}}
+{{- $rbac := .Values.ui.rbac -}}
+{{- $allowed := .Values.ui.auth.allowedGroups | default list -}}
+{{- if and $rbac.bindings (not $rbac.userRoles) -}}
+{{- fail "ui.rbac.bindings is set but ui.rbac.userRoles is false, so the roles those bindings point at are not rendered and every binding would grant nothing. Set ui.rbac.userRoles: true, or remove ui.rbac.bindings." -}}
+{{- end -}}
+{{- range $i, $b := $rbac.bindings -}}
+{{- $where := printf "ui.rbac.bindings[%d]" $i -}}
+{{- $role := $b.role | default "" -}}
+{{- if eq $role "browse" -}}
+{{- fail (printf "%s has role: browse, which ui.rbac.bindings deliberately does not offer: kopiur-ui-browse grants that namespace's repository credentials (anyone who can exec into a browse session pod can read them). Bind it yourself with a namespaced RoleBinding to the ClusterRole <release>-ui-browse, in only the namespaces that person should see — see https://kopiur.home-operations.com/ui/#granting-browse-grants-that-namespaces-repository-credentials" $where) -}}
+{{- end -}}
+{{- if not (has $role (list "user" "viewer" "editor")) -}}
+{{- fail (printf "%s has role: %q. Use one of: user (view + operate backups — the usual choice), viewer (read-only), editor (the action buttons alone)." $where $role) -}}
+{{- end -}}
+{{- if and (not $b.groups) (not $b.users) -}}
+{{- fail (printf "%s (role: %s) names no groups and no users, so it would bind nobody. Add groups: [...] and/or users: [...] — the names exactly as your proxy sends them." $where $role) -}}
+{{- end -}}
+{{- with $b.name -}}
+{{- if not (regexMatch "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$" (toString .)) -}}
+{{- fail (printf "%s has name: %q, which must be lowercase letters, digits and '-' (it becomes part of the ClusterRoleBinding's name)." $where .) -}}
+{{- end -}}
+{{- end -}}
+{{- range concat ($b.groups | default list) ($b.users | default list) -}}
+{{- if hasPrefix "system:" . -}}
+{{- fail (printf "%s names %q. The console never impersonates a system: principal (it refuses any request asserting one), so this binding could never apply. Bind your people's real groups or users instead." $where .) -}}
+{{- end -}}
+{{- end -}}
+{{- if $allowed -}}
+{{- range $b.groups -}}
+{{- if not (has . $allowed) -}}
+{{- fail (printf "%s binds group %q, but ui.auth.allowedGroups is set and does not list it, so the console drops that group before it reaches Kubernetes and this binding would never match. Add %q to ui.auth.allowedGroups, or remove it from the binding." $where . .) -}}
+{{- end -}}
+{{- end -}}
 {{- end -}}
 {{- end -}}
 {{- end }}
@@ -440,6 +500,10 @@ left blank is simply omitted here rather than rendered as "".
 {{- end }}
 {{- with $ui.auth.groupsSeparator }}
 - name: KOPIUR_UI_GROUPS_SEPARATOR
+  value: {{ . | quote }}
+{{- end }}
+{{- with $ui.auth.groupsFormat }}
+- name: KOPIUR_UI_GROUPS_FORMAT
   value: {{ . | quote }}
 {{- end }}
 {{- with $ui.auth.emailHeader }}

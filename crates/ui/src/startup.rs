@@ -335,6 +335,7 @@ mod tests {
                     groups: Vec::new(),
                 }),
                 groups_separator: DEFAULT_GROUPS_SEPARATOR.to_string(),
+                groups_format: crate::config::GroupsFormat::Delimited,
                 email_header: None,
                 extra_keys: extra_keys.iter().map(|k| (*k).to_string()).collect(),
                 allowed_groups: None,

@@ -470,6 +470,19 @@ impl From<AuthError> for ApiError {
                 format!("{reason}."),
                 format!("fix what the authenticating proxy puts in {header}"),
             ),
+            AuthError::MalformedGroupsHeader {
+                header,
+                format,
+                reason,
+            } => problem(
+                400,
+                "invalid-header-value",
+                format!("The {header} header could not be read as a {format} groups list."),
+                format!("{reason}."),
+                "set ui.auth.groupsFormat to the encoding your proxy sends: delimited for \
+                 oauth2-proxy, base64Json for Envoy Gateway claimToHeaders, json for a plain \
+                 JSON array",
+            ),
             AuthError::ForbiddenPrincipal { principal, why } => problem(
                 403,
                 "forbidden-principal",
@@ -916,6 +929,15 @@ mod tests {
                 },
                 403,
                 "urn:kopiur:problem:forbidden-principal",
+            ),
+            (
+                AuthError::MalformedGroupsHeader {
+                    header: "x-user-groups".to_string(),
+                    format: crate::config::GroupsFormat::Base64Json,
+                    reason: "the value is not base64".to_string(),
+                },
+                400,
+                "urn:kopiur:problem:invalid-header-value",
             ),
             (
                 AuthError::TooManyGroups { count: 99, max: 64 },

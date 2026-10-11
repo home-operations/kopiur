@@ -55,28 +55,180 @@ from the proxy, why the chart renders no Ingress, and why the Service is
 ```mermaid
 flowchart LR
   U[Person in a browser] -->|TLS| I[Your Ingress / HTTPRoute]
-  I --> P[Your auth proxy<br/>oauth2-proxy, Authelia, ...]
-  P -->|X-Forwarded-User<br/>X-Forwarded-Groups<br/>X-Kopiur-Proxy-Token| C[kopiur-ui<br/>ClusterIP :8090]
+  I --> P[Your auth proxy<br/>oauth2-proxy, Envoy Gateway, ...]
+  P -->|user + groups headers<br/>X-Kopiur-Proxy-Token| C[kopiur-ui<br/>ClusterIP :8090]
   C -->|Impersonate-User<br/>Impersonate-Group| A[kube-apiserver]
   A -->|allowed / forbidden| C
 ```
+
+## Identity and access
+
+This is the part that takes the most care to set up, so it gets the most care
+here. Getting someone from "signed in to my IdP" to "allowed to take a snapshot
+in the console" involves **five hops**, and each one is controlled by exactly
+one setting:
+
+```mermaid
+flowchart TB
+  IdP["1. Your IdP<br/>(Authelia, Keycloak, Google, ...)<br/>issues a token with the user's groups"]
+  P["2. Your proxy<br/>(oauth2-proxy, Envoy Gateway, ...)<br/>copies user + groups into headers"]
+  R["3. kopiur-ui reads the headers<br/>ui.auth.userHeader / groupsHeader<br/>ui.auth.groupsFormat"]
+  F["4. kopiur-ui filters the groups<br/>ui.auth.allowedGroups (optional)"]
+  K["5. Kubernetes RBAC decides<br/>ui.rbac.bindings, or your own ClusterRoleBinding"]
+  IdP --> P --> R --> F --> K
+```
+
+If a hop is misconfigured, everything after it gets the wrong input, and the
+symptom usually shows up at hop 5 as **Forbidden**. So when access is wrong,
+work through the hops in order — [Check it worked](#check-it-worked) does
+exactly that.
+
+### Three settings, three different jobs
+
+Most confusion comes from mixing these up:
+
+| Job | Setting | What it does | What it does **not** do |
+|---|---|---|---|
+| **Read** the groups | `ui.auth.groupsHeader`, `ui.auth.groupsFormat` (+ `groupsSeparator`) | Tells the console which header holds the groups and how that header is encoded. | Grant or restrict anything. |
+| **Restrict** the groups | `ui.auth.allowedGroups` | Optional. Drops every group *not* on the list before it reaches Kubernetes. Use it when your IdP sends dozens of groups and only a few matter. | **Grant access.** Putting `Admins` here gives Admins nothing. |
+| **Grant** access | `ui.rbac.bindings`, or a ClusterRoleBinding you write | Says what a group (or user) may do: view, operate, or both. | — this is the only setting that grants anything. |
+
+So "how do I let my `Admins` group use the console?" is answered by the third
+row, not the second:
+
+```yaml
+ui:
+  rbac:
+    bindings:
+      - role: user # view + operate backups
+        groups: [Admins]
+```
+
+### Step 1: tell the console how your proxy sends identity
+
+Set `ui.auth.userHeader` and `ui.auth.groupsHeader` to the header names your
+proxy uses, and `ui.auth.groupsFormat` to how it encodes the group list:
+
+| Your proxy | Typical headers | `groupsFormat` | What the groups header looks like |
+|---|---|---|---|
+| oauth2-proxy | `X-Forwarded-User`, `X-Forwarded-Groups` | `delimited` (the default), `groupsSeparator: ","` | `Admins,Domain Users` |
+| Envoy Gateway `SecurityPolicy` (`claimToHeaders`) | whatever you name them, e.g. `x-user-username`, `x-user-groups` | `base64Json` | `WyJBZG1pbnMiLCJEb21haW4gVXNlcnMiXQ==` |
+| A proxy that sends a raw JSON array | — | `json` | `["Admins","Domain Users"]` |
+| A proxy that uses another separator | — | `delimited`, `groupsSeparator: ";"` | `Admins;Domain Users` |
+
+/// warning | Envoy Gateway base64-encodes the groups claim
+
+Envoy's `claimToHeaders` copies a plain string claim as-is, but encodes any
+**list or object** claim as base64 JSON — and there is no option to change that.
+`groups` is a list, so with Envoy Gateway you must set
+`ui.auth.groupsFormat: base64Json`. If you leave it at `delimited`, the console
+reads the whole blob as **one** group named something like `WyJEb21h…`, which
+matches no binding. The console logs a warning naming this setting the first
+time it sees such a value.
+
+///
+
+Group names are used exactly as sent: case-sensitive, and spaces inside a name
+(`Domain Users`) are kept. Surrounding whitespace is trimmed.
+
+The header names must also be ones **only your proxy can set**. That is what the
+shared token is for — see [The proxy shared secret](#the-proxy-shared-secret).
+
+Complete, working wiring for both common proxies is in
+[Deploying it](#deploying-it).
+
+### Step 2: optionally, restrict which groups count
+
+Leave `ui.auth.allowedGroups` empty unless you have a reason. Set it, and:
+
+- every group **not** on the list is dropped before the console talks to
+  Kubernetes (the user menu shows them under **Not forwarded**, so it is never
+  silent);
+- the same list is pinned into the console's own RBAC, so Kubernetes refuses
+  any other group even if the console's parsing were somehow fooled.
+
+Every group you bind in step 3 must also be on this list, or it is dropped
+before Kubernetes can match the binding. The chart refuses to render a
+`ui.rbac.bindings` entry that would be dropped this way.
+
+### Step 3: grant access
+
+Nobody can use the console until you bind a role — see
+[Enabling it grants nobody anything](#enabling-it-grants-nobody-anything). Do it
+in your values:
+
+```yaml
+ui:
+  rbac:
+    bindings:
+      - role: user # view + operate: snapshots, restores, suspend, maintenance
+        groups: [Admins]
+      - role: viewer # read-only
+        groups: [Domain Users]
+        users: [alice] # one person, by the name your proxy puts in userHeader
+```
+
+Each entry becomes one ClusterRoleBinding to the role `<release>-ui-<role>` —
+`kopiur-ui-user` when the Helm release is named `kopiur`, as everywhere on this
+page. The roles are
+described in [The four roles](#the-four-roles). `browse` is deliberately not
+offered here — it grants repository credentials, so you bind it by hand, per
+namespace.
+
+Or write the ClusterRoleBinding yourself, if you keep RBAC outside the Kopiur
+release — [The four roles](#the-four-roles) has the manifest.
+
+### Check it worked
+
+Open the console and click your name at the bottom of the sidebar. The panel
+shows exactly what the console read and what Kubernetes allows:
+
+| What you see | What it means | Fix |
+|---|---|---|
+| **Groups** lists your IdP groups, and actions are permitted | Everything works. | — |
+| **Groups** shows one long unreadable value, e.g. `WyJEb21h…` | The groups header is base64 JSON but is being read as `delimited`. | `ui.auth.groupsFormat: base64Json` (Envoy Gateway). |
+| **Groups** shows only `system:authenticated` | No groups arrived. Either the proxy is not sending the groups header, or `ui.auth.groupsHeader` names a different header. | Check the header name; request the `groups` scope from your IdP. |
+| **Not forwarded** lists the group you expected | It arrived, but `ui.auth.allowedGroups` dropped it. | Add it to `allowedGroups`, or empty `allowedGroups`. |
+| Groups look right, but every screen says **Forbidden** | No role is bound to those groups — or one was just added: permission answers are cached for up to `ui.limits.sarTtl` (60s). | Add a `ui.rbac.bindings` entry (step 3), wait a minute, reload. |
+| Every request fails with `invalid-header-value` | A header is not in the format configured. The error names the header and the format. | Set `groupsFormat` to what your proxy sends (step 1). |
+
+To check the Kubernetes side without the console, ask the apiserver directly as
+the identity the console will impersonate (substitute your user and groups;
+`system:authenticated` is always added):
+
+```console
+$ kubectl auth can-i create snapshots.kopiur.home-operations.com -A \
+    --as=jane --as-group=Admins --as-group=system:authenticated
+yes
+$ kubectl get clusterrolebindings -l app.kubernetes.io/component=ui
+```
+
+`allowedGroups` never blocks `system:authenticated`: the console always adds it,
+and the chart always allows it.
 
 ## Enabling it grants nobody anything
 
 This is the first surprise, and it is deliberate.
 
-Installing the console creates the roles; it creates **no bindings**. Who may
-operate your backups is not a chart decision. So the first person to sign in
-sees a console that loads and then reports **Forbidden on every screen**.
+Installing the console creates the roles; it binds **nobody** to them unless you
+list people in `ui.rbac.bindings`. Who may operate your backups is not a chart
+default. So without that, the first person to sign in sees a console that loads
+and then reports **Forbidden on every screen**.
 
 That is the correct first experience, not a broken install. Fix it by binding a
-role — see below. A console that worked for the first person through the door
+role — [Step 3](#step-3-grant-access). A console that worked for the first person through the door
 would be a console that worked for everyone who could reach the proxy.
 
 ## The four roles
 
-The chart renders four roles while `ui.enabled` and `ui.rbac.userRoles` are both
-true. Bind them yourself.
+The chart renders the first three roles while `ui.enabled` and
+`ui.rbac.userRoles` are both true, and `kopiur-ui-browse` only with
+`ui.rbac.browseRole: true`. Bind the first three with `ui.rbac.bindings`, or by
+hand; `kopiur-ui-browse` is always bound by hand.
+
+The names assume the Helm release is called `kopiur`. For another release name
+they are `<release>-ui-viewer`, `<release>-ui-editor`, `<release>-ui-user` and
+`<release>-ui-browse` — check with `kubectl get clusterroles | grep ui-`.
 
 | Role | What it grants | Bind it |
 |---|---|---|
@@ -310,20 +462,29 @@ quickly.
 
 ## Deploying it
 
-The full worked example — values, the shared-token Secret, an oauth2-proxy that
-injects the headers, both an Ingress and an `HTTPRoute` variant, and the role
-bindings — is `deploy/examples/45-web-ui.yaml`.
+The full worked example is `deploy/examples/45-web-ui.yaml`. It holds two
+complete variants — pick the one that matches your proxy:
 
-The Helm values half:
+- [With oauth2-proxy](#with-oauth2-proxy) — a separate proxy Deployment in front
+  of the console; groups arrive comma-separated.
+- [With Envoy Gateway](#with-envoy-gateway) — Envoy's own OIDC login, no extra
+  Deployment; groups arrive base64-encoded.
+
+Either way, the proxy is **your** wiring. Kopiur owns the console Deployment,
+its `ClusterIP` Service, the console's ServiceAccount and impersonation
+ClusterRole, and the four human roles. You own the proxy, the token Secret, the
+edge, the TLS certificate, and the decision about who gets which role.
+
+### With oauth2-proxy
+
+The Helm values:
 
 ```yaml
 --8<-- "deploy/examples/45-web-ui.yaml:values"
 ```
 
-The proxy is **your** wiring. Kopiur owns the console Deployment, its
-`ClusterIP` Service, the console's ServiceAccount and impersonation ClusterRole,
-and the four human roles. You own the proxy, the token Secret, the edge, the TLS
-certificate, and the decision about who gets which role.
+Create the shared token in both namespaces, as shown in
+[The proxy shared secret](#the-proxy-shared-secret). Then the proxy, which logs the user in and sets the headers:
 
 ```yaml
 --8<-- "deploy/examples/45-web-ui.yaml:oauth2-proxy"
@@ -340,6 +501,79 @@ or, with Gateway API:
 ```yaml
 --8<-- "deploy/examples/45-web-ui.yaml:httproute"
 ```
+
+Then bind roles — [Step 3](#step-3-grant-access).
+
+### With Envoy Gateway
+
+Envoy Gateway can be the authenticating proxy itself: a `SecurityPolicy` on the
+console's `HTTPRoute` logs the user in with OIDC (Authelia here; any OIDC
+provider works) and copies ID-token claims into headers with `claimToHeaders`.
+There is no proxy Deployment, and the route points straight at the console.
+
+Two things differ from oauth2-proxy, and both are handled below:
+
+1. **The groups header is base64 JSON**, because Envoy encodes every list claim
+   that way. Hence `groupsFormat: base64Json`.
+2. **The shared token is set by the route**, with a `RequestHeaderModifier`.
+   Envoy cannot read a Kubernetes Secret into a header value, so the token
+   appears in the `HTTPRoute` itself — treat that manifest as a secret (SOPS, or
+   templated from your secret store).
+
+The Helm values, including the bindings that grant `Admins` and `Domain Users`
+their access:
+
+```yaml
+--8<-- "deploy/examples/45-web-ui.yaml:envoy-values"
+```
+
+The shared token:
+
+```yaml
+--8<-- "deploy/examples/45-web-ui.yaml:envoy-proxy-secret"
+```
+
+The route and the login. Each `claimToHeaders` header must match the
+corresponding `ui.auth.*Header` value above:
+
+```yaml
+--8<-- "deploy/examples/45-web-ui.yaml:envoy-gateway"
+```
+
+/// warning | The claims must be in the ID token, every time
+
+Envoy reads the **ID token** (the cookie the `oidc` block stores) and writes a
+header only for a claim that token actually contains. Two consequences:
+
+- A token without `groups` reaches the console with no groups, so the user menu
+  shows only `system:authenticated` and every screen is **Forbidden**.
+- If a claim is missing, a header of the same name sent by the *browser* is not
+  replaced. The ID token must always carry every claim you map.
+
+**Authelia** (4.39+) puts `groups`, `email` and `preferred_username` only in the
+userinfo endpoint by default, not in the ID token. Add a claims policy and use it
+on the client you register for the console (Authelia's `configuration.yml`):
+
+```yaml
+identity_providers:
+  oidc:
+    claims_policies:
+      kopiur-ui:
+        id_token: [groups, email, preferred_username]
+    clients:
+      - client_id: kopiur-ui # = client-id in the kopiur-ui-oidc Secret
+        client_name: Kopiur
+        client_secret: "$pbkdf2-sha512$..." # hash of client-secret in that Secret
+        claims_policy: kopiur-ui
+        redirect_uris: [https://backups.example.com/oauth2/callback]
+        scopes: [openid, profile, email, groups]
+        authorization_policy: two_factor
+```
+
+Other IdPs have an equivalent "include in ID token" setting for each claim.
+
+///
+
 
 /// warning | The console image is published separately, and starts out private
 
@@ -365,9 +599,11 @@ Most of `ui.*` you can leave alone. These are the ones that matter:
 |---|---|
 | `ui.enabled` | Turn the console on. Requires `installScope: cluster`. |
 | `ui.auth.userHeader` / `groupsHeader` | Match what your proxy emits. oauth2-proxy emits `X-Forwarded-User` / `X-Forwarded-Groups`. |
-| `ui.auth.groupsSeparator` | `,` for oauth2-proxy; some proxies use `|`. |
+| `ui.auth.groupsFormat` | How the groups header is encoded: `delimited` (default, oauth2-proxy), `base64Json` (Envoy Gateway `claimToHeaders`), or `json`. See [Step 1](#step-1-tell-the-console-how-your-proxy-sends-identity). |
+| `ui.auth.groupsSeparator` | Only for `delimited`: `,` for oauth2-proxy; some proxies use `;` or a pipe. |
 | `ui.auth.proxySecret.existingSecret` | The Secret holding your shared token. Required in header mode. |
-| `ui.auth.allowedGroups` | Restrict which groups may be impersonated at all. Enforced twice — the console filters, and the same list is pinned as `resourceNames` on the impersonate rule. |
+| `ui.auth.allowedGroups` | Optional. **Restricts** which groups are forwarded to Kubernetes; never grants. Enforced twice — the console filters, and the same list is pinned as `resourceNames` on the impersonate rule. |
+| `ui.rbac.bindings` | **Grants** access: one entry per role (`user`, `viewer`, `editor`) and the groups/users that get it. Empty by default. See [Step 3](#step-3-grant-access). |
 | `ui.rbac.browseRole` | The file browser. Read the warning above first. |
 | `ui.networkPolicy.enabled` + `proxySelector` | Make "only the proxy can reach it" true at the network layer. |
 | `ui.session.ttl` | How long an idle browse session pod lives. |
@@ -386,8 +622,8 @@ request — the browser shows it, and the SPA surfaces it. Find yours here.
 | `urn:kopiur:problem:proxy-secret` | 401 | The identity headers arrived but the shared token was missing or wrong. Check that the proxy sends `X-Kopiur-Proxy-Token`, and that its value matches the Secret named by `ui.auth.proxySecret`. |
 | `urn:kopiur:problem:forbidden-principal` | 403 | The header named a `system:` principal (or `system:masters`). The console refuses these unconditionally. Your proxy is asserting an identity it should not. |
 | `urn:kopiur:problem:too-many-groups` | 400 | More than 64 groups in the groups header. Narrow what the proxy forwards, or set `ui.auth.allowedGroups`. |
-| `urn:kopiur:problem:invalid-header-value` | 400 | A header carried non-visible-ASCII bytes or exceeded 512 bytes. |
-| `urn:kopiur:problem:forbidden` | 403 | **The apiserver refused the impersonated request.** This is normal RBAC: bind `kopiur-ui-user` (or `-viewer`/`-editor`) to the user or group. The `why` field carries the apiserver's own words, naming the verb and resource. |
+| `urn:kopiur:problem:invalid-header-value` | 400 | An identity header could not be used: it carried control or non-ASCII bytes, a value exceeded 512 bytes, or the groups header was not in the configured `ui.auth.groupsFormat` (the message names the format — usually Envoy Gateway's base64 groups with `groupsFormat` left at `delimited`, or the reverse). See [Step 1](#step-1-tell-the-console-how-your-proxy-sends-identity). |
+| `urn:kopiur:problem:forbidden` | 403 | **The apiserver refused the impersonated request.** This is normal RBAC: bind `kopiur-ui-user` (or `-viewer`/`-editor`) to the user or group — with `ui.rbac.bindings` or your own binding. If you did, open the user menu and follow [Check it worked](#check-it-worked): the group may not be arriving, or `allowedGroups` may be dropping it. The `why` field carries the apiserver's own words, naming the verb and resource. |
 | `urn:kopiur:problem:csrf` | 403 | A mutating request arrived without the `X-Kopiur-Request: 1` marker, without a JSON `Content-Type`, or from another site. If you are scripting against the API, send the header — or use `kubectl kopiur`, which writes the same CRs. |
 | `urn:kopiur:problem:session-required` | 409 | You asked to read inside a snapshot with no browse session running. Start one — reads never create pods. |
 | `urn:kopiur:problem:too-many-requests` | 429 | A concurrency cap; the message names which. Retry, or raise `ui.session.maxExecPerIdentity` / `maxExecGlobal`. |

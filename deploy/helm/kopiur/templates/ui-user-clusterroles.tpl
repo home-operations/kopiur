@@ -2,8 +2,9 @@
 {{- if and .Values.ui.enabled .Values.ui.rbac.userRoles -}}
 # The HUMAN roles, SYNCED from `cargo xtask gen-rbac` (deploy/rbac/ui.yaml).
 #
-# The chart creates no bindings: who may look at and operate your backups is not
-# a chart decision. Bind `<release>-ui-user` to your people with your own
+# The chart binds nobody on its own: who may look at and operate your backups is
+# not a chart decision. Bind `<release>-ui-user` to your people by listing them
+# in `ui.rbac.bindings` (ui-user-bindings.tpl), or with your own
 # ClusterRoleBinding (or a namespaced RoleBinding to scope them to one
 # namespace's objects).
 #

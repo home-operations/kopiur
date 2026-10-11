@@ -119,6 +119,11 @@ pub struct Me {
     pub user: String,
     /// Groups the backend will impersonate alongside `user`.
     pub groups: Vec<String>,
+    /// Groups the proxy asserted that the console's `allowedGroups` filtered
+    /// out — never impersonated. Shown so a caller can tell "my group was
+    /// dropped" from "my proxy never sent it". Empty when nothing was.
+    #[serde(default)]
+    pub dropped_groups: Vec<String>,
     /// Email address, when the authenticating proxy supplied one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub email: Option<String>,

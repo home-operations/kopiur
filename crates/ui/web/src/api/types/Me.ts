@@ -16,6 +16,12 @@ user: string,
  */
 groups: Array<string>,
 /**
+ * Groups the proxy asserted that the console's `allowedGroups` filtered
+ * out — never impersonated. Shown so a caller can tell "my group was
+ * dropped" from "my proxy never sent it". Empty when nothing was.
+ */
+droppedGroups: Array<string>,
+/**
  * Email address, when the authenticating proxy supplied one.
  */
 email?: string | null,

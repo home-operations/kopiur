@@ -13,12 +13,17 @@
 //! it.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use base64::Engine as _;
+use base64::alphabet;
+use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
 
 use http::header::{HeaderMap, HeaderName, HeaderValue};
 
 use kopiur_ui_model::identity::IdentitySource;
 
-use crate::config::{AnonymousIdentity, AuthConfig, AuthMode};
+use crate::config::{AnonymousIdentity, AuthConfig, AuthMode, GroupsFormat};
 
 /// The group every authenticated caller carries, and the one `system:` principal
 /// that is not forbidden. Kubernetes adds it to every authenticated request and
@@ -44,6 +49,32 @@ pub const MAX_PRINCIPAL_BYTES: usize = 512;
 /// identity.
 pub const MAX_GROUPS: usize = 64;
 
+/// Largest accepted groups-header value, in bytes, for the encoded formats.
+///
+/// Checked before decoding so a hostile value is refused before it is
+/// allocated twice. Generous: [`MAX_GROUPS`] principals of
+/// [`MAX_PRINCIPAL_BYTES`] each, doubled for JSON quoting and base64's 4/3.
+pub const MAX_GROUPS_HEADER_BYTES: usize = MAX_GROUPS * MAX_PRINCIPAL_BYTES * 2;
+
+/// Base64 decoders for [`GroupsFormat::Base64Json`]: standard first (what Envoy
+/// emits), then URL-safe, each indifferent to padding — the encoding is the
+/// proxy's choice, and being strict about `=` would refuse a correct list.
+const BASE64_ENGINES: [GeneralPurpose; 2] = [
+    GeneralPurpose::new(
+        &alphabet::STANDARD,
+        GeneralPurposeConfig::new().with_decode_padding_mode(DecodePaddingMode::Indifferent),
+    ),
+    GeneralPurpose::new(
+        &alphabet::URL_SAFE,
+        GeneralPurposeConfig::new().with_decode_padding_mode(DecodePaddingMode::Indifferent),
+    ),
+];
+
+/// Set once the "your groups header looks base64-encoded" warning has been
+/// logged, so a misconfigured proxy produces one actionable line, not one per
+/// request.
+static ENCODED_GROUPS_WARNED: AtomicBool = AtomicBool::new(false);
+
 /// The authenticated caller, as kopiur-ui will assert them to the apiserver.
 ///
 /// `Eq` + `Hash` are load-bearing, not conveniences: the impersonating client
@@ -58,6 +89,10 @@ pub struct Identity {
     pub user: String,
     /// Groups to impersonate (`Impersonate-Group`, repeated).
     pub groups: Vec<String>,
+    /// Groups the proxy asserted that `KOPIUR_UI_ALLOWED_GROUPS` removed,
+    /// sorted. Never impersonated; reported on `/me` so a caller can see why a
+    /// group they expected is missing instead of guessing.
+    pub dropped_groups: Vec<String>,
     /// Email address the proxy supplied, when it did. Display only: never
     /// impersonated, never used for authorization.
     pub email: Option<String>,
@@ -114,6 +149,22 @@ pub enum AuthError {
         principal: String,
         /// Why it is refused.
         why: &'static str,
+    },
+
+    /// The groups header's value is not in the configured [`GroupsFormat`].
+    #[error(
+        "the {header} header is not a {format} groups list: {reason}. \
+         Fix: set ui.auth.groupsFormat (KOPIUR_UI_GROUPS_FORMAT) to the encoding your proxy \
+         sends — delimited for oauth2-proxy, base64Json for Envoy Gateway claimToHeaders, json \
+         for a plain JSON array"
+    )]
+    MalformedGroupsHeader {
+        /// The groups header.
+        header: String,
+        /// The format it was read as.
+        format: GroupsFormat,
+        /// What is wrong with it.
+        reason: String,
     },
 
     /// More groups than the UI will impersonate on one request.
@@ -246,9 +297,11 @@ fn header_identity(
 
 /// Collect the groups from *every* occurrence of the groups header.
 ///
-/// A proxy is free to send one header with a separator-joined list, several
-/// headers with one group each, or any mixture; all three mean the same thing and
-/// all three are read.
+/// A proxy is free to send one header with a list, several headers with one
+/// list each, or any mixture; all of them mean the same thing and all are read.
+/// Whatever the [`GroupsFormat`], every decoded group then passes the same
+/// checks, so an encoded format can never smuggle in what a delimited one
+/// could not.
 fn asserted_groups(
     headers: &HeaderMap,
     cfg: &AuthConfig,
@@ -256,8 +309,12 @@ fn asserted_groups(
 ) -> Result<Vec<String>, AuthError> {
     let mut groups = Vec::new();
     for value in headers.get_all(header) {
-        let raw = value_str(header.as_str(), value)?;
-        for group in split_groups(raw, &cfg.groups_separator) {
+        let raw = value_str(header.as_str(), value)?.trim();
+        for group in decode_groups(raw, cfg, header)? {
+            let group = group.trim();
+            if group.is_empty() {
+                continue;
+            }
             // Bound the *raw* count as we go, not only the deduped set at the
             // end: a proxy sending a hundred thousand repeats of one group would
             // otherwise be validated and allocated in full before the check that
@@ -269,6 +326,98 @@ fn asserted_groups(
         }
     }
     Ok(groups)
+}
+
+/// Turn one groups-header value into its list of (untrimmed, unchecked) groups,
+/// per the configured [`GroupsFormat`].
+fn decode_groups(
+    raw: &str,
+    cfg: &AuthConfig,
+    header: &HeaderName,
+) -> Result<Vec<String>, AuthError> {
+    let malformed = |reason: String| AuthError::MalformedGroupsHeader {
+        header: header.as_str().to_string(),
+        format: cfg.groups_format,
+        reason,
+    };
+    match cfg.groups_format {
+        GroupsFormat::Delimited => {
+            let groups: Vec<String> = split_groups(raw, &cfg.groups_separator)
+                .into_iter()
+                .map(str::to_string)
+                .collect();
+            warn_if_encoded(header, &groups);
+            Ok(groups)
+        }
+        GroupsFormat::Json => {
+            check_encoded_len(raw).map_err(malformed)?;
+            parse_json_groups(raw.as_bytes()).map_err(malformed)
+        }
+        GroupsFormat::Base64Json => {
+            check_encoded_len(raw).map_err(malformed)?;
+            let bytes = decode_base64(raw).ok_or_else(|| {
+                malformed("the value is not base64 (standard or URL-safe)".to_string())
+            })?;
+            parse_json_groups(&bytes).map_err(malformed)
+        }
+    }
+}
+
+/// Refuse an encoded groups value before decoding it if it is implausibly big.
+fn check_encoded_len(raw: &str) -> Result<(), String> {
+    if raw.len() > MAX_GROUPS_HEADER_BYTES {
+        return Err(format!(
+            "{} bytes is longer than the {MAX_GROUPS_HEADER_BYTES}-byte limit",
+            raw.len()
+        ));
+    }
+    Ok(())
+}
+
+/// Decode base64 in either alphabet, padded or not.
+fn decode_base64(raw: &str) -> Option<Vec<u8>> {
+    BASE64_ENGINES
+        .iter()
+        .find_map(|engine| engine.decode(raw).ok())
+}
+
+/// Parse a JSON array of strings. Anything else — an object, a bare string, an
+/// array holding a number — is refused rather than coerced.
+fn parse_json_groups(bytes: &[u8]) -> Result<Vec<String>, String> {
+    serde_json::from_slice::<Vec<String>>(bytes)
+        .map_err(|e| format!("it is not a JSON array of strings ({e})"))
+}
+
+/// Whether a single delimited "group" is really Envoy's base64-encoded JSON
+/// array — the signature of `groupsFormat` left at `delimited` behind Envoy
+/// Gateway. `W` is base64 for a leading `[`, so the cheap prefix test keeps the
+/// decode off every ordinary request.
+pub(crate) fn looks_like_base64_json_array(group: &str) -> bool {
+    group.starts_with('W')
+        && decode_base64(group).is_some_and(|bytes| parse_json_groups(&bytes).is_ok())
+}
+
+/// Log, once per process, that the groups header looks base64-encoded while
+/// the format is `delimited`. Behaviour is unchanged — the format is never
+/// guessed — but the misconfiguration stops being silent: the only other
+/// symptom is one long unreadable group that matches no RoleBinding.
+fn warn_if_encoded(header: &HeaderName, groups: &[String]) {
+    if ENCODED_GROUPS_WARNED.load(Ordering::Relaxed) {
+        return;
+    }
+    if groups
+        .iter()
+        .any(|g| looks_like_base64_json_array(g.trim()))
+        && !ENCODED_GROUPS_WARNED.swap(true, Ordering::Relaxed)
+    {
+        tracing::warn!(
+            header = header.as_str(),
+            "the groups header looks like a base64-encoded JSON array (what Envoy Gateway's \
+             claimToHeaders sends for a list claim), but it is being read as a delimited list, \
+             so the whole value is treated as one group. Fix: set ui.auth.groupsFormat to \
+             base64Json (KOPIUR_UI_GROUPS_FORMAT=base64Json)"
+        );
+    }
 }
 
 /// Build the identity from the operator-chosen anonymous configuration.
@@ -300,8 +449,21 @@ fn finish(
     source: IdentitySource,
     cfg: &AuthConfig,
 ) -> Result<Identity, AuthError> {
+    let mut dropped_groups = Vec::new();
     if let Some(allowed) = &cfg.allowed_groups {
-        groups.retain(|g| allowed.contains(g));
+        let (kept, dropped): (Vec<String>, Vec<String>) =
+            groups.into_iter().partition(|g| allowed.contains(g));
+        groups = kept;
+        dropped_groups = dropped;
+        dropped_groups.sort_unstable();
+        dropped_groups.dedup();
+        if !dropped_groups.is_empty() {
+            tracing::debug!(
+                user = %user,
+                dropped = ?dropped_groups,
+                "groups not in KOPIUR_UI_ALLOWED_GROUPS were not impersonated"
+            );
+        }
     }
     // Appended after the allowlist and never filtered by it: a caller whose every
     // group was filtered out is still an authenticated caller, and dropping this
@@ -325,6 +487,7 @@ fn finish(
     Ok(Identity {
         user,
         groups,
+        dropped_groups,
         email,
         extra,
         source,
@@ -387,13 +550,14 @@ fn value_str<'a>(header: &str, value: &'a HeaderValue) -> Result<&'a str, AuthEr
     })
 }
 
-/// Validate one principal: visible ASCII, non-empty, within
+/// Validate one principal: printable ASCII, non-empty, within
 /// [`MAX_PRINCIPAL_BYTES`].
 ///
-/// Visible ASCII (`!` through `~`) and nothing else. That excludes CR, LF and NUL
-/// — the bytes a header-smuggling attempt needs — and also excludes the space,
-/// which no Kubernetes principal in this deployment shape uses and whose presence
-/// is far more likely to be a proxy concatenating two values than a real name.
+/// Visible ASCII (`!` through `~`) plus the space, and nothing else. That
+/// excludes CR, LF, NUL, tab and DEL — the bytes a header-smuggling attempt
+/// needs. The space is allowed because directory groups like `Domain Users`
+/// are ordinary and Kubernetes accepts them; callers trim first, so it is only
+/// ever interior.
 fn check_principal(header: &str, value: &str) -> Result<(), AuthError> {
     if value.is_empty() {
         return Err(AuthError::InvalidHeaderValue {
@@ -410,11 +574,14 @@ fn check_principal(header: &str, value: &str) -> Result<(), AuthError> {
             ),
         });
     }
-    match value.bytes().find(|b| !b.is_ascii_graphic()) {
+    match value
+        .bytes()
+        .find(|&b| !(b.is_ascii_graphic() || b == b' '))
+    {
         Some(bad) => Err(AuthError::InvalidHeaderValue {
             header: header.to_string(),
             reason: format!(
-                "it contains the byte 0x{bad:02x}; only visible ASCII (! through ~) is \
+                "it contains the byte 0x{bad:02x}; only printable ASCII (space through ~) is \
                  allowed"
             ),
         }),
@@ -436,7 +603,7 @@ fn reject_forbidden(principal: &str) -> Result<(), AuthError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::DEFAULT_GROUPS_SEPARATOR;
+    use crate::config::{DEFAULT_GROUPS_SEPARATOR, GroupsFormat};
     use std::collections::BTreeSet;
 
     const USER_HEADER: &str = "x-forwarded-user";
@@ -451,6 +618,7 @@ mod tests {
                 anonymous_fallback: None,
             },
             groups_separator: DEFAULT_GROUPS_SEPARATOR.to_string(),
+            groups_format: crate::config::GroupsFormat::Delimited,
             email_header: Some(HeaderName::from_static(EMAIL_HEADER)),
             extra_keys: Vec::new(),
             allowed_groups: None,
@@ -465,6 +633,7 @@ mod tests {
                 groups: groups.iter().map(|g| (*g).to_string()).collect(),
             }),
             groups_separator: DEFAULT_GROUPS_SEPARATOR.to_string(),
+            groups_format: crate::config::GroupsFormat::Delimited,
             email_header: None,
             extra_keys: Vec::new(),
             allowed_groups: None,
@@ -694,12 +863,25 @@ mod tests {
             matches!(err, AuthError::InvalidHeaderValue { .. }),
             "{err:?}"
         );
+    }
 
-        let err =
-            extract_identity(&headers(&[(USER_HEADER, "alice bob")]), &header_cfg()).unwrap_err();
-        assert!(
-            matches!(err, AuthError::InvalidHeaderValue { .. }),
-            "a space is not a visible-ASCII principal: {err:?}"
+    #[test]
+    fn an_interior_space_is_a_legal_principal() {
+        // Active Directory / LDAP / Authelia groups like "Domain Users" are
+        // ordinary, and Kubernetes accepts them; refusing the space 400'd every
+        // request from such a directory.
+        let id = extract_identity(
+            &headers(&[
+                (USER_HEADER, "Jane Doe"),
+                (GROUPS_HEADER, "Domain Users, Admins"),
+            ]),
+            &header_cfg(),
+        )
+        .expect("identity");
+        assert_eq!(id.user, "Jane Doe");
+        assert_eq!(
+            id.groups,
+            vec!["Admins", "Domain Users", SYSTEM_AUTHENTICATED]
         );
     }
 
@@ -774,7 +956,7 @@ mod tests {
     #[test]
     fn the_email_header_is_validated_like_any_other_principal() {
         let err = extract_identity(
-            &headers(&[(USER_HEADER, "alice"), (EMAIL_HEADER, "a b@example.com")]),
+            &headers(&[(USER_HEADER, "alice"), (EMAIL_HEADER, "a\tb@example.com")]),
             &header_cfg(),
         )
         .unwrap_err();
@@ -814,5 +996,169 @@ mod tests {
         assert!(is_forbidden_principal("system:masters"));
         assert!(is_forbidden_principal("system:anonymous"));
         assert!(is_forbidden_principal("system:"));
+    }
+
+    /// The exact value Envoy Gateway's `claimToHeaders` sent for an Authelia
+    /// `groups` claim of `["Domain Users","Qsync","Admins"]`, as reported.
+    const ENVOY_GROUPS: &str = "WyJEb21haW4gVXNlcnMiLCJRc3luYyIsIkFkbWlucyJd";
+
+    fn format_cfg(format: GroupsFormat) -> AuthConfig {
+        let mut cfg = header_cfg();
+        cfg.groups_format = format;
+        cfg
+    }
+
+    #[test]
+    fn base64_json_decodes_envoys_encoded_array_claim() {
+        let id = extract_identity(
+            &headers(&[(USER_HEADER, "kraven"), (GROUPS_HEADER, ENVOY_GROUPS)]),
+            &format_cfg(GroupsFormat::Base64Json),
+        )
+        .expect("identity");
+        assert_eq!(
+            id.groups,
+            vec!["Admins", "Domain Users", "Qsync", SYSTEM_AUTHENTICATED]
+        );
+    }
+
+    #[test]
+    fn base64_json_accepts_url_safe_and_unpadded_encodings() {
+        use base64::Engine as _;
+        let json = r#"["a>b?","ops"]"#;
+        for encoded in [
+            base64::engine::general_purpose::STANDARD.encode(json),
+            base64::engine::general_purpose::STANDARD_NO_PAD.encode(json),
+            base64::engine::general_purpose::URL_SAFE.encode(json),
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json),
+        ] {
+            let id = extract_identity(
+                &headers(&[(USER_HEADER, "alice"), (GROUPS_HEADER, &encoded)]),
+                &format_cfg(GroupsFormat::Base64Json),
+            )
+            .unwrap_or_else(|e| panic!("{encoded}: {e}"));
+            assert_eq!(id.groups, vec!["a>b?", "ops", SYSTEM_AUTHENTICATED]);
+        }
+    }
+
+    #[test]
+    fn json_reads_a_plain_array_from_every_occurrence() {
+        let id = extract_identity(
+            &headers(&[
+                (USER_HEADER, "alice"),
+                (GROUPS_HEADER, r#"["ops", "dev"]"#),
+                (GROUPS_HEADER, r#"["platform"]"#),
+            ]),
+            &format_cfg(GroupsFormat::Json),
+        )
+        .expect("identity");
+        assert_eq!(
+            id.groups,
+            vec!["dev", "ops", "platform", SYSTEM_AUTHENTICATED]
+        );
+    }
+
+    #[test]
+    fn a_groups_header_that_does_not_match_its_format_is_refused_naming_the_format() {
+        let cases = [
+            (GroupsFormat::Base64Json, "not base64 at all!"),
+            // Valid base64 of `{"a":1}`: decodes, but is not an array.
+            (GroupsFormat::Base64Json, "eyJhIjoxfQ=="),
+            (GroupsFormat::Json, "ops,dev"),
+            (GroupsFormat::Json, r#"["ops", 1]"#),
+        ];
+        for (format, value) in cases {
+            let err = extract_identity(
+                &headers(&[(USER_HEADER, "alice"), (GROUPS_HEADER, value)]),
+                &format_cfg(format),
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, AuthError::MalformedGroupsHeader { format: f, .. } if f == format),
+                "{format} / {value:?}: {err:?}"
+            );
+            let message = err.to_string();
+            assert!(message.contains(GROUPS_HEADER), "{message}");
+            assert!(message.contains("groupsFormat"), "{message}");
+        }
+    }
+
+    #[test]
+    fn decoded_groups_go_through_the_same_checks_as_delimited_ones() {
+        use base64::Engine as _;
+        let encode = |json: &str| base64::engine::general_purpose::STANDARD.encode(json);
+
+        let err = extract_identity(
+            &headers(&[
+                (USER_HEADER, "alice"),
+                (GROUPS_HEADER, &encode(r#"["ops","system:masters"]"#)),
+            ]),
+            &format_cfg(GroupsFormat::Base64Json),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, AuthError::ForbiddenPrincipal { ref principal, .. } if principal == "system:masters"),
+            "{err:?}"
+        );
+
+        let many: Vec<String> = (0..=MAX_GROUPS).map(|i| format!("g{i}")).collect();
+        let err = extract_identity(
+            &headers(&[
+                (USER_HEADER, "alice"),
+                (GROUPS_HEADER, &serde_json::to_string(&many).expect("json")),
+            ]),
+            &format_cfg(GroupsFormat::Json),
+        )
+        .unwrap_err();
+        assert!(matches!(err, AuthError::TooManyGroups { .. }), "{err:?}");
+
+        let err = extract_identity(
+            &headers(&[
+                (USER_HEADER, "alice"),
+                (GROUPS_HEADER, &encode("[\"a\\nb\"]")),
+            ]),
+            &format_cfg(GroupsFormat::Base64Json),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, AuthError::InvalidHeaderValue { .. }),
+            "a decoded newline must not reach an Impersonate-Group header: {err:?}"
+        );
+    }
+
+    #[test]
+    fn delimited_never_guesses_but_recognises_envoys_encoding() {
+        // No auto-detection: the blob stays one opaque group…
+        let id = extract_identity(
+            &headers(&[(USER_HEADER, "kraven"), (GROUPS_HEADER, ENVOY_GROUPS)]),
+            &header_cfg(),
+        )
+        .expect("identity");
+        assert_eq!(id.groups, vec![ENVOY_GROUPS, SYSTEM_AUTHENTICATED]);
+        // …but the misconfiguration is recognisable, so it can be reported.
+        assert!(looks_like_base64_json_array(ENVOY_GROUPS));
+        assert!(!looks_like_base64_json_array("Admins"));
+        assert!(!looks_like_base64_json_array("eyJhIjoxfQ=="));
+        assert!(!looks_like_base64_json_array("kopiur-operators"));
+    }
+
+    #[test]
+    fn groups_removed_by_the_allowlist_are_reported_not_silently_lost() {
+        let mut cfg = format_cfg(GroupsFormat::Base64Json);
+        cfg.allowed_groups = Some(BTreeSet::from(["Admins".to_string()]));
+        let id = extract_identity(
+            &headers(&[(USER_HEADER, "kraven"), (GROUPS_HEADER, ENVOY_GROUPS)]),
+            &cfg,
+        )
+        .expect("identity");
+        assert_eq!(id.groups, vec!["Admins", SYSTEM_AUTHENTICATED]);
+        assert_eq!(id.dropped_groups, vec!["Domain Users", "Qsync"]);
+
+        // No allowlist, nothing dropped.
+        let id = extract_identity(
+            &headers(&[(USER_HEADER, "kraven"), (GROUPS_HEADER, "ops")]),
+            &header_cfg(),
+        )
+        .expect("identity");
+        assert!(id.dropped_groups.is_empty());
     }
 }
