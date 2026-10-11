@@ -249,26 +249,26 @@ checksum = "sha256:fd65982c97ddad3106754b69ffa196d0e543aa591930ae52aed1adfb92f8c
 url = "https://dl.k8s.io/v1.37.1/bin/darwin/arm64/kubectl"
 
 [[tools.lefthook]]
-version = "2.1.17"
+version = "2.2.0"
 backend = "aqua:evilmartians/lefthook"
-specifiers = ["2.1.17"]
+specifiers = ["2.2.0"]
 
 [tools.lefthook."platforms.linux-arm64"]
-checksum = "sha256:079cca03c2e719a804692fe819bd3786fcdc494af30491a9fd369a382ee6bc84"
-url = "https://github.com/evilmartians/lefthook/releases/download/v2.1.17/lefthook_2.1.17_Linux_aarch64.gz"
-url_api = "https://api.github.com/repos/evilmartians/lefthook/releases/assets/611880089"
+checksum = "sha256:97390b816df207d8ecbfe3714419778007ec02c680f131df6af2a3e7c337d9f5"
+url = "https://github.com/evilmartians/lefthook/releases/download/v2.2.0/lefthook_2.2.0_Linux_aarch64.gz"
+url_api = "https://api.github.com/repos/evilmartians/lefthook/releases/assets/619550824"
 provenance = "github-attestations"
 
 [tools.lefthook."platforms.linux-x64"]
-checksum = "sha256:e3c6e271b6a77a8fac527d7cc21c1036f7605afcb6653aabe4b166913322f900"
-url = "https://github.com/evilmartians/lefthook/releases/download/v2.1.17/lefthook_2.1.17_Linux_x86_64.gz"
-url_api = "https://api.github.com/repos/evilmartians/lefthook/releases/assets/611880017"
+checksum = "sha256:93cdcec92f5918d067f566c4c82ce4334b396646ca70fbc4413918abfd26731f"
+url = "https://github.com/evilmartians/lefthook/releases/download/v2.2.0/lefthook_2.2.0_Linux_x86_64.gz"
+url_api = "https://api.github.com/repos/evilmartians/lefthook/releases/assets/619550696"
 provenance = "github-attestations"
 
 [tools.lefthook."platforms.macos-arm64"]
-checksum = "sha256:aabf434ea7049af9854eb5205520bc16fc52d3d55459c2332a3711cdd6743d34"
-url = "https://github.com/evilmartians/lefthook/releases/download/v2.1.17/lefthook_2.1.17_MacOS_arm64.gz"
-url_api = "https://api.github.com/repos/evilmartians/lefthook/releases/assets/611879927"
+checksum = "sha256:41eceba8ceeb954e9dabfd10cd7a3caed16dd65448cacee7347c43d49ab07f23"
+url = "https://github.com/evilmartians/lefthook/releases/download/v2.2.0/lefthook_2.2.0_MacOS_arm64.gz"
+url_api = "https://api.github.com/repos/evilmartians/lefthook/releases/assets/619550718"
 provenance = "github-attestations"
 
 [[tools.node]]
@@ -295,26 +295,26 @@ backend = "npm:oxfmt"
 specifiers = ["0.71.0"]
 
 [[tools.pnpm]]
-version = "12.9.1"
+version = "12.10.1"
 backend = "aqua:pnpm/pnpm"
-specifiers = ["12.9.1"]
+specifiers = ["12.10.1"]
 
 [tools.pnpm."platforms.linux-arm64"]
-checksum = "sha256:468294b77633d29889c6e4a79cefb1277eba30cd62e7d6a754218cb85a1d730d"
-url = "https://github.com/pnpm/pnpm/releases/download/v12.9.1/pnpm-linux-arm64.tar.gz"
-url_api = "https://api.github.com/repos/pnpm/pnpm/releases/assets/608496442"
+checksum = "sha256:18dbb118de1dbef0e4516c17bf847d6ee206fc4deffb2bb488ec8e1d2814e078"
+url = "https://github.com/pnpm/pnpm/releases/download/v12.10.1/pnpm-linux-arm64.tar.gz"
+url_api = "https://api.github.com/repos/pnpm/pnpm/releases/assets/616153643"
 provenance = "github-attestations"
 
 [tools.pnpm."platforms.linux-x64"]
-checksum = "sha256:b4f58449ac02d9d24023ac89e17e05e8331f8ddc12ca1f489cf231bc2bb2bce1"
-url = "https://github.com/pnpm/pnpm/releases/download/v12.9.1/pnpm-linux-x64.tar.gz"
-url_api = "https://api.github.com/repos/pnpm/pnpm/releases/assets/608496438"
+checksum = "sha256:502a275984a4cd01e5579ac72049a241091cac5118e44becf84951130c3e079e"
+url = "https://github.com/pnpm/pnpm/releases/download/v12.10.1/pnpm-linux-x64.tar.gz"
+url_api = "https://api.github.com/repos/pnpm/pnpm/releases/assets/616153639"
 provenance = "github-attestations"
 
 [tools.pnpm."platforms.macos-arm64"]
-checksum = "sha256:4dcea94654bc8f2189dfd591aea7af4adddd29243e4bfcc8d4c8b4289e7983ba"
-url = "https://github.com/pnpm/pnpm/releases/download/v12.9.1/pnpm-darwin-arm64.tar.gz"
-url_api = "https://api.github.com/repos/pnpm/pnpm/releases/assets/608496449"
+checksum = "sha256:a617ae6a55c8b3cd494c611ada88d65cb7c3cf6d7828e91b2f44b4bed1bee217"
+url = "https://github.com/pnpm/pnpm/releases/download/v12.10.1/pnpm-darwin-arm64.tar.gz"
+url_api = "https://api.github.com/repos/pnpm/pnpm/releases/assets/616153633"
 provenance = "github-attestations"
 
 [[tools.promtool]]
