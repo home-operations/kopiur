@@ -12,6 +12,7 @@
 //! caller might try to escalate — is a unit test with no cluster and no server in
 //! it.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -328,13 +329,19 @@ fn asserted_groups(
     Ok(groups)
 }
 
-/// Turn one groups-header value into its list of (untrimmed, unchecked) groups,
-/// per the configured [`GroupsFormat`].
-fn decode_groups(
-    raw: &str,
+/// Turn one groups-header value into its list of (unchecked) groups, per the
+/// configured [`GroupsFormat`].
+///
+/// The delimited path borrows from the header: only groups that pass the checks
+/// in [`asserted_groups`] are copied, so a flood of repeats is refused at the
+/// group bound without allocating each one first. The encoded paths must own
+/// their decoded strings, and are bounded instead by
+/// [`MAX_GROUPS_HEADER_BYTES`] before they decode anything.
+fn decode_groups<'a>(
+    raw: &'a str,
     cfg: &AuthConfig,
     header: &HeaderName,
-) -> Result<Vec<String>, AuthError> {
+) -> Result<Vec<Cow<'a, str>>, AuthError> {
     let malformed = |reason: String| AuthError::MalformedGroupsHeader {
         header: header.as_str().to_string(),
         format: cfg.groups_format,
@@ -342,25 +349,28 @@ fn decode_groups(
     };
     match cfg.groups_format {
         GroupsFormat::Delimited => {
-            let groups: Vec<String> = split_groups(raw, &cfg.groups_separator)
-                .into_iter()
-                .map(str::to_string)
-                .collect();
+            let groups = split_groups(raw, &cfg.groups_separator);
             warn_if_encoded(header, &groups);
-            Ok(groups)
+            Ok(groups.into_iter().map(Cow::Borrowed).collect())
         }
         GroupsFormat::Json => {
             check_encoded_len(raw).map_err(malformed)?;
-            parse_json_groups(raw.as_bytes()).map_err(malformed)
+            owned(parse_json_groups(raw.as_bytes())).map_err(malformed)
         }
         GroupsFormat::Base64Json => {
             check_encoded_len(raw).map_err(malformed)?;
             let bytes = decode_base64(raw).ok_or_else(|| {
                 malformed("the value is not base64 (standard or URL-safe)".to_string())
             })?;
-            parse_json_groups(&bytes).map_err(malformed)
+            owned(parse_json_groups(&bytes)).map_err(malformed)
         }
     }
+}
+
+/// Lift decoded (owned) groups into the borrowed-or-owned shape the delimited
+/// path shares.
+fn owned<'a>(groups: Result<Vec<String>, String>) -> Result<Vec<Cow<'a, str>>, String> {
+    groups.map(|gs| gs.into_iter().map(Cow::Owned).collect())
 }
 
 /// Refuse an encoded groups value before decoding it if it is implausibly big.
@@ -401,7 +411,7 @@ pub(crate) fn looks_like_base64_json_array(group: &str) -> bool {
 /// the format is `delimited`. Behaviour is unchanged — the format is never
 /// guessed — but the misconfiguration stops being silent: the only other
 /// symptom is one long unreadable group that matches no RoleBinding.
-fn warn_if_encoded(header: &HeaderName, groups: &[String]) {
+fn warn_if_encoded(header: &HeaderName, groups: &[&str]) {
     if ENCODED_GROUPS_WARNED.load(Ordering::Relaxed) {
         return;
     }

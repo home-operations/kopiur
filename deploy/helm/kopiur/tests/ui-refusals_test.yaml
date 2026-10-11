@@ -286,3 +286,70 @@ tests:
     asserts:
       - failedTemplate:
           errorPattern: "ui.rbac.userRoles is false"
+
+  - it: refuses two bindings that would render the same object
+    set:
+      ui.enabled: true
+      ui.auth.userHeader: x-user-name
+      ui.auth.proxySecret.existingSecret: kopiur-ui-proxy
+      ui.rbac.bindings:
+        - role: user
+          name: ops
+          groups: [Admins]
+        - role: user
+          name: ops
+          users: [alice]
+    asserts:
+      - failedTemplate:
+          errorPattern: 'ui.rbac.bindings\[0\] and ui.rbac.bindings\[1\] both render'
+      - failedTemplate:
+          errorPattern: "ui-user-ops"
+
+  - it: refuses an explicit name that collides with another entry's index default
+    set:
+      ui.enabled: true
+      ui.auth.userHeader: x-user-name
+      ui.auth.proxySecret.existingSecret: kopiur-ui-proxy
+      ui.rbac.bindings:
+        - role: viewer
+          groups: [Admins]
+        - role: viewer
+          name: "0"
+          users: [alice]
+    asserts:
+      - failedTemplate:
+          errorPattern: "both render a ClusterRoleBinding named <release>-ui-viewer-0"
+
+  - it: refuses a blank binding subject
+    set:
+      ui.enabled: true
+      ui.auth.userHeader: x-user-name
+      ui.auth.proxySecret.existingSecret: kopiur-ui-proxy
+      ui.rbac.bindings:
+        - role: user
+          groups: ["   "]
+    asserts:
+      - failedTemplate:
+          errorPattern: "blank or has leading/trailing spaces"
+
+  - it: refuses a padded binding subject
+    set:
+      ui.enabled: true
+      ui.auth.userHeader: x-user-name
+      ui.auth.proxySecret.existingSecret: kopiur-ui-proxy
+      ui.rbac.bindings:
+        - role: user
+          groups: [" Admins"]
+    asserts:
+      - failedTemplate:
+          errorPattern: 'names " Admins", which is blank or has leading/trailing spaces'
+
+  - it: refuses a padded allowedGroups name
+    set:
+      ui.enabled: true
+      ui.auth.userHeader: x-user-name
+      ui.auth.proxySecret.existingSecret: kopiur-ui-proxy
+      ui.auth.allowedGroups: ["Admins "]
+    asserts:
+      - failedTemplate:
+          errorPattern: 'allowedGroups contains "Admins "'

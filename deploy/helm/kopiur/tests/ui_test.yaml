@@ -476,6 +476,22 @@ tests:
               name: alice
         documentIndex: 1
 
+  - it: allows the same role twice when the entries render distinct names
+    set:
+      ui.enabled: true
+      ui.auth.userHeader: x-user-name
+      ui.auth.proxySecret.existingSecret: kopiur-ui-proxy
+      ui.rbac.bindings:
+        - role: viewer
+          groups: [Admins]
+        - role: viewer
+          name: staff
+          groups: [Domain Users]
+    template: ui-user-bindings.tpl
+    asserts:
+      - hasDocuments:
+          count: 2
+
   - it: renders no bindings while the console itself is disabled
     set:
       ui.rbac.bindings:

@@ -873,7 +873,8 @@ ui:
     # `editor` = the action buttons alone. Requires userRoles. `browse` is
     # deliberately not offered: it grants repository credentials, so bind
     # kopiur-ui-browse yourself, per namespace (see browseRole). An optional
-    # `name` suffixes the ClusterRoleBinding's name (default: the entry index).
+    # `name` suffixes the ClusterRoleBinding's name (default: the entry index);
+    # two entries for the same role must end up with different names.
     # If you set allowedGroups, every group named here must be in it too, or
     # the console drops that group before Kubernetes can match the binding.
     bindings: []

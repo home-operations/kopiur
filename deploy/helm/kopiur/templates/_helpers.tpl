@@ -386,6 +386,9 @@ into a failed `helm upgrade`.
 {{/* allowedGroups travels to the console as one comma-joined env var, so a
      comma inside a name would silently split it into two groups. */}}
 {{- range $auth.allowedGroups -}}
+{{- if or (eq (trim (toString .)) "") (ne (trim (toString .)) (toString .)) -}}
+{{- fail (printf "ui.auth.allowedGroups contains %q, which is blank or has leading/trailing spaces. The console trims what your proxy sends, so a padded name can never match — and the apiserver, which gets this list verbatim, would refuse the trimmed group. Write the name exactly, without surrounding spaces." .) -}}
+{{- end -}}
 {{- if contains "," . -}}
 {{- fail (printf "ui.auth.allowedGroups contains %q, but a group name in allowedGroups may not contain a comma (the list is passed to the console comma-separated, so it would become two different groups). Rename the group in your IdP, or leave allowedGroups empty." .) -}}
 {{- end -}}
@@ -417,6 +420,7 @@ install with the value to change instead.
 {{- if and $rbac.bindings (not $rbac.userRoles) -}}
 {{- fail "ui.rbac.bindings is set but ui.rbac.userRoles is false, so the roles those bindings point at are not rendered and every binding would grant nothing. Set ui.rbac.userRoles: true, or remove ui.rbac.bindings." -}}
 {{- end -}}
+{{- $seen := dict -}}
 {{- range $i, $b := $rbac.bindings -}}
 {{- $where := printf "ui.rbac.bindings[%d]" $i -}}
 {{- $role := $b.role | default "" -}}
@@ -434,7 +438,17 @@ install with the value to change instead.
 {{- fail (printf "%s has name: %q, which must be lowercase letters, digits and '-' (it becomes part of the ClusterRoleBinding's name)." $where .) -}}
 {{- end -}}
 {{- end -}}
+{{/* Two entries rendering one object name would overwrite each other: only one
+     subject list could survive, so the other entry's people get nothing. */}}
+{{- $objName := printf "%s-%v" $role ($b.name | default $i) -}}
+{{- with get $seen $objName -}}
+{{- fail (printf "%s and %s both render a ClusterRoleBinding named <release>-ui-%s, so one would replace the other and its people would get no access. Give each entry a distinct name (or merge their groups/users into one entry)." . $where $objName) -}}
+{{- end -}}
+{{- $_ := set $seen $objName $where -}}
 {{- range concat ($b.groups | default list) ($b.users | default list) -}}
+{{- if or (eq (trim (toString .)) "") (ne (trim (toString .)) (toString .)) -}}
+{{- fail (printf "%s names %q, which is blank or has leading/trailing spaces. The console trims what your proxy sends, so this subject could never match. Write the name exactly, without surrounding spaces." $where .) -}}
+{{- end -}}
 {{- if hasPrefix "system:" . -}}
 {{- fail (printf "%s names %q. The console never impersonates a system: principal (it refuses any request asserting one), so this binding could never apply. Bind your people's real groups or users instead." $where .) -}}
 {{- end -}}
