@@ -10,6 +10,7 @@ on:
   pull_request:
     paths:
       - .goreleaser.yaml
+      - .krew.yaml
       - Cargo.toml
       - Cargo.lock
       - .mise/config.toml
@@ -67,7 +68,43 @@ jobs:
         run: |
           echo "== cask =="
           cat dist/homebrew/Casks/kopiur.rb
-          echo "== krew manifest =="
-          cat dist/krew/kopiur.yaml
           echo "== archives =="
           ls -lh dist/*.tar.gz
+
+  # release.yaml's krew-release-bot step renders .krew.yaml only after a real
+  # release. Render it here with the bot's own image against the latest
+  # published release (a missing asset fails the render), then run the
+  # validator krew-index's CI runs (which installs every platform) — `template`
+  # alone does not validate the manifest.
+  krew-template:
+    name: Krew template
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: stable
+          cache: false
+
+      - name: Render .krew.yaml
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName -q .tagName)
+          docker run --rm -v "$PWD/.krew.yaml:/tmp/.krew.yaml:ro" \
+            ghcr.io/rajatjindal/krew-release-bot:v0.0.50 \
+            krew-release-bot template --tag "$tag" --template-file /tmp/.krew.yaml \
+            > "$RUNNER_TEMP/kopiur.yaml"
+          cat "$RUNNER_TEMP/kopiur.yaml"
+
+      - name: Validate rendered manifest
+        run: |
+          go run sigs.k8s.io/krew/cmd/validate-krew-manifest@v0.5.0 \
+            -manifest "$RUNNER_TEMP/kopiur.yaml"

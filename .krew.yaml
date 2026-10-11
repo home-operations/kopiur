@@ -1,0 +1,71 @@
+{{- /*
+krew-index manifest template, rendered by krew-release-bot in release.yaml on
+every published release; the bot opens the version-bump PR against
+kubernetes-sigs/krew-index. Tags carry no `v`, but krew requires one in
+spec.version, so it is prefixed here and NOT in the asset URLs. `files`
+extracts only the binary and LICENSE (a krew-index requirement). This is a
+template comment so it stays out of the rendered manifest.
+*/ -}}
+apiVersion: krew.googlecontainertools.github.com/v1alpha2
+kind: Plugin
+metadata:
+  name: kopiur
+spec:
+  version: v{{ .TagName }}
+  homepage: https://kopiur.home-operations.com/cli/
+  shortDescription: Operate the kopiur backup operator
+  description: |
+    Operates the kopiur Kopia-native Kubernetes backup operator: trigger
+    snapshots and restores, suspend and resume resources, inspect snapshots,
+    run repository maintenance, browse files inside snapshots through a
+    read-only in-cluster session, diagnose installs with `doctor`, and
+    translate VolSync restic configs with `migrate volsync`.
+  caveats: |
+    The plugin tracks the kopiur v1alpha1 CRDs, so keep it on the same
+    release as the operator. Browsing needs the chart's opt-in browse
+    ClusterRole (rbac.browseRole) or equivalent RBAC.
+  platforms:
+    - selector:
+        matchLabels:
+          os: linux
+          arch: amd64
+      {{ addURIAndSha "https://github.com/home-operations/kopiur/releases/download/{{ .TagName }}/kubectl-kopiur_{{ .TagName }}_linux_amd64.tar.gz" .TagName | indent 6 }}
+      files:
+        - from: kopiur
+          to: .
+        - from: LICENSE
+          to: .
+      bin: kopiur
+    - selector:
+        matchLabels:
+          os: linux
+          arch: arm64
+      {{ addURIAndSha "https://github.com/home-operations/kopiur/releases/download/{{ .TagName }}/kubectl-kopiur_{{ .TagName }}_linux_arm64.tar.gz" .TagName | indent 6 }}
+      files:
+        - from: kopiur
+          to: .
+        - from: LICENSE
+          to: .
+      bin: kopiur
+    - selector:
+        matchLabels:
+          os: darwin
+          arch: amd64
+      {{ addURIAndSha "https://github.com/home-operations/kopiur/releases/download/{{ .TagName }}/kubectl-kopiur_{{ .TagName }}_darwin_amd64.tar.gz" .TagName | indent 6 }}
+      files:
+        - from: kopiur
+          to: .
+        - from: LICENSE
+          to: .
+      bin: kopiur
+    - selector:
+        matchLabels:
+          os: darwin
+          arch: arm64
+      {{ addURIAndSha "https://github.com/home-operations/kopiur/releases/download/{{ .TagName }}/kubectl-kopiur_{{ .TagName }}_darwin_arm64.tar.gz" .TagName | indent 6 }}
+      files:
+        - from: kopiur
+          to: .
+        - from: LICENSE
+          to: .
+      bin: kopiur

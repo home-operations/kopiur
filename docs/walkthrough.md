@@ -66,11 +66,10 @@ Everything in this walkthrough _can_ be done with raw YAML and `kubectl get -w`.
 
 The plugin exists because day-2 operations are imperative by nature. "Back up **now**." "What failed?" "Show me the files in that snapshot." Those deserve commands with `--wait`, streamed logs, and meaningful exit codes, rather than hand-rolled watch loops.
 
-Install it through [krew](https://krew.sigs.k8s.io/). The kopiur repository doubles as its own krew index:
+Install it through [krew](https://krew.sigs.k8s.io/), from the official krew-index:
 
 ```console
-$ kubectl krew index add kopiur https://github.com/home-operations/kopiur.git
-$ kubectl krew install kopiur/kopiur
+$ kubectl krew install kopiur
 ```
 
 Smoke-test it. On a fresh install this prints an empty but healthy overview:

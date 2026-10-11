@@ -41,6 +41,9 @@ exclude = [
   # after every install. `.prettierignore` covers a manual `oxfmt` run; this
   # covers the staged-file hook, which passes paths explicitly.
   "crates/ui/web/pnpm-lock.yaml",
+  # krew-release-bot's Go template (`{{ addURIAndSha … }}` lines), not YAML —
+  # oxfmt can't parse it. Mirrors `.prettierignore`.
+  ".krew.yaml",
 ]
 
 # The SPA's generated TypeScript is byte-gated by `mise run gen-check`. What

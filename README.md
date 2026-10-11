@@ -42,8 +42,7 @@ Full install guide, prerequisites (k8s >= 1.24, optional cert-manager), install 
 Day-to-day operations without hand-written YAML — trigger/inspect/restore snapshots, run maintenance, browse files inside snapshots, diagnose installs, migrate from VolSync:
 
 ```bash
-kubectl krew index add kopiur https://github.com/home-operations/kopiur.git
-kubectl krew install kopiur/kopiur
+kubectl krew install kopiur
 kubectl kopiur status
 ```
 

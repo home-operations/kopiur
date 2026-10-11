@@ -15,6 +15,9 @@ deploy/rbac/
 # standalone YAML), so oxfmt can't parse them — exclude the whole templates/ dir.
 deploy/helm/kopiur/templates/
 
+# krew-release-bot's krew-index manifest template — Go-templated, same reason.
+.krew.yaml
+
 # Docs site (MkDocs); leave authored Markdown untouched by oxfmt.
 docs/
 

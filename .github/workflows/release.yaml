@@ -8,7 +8,6 @@ on:
       - main
     paths-ignore:
       - "**.md"
-      - "plugins/**"
   release:
     types:
       - published
@@ -304,15 +303,15 @@ jobs:
       version: ${{ github.event.release.tag_name }}
 
   # goreleaser Pro imports the matrix's prebuilt binaries: archives + split
-  # sha256s + SBOMs + cosign to the release, cask to homebrew-tap, krew
-  # manifest to this repo's plugins/ (its own krew custom index).
+  # sha256s + SBOMs + cosign to the release and the cask to homebrew-tap; then
+  # krew-release-bot opens the krew-index version-bump PR from those archives.
   goreleaser:
     name: GoReleaser
     if: ${{ github.event_name == 'release' }}
     needs: plugin
     runs-on: ubuntu-26.04
     permissions:
-      contents: write # attach artifacts to the release + push the krew manifest
+      contents: write # attach artifacts to the release
       id-token: write # keyless Cosign signing of the artifacts
     steps:
       - name: Checkout
@@ -341,10 +340,8 @@ jobs:
       - name: Restore executable bits
         run: chmod +x prebuilt/kopiur-*/kopiur
 
-      # One short-lived bot token scoped to exactly the two repos goreleaser
-      # pushes to: the tap (Homebrew cask) and this repo (krew manifest into
-      # plugins/). Bot-token pushes retrigger workflows — every on-push workflow
-      # here ignores plugins/**, so the manifest commit fans out nothing.
+      # One short-lived bot token scoped to exactly the repo goreleaser pushes
+      # to: the tap (Homebrew cask).
       - name: Generate Bot Token
         id: bot-token
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
@@ -352,7 +349,7 @@ jobs:
           client-id: ${{ secrets.BOT_CLIENT_ID }}
           private-key: ${{ secrets.BOT_APP_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
-          repositories: homebrew-tap,kopiur
+          repositories: homebrew-tap
           permission-contents: write
 
       - name: Run GoReleaser
@@ -365,4 +362,14 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GORELEASER_KEY: ${{ secrets.GORELEASER_KEY }}
           HOMEBREW_TAP_TOKEN: ${{ steps.bot-token.outputs.token }}
-          KREW_INDEX_TOKEN: ${{ steps.bot-token.outputs.token }}
+
+      # Renders .krew.yaml against the archives just attached (it downloads each
+      # to hash it, so it must run after GoReleaser) and has the krew-release-bot
+      # service open the krew-index PR from its own account — no index token.
+      # GITHUB_TOKEN only authenticates its release lookups. Skips prereleases.
+      - name: Update krew-index
+        uses: rajatjindal/krew-release-bot@c970b8a8f6dbc2f2285a26e3ae160903b87002c3 # v0.0.51
+        with:
+          krew_plugin_release_tag: ${{ github.event.release.tag_name }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

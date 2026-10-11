@@ -31,15 +31,26 @@ The plugin tracks the `v1alpha1` CRDs and is versioned with the operator. A plug
 
 ## Install
 
-Install with [krew](https://krew.sigs.k8s.io/). The kopiur repository doubles as its own [custom index](https://krew.sigs.k8s.io/docs/developer-guide/custom-indexes/), which is the `plugins/` directory at the repo root. The plugin is not in the official krew-index yet; that submission waits until kopiur leaves heavy development.
+Install with [krew](https://krew.sigs.k8s.io/). The plugin is in the official [krew-index](https://github.com/kubernetes-sigs/krew-index), so no extra index is needed:
 
 ```console
-$ kubectl krew index add kopiur https://github.com/home-operations/kopiur.git
-$ kubectl krew install kopiur/kopiur
+$ kubectl krew install kopiur
 $ kubectl kopiur --version
 ```
 
-`kubectl krew upgrade` picks up new releases after a `kubectl krew update`, which pulls the index.
+`kubectl krew upgrade kopiur` picks up new releases. Each release automatically opens a version-bump pull request against krew-index, and the new version is installable once that merges.
+
+/// note | Installed from the old kopiur index?
+
+Earlier docs had you add the kopiur repository as a custom index and install `kopiur/kopiur`. That index is retired and stopped receiving updates at 0.8.1. Switch to krew-index:
+
+```console
+$ kubectl krew uninstall kopiur
+$ kubectl krew index remove kopiur
+$ kubectl krew install kopiur
+```
+
+///
 
 Or install with [Homebrew](https://brew.sh/). The release workflow publishes a cask to [home-operations/homebrew-tap](https://github.com/home-operations/homebrew-tap) from the same release assets, covering macOS and Linux on amd64 and arm64. Brew installs the standalone `kopiur` command rather than the `kubectl-kopiur` shim, so it coexists with a krew install of the same plugin:
 
@@ -52,7 +63,7 @@ $ kopiur --version
 
 Without krew or Homebrew, use the release assets. Every GitHub release attaches per-platform archives named `kubectl-kopiur_<version>_<os>_<arch>.tar.gz`, for linux and darwin on amd64 and arm64, and the Linux binaries are fully static musl builds. Each archive ships with a `.sha256` checksum, an SBOM, and a keyless Cosign signature.
 
-`kubectl krew install --manifest-url https://raw.githubusercontent.com/home-operations/kopiur/main/plugins/kopiur.yaml` also works, using the in-repo index copy, which always points at the latest release. Or put the archive's `kopiur` binary on your `PATH`, named `kubectl-kopiur` if you want kubectl discovery, or left as-is for the standalone command.
+Put the archive's `kopiur` binary on your `PATH`, named `kubectl-kopiur` if you want kubectl discovery, or left as-is for the standalone command.
 
 From source, with the repo checked out and [mise](https://mise.jdx.dev/) installed:
 
@@ -80,8 +91,7 @@ $ kubectl -n media wait --for=condition=complete job/seed-app-data --timeout=2m
 **2. Install the plugin** with [krew](#install):
 
 ```console
-$ kubectl krew index add kopiur https://github.com/home-operations/kopiur.git
-$ kubectl krew install kopiur/kopiur
+$ kubectl krew install kopiur
 $ kubectl kopiur --version
 ```
 
