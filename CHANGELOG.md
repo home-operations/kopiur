@@ -1,5 +1,43 @@
 # Changelog
 
+## [0.10.13](https://github.com/home-operations/kopiur/compare/0.10.12...0.10.13) (2026-10-11)
+
+
+### Features
+
+* **npm:** update dependency lucide-react (1.48.0 → 1.49.0) ([#541](https://github.com/home-operations/kopiur/issues/541)) ([ce00cdb](https://github.com/home-operations/kopiur/commit/ce00cdb3ba9c8bae9f75b133cd9576f5e0196954))
+* **npm:** update web ui dependencies ([#533](https://github.com/home-operations/kopiur/issues/533)) ([1fd11d0](https://github.com/home-operations/kopiur/commit/1fd11d06899c4953d748137528a34834408ef01d))
+* **npm:** update web ui dependencies ([#553](https://github.com/home-operations/kopiur/issues/553)) ([a9fbd8f](https://github.com/home-operations/kopiur/commit/a9fbd8f01c3ab4c414d1070622da2a10c5e1c0cd))
+* **npm:** update web ui dependencies ([#564](https://github.com/home-operations/kopiur/issues/564)) ([c00d81e](https://github.com/home-operations/kopiur/commit/c00d81e797262550f9f791357d4b43a04364a59e))
+* **ui:** claude design system and complete UI redesign ([#560](https://github.com/home-operations/kopiur/issues/560)) ([4d54344](https://github.com/home-operations/kopiur/commit/4d54344367f6799ee015c3cb150286f62628f2fe))
+
+
+### Bug Fixes
+
+* **mise:** restore generated lock sidecars ([0b53f48](https://github.com/home-operations/kopiur/commit/0b53f48bea3532e5e05270f00aa8aca6350b142f))
+* **npm:** update dependency typescript-eslint (8.71.0 → 8.71.1) ([#554](https://github.com/home-operations/kopiur/issues/554)) ([c3da280](https://github.com/home-operations/kopiur/commit/c3da2809941b0ce0c9776534954d4151848978dd))
+* **rust:** update crate libc (0.2.189 → 0.2.190) ([#555](https://github.com/home-operations/kopiur/issues/555)) ([9bedaf8](https://github.com/home-operations/kopiur/commit/9bedaf865a5c8185ff94a609f54c6bb29ca4aab2))
+* **rust:** update crate tokio (1.53.1 → 1.53.2) ([#556](https://github.com/home-operations/kopiur/issues/556)) ([cc4b5f0](https://github.com/home-operations/kopiur/commit/cc4b5f0b3d8ce1a02641bf2ff423eb4f7827bffa))
+
+
+### Continuous Integration
+
+* **renovate:** remove the dispatch workflow ([cbd7d46](https://github.com/home-operations/kopiur/commit/cbd7d462f92bd22a97fca7633d5f2a7de6d9e2be))
+
+
+### Miscellaneous Chores
+
+* **github-action:** update action jdx/mise-action (v5.0.1 → v5.1.1) ([#557](https://github.com/home-operations/kopiur/issues/557)) ([8c5326c](https://github.com/home-operations/kopiur/commit/8c5326ce250de0da8e287442ae761c3286ac9454))
+* **github-action:** update github-actions ([#549](https://github.com/home-operations/kopiur/issues/549)) ([1bea8ce](https://github.com/home-operations/kopiur/commit/1bea8ced1f3d196e2ba334f23e39db2f18067552))
+* **github-action:** update github-actions ([#562](https://github.com/home-operations/kopiur/issues/562)) ([05a8ae5](https://github.com/home-operations/kopiur/commit/05a8ae5d41c729311e1d8d19445dffab25dfca0a))
+* **github-release:** update release helm-unittest/helm-unittest (v1.2.0 → v1.2.1) ([#542](https://github.com/home-operations/kopiur/issues/542)) ([5aa81b8](https://github.com/home-operations/kopiur/commit/5aa81b89d3524b7b0f903777fa370d1326fb2e27))
+* **mise:** update mise tools ([#538](https://github.com/home-operations/kopiur/issues/538)) ([128ba86](https://github.com/home-operations/kopiur/commit/128ba864593a2d9dcb4fe2aa643a0bc40309df10))
+* **mise:** update mise tools ([#550](https://github.com/home-operations/kopiur/issues/550)) ([379efb7](https://github.com/home-operations/kopiur/commit/379efb7d551c1d444be606eb2b5f31008163c76f))
+* **mise:** update tool aqua:astral-sh/uv (0.12.20 → 0.12.21) ([#540](https://github.com/home-operations/kopiur/issues/540)) ([6ce9ec4](https://github.com/home-operations/kopiur/commit/6ce9ec40d416c38d5f14e30584bda384bc64aa6b))
+* **mise:** update tool lefthook (2.1.16 → 2.1.17) ([#551](https://github.com/home-operations/kopiur/issues/551)) ([6ced90b](https://github.com/home-operations/kopiur/commit/6ced90b0f169d4ff9953dd0608b5b3c5800d73f5))
+* **mise:** update tool oxfmt (0.70.0 → 0.71.0) ([#531](https://github.com/home-operations/kopiur/issues/531)) ([0d391aa](https://github.com/home-operations/kopiur/commit/0d391aa8cb3339ccdb3200a8ce159ca3e2b02095))
+* **mise:** upgrade lockfile to format revision 3 ([155374a](https://github.com/home-operations/kopiur/commit/155374a981b190a222a11392607e7ddde4401f2a))
+
 ## [0.10.12](https://github.com/home-operations/kopiur/compare/0.10.11...0.10.12) (2026-10-02)
 
 
