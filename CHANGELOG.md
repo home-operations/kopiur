@@ -1,5 +1,33 @@
 # Changelog
 
+## [0.10.14](https://github.com/home-operations/kopiur/compare/0.10.13...0.10.14) (2026-10-13)
+
+
+### Features
+
+* **controller:** browse credential projection ([#574](https://github.com/home-operations/kopiur/issues/574)) ([036b287](https://github.com/home-operations/kopiur/commit/036b28710cba34eb0ec37b6d0066c2487b94a56a))
+* **npm:** update web ui dependencies ([#576](https://github.com/home-operations/kopiur/issues/576)) ([f8f8c79](https://github.com/home-operations/kopiur/commit/f8f8c796d2301295d838f90ff303b19ee3414642))
+* **npm:** update web ui dependencies ([#580](https://github.com/home-operations/kopiur/issues/580)) ([0941888](https://github.com/home-operations/kopiur/commit/09418884ec5f9e7b49af825ede87423f9572e154))
+* **rust:** update crate insta (1.48.0 → 1.49.0) ([#577](https://github.com/home-operations/kopiur/issues/577)) ([ae79e0e](https://github.com/home-operations/kopiur/commit/ae79e0ed85ac9d067321599f743272a1db69f0db))
+
+
+### Bug Fixes
+
+* **deps:** replace unmaintained serde_yaml with serde-saphyr ([#581](https://github.com/home-operations/kopiur/issues/581)) ([a632172](https://github.com/home-operations/kopiur/commit/a632172e1cd26edc748f5ca0e8d65a711726b62c))
+* **ui:** read Envoy Gateway's base64 groups header, and grant roles from values ([#573](https://github.com/home-operations/kopiur/issues/573)) ([d7ccd1e](https://github.com/home-operations/kopiur/commit/d7ccd1e65299c3a02953731feccf6a668eec67b6))
+
+
+### Continuous Integration
+
+* **renovate:** regenerate generated files on Renovate pull requests ([#578](https://github.com/home-operations/kopiur/issues/578)) ([a3803ca](https://github.com/home-operations/kopiur/commit/a3803cada1533310bb8c112db2ac1c306cdc0064))
+
+
+### Miscellaneous Chores
+
+* **mise:** update mise tools ([#565](https://github.com/home-operations/kopiur/issues/565)) ([ce24476](https://github.com/home-operations/kopiur/commit/ce24476a42605b5070c7d68ee6493def1f0fa4ef))
+* **mise:** update mise tools ([#575](https://github.com/home-operations/kopiur/issues/575)) ([0688267](https://github.com/home-operations/kopiur/commit/0688267e6c2f950469c81b3aa7aa8c7ef6fbb446))
+* **mise:** update tool oxfmt (0.71.0 → 0.72.0) ([#566](https://github.com/home-operations/kopiur/issues/566)) ([906af4f](https://github.com/home-operations/kopiur/commit/906af4fce75f4500146680064e173df30beebf8d))
+
 ## [0.10.13](https://github.com/home-operations/kopiur/compare/0.10.12...0.10.13) (2026-10-11)
 
 
