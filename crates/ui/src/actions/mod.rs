@@ -983,7 +983,7 @@ mod tests {
     // --- helpers ------------------------------------------------------------
 
     /// Round-trip a JSON value through the wire type, the way the apiserver's
-    /// clients do — never `serde_yaml` straight into a typed value (see the
+    /// clients do — never YAML straight into a typed value (see the
     /// api-conventions rule on externally-tagged enums).
     fn body_from(value: serde_json::Value) -> RestoreBody {
         serde_json::from_value(value).expect("a RestoreBody fixture must deserialize")

@@ -60,14 +60,14 @@ fn docs(content: &str) -> Vec<String> {
 }
 
 /// Every YAML document in a generated file, as an untyped value.
-fn values(content: &str) -> Vec<serde_yaml::Value> {
+fn values(content: &str) -> Vec<serde_json::Value> {
     docs(content)
         .into_iter()
-        .filter_map(|d| serde_yaml::from_str::<serde_yaml::Value>(&d).ok())
+        .filter_map(|d| serde_saphyr::from_str::<serde_json::Value>(&d).ok())
         .collect()
 }
 
-fn doc_named(content: &str, kind: &str, name: &str) -> serde_yaml::Value {
+fn doc_named(content: &str, kind: &str, name: &str) -> serde_json::Value {
     values(content)
         .into_iter()
         .find(|v| {
@@ -81,12 +81,12 @@ fn doc_named(content: &str, kind: &str, name: &str) -> serde_yaml::Value {
 }
 
 fn clusterrole_named(content: &str, name: &str) -> ClusterRole {
-    serde_yaml::from_value(doc_named(content, "ClusterRole", name))
+    serde_json::from_value(doc_named(content, "ClusterRole", name))
         .unwrap_or_else(|e| panic!("ClusterRole {name} must parse: {e}"))
 }
 
 fn role_named(content: &str, name: &str) -> Role {
-    serde_yaml::from_value(doc_named(content, "Role", name))
+    serde_json::from_value(doc_named(content, "Role", name))
         .unwrap_or_else(|e| panic!("Role {name} must parse: {e}"))
 }
 

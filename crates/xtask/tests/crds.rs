@@ -22,7 +22,8 @@ fn crd_yaml(artifacts: &[Artifact], plural: &str) -> String {
 }
 
 fn parse(yaml: &str) -> CustomResourceDefinition {
-    serde_yaml::from_str(yaml).expect("generated CRD YAML must parse as a CustomResourceDefinition")
+    serde_saphyr::from_str(yaml)
+        .expect("generated CRD YAML must parse as a CustomResourceDefinition")
 }
 
 #[test]
@@ -79,7 +80,7 @@ fn bundle_contains_all_nine_crds() {
     for (i, doc) in docs.iter().enumerate() {
         let cleaned = doc.strip_prefix(GEN_HEADER).unwrap_or(doc);
         let crd: CustomResourceDefinition =
-            serde_yaml::from_str(cleaned).unwrap_or_else(|e| panic!("bundle doc {i} parse: {e}"));
+            serde_saphyr::from_str(cleaned).unwrap_or_else(|e| panic!("bundle doc {i} parse: {e}"));
         assert_eq!(crd.spec.group, "kopiur.home-operations.com");
     }
 }

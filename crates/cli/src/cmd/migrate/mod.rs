@@ -436,7 +436,7 @@ fn render_yaml(objects: &[serde_json::Value], banner: &str) -> Result<String, Cl
     out.push('\n');
     for obj in objects {
         out.push_str("---\n");
-        out.push_str(&serde_yaml::to_string(obj).map_err(|e| {
+        out.push_str(&crate::output::to_yaml(obj).map_err(|e| {
             CliError::Ops(OpsError::Serialization {
                 what: "translated manifest",
                 source: e.into(),

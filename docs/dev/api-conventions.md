@@ -96,11 +96,11 @@ Always carries `resolved.*` pinned values (ADR §4.2: resolved identity pinned a
 
 ## 6. Tests (in each CRD module or `tests/`)
 
-Use the YAML→JSON→typed bridge (the API-server path), NOT `serde_yaml` directly (serde_yaml 0.9 encodes externally-tagged enums as non-standard `!Variant` tags):
+Use the YAML→JSON→typed bridge (the API-server path), never YAML straight into a typed value (a YAML library's enum handling is not the wire format):
 
 ```rust
 fn from_yaml<T: serde::de::DeserializeOwned>(yaml: &str) -> T {
-    let v: serde_json::Value = serde_yaml::from_str(yaml).unwrap();
+    let v: serde_json::Value = serde_saphyr::from_str(yaml).unwrap();
     serde_json::from_value(v).unwrap()
 }
 ```

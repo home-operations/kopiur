@@ -52,16 +52,16 @@ pub async fn run(
         let text = match output {
             OutputFormat::Table | OutputFormat::Wide => created_line,
             OutputFormat::Yaml => {
-                // Through a JSON Value first: serde_yaml would render the
-                // externally-tagged enums (source/target) as `!snapshotRef`
-                // YAML tags — not the cluster's encoding (convention #5).
+                // Through a JSON Value first, so the externally-tagged enums
+                // (source/target) are emitted in the cluster's plain-mapping
+                // encoding whatever the YAML emitter's enum style (convention #5).
                 let value = serde_json::to_value(&created).map_err(|e| {
                     CliError::Ops(OpsError::Serialization {
                         what: "created Restore",
                         source: e.into(),
                     })
                 })?;
-                serde_yaml::to_string(&value).map_err(|e| {
+                crate::output::to_yaml(&value).map_err(|e| {
                     CliError::Ops(OpsError::Serialization {
                         what: "created Restore",
                         source: e.into(),
@@ -277,27 +277,21 @@ mod tests {
     }
 
     #[test]
-    fn yaml_output_uses_the_cluster_encoding_not_serde_yaml_tags() {
-        // serde_yaml renders newtype enum variants as `!snapshotRef` tags when
-        // serialized directly; the CLI must emit the cluster's plain-mapping
-        // encoding (via a JSON Value) so the output is kubectl-applyable.
+    fn yaml_output_uses_the_cluster_encoding_not_yaml_tags() {
+        // The CLI must emit the cluster's plain-mapping encoding for
+        // externally-tagged enums (never `!snapshotRef` YAML tags) so the
+        // output is kubectl-applyable.
         let args = parse(&["--from-snapshot", "snap1", "--to-pvc", "data"]);
         let req = RestoreRequest::try_from(&args).expect("valid target flags");
         let restore = build_restore(&req, "media", at());
         let value = serde_json::to_value(&restore).unwrap();
-        let yaml = serde_yaml::to_string(&value).unwrap();
+        let yaml = crate::output::to_yaml(&value).unwrap();
         assert!(yaml.contains("snapshotRef:"), "{yaml}");
         assert!(yaml.contains("pvcRef:"), "{yaml}");
-        assert!(
-            !yaml.contains('!'),
-            "no serde_yaml enum tags allowed: {yaml}"
-        );
-        // The direct serialization WOULD tag — this guards the reason the
-        // Value route exists. If serde_yaml ever changes, revisit.
-        let direct = serde_yaml::to_string(&restore).unwrap();
-        assert!(
-            direct.contains('!'),
-            "serde_yaml behavior changed: {direct}"
-        );
+        assert!(!yaml.contains('!'), "no YAML enum tags allowed: {yaml}");
+        // The emitter must not tag enums even when handed the typed value
+        // directly: if a dependency bump turns tagging on, this catches it.
+        let direct = crate::output::to_yaml(&restore).unwrap();
+        assert_eq!(direct, yaml, "typed and JSON-Value YAML must match");
     }
 }

@@ -63,7 +63,7 @@ tower = { workspace = true, features = ["util"] }
 # without it the tests that exercise the timeout and recovery branches would have
 # to wait that long in real time, so they would not exist.
 tokio = { workspace = true, features = ["test-util"] }
-serde_yaml = { workspace = true }
+serde-saphyr = { workspace = true }
 serial_test = { workspace = true }
 
 [[bin]]

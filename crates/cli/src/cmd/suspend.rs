@@ -33,7 +33,7 @@ pub fn render(report: &SuspendReport, output: OutputFormat) -> Result<String, Cl
                 Ok(format!("{resource} {verb}\n"))
             }
         }
-        OutputFormat::Yaml => serde_yaml::to_string(&report.object).map_err(|e| {
+        OutputFormat::Yaml => crate::output::to_yaml(&report.object).map_err(|e| {
             CliError::Ops(OpsError::Serialization {
                 what: "patched object",
                 source: e.into(),

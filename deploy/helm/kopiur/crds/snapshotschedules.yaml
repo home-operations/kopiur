@@ -147,9 +147,9 @@ spec:
             type: object
             x-kubernetes-validations:
             - message: exactly one of policyRef or policySelector
-              rule: '[has(self.policyRef), has(self.policySelector)].filter(x, x).size() == 1'
+              rule: "[has(self.policyRef), has(self.policySelector)].filter(x, x).size() == 1"
           status:
-            description: 'Observed state of a `SnapshotSchedule`: pinned firing slots and failure run.'
+            description: "Observed state of a `SnapshotSchedule`: pinned firing slots and failure run."
             nullable: true
             properties:
               conditions:

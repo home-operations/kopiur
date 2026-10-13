@@ -129,18 +129,19 @@ pub const VERSION: &str = "v1alpha1";
 /// (YAML → JSON value → typed), reused by every CRD module's round-trip tests.
 ///
 /// `kubectl` converts YAML to JSON before sending to the API server, and `kube`
-/// (de)serializes exclusively via `serde_json`. Going straight through `serde_yaml`
-/// would instead exercise its non-standard `!Variant` encoding of externally-tagged
-/// enums, which the real wire format never uses — so this is the representative path.
+/// (de)serializes exclusively via `serde_json`. Going straight from YAML into a
+/// typed value would exercise the YAML library's own enum handling instead (the
+/// old `serde_yaml` used non-standard `!Variant` tags), which the real wire format
+/// never sees — so this is the representative path.
 ///
 /// Enable the `testutil` feature to reach it from another crate's tests — it is
-/// test support only, and pulls `serde_yaml` in with it.
+/// test support only, and pulls `serde-saphyr` in with it.
 #[cfg(any(test, feature = "testutil"))]
 pub mod testutil {
     /// Parse a YAML manifest the way the cluster does: YAML → JSON value →
     /// typed. Panics on either step, which is what a test wants.
     pub fn from_yaml<T: serde::de::DeserializeOwned>(yaml: &str) -> T {
-        let value: serde_json::Value = serde_yaml::from_str(yaml).expect("yaml -> json value");
+        let value: serde_json::Value = serde_saphyr::from_str(yaml).expect("yaml -> json value");
         serde_json::from_value(value).expect("json value -> typed")
     }
 }
@@ -323,7 +324,7 @@ create:
 
     #[test]
     fn unknown_backend_variant_is_rejected() {
-        let value: serde_json::Value = serde_yaml::from_str("dropbox:\n  bucket: x\n").unwrap();
+        let value: serde_json::Value = serde_saphyr::from_str("dropbox:\n  bucket: x\n").unwrap();
         let err = serde_json::from_value::<Backend>(value);
         assert!(
             err.is_err(),

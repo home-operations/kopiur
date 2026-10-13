@@ -198,7 +198,7 @@ pub fn render_manifest(manifest: &DirManifest, format: OutputFormat) -> Result<S
                 }
                 .into()
             }),
-        OutputFormat::Yaml => serde_yaml::to_string(manifest).map_err(|e| {
+        OutputFormat::Yaml => crate::output::to_yaml(manifest).map_err(|e| {
             OpsError::Serialization {
                 what: "directory manifest",
                 source: e.into(),

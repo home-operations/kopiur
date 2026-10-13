@@ -24,4 +24,4 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 kopiur-api = { workspace = true, features = ["testutil"] }
-serde_yaml = { workspace = true }
+serde-saphyr = { workspace = true }

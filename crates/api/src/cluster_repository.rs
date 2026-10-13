@@ -333,7 +333,7 @@ catalog:
 
     #[test]
     fn allowed_namespaces_unknown_variant_is_rejected() {
-        let value: serde_json::Value = serde_yaml::from_str("everyone: true\n").unwrap();
+        let value: serde_json::Value = serde_saphyr::from_str("everyone: true\n").unwrap();
         assert!(serde_json::from_value::<AllowedNamespaces>(value).is_err());
     }
 
@@ -725,7 +725,8 @@ catalog:
 
     #[test]
     fn catalog_foreign_snapshots_unknown_variant_is_rejected() {
-        let value: serde_json::Value = serde_yaml::from_str("foreignSnapshots: Delete\n").unwrap();
+        let value: serde_json::Value =
+            serde_saphyr::from_str("foreignSnapshots: Delete\n").unwrap();
         assert!(serde_json::from_value::<crate::common::CatalogBounds>(value).is_err());
     }
 

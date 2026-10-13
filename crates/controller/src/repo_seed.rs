@@ -1127,9 +1127,9 @@ mod tests {
     use kopiur_mover::workspec::{PolicyCopyModeSpec, RepositoryConnect, SeedModeSpec};
 
     /// Build a `SeedSpec` the way the apiserver hands one over: a JSON value
-    /// (what a decoded CR body is) into the typed struct. Never `serde_yaml`
-    /// straight into a typed value — 0.9 mis-encodes externally-tagged enums,
-    /// and `from.backend` is one.
+    /// (what a decoded CR body is) into the typed struct. Never YAML
+    /// straight into a typed value — `from.backend` is an externally-tagged
+    /// enum, and only the JSON path decodes it the way the cluster does.
     fn seed_spec(v: serde_json::Value) -> SeedSpec {
         serde_json::from_value(v).expect("typed")
     }

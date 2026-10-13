@@ -2544,8 +2544,8 @@ mod tests {
     // --- #456: the (repository x member) verify fan-out -----------------------
 
     /// A policy built the way the apiserver hands one over: a JSON value (what
-    /// a decoded CR body is) into the typed struct. Never `serde_yaml` straight
-    /// into a typed value — 0.9 mis-encodes externally-tagged enums.
+    /// a decoded CR body is) into the typed struct. Never YAML straight
+    /// into a typed value.
     fn selector_policy(sources: serde_json::Value) -> SnapshotPolicy {
         policy_json(serde_json::json!({
             "repository": { "name": "r" },

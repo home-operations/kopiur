@@ -658,7 +658,7 @@ schedule: { cron: "0 6 * * 0" }
     #[test]
     fn unknown_pruning_variant_is_rejected() {
         let value: serde_json::Value =
-            serde_yaml::from_str("keepEverything: {}\n").expect("yaml value");
+            serde_saphyr::from_str("keepEverything: {}\n").expect("yaml value");
         assert!(
             serde_json::from_value::<Pruning>(value).is_err(),
             "unknown pruning variant must fail to deserialize"

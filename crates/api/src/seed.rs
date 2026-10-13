@@ -594,7 +594,7 @@ migrate:
     fn unknown_source_variant_is_rejected() {
         // An externally-tagged enum must refuse a key it does not know rather
         // than silently defaulting to one of the two real modes.
-        let v: serde_json::Value = serde_yaml::from_str("mirror:\n  name: offsite\n").unwrap();
+        let v: serde_json::Value = serde_saphyr::from_str("mirror:\n  name: offsite\n").unwrap();
         let err = serde_json::from_value::<SeedSource>(v).expect_err("unknown variant must fail");
         assert!(
             err.to_string().contains("unknown variant"),

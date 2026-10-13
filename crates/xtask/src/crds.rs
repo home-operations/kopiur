@@ -21,7 +21,7 @@ use crate::artifact::{Artifact, GEN_HEADER};
 fn render_crd<T: CustomResourceExt>() -> Result<(String, String)> {
     let crd = T::crd();
     let plural = crd.spec.names.plural.clone();
-    let body = serde_yaml::to_string(&crd)
+    let body = crate::yaml::to_string(&crd)
         .with_context(|| format!("serializing CRD '{plural}' to YAML"))?;
     let content = format!("{GEN_HEADER}{body}");
     Ok((plural, content))

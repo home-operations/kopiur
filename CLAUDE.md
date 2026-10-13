@@ -95,8 +95,8 @@ add controller-runtime dependencies to `crates/api`.
    `ui-check`/`gen-check` fail if it is stale or uncommitted. Change a wire type
    ⇒ run `mise run ui-types` in the same commit.
 6. **Tests parse YAML the cluster's way**: YAML → `serde_json::Value` → typed
-   (see `crates/api/src/lib.rs::testutil::from_yaml`). Never `serde_yaml::from_str`
-   directly into a typed value — serde_yaml 0.9 mis-encodes externally-tagged enums.
+   (see `crates/api/src/lib.rs::testutil::from_yaml`). Never `serde_saphyr::from_str`
+   directly into a typed value — a YAML library's enum handling is not the wire format.
 
 ## Locked technical decisions
 

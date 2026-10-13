@@ -2,9 +2,9 @@
 //! repository Secrets from YAML files (or stdin) instead of the cluster, and
 //! write the translated manifests to a directory (one file per source).
 //!
-//! All YAML parsing goes `yaml → serde_json::Value → typed` (never `serde_yaml`
-//! straight into a typed value) — serde_yaml 0.9 mis-encodes externally-tagged
-//! enums, which both the VolSync specs and the emitted kopiur types rely on.
+//! All YAML parsing goes `yaml → serde_json::Value → typed` (never YAML
+//! straight into a typed value), so externally-tagged enums — which both the
+//! VolSync specs and the emitted kopiur types rely on — decode as the cluster does.
 //! See `crates/api/src/lib.rs::testutil::from_yaml` for the same rule.
 
 use std::collections::BTreeMap;
@@ -14,7 +14,6 @@ use std::path::{Path, PathBuf};
 use k8s_openapi::ByteString;
 use k8s_openapi::api::core::v1::Secret;
 use kube::api::Api;
-use serde::Deserialize;
 
 use crate::consts::STDIN_TOKEN;
 use crate::error::{CliError, classify_kube};
@@ -123,12 +122,12 @@ fn collect_documents(paths: &[PathBuf]) -> Result<Vec<(String, serde_json::Value
         };
 
         for (label, content) in blobs {
-            for (i, doc) in serde_yaml::Deserializer::from_str(&content).enumerate() {
-                let value =
-                    serde_json::Value::deserialize(doc).map_err(|e| CliError::MigrationInput {
-                        what: format!("{label} document {i} is not valid YAML/JSON: {e}"),
-                        fix: "fix or remove the offending document".into(),
-                    })?;
+            let docs: Vec<serde_json::Value> =
+                serde_saphyr::from_multiple(&content).map_err(|e| CliError::MigrationInput {
+                    what: format!("{label} is not valid YAML/JSON: {e}"),
+                    fix: "fix or remove the offending document".into(),
+                })?;
+            for (i, value) in docs.into_iter().enumerate() {
                 if value.is_null() {
                     continue;
                 }

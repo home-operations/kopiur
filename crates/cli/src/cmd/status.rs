@@ -238,7 +238,7 @@ pub async fn run(
                     source: e.into(),
                 })
             })?;
-            serde_yaml::to_string(&value).map_err(|e| {
+            crate::output::to_yaml(&value).map_err(|e| {
                 CliError::Ops(OpsError::Serialization {
                     what: "status report",
                     source: e.into(),

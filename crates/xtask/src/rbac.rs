@@ -442,7 +442,7 @@ fn render<T: Serialize + Resource>(obj: &T) -> Result<String> {
         .context("RBAC object did not serialize to a JSON object")?;
     map.insert("apiVersion".into(), T::API_VERSION.into());
     map.insert("kind".into(), T::KIND.into());
-    let yaml = serde_yaml::to_string(&value).context("rendering RBAC object to YAML")?;
+    let yaml = crate::yaml::to_string(&value).context("rendering RBAC object to YAML")?;
     Ok(yaml)
 }
 

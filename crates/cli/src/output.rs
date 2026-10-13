@@ -16,6 +16,14 @@ pub use kopiur_ops::format::EMPTY_CELL;
 /// size reads identically wherever it is rendered.
 pub use kopiur_ops::format::human_bytes;
 
+/// Serialize `value` as YAML the way `kubectl` does: one physical line per single-line string, never wrapped into a folded
+/// `>-` block. Multi-line strings still render as `|` literal blocks.
+pub fn to_yaml<T: serde::Serialize>(value: &T) -> Result<String, serde_saphyr::SerializeError> {
+    let mut options = serde_saphyr::SerializerOptions::default();
+    options.folded_wrap_chars = usize::MAX;
+    serde_saphyr::to_string_with_options(value, options)
+}
+
 /// Every `-o` value the plugin accepts. Dispatchers `match` this exhaustively,
 /// so adding a format forces every command to handle it.
 #[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq, Default)]

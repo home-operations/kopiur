@@ -40,7 +40,7 @@ spec:
         description: Auto-generated derived type for SnapshotPolicySpec via `CustomResource`
         properties:
           spec:
-            description: 'What to back up: sources, identity, retention, policy, hooks.'
+            description: "What to back up: sources, identity, retention, policy, hooks."
             properties:
               adoption:
                 description: |-
@@ -70,7 +70,7 @@ spec:
                 type: object
               copyMethod:
                 default: Snapshot
-                description: 'How the source volume is captured before kopia reads it: `Snapshot` (default), `Direct`, or `Clone`.'
+                description: "How the source volume is captured before kopia reads it: `Snapshot` (default), `Direct`, or `Clone`."
                 enum:
                 - Snapshot
                 - Clone
@@ -111,7 +111,7 @@ spec:
                     type: string
                 type: object
               errorHandling:
-                description: 'Backup-side error handling: let a snapshot complete-with-errors instead of failing outright.'
+                description: "Backup-side error handling: let a snapshot complete-with-errors instead of failing outright."
                 nullable: true
                 properties:
                   failFast:
@@ -151,7 +151,7 @@ spec:
                     - /lost+found
                     - System Volume Information
                     - $RECYCLE.BIN
-                    - '@eaDir'
+                    - "@eaDir"
                     - .snapshot
                     description: |-
                       Filename/path globs to exclude from the snapshot (e.g. `*.tmp`, `*/cache/*`).
@@ -204,10 +204,10 @@ spec:
                               nullable: true
                               type: string
                             continueOnFailure:
-                              description: 'If `true`, a failed request does not abort the backup (default: abort).'
+                              description: "If `true`, a failed request does not abort the backup (default: abort)."
                               type: boolean
                             headers:
-                              description: 'Additional request headers (e.g. `Content-Type: application/json`).'
+                              description: "Additional request headers (e.g. `Content-Type: application/json`)."
                               items:
                                 description: One HTTP header sent with an `httpRequest` hook.
                                 properties:
@@ -240,7 +240,7 @@ spec:
                           description: Full `JobSpec` run as a one-shot Job (k8up `PreBackupPod` analog).
                           properties:
                             continueOnFailure:
-                              description: 'If `true`, a failed Job does not abort the backup (default: abort).'
+                              description: "If `true`, a failed Job does not abort the backup (default: abort)."
                               type: boolean
                             jobSpec:
                               description: The full Kubernetes `JobSpec` to run.
@@ -254,7 +254,7 @@ spec:
                           - jobSpec
                           type: object
                         workloadExec:
-                          description: '`kubectl exec`-style into a matched workload pod/container (the default form).'
+                          description: "`kubectl exec`-style into a matched workload pod/container (the default form)."
                           properties:
                             command:
                               description: Command + args to run inside the selected container.
@@ -266,7 +266,7 @@ spec:
                               nullable: true
                               type: string
                             continueOnFailure:
-                              description: 'If `true`, a failed hook does not abort the backup (default: abort).'
+                              description: "If `true`, a failed hook does not abort the backup (default: abort)."
                               type: boolean
                             podSelector:
                               description: Label selector matching the workload pod(s) to read context/hooks from.
@@ -330,10 +330,10 @@ spec:
                               nullable: true
                               type: string
                             continueOnFailure:
-                              description: 'If `true`, a failed request does not abort the backup (default: abort).'
+                              description: "If `true`, a failed request does not abort the backup (default: abort)."
                               type: boolean
                             headers:
-                              description: 'Additional request headers (e.g. `Content-Type: application/json`).'
+                              description: "Additional request headers (e.g. `Content-Type: application/json`)."
                               items:
                                 description: One HTTP header sent with an `httpRequest` hook.
                                 properties:
@@ -366,7 +366,7 @@ spec:
                           description: Full `JobSpec` run as a one-shot Job (k8up `PreBackupPod` analog).
                           properties:
                             continueOnFailure:
-                              description: 'If `true`, a failed Job does not abort the backup (default: abort).'
+                              description: "If `true`, a failed Job does not abort the backup (default: abort)."
                               type: boolean
                             jobSpec:
                               description: The full Kubernetes `JobSpec` to run.
@@ -380,7 +380,7 @@ spec:
                           - jobSpec
                           type: object
                         workloadExec:
-                          description: '`kubectl exec`-style into a matched workload pod/container (the default form).'
+                          description: "`kubectl exec`-style into a matched workload pod/container (the default form)."
                           properties:
                             command:
                               description: Command + args to run inside the selected container.
@@ -392,7 +392,7 @@ spec:
                               nullable: true
                               type: string
                             continueOnFailure:
-                              description: 'If `true`, a failed hook does not abort the backup (default: abort).'
+                              description: "If `true`, a failed hook does not abort the backup (default: abort)."
                               type: boolean
                             podSelector:
                               description: Label selector matching the workload pod(s) to read context/hooks from.
@@ -484,11 +484,11 @@ spec:
                   inheritSecurityContextFrom:
                     description: |-
                       Copy the UID/GID security context from a live workload rather than hard-coding it.
-
+                      
                       Requires the workload to pin `runAsUser` (container or pod level): a UID that comes
                       from the container image's `USER` line is invisible in the pod spec and cannot be
                       inherited — the mover would silently run as its own image's UID instead.
-
+                      
                       May be combined with `securityContext`/`podSecurityContext`, which override it
                       field-wise and act as the fallback when no workload pod can be resolved.
                     nullable: true
@@ -501,7 +501,7 @@ spec:
                       - snapshot
                     properties:
                       pvcConsumer:
-                        description: 'Backup sources only: auto-derive the workload from the PVC this snapshot backs up.'
+                        description: "Backup sources only: auto-derive the workload from the PVC this snapshot backs up."
                         properties:
                           container:
                             description: Which container within the matched consumer pod to inherit from; absent uses the first/only.
@@ -585,14 +585,14 @@ spec:
                       fsGroup:
                         description: |-
                           A special supplemental group that applies to all containers in a pod. Some volume types allow the Kubelet to change the ownership of that volume to be owned by the pod:
-
+                          
                           1. The owning GID will be the FSGroup 2. The setgid bit is set (new files created in the volume will be owned by FSGroup) 3. The permission bits are OR'd with rw-rw----
-
+                          
                           If unset, the Kubelet will not modify the ownership and permissions of any volume. Note that this field cannot be set when spec.os.name is windows.
                         format: int64
                         type: integer
                       fsGroupChangePolicy:
-                        description: 'fsGroupChangePolicy defines behavior of changing ownership and permission of the volume before being exposed inside Pod. This field will only apply to volume types which support fsGroup based ownership(and permissions). It will have no effect on ephemeral volume types such as: secret, configmaps and emptydir. Valid values are "OnRootMismatch" and "Always". If not specified, "Always" is used. Note that this field cannot be set when spec.os.name is windows.'
+                        description: "fsGroupChangePolicy defines behavior of changing ownership and permission of the volume before being exposed inside Pod. This field will only apply to volume types which support fsGroup based ownership(and permissions). It will have no effect on ephemeral volume types such as: secret, configmaps and emptydir. Valid values are \"OnRootMismatch\" and \"Always\". If not specified, \"Always\" is used. Note that this field cannot be set when spec.os.name is windows."
                         type: string
                       runAsGroup:
                         description: The GID to run the entrypoint of the container process. Uses runtime default if unset. May also be set in SecurityContext.  If set in both SecurityContext and PodSecurityContext, the value specified in SecurityContext takes precedence for that container. Note that this field cannot be set when spec.os.name is windows.
@@ -608,15 +608,15 @@ spec:
                       seLinuxChangePolicy:
                         description: |-
                           seLinuxChangePolicy defines how the container's SELinux label is applied to all volumes used by the Pod. It has no effect on nodes that do not support SELinux or to volumes does not support SELinux. Valid values are "MountOption" and "Recursive".
-
+                          
                           "Recursive" means relabeling of all files on all Pod volumes by the container runtime. This may be slow for large volumes, but allows mixing privileged and unprivileged Pods sharing the same volume on the same node.
-
+                          
                           "MountOption" mounts all eligible Pod volumes with `-o context` mount option. This requires all Pods that share the same volume to use the same SELinux label. It is not possible to share the same volume among privileged and unprivileged Pods. Eligible volumes are in-tree FibreChannel and iSCSI volumes, and all CSI volumes whose CSI driver announces SELinux support by setting spec.seLinuxMount: true in their CSIDriver instance. Other volumes are always re-labelled recursively. "MountOption" value is allowed only when SELinuxMount feature gate is enabled.
-
+                          
                           If not specified and SELinuxMount feature gate is enabled, "MountOption" is used. If not specified and SELinuxMount feature gate is disabled, "MountOption" is used for ReadWriteOncePod volumes and "Recursive" for all other volumes.
-
+                          
                           This field affects only Pods that have SELinux label set, either in PodSecurityContext or in SecurityContext of all containers.
-
+                          
                           All Pods that use the same volume should use the same seLinuxChangePolicy, otherwise some pods can get stuck in ContainerCreating state. Note that this field cannot be set when spec.os.name is windows.
                         type: string
                       seLinuxOptions:
@@ -644,7 +644,7 @@ spec:
                           type:
                             description: |-
                               type indicates which kind of seccomp profile will be applied. Valid options are:
-
+                              
                               Localhost - a profile defined in a file on the node should be used. RuntimeDefault - the container runtime default profile should be used. Unconfined - no profile should be applied.
                             type: string
                         required:
@@ -703,9 +703,9 @@ spec:
                       claims:
                         description: |-
                           Claims lists the names of resources, defined in spec.resourceClaims, that are used by this container.
-
+                          
                           This is an alpha field and requires enabling the DynamicResourceAllocation feature gate.
-
+                          
                           This field is immutable. It can only be set for containers.
                         items:
                           description: ResourceClaim references one entry in PodSpec.ResourceClaims.
@@ -722,15 +722,89 @@ spec:
                         type: array
                       limits:
                         additionalProperties:
-                          description: "Quantity is a fixed-point representation of a number. It provides convenient marshaling/unmarshaling in JSON and YAML, in addition to String() and AsInt64() accessors.\n\nThe serialization format is:\n\n``` <quantity>        ::= <signedNumber><suffix>\n\n\t(Note that <suffix> may be empty, from the \"\" case in <decimalSI>.)\n\n<digit>           ::= 0 | 1 | ... | 9 <digits>          ::= <digit> | <digit><digits> <number>          ::= <digits> | <digits>.<digits> | <digits>. | .<digits> <sign>            ::= \"+\" | \"-\" <signedNumber>    ::= <number> | <sign><number> <suffix>          ::= <binarySI> | <decimalExponent> | <decimalSI> <binarySI>        ::= Ki | Mi | Gi | Ti | Pi | Ei\n\n\t(International System of units; See: http://physics.nist.gov/cuu/Units/binary.html)\n\n<decimalSI>       ::= m | \"\" | k | M | G | T | P | E\n\n\t(Note that 1024 = 1Ki but 1000 = 1k; I didn't choose the capitalization.)\n\n<decimalExponent> ::= \"e\" <signedNumber> | \"E\" <signedNumber> ```\n\nNo matter which of the three exponent forms is used, no quantity may represent a number greater than 2^63-1 in magnitude, nor may it have more than 3 decimal places. Numbers larger or more precise will be capped or rounded up. (E.g.: 0.1m will rounded up to 1m.) This may be extended in the future if we require larger or smaller quantities.\n\nWhen a Quantity is parsed from a string, it will remember the type of suffix it had, and will use the same type again when it is serialized.\n\nBefore serializing, Quantity will be put in \"canonical form\". This means that Exponent/suffix will be adjusted up or down (with a corresponding increase or decrease in Mantissa) such that:\n\n- No precision is lost - No fractional digits will be emitted - The exponent (or suffix) is as large as possible.\n\nThe sign will be omitted unless the number is negative.\n\nExamples:\n\n- 1.5 will be serialized as \"1500m\" - 1.5Gi will be serialized as \"1536Mi\"\n\nNote that the quantity will NEVER be internally represented by a floating point number. That is the whole point of this exercise.\n\nNon-canonical values will still parse as long as they are well formed, but will be re-emitted in their canonical form. (So always use canonical form, or don't diff.)\n\nThis format is intended to make it difficult to use these numbers without writing some sort of special handling code in the hopes that that will cause implementors to also use a fixed point implementation."
+                          description: |-
+                            Quantity is a fixed-point representation of a number. It provides convenient marshaling/unmarshaling in JSON and YAML, in addition to String() and AsInt64() accessors.
+                            
+                            The serialization format is:
+                            
+                            ``` <quantity>        ::= <signedNumber><suffix>
+                            
+                            	(Note that <suffix> may be empty, from the "" case in <decimalSI>.)
+                            
+                            <digit>           ::= 0 | 1 | ... | 9 <digits>          ::= <digit> | <digit><digits> <number>          ::= <digits> | <digits>.<digits> | <digits>. | .<digits> <sign>            ::= "+" | "-" <signedNumber>    ::= <number> | <sign><number> <suffix>          ::= <binarySI> | <decimalExponent> | <decimalSI> <binarySI>        ::= Ki | Mi | Gi | Ti | Pi | Ei
+                            
+                            	(International System of units; See: http://physics.nist.gov/cuu/Units/binary.html)
+                            
+                            <decimalSI>       ::= m | "" | k | M | G | T | P | E
+                            
+                            	(Note that 1024 = 1Ki but 1000 = 1k; I didn't choose the capitalization.)
+                            
+                            <decimalExponent> ::= "e" <signedNumber> | "E" <signedNumber> ```
+                            
+                            No matter which of the three exponent forms is used, no quantity may represent a number greater than 2^63-1 in magnitude, nor may it have more than 3 decimal places. Numbers larger or more precise will be capped or rounded up. (E.g.: 0.1m will rounded up to 1m.) This may be extended in the future if we require larger or smaller quantities.
+                            
+                            When a Quantity is parsed from a string, it will remember the type of suffix it had, and will use the same type again when it is serialized.
+                            
+                            Before serializing, Quantity will be put in "canonical form". This means that Exponent/suffix will be adjusted up or down (with a corresponding increase or decrease in Mantissa) such that:
+                            
+                            - No precision is lost - No fractional digits will be emitted - The exponent (or suffix) is as large as possible.
+                            
+                            The sign will be omitted unless the number is negative.
+                            
+                            Examples:
+                            
+                            - 1.5 will be serialized as "1500m" - 1.5Gi will be serialized as "1536Mi"
+                            
+                            Note that the quantity will NEVER be internally represented by a floating point number. That is the whole point of this exercise.
+                            
+                            Non-canonical values will still parse as long as they are well formed, but will be re-emitted in their canonical form. (So always use canonical form, or don't diff.)
+                            
+                            This format is intended to make it difficult to use these numbers without writing some sort of special handling code in the hopes that that will cause implementors to also use a fixed point implementation.
                           x-kubernetes-int-or-string: true
-                        description: 'Limits describes the maximum amount of compute resources allowed. More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/'
+                        description: "Limits describes the maximum amount of compute resources allowed. More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/"
                         type: object
                       requests:
                         additionalProperties:
-                          description: "Quantity is a fixed-point representation of a number. It provides convenient marshaling/unmarshaling in JSON and YAML, in addition to String() and AsInt64() accessors.\n\nThe serialization format is:\n\n``` <quantity>        ::= <signedNumber><suffix>\n\n\t(Note that <suffix> may be empty, from the \"\" case in <decimalSI>.)\n\n<digit>           ::= 0 | 1 | ... | 9 <digits>          ::= <digit> | <digit><digits> <number>          ::= <digits> | <digits>.<digits> | <digits>. | .<digits> <sign>            ::= \"+\" | \"-\" <signedNumber>    ::= <number> | <sign><number> <suffix>          ::= <binarySI> | <decimalExponent> | <decimalSI> <binarySI>        ::= Ki | Mi | Gi | Ti | Pi | Ei\n\n\t(International System of units; See: http://physics.nist.gov/cuu/Units/binary.html)\n\n<decimalSI>       ::= m | \"\" | k | M | G | T | P | E\n\n\t(Note that 1024 = 1Ki but 1000 = 1k; I didn't choose the capitalization.)\n\n<decimalExponent> ::= \"e\" <signedNumber> | \"E\" <signedNumber> ```\n\nNo matter which of the three exponent forms is used, no quantity may represent a number greater than 2^63-1 in magnitude, nor may it have more than 3 decimal places. Numbers larger or more precise will be capped or rounded up. (E.g.: 0.1m will rounded up to 1m.) This may be extended in the future if we require larger or smaller quantities.\n\nWhen a Quantity is parsed from a string, it will remember the type of suffix it had, and will use the same type again when it is serialized.\n\nBefore serializing, Quantity will be put in \"canonical form\". This means that Exponent/suffix will be adjusted up or down (with a corresponding increase or decrease in Mantissa) such that:\n\n- No precision is lost - No fractional digits will be emitted - The exponent (or suffix) is as large as possible.\n\nThe sign will be omitted unless the number is negative.\n\nExamples:\n\n- 1.5 will be serialized as \"1500m\" - 1.5Gi will be serialized as \"1536Mi\"\n\nNote that the quantity will NEVER be internally represented by a floating point number. That is the whole point of this exercise.\n\nNon-canonical values will still parse as long as they are well formed, but will be re-emitted in their canonical form. (So always use canonical form, or don't diff.)\n\nThis format is intended to make it difficult to use these numbers without writing some sort of special handling code in the hopes that that will cause implementors to also use a fixed point implementation."
+                          description: |-
+                            Quantity is a fixed-point representation of a number. It provides convenient marshaling/unmarshaling in JSON and YAML, in addition to String() and AsInt64() accessors.
+                            
+                            The serialization format is:
+                            
+                            ``` <quantity>        ::= <signedNumber><suffix>
+                            
+                            	(Note that <suffix> may be empty, from the "" case in <decimalSI>.)
+                            
+                            <digit>           ::= 0 | 1 | ... | 9 <digits>          ::= <digit> | <digit><digits> <number>          ::= <digits> | <digits>.<digits> | <digits>. | .<digits> <sign>            ::= "+" | "-" <signedNumber>    ::= <number> | <sign><number> <suffix>          ::= <binarySI> | <decimalExponent> | <decimalSI> <binarySI>        ::= Ki | Mi | Gi | Ti | Pi | Ei
+                            
+                            	(International System of units; See: http://physics.nist.gov/cuu/Units/binary.html)
+                            
+                            <decimalSI>       ::= m | "" | k | M | G | T | P | E
+                            
+                            	(Note that 1024 = 1Ki but 1000 = 1k; I didn't choose the capitalization.)
+                            
+                            <decimalExponent> ::= "e" <signedNumber> | "E" <signedNumber> ```
+                            
+                            No matter which of the three exponent forms is used, no quantity may represent a number greater than 2^63-1 in magnitude, nor may it have more than 3 decimal places. Numbers larger or more precise will be capped or rounded up. (E.g.: 0.1m will rounded up to 1m.) This may be extended in the future if we require larger or smaller quantities.
+                            
+                            When a Quantity is parsed from a string, it will remember the type of suffix it had, and will use the same type again when it is serialized.
+                            
+                            Before serializing, Quantity will be put in "canonical form". This means that Exponent/suffix will be adjusted up or down (with a corresponding increase or decrease in Mantissa) such that:
+                            
+                            - No precision is lost - No fractional digits will be emitted - The exponent (or suffix) is as large as possible.
+                            
+                            The sign will be omitted unless the number is negative.
+                            
+                            Examples:
+                            
+                            - 1.5 will be serialized as "1500m" - 1.5Gi will be serialized as "1536Mi"
+                            
+                            Note that the quantity will NEVER be internally represented by a floating point number. That is the whole point of this exercise.
+                            
+                            Non-canonical values will still parse as long as they are well formed, but will be re-emitted in their canonical form. (So always use canonical form, or don't diff.)
+                            
+                            This format is intended to make it difficult to use these numbers without writing some sort of special handling code in the hopes that that will cause implementors to also use a fixed point implementation.
                           x-kubernetes-int-or-string: true
-                        description: 'Requests describes the minimum amount of compute resources required. If Requests is omitted for a container, it defaults to Limits if that is explicitly specified, otherwise to an implementation-defined value. Requests cannot exceed Limits. More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/'
+                        description: "Requests describes the minimum amount of compute resources required. If Requests is omitted for a container, it defaults to Limits if that is explicitly specified, otherwise to an implementation-defined value. Requests cannot exceed Limits. More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/"
                         type: object
                     type: object
                   securityContext:
@@ -743,7 +817,7 @@ spec:
                     nullable: true
                     properties:
                       allowPrivilegeEscalation:
-                        description: 'AllowPrivilegeEscalation controls whether a process can gain more privileges than its parent process. This bool directly controls if the no_new_privs flag will be set on the container process. AllowPrivilegeEscalation is true always when the container is: 1) run as Privileged 2) has CAP_SYS_ADMIN Note that this field cannot be set when spec.os.name is windows.'
+                        description: "AllowPrivilegeEscalation controls whether a process can gain more privileges than its parent process. This bool directly controls if the no_new_privs flag will be set on the container process. AllowPrivilegeEscalation is true always when the container is: 1) run as Privileged 2) has CAP_SYS_ADMIN Note that this field cannot be set when spec.os.name is windows."
                         type: boolean
                       appArmorProfile:
                         description: appArmorProfile is the AppArmor options to use by this container. If set, this profile overrides the pod's appArmorProfile. Note that this field cannot be set when spec.os.name is windows.
@@ -820,7 +894,7 @@ spec:
                           type:
                             description: |-
                               type indicates which kind of seccomp profile will be applied. Valid options are:
-
+                              
                               Localhost - a profile defined in a file on the node should be used. RuntimeDefault - the container runtime default profile should be used. Unconfined - no profile should be applied.
                             type: string
                         required:
@@ -861,7 +935,7 @@ spec:
                       Checks that must **all** pass (AND) before the backup launches. An empty
                       list is an inert no-op (symmetric with `verification` absent).
                     items:
-                      description: 'One named precondition: a CEL bool predicate over the preflight environment.'
+                      description: "One named precondition: a CEL bool predicate over the preflight environment."
                       properties:
                         expr:
                           description: CEL bool predicate; the backup proceeds only when this evaluates `true`.
@@ -1002,7 +1076,7 @@ spec:
                         recursively `chgrp` the **live** volume to the mover's `fsGroup` and make it
                         group-writable — permanently, while the workload is running. Required for that
                         combination alone.
-
+                        
                         Ignored (not rejected) otherwise: it is an acknowledgement, never harmful to
                         carry, and rejecting a stale one would make switching `copyMethod` between
                         `Direct` and `Snapshot`/`Clone` a two-step edit in both directions.
@@ -1082,7 +1156,7 @@ spec:
                       default: true
                       description: |-
                         Mount the source read-only (default `true`; kopia only ever reads it).
-
+                        
                         Set `false` **only** to make `fsGroup` work on the source. The kubelet applies
                         `fsGroup` by recursively `chgrp`-ing the volume and adding group-write — and it
                         skips that walk entirely on a read-only mount, which is why a mover
@@ -1090,7 +1164,7 @@ spec:
                         `copyMethod: Snapshot`/`Clone` the walk rewrites the throwaway staged PVC and
                         never touches your data. Under `copyMethod: Direct` it rewrites the LIVE volume,
                         which requires `acknowledgeLiveMutation`.
-
+                        
                         Not supported on an `nfs` source: the kubelet does not apply `fsGroup` to
                         in-tree NFS volumes at all, so a read-write mount would grant nothing.
                       nullable: true
@@ -1098,14 +1172,14 @@ spec:
                     sourcePathOverride:
                       description: |-
                         What kopia records as the source path (default `/pvc/<name>`, or the NFS export `path`).
-
+                        
                         On a `pvcSelector` source this is a footgun. It is ONE literal path, so
                         it works only while the selector matches exactly one PVC; the moment a
                         second PVC matches, both would land on that same kopia source, merging
                         their histories into one stream where they also prune each other, so the
                         BACKUP is refused at run time and no further snapshots are minted for
                         that source.
-
+                        
                         Watch the failed schedule fire, not verification: the earlier snapshots
                         remain at that path, so verification keeps passing while backups have
                         stopped. (Verification only fails on a path that never received a
@@ -1136,7 +1210,7 @@ spec:
                         fileName:
                           description: |-
                             Name of the single virtual file stored in the snapshot (e.g. `postgres.sql`).
-
+                            
                             Must be ONE file name: no `/`, and not `.` or `..`. kopia stores this string
                             verbatim as the entry name and does not sanitize it, so a path-shaped value
                             would make a later `kopia restore` write OUTSIDE its destination directory.
@@ -1144,13 +1218,13 @@ spec:
                           minLength: 1
                           type: string
                         workloadExec:
-                          description: 'The producer: what to run, and where. Its stdout IS the backup data.'
+                          description: "The producer: what to run, and where. Its stdout IS the backup data."
                           properties:
                             command:
                               description: |-
                                 The argv to execute. NOT a shell line: element 0 is the program, so use
                                 `["sh", "-ec", "..."]` explicitly if you want shell semantics.
-
+                                
                                 Reference credentials through the container's existing environment or mounted
                                 Secrets — never inline them here. This argv is copied into the mover Pod's
                                 spec, so anyone with `pods:get` in the namespace can read it.
@@ -1200,7 +1274,7 @@ spec:
                               description: |-
                                 Go duration bounding the command (e.g. `2h`; default `1h`). On expiry the
                                 command is abandoned and the run fails, leaving no snapshot behind.
-
+                                
                                 The same bound applies whether this exec is a backup's producer or a
                                 `streamExec` restore's consumer.
                               nullable: true
@@ -1216,7 +1290,7 @@ spec:
                   type: object
                   x-kubernetes-validations:
                   - message: exactly one of pvc, pvcSelector, nfs, stream
-                    rule: '(has(self.pvc) ? 1 : 0) + (has(self.pvcSelector) ? 1 : 0) + (has(self.nfs) ? 1 : 0) + (has(self.stream) ? 1 : 0) == 1'
+                    rule: "(has(self.pvc) ? 1 : 0) + (has(self.pvcSelector) ? 1 : 0) + (has(self.nfs) ? 1 : 0) + (has(self.stream) ? 1 : 0) == 1"
                 maxItems: 100
                 type: array
               staging:
@@ -1286,12 +1360,12 @@ spec:
                     nullable: true
                     type: integer
                   maxParallelFileReads:
-                    description: '`--max-parallel-file-reads`: file-read concurrency within a snapshot.'
+                    description: "`--max-parallel-file-reads`: file-read concurrency within a snapshot."
                     format: int64
                     nullable: true
                     type: integer
                   maxParallelSnapshots:
-                    description: '`--max-parallel-snapshots`: how many sources snapshot concurrently.'
+                    description: "`--max-parallel-snapshots`: how many sources snapshot concurrently."
                     format: int64
                     nullable: true
                     type: integer
@@ -1349,13 +1423,13 @@ spec:
                     nullable: true
                     properties:
                       fileParallelism:
-                        description: '`--file-parallelism`: parallelism for file verification (kopia default: unset).'
+                        description: "`--file-parallelism`: parallelism for file verification (kopia default: unset)."
                         format: uint32
                         minimum: 0.0
                         nullable: true
                         type: integer
                       fileQueueLength:
-                        description: '`--file-queue-length`: queue length for file verification (kopia default: 20000).'
+                        description: "`--file-queue-length`: queue length for file verification (kopia default: 20000)."
                         format: uint32
                         minimum: 0.0
                         nullable: true
@@ -1369,7 +1443,7 @@ spec:
                         nullable: true
                         type: integer
                       parallel:
-                        description: '`--parallel`: verification parallelism (kopia default: 8).'
+                        description: "`--parallel`: verification parallelism (kopia default: 8)."
                         format: uint32
                         minimum: 0.0
                         nullable: true
@@ -1417,7 +1491,7 @@ spec:
             type: object
             x-kubernetes-validations:
             - message: exactly one of repository, repositories
-              rule: '(has(self.repository) ? 1 : 0) + (has(self.repositories) ? 1 : 0) == 1'
+              rule: "(has(self.repository) ? 1 : 0) + (has(self.repositories) ? 1 : 0) == 1"
           status:
             description: Observed state of a `SnapshotPolicy`.
             nullable: true
@@ -1536,12 +1610,12 @@ spec:
               lastVerified:
                 description: |-
                   RFC3339 timestamp of the most recent successful verification (any tier).
-
+                  
                   Verification runs once per (repository x source) cell: a
                   `spec.repositories` fan-out adds the repository dimension, and a
                   `pvcSelector` source adds one cell per matched PVC (each has its own
                   kopia source path, so each needs its own verification).
-
+                  
                   * one repository AND a non-selector source (`pvc`/`nfs`): stamped
                     directly by the verify mover, exactly as before;
                   * otherwise — a `spec.repositories` fan-out, or ANY `pvcSelector` source
@@ -1553,7 +1627,7 @@ spec:
                 nullable: true
                 type: string
               observedGeneration:
-                description: '`metadata.generation` last reconciled, for staleness detection.'
+                description: "`metadata.generation` last reconciled, for staleness detection."
                 format: int64
                 nullable: true
                 type: integer
@@ -1659,7 +1733,7 @@ spec:
                       description: One resolved source — a concrete PVC and the path kopia records for it.
                       properties:
                         pvc:
-                          description: '`namespace/name` of the PVC, as kopia sees it.'
+                          description: "`namespace/name` of the PVC, as kopia sees it."
                           nullable: true
                           type: string
                         sourcePath:
@@ -1705,7 +1779,7 @@ spec:
                       description: |-
                         RFC3339 timestamp of the most recent successful verification (any tier)
                         against THIS repository; absent until its first successful verify.
-
+                        
                         When the policy's source is a `pvcSelector`, this is the MINIMUM across
                         that repository's matched PVCs, and absent until every one of them has
                         verified — a repository whose volumes are only partly verified must not
@@ -1745,18 +1819,18 @@ spec:
                 description: |-
                   Internal write channel for per-cell verification: RFC3339 markers keyed
                   by the (repository x source) cell a verify run covered.
-
+                  
                   Key shapes, where the repository segment is the normalized repository
                   key ([`repo_key`](crate::common::repo_key)) and the member segment is a
                   stable 12-hex tag over the matched PVC's derived kopia source path:
-
+                  
                   * `<repository>` — a `spec.repositories` fan-out with a single source;
                   * `<repository>#<member>` — a fan-out over both dimensions;
                   * `#<member>` — one repository, a `pvcSelector` source (the repository
                     segment is empty).
-
+                  
                   `#` is the separator because a repository key cannot contain one.
-
+                  
                   Each verify mover merge-patches ONLY its own key — a JSON merge patch
                   merges map keys, so concurrent cells can never clobber one another (a
                   Vec would be replaced wholesale). The controller folds these into

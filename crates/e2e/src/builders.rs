@@ -2,8 +2,8 @@
 //!
 //! Each function returns a typed `k8s-openapi` object built the cluster's way
 //! (`serde_json::json!` → `serde_json::from_value`, matching the existing
-//! `apply_secret`/`ensure_namespace` style and sidestepping serde_yaml's
-//! externally-tagged-enum quirk). They are deliberately *pure* — no cluster, no
+//! `apply_secret`/`ensure_namespace` style and never YAML straight into
+//! a typed value). They are deliberately *pure* — no cluster, no
 //! IO — so they unit-test hermetically (mirrors `crates/controller/src/jobs.rs`).
 //! The imperative side (apply, wait, the one-shot bucket Pod) lives in
 //! [`crate::apply`] / [`crate::wait`] / [`crate::world`].

@@ -53,9 +53,9 @@ fn clusterrole_parses_and_grants_expected_rules() {
     let clusterrole = docs(&a.content)
         .into_iter()
         .find_map(|d| {
-            let v: serde_yaml::Value = serde_yaml::from_str(&d).ok()?;
+            let v: serde_json::Value = serde_saphyr::from_str(&d).ok()?;
             if v.get("kind").and_then(|k| k.as_str()) == Some("ClusterRole") {
-                serde_yaml::from_str::<ClusterRole>(&d).ok()
+                serde_saphyr::from_str::<ClusterRole>(&d).ok()
             } else {
                 None
             }
@@ -101,9 +101,9 @@ fn namespaced_role_omits_cluster_crds_but_keeps_mover_minting() {
     let role = docs(&a.content)
         .into_iter()
         .find_map(|d| {
-            let v: serde_yaml::Value = serde_yaml::from_str(&d).ok()?;
+            let v: serde_json::Value = serde_saphyr::from_str(&d).ok()?;
             if v.get("kind").and_then(|k| k.as_str()) == Some("Role") {
-                serde_yaml::from_str::<Role>(&d).ok()
+                serde_saphyr::from_str::<Role>(&d).ok()
             } else {
                 None
             }
@@ -160,12 +160,12 @@ fn operator_role_can_server_side_apply_the_minted_mover_rbac() {
         let rules = docs(&a.content)
             .into_iter()
             .find_map(|d| {
-                let v: serde_yaml::Value = serde_yaml::from_str(&d).ok()?;
+                let v: serde_json::Value = serde_saphyr::from_str(&d).ok()?;
                 (v.get("kind").and_then(|k| k.as_str()) == Some(kind)).then_some(())?;
                 if kind == "ClusterRole" {
-                    serde_yaml::from_str::<ClusterRole>(&d).ok()?.rules
+                    serde_saphyr::from_str::<ClusterRole>(&d).ok()?.rules
                 } else {
-                    serde_yaml::from_str::<Role>(&d).ok()?.rules
+                    serde_saphyr::from_str::<Role>(&d).ok()?.rules
                 }
             })
             .unwrap_or_else(|| panic!("{rel}: {kind} rules must parse"));
@@ -198,15 +198,15 @@ fn named_role_rules(content: &str, name: &str) -> Vec<PolicyRule> {
     docs(content)
         .into_iter()
         .find_map(|d| {
-            let v: serde_yaml::Value = serde_yaml::from_str(&d).ok()?;
+            let v: serde_json::Value = serde_saphyr::from_str(&d).ok()?;
             let doc_name = v
                 .get("metadata")
                 .and_then(|m| m.get("name"))
                 .and_then(|n| n.as_str());
             (doc_name == Some(name)).then_some(())?;
             match v.get("kind").and_then(|k| k.as_str()) {
-                Some("ClusterRole") => serde_yaml::from_str::<ClusterRole>(&d).ok()?.rules,
-                Some("Role") => serde_yaml::from_str::<Role>(&d).ok()?.rules,
+                Some("ClusterRole") => serde_saphyr::from_str::<ClusterRole>(&d).ok()?.rules,
+                Some("Role") => serde_saphyr::from_str::<Role>(&d).ok()?.rules,
                 _ => None,
             }
         })

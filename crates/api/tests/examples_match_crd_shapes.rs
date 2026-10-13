@@ -8,13 +8,12 @@
 //! Each document is routed by `apiVersion`/`kind`; `kopiur.home-operations.com/v1alpha1` docs have
 //! their `.spec` deserialized into the corresponding `*Spec` type via the same
 //! YAML -> serde_json::Value -> typed path the cluster uses (see
-//! `crates/api/src/lib.rs::testutil` for why serde_yaml-direct is wrong here).
+//! `crates/api/src/lib.rs::testutil` for why YAML-direct is wrong here).
 
 use kopiur_api::{
     ClusterRepositorySpec, MaintenanceSpec, RepositoryReplicationSpec, RepositorySpec, RestoreSpec,
     SnapshotPolicySpec, SnapshotReplicationSpec, SnapshotScheduleSpec, SnapshotSpec,
 };
-use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use std::path::{Path, PathBuf};
 
@@ -83,12 +82,11 @@ fn all_examples_match_crd_field_shapes() {
     for path in &files {
         let file = path.file_name().unwrap().to_string_lossy().to_string();
         let content = std::fs::read_to_string(path).expect("read example");
-        // serde_yaml splits multi-doc streams on `---`.
-        for de in serde_yaml::Deserializer::from_str(&content) {
-            let value = serde_yaml::Value::deserialize(de).expect("yaml doc");
-            // Convert the per-doc yaml Value into a serde_json::Value (cluster path).
-            let json: serde_json::Value =
-                serde_json::to_value(&value).expect("yaml value -> json value");
+        // Split the multi-doc stream on `---`, each doc straight into a
+        // serde_json::Value (the cluster path).
+        let docs: Vec<serde_json::Value> =
+            serde_saphyr::from_multiple(&content).expect("yaml docs");
+        for json in docs {
             if json.is_null() {
                 continue;
             }
@@ -140,7 +138,7 @@ fn new_optional_example_keys_survive_the_round_trip() {
     let rt = |file: &str, kind: &str| -> serde_json::Value {
         let text = std::fs::read_to_string(dir.join(file)).unwrap();
         for doc in text.split("\n---") {
-            let Ok(v) = serde_yaml::from_str::<serde_json::Value>(doc) else {
+            let Ok(v) = serde_saphyr::from_str::<serde_json::Value>(doc) else {
                 continue;
             };
             if v.get("kind").and_then(|k| k.as_str()) != Some(kind) {
@@ -192,12 +190,10 @@ fn new_optional_example_keys_survive_the_round_trip() {
 /// documents (one per cluster / per variant), so a "first document of this kind"
 /// lookup cannot reach them all.
 fn round_tripped_repositories(file: &str) -> Vec<serde_json::Value> {
-    use serde::Deserialize;
     let text = std::fs::read_to_string(examples_dir().join(file)).expect("read example");
     let mut out = Vec::new();
-    for de in serde_yaml::Deserializer::from_str(&text) {
-        let value = serde_yaml::Value::deserialize(de).expect("yaml doc");
-        let v: serde_json::Value = serde_json::to_value(&value).expect("yaml -> json");
+    let docs: Vec<serde_json::Value> = serde_saphyr::from_multiple(&text).expect("yaml docs");
+    for v in docs {
         if v.get("kind").and_then(|k| k.as_str()) != Some("Repository") {
             continue;
         }

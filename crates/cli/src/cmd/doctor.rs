@@ -79,7 +79,7 @@ pub async fn run(
                 what: "doctor report",
                 source: e.into(),
             })?;
-            serde_yaml::to_string(&value).map_err(|e| OpsError::Serialization {
+            crate::output::to_yaml(&value).map_err(|e| OpsError::Serialization {
                 what: "doctor report",
                 source: e.into(),
             })?

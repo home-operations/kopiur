@@ -163,7 +163,7 @@ spec:
                         description: Mount path inside the mover pod where kopia writes the repository (e.g. `/repo`).
                         type: string
                       volume:
-                        description: 'What backs `path`: a PVC or an inline NFS export; absent for a path already on the node/image.'
+                        description: "What backs `path`: a PVC or an inline NFS export; absent for a path already on the node/image."
                         nullable: true
                         oneOf:
                         - required:
@@ -548,7 +548,7 @@ spec:
                     type: object
                 type: object
               catalog:
-                description: 'Bounds materialization of `origin: discovered` `Snapshot` CRs from the kopia catalog.'
+                description: "Bounds materialization of `origin: discovered` `Snapshot` CRs from the kopia catalog."
                 nullable: true
                 properties:
                   adoption:
@@ -626,17 +626,17 @@ spec:
                       Ceiling on how many snapshot-delete batch Jobs may run against this
                       repository at once. **Absent means 1**: one batch at a time, and the next
                       batch starts when the current one finishes.
-
+                      
                       A batch Job deletes hundreds of snapshots in a single kopia call. kopia
                       serializes manifest deletes on the repository's index anyway, so running
                       several batches in parallel adds no throughput. Each extra Job only loads
                       the full index again against the same backend (issue #477). Raise it only
                       for a fast local backend with a very large deletion backlog.
-
+                      
                       Must be at least 1. There is no "unlimited" value. Omit the field for the
                       default. The controller-wide `maxConcurrentDeleteJobs` Helm value still
                       caps delete Jobs across ALL repositories on top of this.
-
+                      
                       No schema `default:` is emitted (api-conventions §4a); the controller
                       resolves absent to 1, so stored repositories carry no diff noise.
                     format: uint32
@@ -650,19 +650,19 @@ spec:
                       repository all draw from ONE pool — a repository's backend (and the
                       bandwidth to it) is the shared resource, so splitting the budget per work
                       kind would let three "safe" limits still saturate it.
-
+                      
                       Restores are **always admitted** and never parked: a restore is a recovery
                       in progress, and holding one behind a queue of routine backups is exactly
                       backwards. An in-flight restore still COUNTS toward the pool, so it
                       displaces backups rather than adding to them.
-
+                      
                       Excluded from the pool entirely: maintenance (already single-flight per
                       repository), verification, pin, and snapshot-delete batch Jobs. These are
                       operator-driven housekeeping that must not be starved by a saturated
                       backup pool. Delete batches have their own cap, `maxConcurrentDeleteJobs`.
-
+                      
                       Absent or `0` means unlimited — the default, and today's behavior.
-
+                      
                       No schema `default:` is emitted for this field (api-conventions §4a):
                       absent and `0` are the SAME state (unlimited), so a materialized default
                       would stamp `{maxConcurrentJobs: 0}` onto every stored repository — GitOps
@@ -925,11 +925,11 @@ spec:
                       inheritSecurityContextFrom:
                         description: |-
                           Copy the UID/GID security context from a live workload rather than hard-coding it.
-
+                          
                           Requires the workload to pin `runAsUser` (container or pod level): a UID that comes
                           from the container image's `USER` line is invisible in the pod spec and cannot be
                           inherited — the mover would silently run as its own image's UID instead.
-
+                          
                           May be combined with `securityContext`/`podSecurityContext`, which override it
                           field-wise and act as the fallback when no workload pod can be resolved.
                         nullable: true
@@ -942,7 +942,7 @@ spec:
                           - snapshot
                         properties:
                           pvcConsumer:
-                            description: 'Backup sources only: auto-derive the workload from the PVC this snapshot backs up.'
+                            description: "Backup sources only: auto-derive the workload from the PVC this snapshot backs up."
                             properties:
                               container:
                                 description: Which container within the matched consumer pod to inherit from; absent uses the first/only.
@@ -1026,14 +1026,14 @@ spec:
                           fsGroup:
                             description: |-
                               A special supplemental group that applies to all containers in a pod. Some volume types allow the Kubelet to change the ownership of that volume to be owned by the pod:
-
+                              
                               1. The owning GID will be the FSGroup 2. The setgid bit is set (new files created in the volume will be owned by FSGroup) 3. The permission bits are OR'd with rw-rw----
-
+                              
                               If unset, the Kubelet will not modify the ownership and permissions of any volume. Note that this field cannot be set when spec.os.name is windows.
                             format: int64
                             type: integer
                           fsGroupChangePolicy:
-                            description: 'fsGroupChangePolicy defines behavior of changing ownership and permission of the volume before being exposed inside Pod. This field will only apply to volume types which support fsGroup based ownership(and permissions). It will have no effect on ephemeral volume types such as: secret, configmaps and emptydir. Valid values are "OnRootMismatch" and "Always". If not specified, "Always" is used. Note that this field cannot be set when spec.os.name is windows.'
+                            description: "fsGroupChangePolicy defines behavior of changing ownership and permission of the volume before being exposed inside Pod. This field will only apply to volume types which support fsGroup based ownership(and permissions). It will have no effect on ephemeral volume types such as: secret, configmaps and emptydir. Valid values are \"OnRootMismatch\" and \"Always\". If not specified, \"Always\" is used. Note that this field cannot be set when spec.os.name is windows."
                             type: string
                           runAsGroup:
                             description: The GID to run the entrypoint of the container process. Uses runtime default if unset. May also be set in SecurityContext.  If set in both SecurityContext and PodSecurityContext, the value specified in SecurityContext takes precedence for that container. Note that this field cannot be set when spec.os.name is windows.
@@ -1049,15 +1049,15 @@ spec:
                           seLinuxChangePolicy:
                             description: |-
                               seLinuxChangePolicy defines how the container's SELinux label is applied to all volumes used by the Pod. It has no effect on nodes that do not support SELinux or to volumes does not support SELinux. Valid values are "MountOption" and "Recursive".
-
+                              
                               "Recursive" means relabeling of all files on all Pod volumes by the container runtime. This may be slow for large volumes, but allows mixing privileged and unprivileged Pods sharing the same volume on the same node.
-
+                              
                               "MountOption" mounts all eligible Pod volumes with `-o context` mount option. This requires all Pods that share the same volume to use the same SELinux label. It is not possible to share the same volume among privileged and unprivileged Pods. Eligible volumes are in-tree FibreChannel and iSCSI volumes, and all CSI volumes whose CSI driver announces SELinux support by setting spec.seLinuxMount: true in their CSIDriver instance. Other volumes are always re-labelled recursively. "MountOption" value is allowed only when SELinuxMount feature gate is enabled.
-
+                              
                               If not specified and SELinuxMount feature gate is enabled, "MountOption" is used. If not specified and SELinuxMount feature gate is disabled, "MountOption" is used for ReadWriteOncePod volumes and "Recursive" for all other volumes.
-
+                              
                               This field affects only Pods that have SELinux label set, either in PodSecurityContext or in SecurityContext of all containers.
-
+                              
                               All Pods that use the same volume should use the same seLinuxChangePolicy, otherwise some pods can get stuck in ContainerCreating state. Note that this field cannot be set when spec.os.name is windows.
                             type: string
                           seLinuxOptions:
@@ -1085,7 +1085,7 @@ spec:
                               type:
                                 description: |-
                                   type indicates which kind of seccomp profile will be applied. Valid options are:
-
+                                  
                                   Localhost - a profile defined in a file on the node should be used. RuntimeDefault - the container runtime default profile should be used. Unconfined - no profile should be applied.
                                 type: string
                             required:
@@ -1144,9 +1144,9 @@ spec:
                           claims:
                             description: |-
                               Claims lists the names of resources, defined in spec.resourceClaims, that are used by this container.
-
+                              
                               This is an alpha field and requires enabling the DynamicResourceAllocation feature gate.
-
+                              
                               This field is immutable. It can only be set for containers.
                             items:
                               description: ResourceClaim references one entry in PodSpec.ResourceClaims.
@@ -1163,15 +1163,89 @@ spec:
                             type: array
                           limits:
                             additionalProperties:
-                              description: "Quantity is a fixed-point representation of a number. It provides convenient marshaling/unmarshaling in JSON and YAML, in addition to String() and AsInt64() accessors.\n\nThe serialization format is:\n\n``` <quantity>        ::= <signedNumber><suffix>\n\n\t(Note that <suffix> may be empty, from the \"\" case in <decimalSI>.)\n\n<digit>           ::= 0 | 1 | ... | 9 <digits>          ::= <digit> | <digit><digits> <number>          ::= <digits> | <digits>.<digits> | <digits>. | .<digits> <sign>            ::= \"+\" | \"-\" <signedNumber>    ::= <number> | <sign><number> <suffix>          ::= <binarySI> | <decimalExponent> | <decimalSI> <binarySI>        ::= Ki | Mi | Gi | Ti | Pi | Ei\n\n\t(International System of units; See: http://physics.nist.gov/cuu/Units/binary.html)\n\n<decimalSI>       ::= m | \"\" | k | M | G | T | P | E\n\n\t(Note that 1024 = 1Ki but 1000 = 1k; I didn't choose the capitalization.)\n\n<decimalExponent> ::= \"e\" <signedNumber> | \"E\" <signedNumber> ```\n\nNo matter which of the three exponent forms is used, no quantity may represent a number greater than 2^63-1 in magnitude, nor may it have more than 3 decimal places. Numbers larger or more precise will be capped or rounded up. (E.g.: 0.1m will rounded up to 1m.) This may be extended in the future if we require larger or smaller quantities.\n\nWhen a Quantity is parsed from a string, it will remember the type of suffix it had, and will use the same type again when it is serialized.\n\nBefore serializing, Quantity will be put in \"canonical form\". This means that Exponent/suffix will be adjusted up or down (with a corresponding increase or decrease in Mantissa) such that:\n\n- No precision is lost - No fractional digits will be emitted - The exponent (or suffix) is as large as possible.\n\nThe sign will be omitted unless the number is negative.\n\nExamples:\n\n- 1.5 will be serialized as \"1500m\" - 1.5Gi will be serialized as \"1536Mi\"\n\nNote that the quantity will NEVER be internally represented by a floating point number. That is the whole point of this exercise.\n\nNon-canonical values will still parse as long as they are well formed, but will be re-emitted in their canonical form. (So always use canonical form, or don't diff.)\n\nThis format is intended to make it difficult to use these numbers without writing some sort of special handling code in the hopes that that will cause implementors to also use a fixed point implementation."
+                              description: |-
+                                Quantity is a fixed-point representation of a number. It provides convenient marshaling/unmarshaling in JSON and YAML, in addition to String() and AsInt64() accessors.
+                                
+                                The serialization format is:
+                                
+                                ``` <quantity>        ::= <signedNumber><suffix>
+                                
+                                	(Note that <suffix> may be empty, from the "" case in <decimalSI>.)
+                                
+                                <digit>           ::= 0 | 1 | ... | 9 <digits>          ::= <digit> | <digit><digits> <number>          ::= <digits> | <digits>.<digits> | <digits>. | .<digits> <sign>            ::= "+" | "-" <signedNumber>    ::= <number> | <sign><number> <suffix>          ::= <binarySI> | <decimalExponent> | <decimalSI> <binarySI>        ::= Ki | Mi | Gi | Ti | Pi | Ei
+                                
+                                	(International System of units; See: http://physics.nist.gov/cuu/Units/binary.html)
+                                
+                                <decimalSI>       ::= m | "" | k | M | G | T | P | E
+                                
+                                	(Note that 1024 = 1Ki but 1000 = 1k; I didn't choose the capitalization.)
+                                
+                                <decimalExponent> ::= "e" <signedNumber> | "E" <signedNumber> ```
+                                
+                                No matter which of the three exponent forms is used, no quantity may represent a number greater than 2^63-1 in magnitude, nor may it have more than 3 decimal places. Numbers larger or more precise will be capped or rounded up. (E.g.: 0.1m will rounded up to 1m.) This may be extended in the future if we require larger or smaller quantities.
+                                
+                                When a Quantity is parsed from a string, it will remember the type of suffix it had, and will use the same type again when it is serialized.
+                                
+                                Before serializing, Quantity will be put in "canonical form". This means that Exponent/suffix will be adjusted up or down (with a corresponding increase or decrease in Mantissa) such that:
+                                
+                                - No precision is lost - No fractional digits will be emitted - The exponent (or suffix) is as large as possible.
+                                
+                                The sign will be omitted unless the number is negative.
+                                
+                                Examples:
+                                
+                                - 1.5 will be serialized as "1500m" - 1.5Gi will be serialized as "1536Mi"
+                                
+                                Note that the quantity will NEVER be internally represented by a floating point number. That is the whole point of this exercise.
+                                
+                                Non-canonical values will still parse as long as they are well formed, but will be re-emitted in their canonical form. (So always use canonical form, or don't diff.)
+                                
+                                This format is intended to make it difficult to use these numbers without writing some sort of special handling code in the hopes that that will cause implementors to also use a fixed point implementation.
                               x-kubernetes-int-or-string: true
-                            description: 'Limits describes the maximum amount of compute resources allowed. More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/'
+                            description: "Limits describes the maximum amount of compute resources allowed. More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/"
                             type: object
                           requests:
                             additionalProperties:
-                              description: "Quantity is a fixed-point representation of a number. It provides convenient marshaling/unmarshaling in JSON and YAML, in addition to String() and AsInt64() accessors.\n\nThe serialization format is:\n\n``` <quantity>        ::= <signedNumber><suffix>\n\n\t(Note that <suffix> may be empty, from the \"\" case in <decimalSI>.)\n\n<digit>           ::= 0 | 1 | ... | 9 <digits>          ::= <digit> | <digit><digits> <number>          ::= <digits> | <digits>.<digits> | <digits>. | .<digits> <sign>            ::= \"+\" | \"-\" <signedNumber>    ::= <number> | <sign><number> <suffix>          ::= <binarySI> | <decimalExponent> | <decimalSI> <binarySI>        ::= Ki | Mi | Gi | Ti | Pi | Ei\n\n\t(International System of units; See: http://physics.nist.gov/cuu/Units/binary.html)\n\n<decimalSI>       ::= m | \"\" | k | M | G | T | P | E\n\n\t(Note that 1024 = 1Ki but 1000 = 1k; I didn't choose the capitalization.)\n\n<decimalExponent> ::= \"e\" <signedNumber> | \"E\" <signedNumber> ```\n\nNo matter which of the three exponent forms is used, no quantity may represent a number greater than 2^63-1 in magnitude, nor may it have more than 3 decimal places. Numbers larger or more precise will be capped or rounded up. (E.g.: 0.1m will rounded up to 1m.) This may be extended in the future if we require larger or smaller quantities.\n\nWhen a Quantity is parsed from a string, it will remember the type of suffix it had, and will use the same type again when it is serialized.\n\nBefore serializing, Quantity will be put in \"canonical form\". This means that Exponent/suffix will be adjusted up or down (with a corresponding increase or decrease in Mantissa) such that:\n\n- No precision is lost - No fractional digits will be emitted - The exponent (or suffix) is as large as possible.\n\nThe sign will be omitted unless the number is negative.\n\nExamples:\n\n- 1.5 will be serialized as \"1500m\" - 1.5Gi will be serialized as \"1536Mi\"\n\nNote that the quantity will NEVER be internally represented by a floating point number. That is the whole point of this exercise.\n\nNon-canonical values will still parse as long as they are well formed, but will be re-emitted in their canonical form. (So always use canonical form, or don't diff.)\n\nThis format is intended to make it difficult to use these numbers without writing some sort of special handling code in the hopes that that will cause implementors to also use a fixed point implementation."
+                              description: |-
+                                Quantity is a fixed-point representation of a number. It provides convenient marshaling/unmarshaling in JSON and YAML, in addition to String() and AsInt64() accessors.
+                                
+                                The serialization format is:
+                                
+                                ``` <quantity>        ::= <signedNumber><suffix>
+                                
+                                	(Note that <suffix> may be empty, from the "" case in <decimalSI>.)
+                                
+                                <digit>           ::= 0 | 1 | ... | 9 <digits>          ::= <digit> | <digit><digits> <number>          ::= <digits> | <digits>.<digits> | <digits>. | .<digits> <sign>            ::= "+" | "-" <signedNumber>    ::= <number> | <sign><number> <suffix>          ::= <binarySI> | <decimalExponent> | <decimalSI> <binarySI>        ::= Ki | Mi | Gi | Ti | Pi | Ei
+                                
+                                	(International System of units; See: http://physics.nist.gov/cuu/Units/binary.html)
+                                
+                                <decimalSI>       ::= m | "" | k | M | G | T | P | E
+                                
+                                	(Note that 1024 = 1Ki but 1000 = 1k; I didn't choose the capitalization.)
+                                
+                                <decimalExponent> ::= "e" <signedNumber> | "E" <signedNumber> ```
+                                
+                                No matter which of the three exponent forms is used, no quantity may represent a number greater than 2^63-1 in magnitude, nor may it have more than 3 decimal places. Numbers larger or more precise will be capped or rounded up. (E.g.: 0.1m will rounded up to 1m.) This may be extended in the future if we require larger or smaller quantities.
+                                
+                                When a Quantity is parsed from a string, it will remember the type of suffix it had, and will use the same type again when it is serialized.
+                                
+                                Before serializing, Quantity will be put in "canonical form". This means that Exponent/suffix will be adjusted up or down (with a corresponding increase or decrease in Mantissa) such that:
+                                
+                                - No precision is lost - No fractional digits will be emitted - The exponent (or suffix) is as large as possible.
+                                
+                                The sign will be omitted unless the number is negative.
+                                
+                                Examples:
+                                
+                                - 1.5 will be serialized as "1500m" - 1.5Gi will be serialized as "1536Mi"
+                                
+                                Note that the quantity will NEVER be internally represented by a floating point number. That is the whole point of this exercise.
+                                
+                                Non-canonical values will still parse as long as they are well formed, but will be re-emitted in their canonical form. (So always use canonical form, or don't diff.)
+                                
+                                This format is intended to make it difficult to use these numbers without writing some sort of special handling code in the hopes that that will cause implementors to also use a fixed point implementation.
                               x-kubernetes-int-or-string: true
-                            description: 'Requests describes the minimum amount of compute resources required. If Requests is omitted for a container, it defaults to Limits if that is explicitly specified, otherwise to an implementation-defined value. Requests cannot exceed Limits. More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/'
+                            description: "Requests describes the minimum amount of compute resources required. If Requests is omitted for a container, it defaults to Limits if that is explicitly specified, otherwise to an implementation-defined value. Requests cannot exceed Limits. More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/"
                             type: object
                         type: object
                       securityContext:
@@ -1184,7 +1258,7 @@ spec:
                         nullable: true
                         properties:
                           allowPrivilegeEscalation:
-                            description: 'AllowPrivilegeEscalation controls whether a process can gain more privileges than its parent process. This bool directly controls if the no_new_privs flag will be set on the container process. AllowPrivilegeEscalation is true always when the container is: 1) run as Privileged 2) has CAP_SYS_ADMIN Note that this field cannot be set when spec.os.name is windows.'
+                            description: "AllowPrivilegeEscalation controls whether a process can gain more privileges than its parent process. This bool directly controls if the no_new_privs flag will be set on the container process. AllowPrivilegeEscalation is true always when the container is: 1) run as Privileged 2) has CAP_SYS_ADMIN Note that this field cannot be set when spec.os.name is windows."
                             type: boolean
                           appArmorProfile:
                             description: appArmorProfile is the AppArmor options to use by this container. If set, this profile overrides the pod's appArmorProfile. Note that this field cannot be set when spec.os.name is windows.
@@ -1261,7 +1335,7 @@ spec:
                               type:
                                 description: |-
                                   type indicates which kind of seccomp profile will be applied. Valid options are:
-
+                                  
                                   Localhost - a profile defined in a file on the node should be used. RuntimeDefault - the container runtime default profile should be used. Unconfined - no profile should be applied.
                                 type: string
                             required:
@@ -1291,7 +1365,7 @@ spec:
                         type: integer
                     type: object
                   namespace:
-                    description: 'ClusterRepository only: namespace the managed `Maintenance` CR is created in (default the operator''s namespace).'
+                    description: "ClusterRepository only: namespace the managed `Maintenance` CR is created in (default the operator's namespace)."
                     nullable: true
                     type: string
                   schedule:
@@ -1357,7 +1431,7 @@ spec:
                 type: object
               mode:
                 default: ReadWrite
-                description: 'Access mode: `ReadWrite` (default) or `ReadOnly` (serves restores only).'
+                description: "Access mode: `ReadWrite` (default) or `ReadOnly` (serves restores only)."
                 enum:
                 - ReadWrite
                 - ReadOnly
@@ -1915,7 +1989,7 @@ spec:
                       `vault.hashicorp.com/agent-inject: "false"`) that only means anything on
                       the pod a mesh webhook actually sees. A mover is a short-lived batch pod;
                       an injected sidecar that never exits keeps its Job running forever.
-
+                      
                       Same reserved keys as `podLabels`, rejected at admission.
                     nullable: true
                     type: object
@@ -1927,12 +2001,12 @@ spec:
                       UNDER kopiur's own labels — a key kopiur sets always wins, so a
                       user-supplied value can never break the selectors the controller counts
                       and reaps by.
-
+                      
                       This is the hook for cluster machinery that keys off pod labels and that
                       kopiur has no field of its own for: a Kueue `kueue.x-k8s.io/queue-name` to
                       put movers under a cluster queue, a monitoring/`NetworkPolicy` selector, a
                       service-mesh exclusion label.
-
+                      
                       Keys under `kopiur.home-operations.com/` and the exact key
                       `app.kubernetes.io/managed-by` are reserved and rejected at admission.
                     nullable: true
@@ -1960,14 +2034,14 @@ spec:
                       fsGroup:
                         description: |-
                           A special supplemental group that applies to all containers in a pod. Some volume types allow the Kubelet to change the ownership of that volume to be owned by the pod:
-
+                          
                           1. The owning GID will be the FSGroup 2. The setgid bit is set (new files created in the volume will be owned by FSGroup) 3. The permission bits are OR'd with rw-rw----
-
+                          
                           If unset, the Kubelet will not modify the ownership and permissions of any volume. Note that this field cannot be set when spec.os.name is windows.
                         format: int64
                         type: integer
                       fsGroupChangePolicy:
-                        description: 'fsGroupChangePolicy defines behavior of changing ownership and permission of the volume before being exposed inside Pod. This field will only apply to volume types which support fsGroup based ownership(and permissions). It will have no effect on ephemeral volume types such as: secret, configmaps and emptydir. Valid values are "OnRootMismatch" and "Always". If not specified, "Always" is used. Note that this field cannot be set when spec.os.name is windows.'
+                        description: "fsGroupChangePolicy defines behavior of changing ownership and permission of the volume before being exposed inside Pod. This field will only apply to volume types which support fsGroup based ownership(and permissions). It will have no effect on ephemeral volume types such as: secret, configmaps and emptydir. Valid values are \"OnRootMismatch\" and \"Always\". If not specified, \"Always\" is used. Note that this field cannot be set when spec.os.name is windows."
                         type: string
                       runAsGroup:
                         description: The GID to run the entrypoint of the container process. Uses runtime default if unset. May also be set in SecurityContext.  If set in both SecurityContext and PodSecurityContext, the value specified in SecurityContext takes precedence for that container. Note that this field cannot be set when spec.os.name is windows.
@@ -1983,15 +2057,15 @@ spec:
                       seLinuxChangePolicy:
                         description: |-
                           seLinuxChangePolicy defines how the container's SELinux label is applied to all volumes used by the Pod. It has no effect on nodes that do not support SELinux or to volumes does not support SELinux. Valid values are "MountOption" and "Recursive".
-
+                          
                           "Recursive" means relabeling of all files on all Pod volumes by the container runtime. This may be slow for large volumes, but allows mixing privileged and unprivileged Pods sharing the same volume on the same node.
-
+                          
                           "MountOption" mounts all eligible Pod volumes with `-o context` mount option. This requires all Pods that share the same volume to use the same SELinux label. It is not possible to share the same volume among privileged and unprivileged Pods. Eligible volumes are in-tree FibreChannel and iSCSI volumes, and all CSI volumes whose CSI driver announces SELinux support by setting spec.seLinuxMount: true in their CSIDriver instance. Other volumes are always re-labelled recursively. "MountOption" value is allowed only when SELinuxMount feature gate is enabled.
-
+                          
                           If not specified and SELinuxMount feature gate is enabled, "MountOption" is used. If not specified and SELinuxMount feature gate is disabled, "MountOption" is used for ReadWriteOncePod volumes and "Recursive" for all other volumes.
-
+                          
                           This field affects only Pods that have SELinux label set, either in PodSecurityContext or in SecurityContext of all containers.
-
+                          
                           All Pods that use the same volume should use the same seLinuxChangePolicy, otherwise some pods can get stuck in ContainerCreating state. Note that this field cannot be set when spec.os.name is windows.
                         type: string
                       seLinuxOptions:
@@ -2019,7 +2093,7 @@ spec:
                           type:
                             description: |-
                               type indicates which kind of seccomp profile will be applied. Valid options are:
-
+                              
                               Localhost - a profile defined in a file on the node should be used. RuntimeDefault - the container runtime default profile should be used. Unconfined - no profile should be applied.
                             type: string
                         required:
@@ -2074,9 +2148,9 @@ spec:
                       claims:
                         description: |-
                           Claims lists the names of resources, defined in spec.resourceClaims, that are used by this container.
-
+                          
                           This is an alpha field and requires enabling the DynamicResourceAllocation feature gate.
-
+                          
                           This field is immutable. It can only be set for containers.
                         items:
                           description: ResourceClaim references one entry in PodSpec.ResourceClaims.
@@ -2093,15 +2167,89 @@ spec:
                         type: array
                       limits:
                         additionalProperties:
-                          description: "Quantity is a fixed-point representation of a number. It provides convenient marshaling/unmarshaling in JSON and YAML, in addition to String() and AsInt64() accessors.\n\nThe serialization format is:\n\n``` <quantity>        ::= <signedNumber><suffix>\n\n\t(Note that <suffix> may be empty, from the \"\" case in <decimalSI>.)\n\n<digit>           ::= 0 | 1 | ... | 9 <digits>          ::= <digit> | <digit><digits> <number>          ::= <digits> | <digits>.<digits> | <digits>. | .<digits> <sign>            ::= \"+\" | \"-\" <signedNumber>    ::= <number> | <sign><number> <suffix>          ::= <binarySI> | <decimalExponent> | <decimalSI> <binarySI>        ::= Ki | Mi | Gi | Ti | Pi | Ei\n\n\t(International System of units; See: http://physics.nist.gov/cuu/Units/binary.html)\n\n<decimalSI>       ::= m | \"\" | k | M | G | T | P | E\n\n\t(Note that 1024 = 1Ki but 1000 = 1k; I didn't choose the capitalization.)\n\n<decimalExponent> ::= \"e\" <signedNumber> | \"E\" <signedNumber> ```\n\nNo matter which of the three exponent forms is used, no quantity may represent a number greater than 2^63-1 in magnitude, nor may it have more than 3 decimal places. Numbers larger or more precise will be capped or rounded up. (E.g.: 0.1m will rounded up to 1m.) This may be extended in the future if we require larger or smaller quantities.\n\nWhen a Quantity is parsed from a string, it will remember the type of suffix it had, and will use the same type again when it is serialized.\n\nBefore serializing, Quantity will be put in \"canonical form\". This means that Exponent/suffix will be adjusted up or down (with a corresponding increase or decrease in Mantissa) such that:\n\n- No precision is lost - No fractional digits will be emitted - The exponent (or suffix) is as large as possible.\n\nThe sign will be omitted unless the number is negative.\n\nExamples:\n\n- 1.5 will be serialized as \"1500m\" - 1.5Gi will be serialized as \"1536Mi\"\n\nNote that the quantity will NEVER be internally represented by a floating point number. That is the whole point of this exercise.\n\nNon-canonical values will still parse as long as they are well formed, but will be re-emitted in their canonical form. (So always use canonical form, or don't diff.)\n\nThis format is intended to make it difficult to use these numbers without writing some sort of special handling code in the hopes that that will cause implementors to also use a fixed point implementation."
+                          description: |-
+                            Quantity is a fixed-point representation of a number. It provides convenient marshaling/unmarshaling in JSON and YAML, in addition to String() and AsInt64() accessors.
+                            
+                            The serialization format is:
+                            
+                            ``` <quantity>        ::= <signedNumber><suffix>
+                            
+                            	(Note that <suffix> may be empty, from the "" case in <decimalSI>.)
+                            
+                            <digit>           ::= 0 | 1 | ... | 9 <digits>          ::= <digit> | <digit><digits> <number>          ::= <digits> | <digits>.<digits> | <digits>. | .<digits> <sign>            ::= "+" | "-" <signedNumber>    ::= <number> | <sign><number> <suffix>          ::= <binarySI> | <decimalExponent> | <decimalSI> <binarySI>        ::= Ki | Mi | Gi | Ti | Pi | Ei
+                            
+                            	(International System of units; See: http://physics.nist.gov/cuu/Units/binary.html)
+                            
+                            <decimalSI>       ::= m | "" | k | M | G | T | P | E
+                            
+                            	(Note that 1024 = 1Ki but 1000 = 1k; I didn't choose the capitalization.)
+                            
+                            <decimalExponent> ::= "e" <signedNumber> | "E" <signedNumber> ```
+                            
+                            No matter which of the three exponent forms is used, no quantity may represent a number greater than 2^63-1 in magnitude, nor may it have more than 3 decimal places. Numbers larger or more precise will be capped or rounded up. (E.g.: 0.1m will rounded up to 1m.) This may be extended in the future if we require larger or smaller quantities.
+                            
+                            When a Quantity is parsed from a string, it will remember the type of suffix it had, and will use the same type again when it is serialized.
+                            
+                            Before serializing, Quantity will be put in "canonical form". This means that Exponent/suffix will be adjusted up or down (with a corresponding increase or decrease in Mantissa) such that:
+                            
+                            - No precision is lost - No fractional digits will be emitted - The exponent (or suffix) is as large as possible.
+                            
+                            The sign will be omitted unless the number is negative.
+                            
+                            Examples:
+                            
+                            - 1.5 will be serialized as "1500m" - 1.5Gi will be serialized as "1536Mi"
+                            
+                            Note that the quantity will NEVER be internally represented by a floating point number. That is the whole point of this exercise.
+                            
+                            Non-canonical values will still parse as long as they are well formed, but will be re-emitted in their canonical form. (So always use canonical form, or don't diff.)
+                            
+                            This format is intended to make it difficult to use these numbers without writing some sort of special handling code in the hopes that that will cause implementors to also use a fixed point implementation.
                           x-kubernetes-int-or-string: true
-                        description: 'Limits describes the maximum amount of compute resources allowed. More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/'
+                        description: "Limits describes the maximum amount of compute resources allowed. More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/"
                         type: object
                       requests:
                         additionalProperties:
-                          description: "Quantity is a fixed-point representation of a number. It provides convenient marshaling/unmarshaling in JSON and YAML, in addition to String() and AsInt64() accessors.\n\nThe serialization format is:\n\n``` <quantity>        ::= <signedNumber><suffix>\n\n\t(Note that <suffix> may be empty, from the \"\" case in <decimalSI>.)\n\n<digit>           ::= 0 | 1 | ... | 9 <digits>          ::= <digit> | <digit><digits> <number>          ::= <digits> | <digits>.<digits> | <digits>. | .<digits> <sign>            ::= \"+\" | \"-\" <signedNumber>    ::= <number> | <sign><number> <suffix>          ::= <binarySI> | <decimalExponent> | <decimalSI> <binarySI>        ::= Ki | Mi | Gi | Ti | Pi | Ei\n\n\t(International System of units; See: http://physics.nist.gov/cuu/Units/binary.html)\n\n<decimalSI>       ::= m | \"\" | k | M | G | T | P | E\n\n\t(Note that 1024 = 1Ki but 1000 = 1k; I didn't choose the capitalization.)\n\n<decimalExponent> ::= \"e\" <signedNumber> | \"E\" <signedNumber> ```\n\nNo matter which of the three exponent forms is used, no quantity may represent a number greater than 2^63-1 in magnitude, nor may it have more than 3 decimal places. Numbers larger or more precise will be capped or rounded up. (E.g.: 0.1m will rounded up to 1m.) This may be extended in the future if we require larger or smaller quantities.\n\nWhen a Quantity is parsed from a string, it will remember the type of suffix it had, and will use the same type again when it is serialized.\n\nBefore serializing, Quantity will be put in \"canonical form\". This means that Exponent/suffix will be adjusted up or down (with a corresponding increase or decrease in Mantissa) such that:\n\n- No precision is lost - No fractional digits will be emitted - The exponent (or suffix) is as large as possible.\n\nThe sign will be omitted unless the number is negative.\n\nExamples:\n\n- 1.5 will be serialized as \"1500m\" - 1.5Gi will be serialized as \"1536Mi\"\n\nNote that the quantity will NEVER be internally represented by a floating point number. That is the whole point of this exercise.\n\nNon-canonical values will still parse as long as they are well formed, but will be re-emitted in their canonical form. (So always use canonical form, or don't diff.)\n\nThis format is intended to make it difficult to use these numbers without writing some sort of special handling code in the hopes that that will cause implementors to also use a fixed point implementation."
+                          description: |-
+                            Quantity is a fixed-point representation of a number. It provides convenient marshaling/unmarshaling in JSON and YAML, in addition to String() and AsInt64() accessors.
+                            
+                            The serialization format is:
+                            
+                            ``` <quantity>        ::= <signedNumber><suffix>
+                            
+                            	(Note that <suffix> may be empty, from the "" case in <decimalSI>.)
+                            
+                            <digit>           ::= 0 | 1 | ... | 9 <digits>          ::= <digit> | <digit><digits> <number>          ::= <digits> | <digits>.<digits> | <digits>. | .<digits> <sign>            ::= "+" | "-" <signedNumber>    ::= <number> | <sign><number> <suffix>          ::= <binarySI> | <decimalExponent> | <decimalSI> <binarySI>        ::= Ki | Mi | Gi | Ti | Pi | Ei
+                            
+                            	(International System of units; See: http://physics.nist.gov/cuu/Units/binary.html)
+                            
+                            <decimalSI>       ::= m | "" | k | M | G | T | P | E
+                            
+                            	(Note that 1024 = 1Ki but 1000 = 1k; I didn't choose the capitalization.)
+                            
+                            <decimalExponent> ::= "e" <signedNumber> | "E" <signedNumber> ```
+                            
+                            No matter which of the three exponent forms is used, no quantity may represent a number greater than 2^63-1 in magnitude, nor may it have more than 3 decimal places. Numbers larger or more precise will be capped or rounded up. (E.g.: 0.1m will rounded up to 1m.) This may be extended in the future if we require larger or smaller quantities.
+                            
+                            When a Quantity is parsed from a string, it will remember the type of suffix it had, and will use the same type again when it is serialized.
+                            
+                            Before serializing, Quantity will be put in "canonical form". This means that Exponent/suffix will be adjusted up or down (with a corresponding increase or decrease in Mantissa) such that:
+                            
+                            - No precision is lost - No fractional digits will be emitted - The exponent (or suffix) is as large as possible.
+                            
+                            The sign will be omitted unless the number is negative.
+                            
+                            Examples:
+                            
+                            - 1.5 will be serialized as "1500m" - 1.5Gi will be serialized as "1536Mi"
+                            
+                            Note that the quantity will NEVER be internally represented by a floating point number. That is the whole point of this exercise.
+                            
+                            Non-canonical values will still parse as long as they are well formed, but will be re-emitted in their canonical form. (So always use canonical form, or don't diff.)
+                            
+                            This format is intended to make it difficult to use these numbers without writing some sort of special handling code in the hopes that that will cause implementors to also use a fixed point implementation.
                           x-kubernetes-int-or-string: true
-                        description: 'Requests describes the minimum amount of compute resources required. If Requests is omitted for a container, it defaults to Limits if that is explicitly specified, otherwise to an implementation-defined value. Requests cannot exceed Limits. More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/'
+                        description: "Requests describes the minimum amount of compute resources required. If Requests is omitted for a container, it defaults to Limits if that is explicitly specified, otherwise to an implementation-defined value. Requests cannot exceed Limits. More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/"
                         type: object
                     type: object
                   scratch:
@@ -2122,7 +2270,7 @@ spec:
                     nullable: true
                     properties:
                       allowPrivilegeEscalation:
-                        description: 'AllowPrivilegeEscalation controls whether a process can gain more privileges than its parent process. This bool directly controls if the no_new_privs flag will be set on the container process. AllowPrivilegeEscalation is true always when the container is: 1) run as Privileged 2) has CAP_SYS_ADMIN Note that this field cannot be set when spec.os.name is windows.'
+                        description: "AllowPrivilegeEscalation controls whether a process can gain more privileges than its parent process. This bool directly controls if the no_new_privs flag will be set on the container process. AllowPrivilegeEscalation is true always when the container is: 1) run as Privileged 2) has CAP_SYS_ADMIN Note that this field cannot be set when spec.os.name is windows."
                         type: boolean
                       appArmorProfile:
                         description: appArmorProfile is the AppArmor options to use by this container. If set, this profile overrides the pod's appArmorProfile. Note that this field cannot be set when spec.os.name is windows.
@@ -2199,7 +2347,7 @@ spec:
                           type:
                             description: |-
                               type indicates which kind of seccomp profile will be applied. Valid options are:
-
+                              
                               Localhost - a profile defined in a file on the node should be used. RuntimeDefault - the container runtime default profile should be used. Unconfined - no profile should be applied.
                             type: string
                         required:
@@ -2285,7 +2433,7 @@ spec:
                     nullable: true
                     type: array
                   ttlSecondsAfterFinished:
-                    description: '`Job.spec.ttlSecondsAfterFinished` for every mover Job so finished Jobs self-GC.'
+                    description: "`Job.spec.ttlSecondsAfterFinished` for every mover Job so finished Jobs self-GC."
                     format: int64
                     nullable: true
                     type: integer
@@ -2323,7 +2471,7 @@ spec:
                           period:
                             description: |-
                               Go-style duration; kopia's minimum is `24h` and there is no maximum.
-
+                              
                               Accepts `h`/`m`/`s` (or a bare number of seconds) — **not `d`**. Note that kopia's own
                               CLI *does* take `30d`, so a period copied from kopia's documentation is rejected here;
                               write 30 days as `720h`. Kopiur deliberately keeps one duration grammar across every
@@ -2335,12 +2483,12 @@ spec:
                       disabled:
                         description: |-
                           Actively disable retention (`--retention-mode=none`). Must be `true`.
-
+                          
                           A `bool` rather than a unit variant because an externally-tagged unit variant
                           serializes as the bare string `"Disabled"`, mixing string and object forms in one
                           `oneOf` and breaking the structural schema. Same shape, and same reason, as
                           [`AllowedNamespaces::All`](crate::cluster_repository::AllowedNamespaces::All).
-
+                          
                           This is distinct from omitting `blobRetention` entirely: absent means "leave the
                           repository alone", so deleting the block from a manifest can never silently strip
                           ransomware protection someone configured deliberately.
@@ -2353,7 +2501,7 @@ spec:
                           period:
                             description: |-
                               Go-style duration; kopia's minimum is `24h` and there is no maximum.
-
+                              
                               Accepts `h`/`m`/`s` (or a bare number of seconds) — **not `d`**. Note that kopia's own
                               CLI *does* take `30d`, so a period copied from kopia's documentation is rejected here;
                               write 30 days as `720h`. Kopiur deliberately keeps one duration grammar across every
@@ -2373,7 +2521,7 @@ spec:
                         description: |-
                           Index blobs in an epoch that trigger an advance, once older than `minDuration`
                           (kopia default `20`).
-
+                          
                           At least `10` — kopia refuses anything lower with "epoch advance on count too low".
                         format: int64
                         nullable: true
@@ -2382,10 +2530,10 @@ spec:
                         description: |-
                           Total index size in an epoch that triggers an advance, once older than `minDuration`
                           (kopia default `10` MiB).
-
+                          
                           At least `1` — kopia refuses anything lower with "epoch advance on size too low",
                           and 1 MiB is the smallest threshold the flag can express.
-
+                          
                           Named `MiB`, not `MB`, with an explicit rename rather than the derived camelCase
                           (`advanceOnSizeMb`, which reads as *megabit*). The unit is genuinely mebibytes —
                           kopia's `--epoch-advance-on-size-mb` multiplies by 1048576, so `10` is 10485760
@@ -2397,7 +2545,7 @@ spec:
                       checkpointFrequency:
                         description: |-
                           Epochs between full index checkpoints (kopia default `7`).
-
+                          
                           At least `1` — kopia refuses anything lower with "invalid epoch range compaction
                           period".
                         format: int64
@@ -2406,7 +2554,7 @@ spec:
                       deleteParallelism:
                         description: |-
                           Parallelism for epoch cleanup deletions (kopia default `4`).
-
+                          
                           At least `1`. This floor is kopiur's own: kopia does not validate the field, so a
                           non-positive value would ask it to run epoch cleanup with no workers.
                         format: int64
@@ -2416,7 +2564,7 @@ spec:
                         description: |-
                           Minimum epoch age before it may advance (kopia default `24h`). A Go-style duration
                           (`6h`, `90m`). The advance **gate** — no blob count closes an epoch younger than this.
-
+                          
                           Must be at least `10m` (kopia's absolute floor) AND at least 3x `refreshFrequency`.
                           When `refreshFrequency` is not declared, that second bound is measured against
                           kopia's untouched `20m` default, so `10m` on its own is rejected: use `60m`, or
@@ -2426,7 +2574,7 @@ spec:
                       refreshFrequency:
                         description: |-
                           How often clients re-read epoch state (kopia default `20m`). Go-style duration.
-
+                          
                           At most `80m`: kopia requires `cleanupSafetyMargin >= 3x` this value, and
                           `cleanupSafetyMargin` is observable-but-not-settable here, so it stays at kopia's
                           `4h` default and `4h / 3` is a hard ceiling.
@@ -2449,7 +2597,7 @@ spec:
                       deep), and both replication kinds. Set once here instead of repeating it on
                       every cron, so a whole repository's schedules spread their load off the
                       top-of-the-hour thundering herd.
-
+                      
                       The spread is deterministic per `(scheduleUID, slot)`, not random: the same
                       slot always lands on the same instant, so a restart never re-rolls it.
                       Capped at 24h by validation — jitter is a spread WITHIN a cron period, not a
@@ -2469,7 +2617,7 @@ spec:
                 description: |-
                   Initialize this repository from an existing replica on its FIRST
                   bootstrap (issue #380) — a disaster-recovery entry point.
-
+                  
                   Armed only while the repository has never been initialized
                   (`status.uniqueId` unset) **and** the mover's connect reports the backend
                   uninitialized; on an already-initialized repository it is a documented
@@ -2482,7 +2630,7 @@ spec:
                   allowEmptySource:
                     description: |-
                       Accept a source that holds zero snapshots (default `false`).
-
+                      
                       A mirror that answers but is empty is almost always a mis-pointed
                       bucket/prefix, and silently seeding nothing would hand you a `Ready`
                       repository with no history — the failure mode #380 is about. By default
@@ -2670,7 +2818,7 @@ spec:
                                 description: Mount path inside the mover pod where kopia writes the repository (e.g. `/repo`).
                                 type: string
                               volume:
-                                description: 'What backs `path`: a PVC or an inline NFS export; absent for a path already on the node/image.'
+                                description: "What backs `path`: a PVC or an inline NFS export; absent for a path already on the node/image."
                                 nullable: true
                                 oneOf:
                                 - required:
@@ -3020,7 +3168,7 @@ spec:
                           Another `Repository`/`ClusterRepository`, opened read-only (migrate mode,
                           `kopia snapshot migrate`). Snapshot identities and times are preserved,
                           so seeded history is restorable by `identity`/`fromPolicy`.
-
+                          
                           A `kind: Repository` reference with no `namespace` resolves in the
                           referrer's own namespace — and, on a cluster-scoped `ClusterRepository`
                           (which has none), in the operator's namespace, the same rule its
@@ -3086,13 +3234,13 @@ spec:
                           two repositories under two kopia connections and `snapshot migrate` has
                           no speed flags of its own, so each side is applied as `kopia repository
                           throttle set` on that side's connection:
-
+                          
                           * `source` caps the REPLICA — the repository named by
                             `spec.seed.from.repository`, opened read-only — overriding **its**
                             `moverDefaults.throttle`;
                           * `destination` caps THIS repository, the one being seeded, overriding
                             **its own** `moverDefaults.throttle`.
-
+                          
                           Each side overrides field by field: a knob set here wins, a knob left
                           unset keeps that repository's default. Absent: both sides use their
                           repository's defaults. Applies only while the seed is armed — an
@@ -3217,7 +3365,7 @@ spec:
                             type: string
                         type: object
                       insecure:
-                        description: 'No UI authentication; requires an explicit `acknowledgeInsecure: true`.'
+                        description: "No UI authentication; requires an explicit `acknowledgeInsecure: true`."
                         properties:
                           acknowledgeInsecure:
                             default: false
@@ -3265,14 +3413,14 @@ spec:
                       fsGroup:
                         description: |-
                           A special supplemental group that applies to all containers in a pod. Some volume types allow the Kubelet to change the ownership of that volume to be owned by the pod:
-
+                          
                           1. The owning GID will be the FSGroup 2. The setgid bit is set (new files created in the volume will be owned by FSGroup) 3. The permission bits are OR'd with rw-rw----
-
+                          
                           If unset, the Kubelet will not modify the ownership and permissions of any volume. Note that this field cannot be set when spec.os.name is windows.
                         format: int64
                         type: integer
                       fsGroupChangePolicy:
-                        description: 'fsGroupChangePolicy defines behavior of changing ownership and permission of the volume before being exposed inside Pod. This field will only apply to volume types which support fsGroup based ownership(and permissions). It will have no effect on ephemeral volume types such as: secret, configmaps and emptydir. Valid values are "OnRootMismatch" and "Always". If not specified, "Always" is used. Note that this field cannot be set when spec.os.name is windows.'
+                        description: "fsGroupChangePolicy defines behavior of changing ownership and permission of the volume before being exposed inside Pod. This field will only apply to volume types which support fsGroup based ownership(and permissions). It will have no effect on ephemeral volume types such as: secret, configmaps and emptydir. Valid values are \"OnRootMismatch\" and \"Always\". If not specified, \"Always\" is used. Note that this field cannot be set when spec.os.name is windows."
                         type: string
                       runAsGroup:
                         description: The GID to run the entrypoint of the container process. Uses runtime default if unset. May also be set in SecurityContext.  If set in both SecurityContext and PodSecurityContext, the value specified in SecurityContext takes precedence for that container. Note that this field cannot be set when spec.os.name is windows.
@@ -3288,15 +3436,15 @@ spec:
                       seLinuxChangePolicy:
                         description: |-
                           seLinuxChangePolicy defines how the container's SELinux label is applied to all volumes used by the Pod. It has no effect on nodes that do not support SELinux or to volumes does not support SELinux. Valid values are "MountOption" and "Recursive".
-
+                          
                           "Recursive" means relabeling of all files on all Pod volumes by the container runtime. This may be slow for large volumes, but allows mixing privileged and unprivileged Pods sharing the same volume on the same node.
-
+                          
                           "MountOption" mounts all eligible Pod volumes with `-o context` mount option. This requires all Pods that share the same volume to use the same SELinux label. It is not possible to share the same volume among privileged and unprivileged Pods. Eligible volumes are in-tree FibreChannel and iSCSI volumes, and all CSI volumes whose CSI driver announces SELinux support by setting spec.seLinuxMount: true in their CSIDriver instance. Other volumes are always re-labelled recursively. "MountOption" value is allowed only when SELinuxMount feature gate is enabled.
-
+                          
                           If not specified and SELinuxMount feature gate is enabled, "MountOption" is used. If not specified and SELinuxMount feature gate is disabled, "MountOption" is used for ReadWriteOncePod volumes and "Recursive" for all other volumes.
-
+                          
                           This field affects only Pods that have SELinux label set, either in PodSecurityContext or in SecurityContext of all containers.
-
+                          
                           All Pods that use the same volume should use the same seLinuxChangePolicy, otherwise some pods can get stuck in ContainerCreating state. Note that this field cannot be set when spec.os.name is windows.
                         type: string
                       seLinuxOptions:
@@ -3324,7 +3472,7 @@ spec:
                           type:
                             description: |-
                               type indicates which kind of seccomp profile will be applied. Valid options are:
-
+                              
                               Localhost - a profile defined in a file on the node should be used. RuntimeDefault - the container runtime default profile should be used. Unconfined - no profile should be applied.
                             type: string
                         required:
@@ -3383,9 +3531,9 @@ spec:
                       claims:
                         description: |-
                           Claims lists the names of resources, defined in spec.resourceClaims, that are used by this container.
-
+                          
                           This is an alpha field and requires enabling the DynamicResourceAllocation feature gate.
-
+                          
                           This field is immutable. It can only be set for containers.
                         items:
                           description: ResourceClaim references one entry in PodSpec.ResourceClaims.
@@ -3402,15 +3550,89 @@ spec:
                         type: array
                       limits:
                         additionalProperties:
-                          description: "Quantity is a fixed-point representation of a number. It provides convenient marshaling/unmarshaling in JSON and YAML, in addition to String() and AsInt64() accessors.\n\nThe serialization format is:\n\n``` <quantity>        ::= <signedNumber><suffix>\n\n\t(Note that <suffix> may be empty, from the \"\" case in <decimalSI>.)\n\n<digit>           ::= 0 | 1 | ... | 9 <digits>          ::= <digit> | <digit><digits> <number>          ::= <digits> | <digits>.<digits> | <digits>. | .<digits> <sign>            ::= \"+\" | \"-\" <signedNumber>    ::= <number> | <sign><number> <suffix>          ::= <binarySI> | <decimalExponent> | <decimalSI> <binarySI>        ::= Ki | Mi | Gi | Ti | Pi | Ei\n\n\t(International System of units; See: http://physics.nist.gov/cuu/Units/binary.html)\n\n<decimalSI>       ::= m | \"\" | k | M | G | T | P | E\n\n\t(Note that 1024 = 1Ki but 1000 = 1k; I didn't choose the capitalization.)\n\n<decimalExponent> ::= \"e\" <signedNumber> | \"E\" <signedNumber> ```\n\nNo matter which of the three exponent forms is used, no quantity may represent a number greater than 2^63-1 in magnitude, nor may it have more than 3 decimal places. Numbers larger or more precise will be capped or rounded up. (E.g.: 0.1m will rounded up to 1m.) This may be extended in the future if we require larger or smaller quantities.\n\nWhen a Quantity is parsed from a string, it will remember the type of suffix it had, and will use the same type again when it is serialized.\n\nBefore serializing, Quantity will be put in \"canonical form\". This means that Exponent/suffix will be adjusted up or down (with a corresponding increase or decrease in Mantissa) such that:\n\n- No precision is lost - No fractional digits will be emitted - The exponent (or suffix) is as large as possible.\n\nThe sign will be omitted unless the number is negative.\n\nExamples:\n\n- 1.5 will be serialized as \"1500m\" - 1.5Gi will be serialized as \"1536Mi\"\n\nNote that the quantity will NEVER be internally represented by a floating point number. That is the whole point of this exercise.\n\nNon-canonical values will still parse as long as they are well formed, but will be re-emitted in their canonical form. (So always use canonical form, or don't diff.)\n\nThis format is intended to make it difficult to use these numbers without writing some sort of special handling code in the hopes that that will cause implementors to also use a fixed point implementation."
+                          description: |-
+                            Quantity is a fixed-point representation of a number. It provides convenient marshaling/unmarshaling in JSON and YAML, in addition to String() and AsInt64() accessors.
+                            
+                            The serialization format is:
+                            
+                            ``` <quantity>        ::= <signedNumber><suffix>
+                            
+                            	(Note that <suffix> may be empty, from the "" case in <decimalSI>.)
+                            
+                            <digit>           ::= 0 | 1 | ... | 9 <digits>          ::= <digit> | <digit><digits> <number>          ::= <digits> | <digits>.<digits> | <digits>. | .<digits> <sign>            ::= "+" | "-" <signedNumber>    ::= <number> | <sign><number> <suffix>          ::= <binarySI> | <decimalExponent> | <decimalSI> <binarySI>        ::= Ki | Mi | Gi | Ti | Pi | Ei
+                            
+                            	(International System of units; See: http://physics.nist.gov/cuu/Units/binary.html)
+                            
+                            <decimalSI>       ::= m | "" | k | M | G | T | P | E
+                            
+                            	(Note that 1024 = 1Ki but 1000 = 1k; I didn't choose the capitalization.)
+                            
+                            <decimalExponent> ::= "e" <signedNumber> | "E" <signedNumber> ```
+                            
+                            No matter which of the three exponent forms is used, no quantity may represent a number greater than 2^63-1 in magnitude, nor may it have more than 3 decimal places. Numbers larger or more precise will be capped or rounded up. (E.g.: 0.1m will rounded up to 1m.) This may be extended in the future if we require larger or smaller quantities.
+                            
+                            When a Quantity is parsed from a string, it will remember the type of suffix it had, and will use the same type again when it is serialized.
+                            
+                            Before serializing, Quantity will be put in "canonical form". This means that Exponent/suffix will be adjusted up or down (with a corresponding increase or decrease in Mantissa) such that:
+                            
+                            - No precision is lost - No fractional digits will be emitted - The exponent (or suffix) is as large as possible.
+                            
+                            The sign will be omitted unless the number is negative.
+                            
+                            Examples:
+                            
+                            - 1.5 will be serialized as "1500m" - 1.5Gi will be serialized as "1536Mi"
+                            
+                            Note that the quantity will NEVER be internally represented by a floating point number. That is the whole point of this exercise.
+                            
+                            Non-canonical values will still parse as long as they are well formed, but will be re-emitted in their canonical form. (So always use canonical form, or don't diff.)
+                            
+                            This format is intended to make it difficult to use these numbers without writing some sort of special handling code in the hopes that that will cause implementors to also use a fixed point implementation.
                           x-kubernetes-int-or-string: true
-                        description: 'Limits describes the maximum amount of compute resources allowed. More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/'
+                        description: "Limits describes the maximum amount of compute resources allowed. More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/"
                         type: object
                       requests:
                         additionalProperties:
-                          description: "Quantity is a fixed-point representation of a number. It provides convenient marshaling/unmarshaling in JSON and YAML, in addition to String() and AsInt64() accessors.\n\nThe serialization format is:\n\n``` <quantity>        ::= <signedNumber><suffix>\n\n\t(Note that <suffix> may be empty, from the \"\" case in <decimalSI>.)\n\n<digit>           ::= 0 | 1 | ... | 9 <digits>          ::= <digit> | <digit><digits> <number>          ::= <digits> | <digits>.<digits> | <digits>. | .<digits> <sign>            ::= \"+\" | \"-\" <signedNumber>    ::= <number> | <sign><number> <suffix>          ::= <binarySI> | <decimalExponent> | <decimalSI> <binarySI>        ::= Ki | Mi | Gi | Ti | Pi | Ei\n\n\t(International System of units; See: http://physics.nist.gov/cuu/Units/binary.html)\n\n<decimalSI>       ::= m | \"\" | k | M | G | T | P | E\n\n\t(Note that 1024 = 1Ki but 1000 = 1k; I didn't choose the capitalization.)\n\n<decimalExponent> ::= \"e\" <signedNumber> | \"E\" <signedNumber> ```\n\nNo matter which of the three exponent forms is used, no quantity may represent a number greater than 2^63-1 in magnitude, nor may it have more than 3 decimal places. Numbers larger or more precise will be capped or rounded up. (E.g.: 0.1m will rounded up to 1m.) This may be extended in the future if we require larger or smaller quantities.\n\nWhen a Quantity is parsed from a string, it will remember the type of suffix it had, and will use the same type again when it is serialized.\n\nBefore serializing, Quantity will be put in \"canonical form\". This means that Exponent/suffix will be adjusted up or down (with a corresponding increase or decrease in Mantissa) such that:\n\n- No precision is lost - No fractional digits will be emitted - The exponent (or suffix) is as large as possible.\n\nThe sign will be omitted unless the number is negative.\n\nExamples:\n\n- 1.5 will be serialized as \"1500m\" - 1.5Gi will be serialized as \"1536Mi\"\n\nNote that the quantity will NEVER be internally represented by a floating point number. That is the whole point of this exercise.\n\nNon-canonical values will still parse as long as they are well formed, but will be re-emitted in their canonical form. (So always use canonical form, or don't diff.)\n\nThis format is intended to make it difficult to use these numbers without writing some sort of special handling code in the hopes that that will cause implementors to also use a fixed point implementation."
+                          description: |-
+                            Quantity is a fixed-point representation of a number. It provides convenient marshaling/unmarshaling in JSON and YAML, in addition to String() and AsInt64() accessors.
+                            
+                            The serialization format is:
+                            
+                            ``` <quantity>        ::= <signedNumber><suffix>
+                            
+                            	(Note that <suffix> may be empty, from the "" case in <decimalSI>.)
+                            
+                            <digit>           ::= 0 | 1 | ... | 9 <digits>          ::= <digit> | <digit><digits> <number>          ::= <digits> | <digits>.<digits> | <digits>. | .<digits> <sign>            ::= "+" | "-" <signedNumber>    ::= <number> | <sign><number> <suffix>          ::= <binarySI> | <decimalExponent> | <decimalSI> <binarySI>        ::= Ki | Mi | Gi | Ti | Pi | Ei
+                            
+                            	(International System of units; See: http://physics.nist.gov/cuu/Units/binary.html)
+                            
+                            <decimalSI>       ::= m | "" | k | M | G | T | P | E
+                            
+                            	(Note that 1024 = 1Ki but 1000 = 1k; I didn't choose the capitalization.)
+                            
+                            <decimalExponent> ::= "e" <signedNumber> | "E" <signedNumber> ```
+                            
+                            No matter which of the three exponent forms is used, no quantity may represent a number greater than 2^63-1 in magnitude, nor may it have more than 3 decimal places. Numbers larger or more precise will be capped or rounded up. (E.g.: 0.1m will rounded up to 1m.) This may be extended in the future if we require larger or smaller quantities.
+                            
+                            When a Quantity is parsed from a string, it will remember the type of suffix it had, and will use the same type again when it is serialized.
+                            
+                            Before serializing, Quantity will be put in "canonical form". This means that Exponent/suffix will be adjusted up or down (with a corresponding increase or decrease in Mantissa) such that:
+                            
+                            - No precision is lost - No fractional digits will be emitted - The exponent (or suffix) is as large as possible.
+                            
+                            The sign will be omitted unless the number is negative.
+                            
+                            Examples:
+                            
+                            - 1.5 will be serialized as "1500m" - 1.5Gi will be serialized as "1536Mi"
+                            
+                            Note that the quantity will NEVER be internally represented by a floating point number. That is the whole point of this exercise.
+                            
+                            Non-canonical values will still parse as long as they are well formed, but will be re-emitted in their canonical form. (So always use canonical form, or don't diff.)
+                            
+                            This format is intended to make it difficult to use these numbers without writing some sort of special handling code in the hopes that that will cause implementors to also use a fixed point implementation.
                           x-kubernetes-int-or-string: true
-                        description: 'Requests describes the minimum amount of compute resources required. If Requests is omitted for a container, it defaults to Limits if that is explicitly specified, otherwise to an implementation-defined value. Requests cannot exceed Limits. More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/'
+                        description: "Requests describes the minimum amount of compute resources required. If Requests is omitted for a container, it defaults to Limits if that is explicitly specified, otherwise to an implementation-defined value. Requests cannot exceed Limits. More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/"
                         type: object
                     type: object
                   securityContext:
@@ -3418,7 +3640,7 @@ spec:
                     nullable: true
                     properties:
                       allowPrivilegeEscalation:
-                        description: 'AllowPrivilegeEscalation controls whether a process can gain more privileges than its parent process. This bool directly controls if the no_new_privs flag will be set on the container process. AllowPrivilegeEscalation is true always when the container is: 1) run as Privileged 2) has CAP_SYS_ADMIN Note that this field cannot be set when spec.os.name is windows.'
+                        description: "AllowPrivilegeEscalation controls whether a process can gain more privileges than its parent process. This bool directly controls if the no_new_privs flag will be set on the container process. AllowPrivilegeEscalation is true always when the container is: 1) run as Privileged 2) has CAP_SYS_ADMIN Note that this field cannot be set when spec.os.name is windows."
                         type: boolean
                       appArmorProfile:
                         description: appArmorProfile is the AppArmor options to use by this container. If set, this profile overrides the pod's appArmorProfile. Note that this field cannot be set when spec.os.name is windows.
@@ -3495,7 +3717,7 @@ spec:
                           type:
                             description: |-
                               type indicates which kind of seccomp profile will be applied. Valid options are:
-
+                              
                               Localhost - a profile defined in a file on the node should be used. RuntimeDefault - the container runtime default profile should be used. Unconfined - no profile should be applied.
                             type: string
                         required:
@@ -3548,7 +3770,7 @@ spec:
                     type: object
                 type: object
               suspend:
-                description: 'Pause this repository: skip connect/bootstrap and maintenance projection.'
+                description: "Pause this repository: skip connect/bootstrap and maintenance projection."
                 type: boolean
             required:
             - backend
@@ -3556,13 +3778,13 @@ spec:
             type: object
             x-kubernetes-validations:
             - message: create.splitter is immutable after creation
-              rule: '!has(self.create) || !has(oldSelf.create) || (has(self.create.splitter) == has(oldSelf.create.splitter) && (!has(self.create.splitter) || self.create.splitter == oldSelf.create.splitter))'
+              rule: "!has(self.create) || !has(oldSelf.create) || (has(self.create.splitter) == has(oldSelf.create.splitter) && (!has(self.create.splitter) || self.create.splitter == oldSelf.create.splitter))"
             - message: create.hash is immutable after creation
-              rule: '!has(self.create) || !has(oldSelf.create) || (has(self.create.hash) == has(oldSelf.create.hash) && (!has(self.create.hash) || self.create.hash == oldSelf.create.hash))'
+              rule: "!has(self.create) || !has(oldSelf.create) || (has(self.create.hash) == has(oldSelf.create.hash) && (!has(self.create.hash) || self.create.hash == oldSelf.create.hash))"
             - message: create.encryption is immutable after creation
-              rule: '!has(self.create) || !has(oldSelf.create) || (has(self.create.encryption) == has(oldSelf.create.encryption) && (!has(self.create.encryption) || self.create.encryption == oldSelf.create.encryption))'
+              rule: "!has(self.create) || !has(oldSelf.create) || (has(self.create.encryption) == has(oldSelf.create.encryption) && (!has(self.create.encryption) || self.create.encryption == oldSelf.create.encryption))"
             - message: create.ecc is immutable after creation
-              rule: '!has(self.create) || !has(oldSelf.create) || (has(self.create.ecc) == has(oldSelf.create.ecc) && (!has(self.create.ecc) || self.create.ecc == oldSelf.create.ecc))'
+              rule: "!has(self.create) || !has(oldSelf.create) || (has(self.create.ecc) == has(oldSelf.create.ecc) && (!has(self.create.ecc) || self.create.ecc == oldSelf.create.ecc))"
           status:
             description: Observed state of a `Repository`, carrying resolved values pinned by the reconciler.
             nullable: true
@@ -3684,7 +3906,7 @@ spec:
                     description: |-
                       RFC 3339 timestamp at which the last backend health probe was *launched*
                       (the bootstrap Job created for it), cleared when its result is finalized.
-
+                      
                       This is the **launch-side** rate limit, and it is what makes the probe
                       terminate. `lastProbeAt` is written only at *finalize*, so gating the
                       launch on that alone recycles the bootstrap Job forever: the gate destroys
@@ -3700,7 +3922,7 @@ spec:
                 nullable: true
                 type: string
               observedGeneration:
-                description: '`metadata.generation` of the `spec` last reconciled; drives staleness detection.'
+                description: "`metadata.generation` of the `spec` last reconciled; drives staleness detection."
                 format: int64
                 nullable: true
                 type: integer
@@ -3745,7 +3967,7 @@ spec:
                       advanceOnSizeMiB:
                         description: |-
                           Observed total index size (MiB) that triggers an epoch advance, **rounded up**.
-
+                          
                           kopia reports this threshold in BYTES and it need not be a whole number of MiB, so
                           the mirror rounds up to keep a sub-MiB remainder visible rather than reporting a
                           value the repository does not actually hold. Drift against `spec` is computed on the
@@ -3796,7 +4018,7 @@ spec:
                 nullable: true
                 type: string
               resolvedCredentialVersion:
-                description: '`resourceVersion` of the password Secret observed at the last connect attempt.'
+                description: "`resourceVersion` of the password Secret observed at the last connect attempt."
                 nullable: true
                 type: string
               seed:
@@ -3849,7 +4071,7 @@ spec:
                     description: |-
                       RFC 3339 timestamp the operator LAUNCHED a seeding bootstrap Job for
                       this repository — the durable **seed-attempt marker**.
-
+                      
                       Stamped before the Job is created, and never cleared. Its whole job is
                       to distinguish "a seed this operator started did not finish" from "this
                       backend was initialized by somebody else": the first must resume the
@@ -3873,7 +4095,7 @@ spec:
                     nullable: true
                     type: string
                   generatedSecretRef:
-                    description: 'For `Generate` mode: the operator-owned Secret holding the UI credentials.'
+                    description: "For `Generate` mode: the operator-owned Secret holding the UI credentials."
                     nullable: true
                     properties:
                       name:
@@ -3918,7 +4140,7 @@ spec:
                   indexBlobCountAt:
                     description: |-
                       RFC3339 instant `indexBlobCount` was observed.
-
+                      
                       Distinct from `lastObservedAt` (the catalog scan's timestamp) and from
                       `status.health.lastProbeAt` (the backend probe's): the index-blob count
                       has its own writers, and this is what lets the reconciler decide whether
@@ -3927,7 +4149,7 @@ spec:
                       `IndexBlobHealth` warning could only ever quote the bootstrap figure —
                       which is pre-compaction, and stayed pre-compaction until the next
                       bootstrap ran (#458).
-
+                      
                       The two writers mean subtly different things, deliberately. A bootstrap
                       stamps "when this count was FIRST seen at this value", reusing the
                       previous stamp while the number is unchanged — that arm re-observes on
@@ -3967,14 +4189,14 @@ spec:
               uniqueId:
                 description: |-
                   Kopia repository unique ID, pinned on the first successful bootstrap.
-
+                  
                   Its presence is the "this repository has been Ready" flag that makes
                   auto-create one-way in time: `spec.create.enabled` governs the FIRST
                   bootstrap only, and once this is set kopiur will never create a fresh
                   empty repository over the backend, however empty the backend goes. A
                   wiped backend therefore parks at `Failed` with reason
                   `RepositoryReinitializeBlocked` instead of being silently re-created.
-
+                  
                   To deliberately re-initialize a wiped repository, annotate it with
                   `kopiur.home-operations.com/allow-reinitialize` set to THIS value; the
                   ack is honored only while it matches, so the new ID minted by a

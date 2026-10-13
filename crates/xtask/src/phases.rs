@@ -305,7 +305,7 @@ impl Allowlist {
         let p = workspace_root().join(ALLOWLIST_REL);
         let raw =
             std::fs::read_to_string(&p).with_context(|| format!("reading {}", p.display()))?;
-        serde_yaml::from_str(&raw).with_context(|| format!("parsing {}", p.display()))
+        serde_saphyr::from_str(&raw).with_context(|| format!("parsing {}", p.display()))
     }
 }
 

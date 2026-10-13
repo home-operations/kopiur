@@ -270,7 +270,7 @@ pub fn render_list(
                 "items": snaps,
             });
             match output {
-                OutputFormat::Yaml => serde_yaml::to_string(&list).map_err(|e| {
+                OutputFormat::Yaml => crate::output::to_yaml(&list).map_err(|e| {
                     CliError::Ops(OpsError::Serialization {
                         what: "snapshot list",
                         source: e.into(),
@@ -303,7 +303,7 @@ mod tests {
     /// Parse a manifest the way the cluster does (YAML → JSON value → typed),
     /// matching the api crate's testutil convention.
     fn from_yaml<T: serde::de::DeserializeOwned>(yaml: &str) -> T {
-        let value: serde_json::Value = serde_yaml::from_str(yaml).expect("yaml -> json value");
+        let value: serde_json::Value = serde_saphyr::from_str(yaml).expect("yaml -> json value");
         serde_json::from_value(value).expect("json value -> typed")
     }
 

@@ -4280,7 +4280,7 @@ fn a_rendered_maintenance_job_carries_no_pool_label() {
 fn backup_mover_defaults_pod_metadata_reaches_the_pod_template() {
     use kopiur_mover::jobs::{JobLimits, MoverJobInputs, build_job};
 
-    // Typed the cluster's way: JSON value -> typed (never serde_yaml straight
+    // Typed the cluster's way: JSON value -> typed (never YAML straight
     // into a typed value; see CLAUDE.md).
     let defaults: kopiur_api::common::MoverDefaults = serde_json::from_value(serde_json::json!({
         "podLabels": { "kueue.x-k8s.io/queue-name": "backups" },

@@ -254,7 +254,7 @@ mod tests {
 
     #[test]
     fn unknown_auth_variant_is_rejected() {
-        let value: serde_json::Value = serde_yaml::from_str("oauth: {}\n").unwrap();
+        let value: serde_json::Value = serde_saphyr::from_str("oauth: {}\n").unwrap();
         assert!(serde_json::from_value::<ServerAuth>(value).is_err());
     }
 

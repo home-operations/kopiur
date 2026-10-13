@@ -3948,8 +3948,8 @@ mod tests {
     // --- F2 / S1: the verification status decision -----------------------------
 
     /// A `SnapshotPolicy` the way the apiserver hands one over — a decoded JSON
-    /// body into the typed struct, never `serde_yaml` straight into a typed
-    /// value (0.9 mis-encodes externally-tagged enums).
+    /// body into the typed struct, never YAML straight into a typed
+    /// value.
     fn verify_policy(sources: serde_json::Value, status: serde_json::Value) -> SnapshotPolicy {
         serde_json::from_value(serde_json::json!({
             "apiVersion": "kopiur.home-operations.com/v1alpha1",

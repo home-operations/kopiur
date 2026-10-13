@@ -1862,7 +1862,7 @@ runJob:
 
     #[test]
     fn hook_unknown_variant_is_rejected() {
-        let value: serde_json::Value = serde_yaml::from_str("teleport:\n  url: x\n").unwrap();
+        let value: serde_json::Value = serde_saphyr::from_str("teleport:\n  url: x\n").unwrap();
         assert!(serde_json::from_value::<Hook>(value).is_err());
     }
 
@@ -2406,7 +2406,7 @@ preflight:
     #[test]
     fn policy_deletion_unknown_on_policy_delete_value_is_rejected() {
         let value: serde_json::Value =
-            serde_yaml::from_str("deletion:\n  onPolicyDelete: Orphan\n").unwrap();
+            serde_saphyr::from_str("deletion:\n  onPolicyDelete: Orphan\n").unwrap();
         assert!(serde_json::from_value::<SnapshotPolicySpec>(value).is_err());
     }
 

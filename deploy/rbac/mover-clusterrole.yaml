@@ -21,7 +21,7 @@ rules:
   - get
   - patch
 - apiGroups:
-  - ''
+  - ""
   resources:
   - configmaps
   verbs:
@@ -54,7 +54,7 @@ rules:
   - get
   - patch
 - apiGroups:
-  - ''
+  - ""
   resources:
   - configmaps
   verbs:
@@ -83,21 +83,21 @@ rules:
   - get
   - patch
 - apiGroups:
-  - ''
+  - ""
   resources:
   - configmaps
   verbs:
   - get
   - patch
 - apiGroups:
-  - ''
+  - ""
   resources:
   - pods
   verbs:
   - get
   - list
 - apiGroups:
-  - ''
+  - ""
   resources:
   - pods/exec
   verbs:

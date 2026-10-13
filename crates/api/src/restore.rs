@@ -1085,7 +1085,7 @@ policy: { onMissingSnapshot: Continue }
     fn restore_without_target_fails_to_deserialize() {
         // ADR-0005 §9 breaking change: a Restore with no `target` is invalid.
         let value: serde_json::Value =
-            serde_yaml::from_str("source: { snapshotRef: { name: b } }\n").unwrap();
+            serde_saphyr::from_str("source: { snapshotRef: { name: b } }\n").unwrap();
         assert!(
             serde_json::from_value::<RestoreSpec>(value).is_err(),
             "an absent target must be rejected (no empty-target form, ADR-0005 §9)"
@@ -1287,7 +1287,7 @@ mover:
 
     #[test]
     fn restore_source_unknown_variant_is_rejected() {
-        let value: serde_json::Value = serde_yaml::from_str("snapshotUrl:\n  url: x\n").unwrap();
+        let value: serde_json::Value = serde_saphyr::from_str("snapshotUrl:\n  url: x\n").unwrap();
         assert!(serde_json::from_value::<RestoreSource>(value).is_err());
     }
 

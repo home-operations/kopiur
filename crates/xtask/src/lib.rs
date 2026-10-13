@@ -11,6 +11,7 @@ pub mod rbac;
 pub mod scan;
 pub mod ui_types;
 pub mod wiring;
+pub mod yaml;
 
 use anyhow::Result;
 

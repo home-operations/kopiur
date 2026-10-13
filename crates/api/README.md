@@ -102,9 +102,9 @@ assert_eq!(summary, "s3://my-backups");
 assert_eq!(backend.kind_str(), "S3");
 ```
 
-> Note: deserialize via `serde_json` (the API-server path), never `serde_yaml`
-> directly into a typed value — serde_yaml 0.9 mis-encodes externally-tagged
-> enums. For YAML tests, go YAML → `serde_json::Value` → typed.
+> Note: deserialize via `serde_json` (the API-server path), never from YAML
+> directly into a typed value — a YAML library's enum handling is not the wire
+> format. For YAML tests, go YAML → `serde_json::Value` → typed.
 
 ## See also
 

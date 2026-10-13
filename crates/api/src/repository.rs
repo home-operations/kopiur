@@ -1801,7 +1801,7 @@ health:
 
         // Unknown variant is rejected at decode (the closed enum IS the
         // validator; the CRD schema enforces the same set at admission).
-        let v: serde_json::Value = serde_yaml::from_str(
+        let v: serde_json::Value = serde_saphyr::from_str(
             "backend: { filesystem: { path: /repo } }\n\
              encryption: { passwordSecretRef: { name: s } }\n\
              health:\n  probe:\n    onFailure: Recreate\n",

@@ -1720,7 +1720,7 @@ fn backup_config_aggregate_collects_multiple_errors() {
 /// multi-repository admission matrix below.
 fn policy_spec_yaml(repo_surface: &str, extra: &str) -> SnapshotPolicySpec {
     let yaml = format!("{repo_surface}sources: [ {{ pvc: {{ name: d }} }} ]\n{extra}");
-    let value: serde_json::Value = serde_yaml::from_str(&yaml).unwrap();
+    let value: serde_json::Value = serde_saphyr::from_str(&yaml).unwrap();
     serde_json::from_value(value).unwrap()
 }
 
@@ -3270,7 +3270,7 @@ fn foreign_snapshots_fallback_is_cluster_repository_only() {
 
 #[test]
 fn foreign_snapshots_unknown_variant_is_rejected() {
-    let value: serde_json::Value = serde_yaml::from_str("foreignSnapshots: Delete\n").unwrap();
+    let value: serde_json::Value = serde_saphyr::from_str("foreignSnapshots: Delete\n").unwrap();
     assert!(
         serde_json::from_value::<crate::common::CatalogBounds>(value).is_err(),
         "an unknown foreignSnapshots variant must be rejected"
@@ -5297,7 +5297,6 @@ fn example_18_merged_policy_is_valid() {
         .find(|d| d.contains("name: app-data-merged"))
         .expect("the `merged` policy document must exist in example 18");
     // YAML -> serde_json::Value -> typed, the way the cluster does it (CLAUDE.md §5):
-    // serde_yaml 0.9 mis-encodes externally-tagged enums when deserialized directly.
     let policy: crate::snapshot_policy::SnapshotPolicy = crate::testutil::from_yaml(doc);
 
     let mover = policy.spec.mover.as_ref().expect("mover set");
@@ -5508,7 +5507,7 @@ fn e2e_inherit_scenario_mover_shapes_deserialize() {
 // --- #254: source readOnly ------------------------------------------------
 
 /// Parse a SnapshotPolicy spec the way the apiserver would (YAML → Value → typed),
-/// per the repo's testutil rule — never `serde_yaml` straight into a typed value.
+/// per the repo's testutil rule — never YAML straight into a typed value.
 fn policy_yaml(body: &str) -> SnapshotPolicySpec {
     crate::testutil::from_yaml(body)
 }
@@ -6811,8 +6810,7 @@ fn srepl_migrate_throttle_rejects_non_positive_rates_per_side() {
 
 #[test]
 fn srepl_migrate_throttle_roundtrips_camel_case_through_the_apiserver_path() {
-    // YAML → JSON → typed, the way the cluster parses it (serde_yaml 0.9 would
-    // mis-encode the nested sub-objects).
+    // YAML → JSON → typed, the way the cluster parses it.
     use crate::snapshot_replication::SnapshotReplicationSpec;
     use crate::testutil::from_yaml;
     let spec: SnapshotReplicationSpec = from_yaml(

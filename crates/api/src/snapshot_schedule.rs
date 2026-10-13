@@ -4,7 +4,7 @@
 //! ```
 //! use kopiur_api::{SnapshotScheduleSpec, ConcurrencyPolicy};
 //!
-//! // The cluster path: YAML -> JSON value -> typed (never serde_yaml -> typed).
+//! // The cluster path: YAML -> JSON value -> typed (never YAML -> typed).
 //! let spec: SnapshotScheduleSpec = serde_json::from_value(serde_json::json!({
 //!     "policyRef": { "name": "postgres-data" },
 //!     "schedule": { "cron": "H 2 * * *", "jitter": "30m" },

@@ -60,7 +60,7 @@ rules:
   - update
   - patch
 - apiGroups:
-  - ''
+  - ""
   resources:
   - pods
   - persistentvolumeclaims
@@ -74,14 +74,14 @@ rules:
   - patch
   - delete
 - apiGroups:
-  - ''
+  - ""
   resources:
   - pods/exec
   verbs:
   - create
   - get
 - apiGroups:
-  - ''
+  - ""
   resources:
   - events
   verbs:
@@ -95,7 +95,7 @@ rules:
   - create
   - patch
 - apiGroups:
-  - ''
+  - ""
   resources:
   - secrets
   verbs:
@@ -103,7 +103,7 @@ rules:
   - list
   - watch
 - apiGroups:
-  - ''
+  - ""
   resources:
   - secrets
   verbs:
@@ -111,7 +111,7 @@ rules:
   - patch
   - delete
 - apiGroups:
-  - ''
+  - ""
   resources:
   - services
   verbs:
@@ -169,7 +169,7 @@ rules:
   - patch
   - delete
 - apiGroups:
-  - ''
+  - ""
   resources:
   - serviceaccounts
   verbs:
@@ -189,7 +189,7 @@ rules:
   - update
   - patch
 - apiGroups:
-  - ''
+  - ""
   resources:
   - namespaces
   verbs:
@@ -197,7 +197,7 @@ rules:
   - list
   - watch
 - apiGroups:
-  - ''
+  - ""
   resources:
   - persistentvolumes
   verbs:
@@ -258,13 +258,13 @@ rules:
   - get
   - patch
 - apiGroups:
-  - ''
+  - ""
   resources:
   - secrets
   verbs:
   - create
 - apiGroups:
-  - ''
+  - ""
   resourceNames:
   - kopiur-webhook-tls
   resources:

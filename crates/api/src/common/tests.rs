@@ -872,7 +872,7 @@ fn source_colocation_mode_flows_from_defaults() {
 
 #[test]
 fn source_colocation_parses_the_cluster_way() {
-    // YAML → serde_json::Value → typed (the cluster's path), never serde_yaml direct.
+    // YAML → serde_json::Value → typed (the cluster's path), never YAML direct.
     let defaults: MoverDefaults = crate::testutil::from_yaml(
         r#"
             sourceColocation:
@@ -900,7 +900,7 @@ fn source_colocation_parses_the_cluster_way() {
 #[test]
 fn inherit_security_context_from_parses_both_variants_the_cluster_way() {
     // Externally tagged: { workloadSelector: {...} } vs { pvcConsumer: {...} }, parsed via
-    // YAML → serde_json::Value → typed (never serde_yaml, which mis-encodes external tags).
+    // YAML → serde_json::Value → typed (never YAML straight into a typed value).
     let selector: MoverSpec = crate::testutil::from_yaml(
         r#"
             inheritSecurityContextFrom:
@@ -969,7 +969,7 @@ fn inherit_security_context_from_snapshot_variant_parses_the_cluster_way() {
     // The YAML footgun: `snapshot:` (null) is NOT the empty sub-object — serde
     // rejects it rather than guessing. Doc examples must write `snapshot: {}`.
     let null_value: serde_json::Value =
-        serde_yaml::from_str("inheritSecurityContextFrom:\n  snapshot:\n").unwrap();
+        serde_saphyr::from_str("inheritSecurityContextFrom:\n  snapshot:\n").unwrap();
     assert!(
         serde_json::from_value::<MoverSpec>(null_value).is_err(),
         "a null `snapshot:` must be rejected, not silently treated as `snapshot: {{}}`"
@@ -1203,7 +1203,7 @@ fn pvc_access_mode_legacy_value_decodes_to_unknown_and_roundtrips() {
 
 #[test]
 fn failure_block_roundtrips_with_op_via_the_api_server_path() {
-    // YAML → JSON → typed (the cluster's decode path — never serde_yaml direct).
+    // YAML → JSON → typed (the cluster's decode path — never YAML direct).
     let fb: FailureBlock = crate::testutil::from_yaml(
         r#"
 kopiaErrorClass: RepositoryUnavailable

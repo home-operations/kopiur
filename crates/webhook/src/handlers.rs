@@ -3286,7 +3286,7 @@ mod tests {
     // --- assessable_sources: a pinned Snapshot judges ONE source (#464) ----------
 
     /// A policy with `n` PVC sources named `pvc-0`..`pvc-{n-1}`, decoded the
-    /// cluster's way (JSON value -> typed, never serde_yaml into a typed value).
+    /// cluster's way (JSON value -> typed, never YAML into a typed value).
     fn policy_with_sources(n: usize) -> api::snapshot_policy::SnapshotPolicySpec {
         let sources: Vec<Value> = (0..n)
             .map(|i| json!({ "pvc": { "name": format!("pvc-{i}") } }))
