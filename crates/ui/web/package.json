@@ -17,15 +17,15 @@
   },
   "dependencies": {
     "@tanstack/react-query": "5.104.1",
-    "@tanstack/react-router": "1.170.41",
+    "@tanstack/react-router": "1.170.42",
     "elkjs": "0.12.0",
-    "lucide-react": "1.54.0",
+    "lucide-react": "1.55.0",
     "react": "19.3.0",
     "react-dom": "19.3.0"
   },
   "devDependencies": {
     "@eslint/js": "10.0.1",
-    "@tanstack/router-plugin": "1.168.42",
+    "@tanstack/router-plugin": "1.168.43",
     "@testing-library/jest-dom": "7.0.1",
     "@testing-library/react": "16.3.3",
     "@testing-library/user-event": "14.6.7",
