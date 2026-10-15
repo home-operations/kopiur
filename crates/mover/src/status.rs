@@ -1816,7 +1816,7 @@ mod tests {
     #[test]
     fn log_only_reporter_never_carries_a_kube_client() {
         // The whole point of `log_only`: no kube client is ever built, so
-        // `.report()`/`.pin_resolved()` can only ever log — ​never PATCH —
+        // `.report()`/`.pin_resolved()` can only ever log — never PATCH —
         // regardless of whether a client happens to be reachable in-cluster.
         // (RBAC is deliberately not granted for this target, e.g.
         // SnapshotDeleteBatch's targetRef names the Job itself.)
