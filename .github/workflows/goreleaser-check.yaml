@@ -97,10 +97,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # Bot image version tracks release.yaml's krew-release-bot action pin.
+          # Must match the image the pinned action runs, which is hardcoded in
+          # the action's action.yml (the v0.0.51 action runs the v0.0.50 image),
+          # not the action's own tag. Re-check on every action bump.
           tag=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName -q .tagName)
           docker run --rm -v "$PWD/.krew.yaml:/tmp/.krew.yaml:ro" \
-            ghcr.io/rajatjindal/krew-release-bot:v0.0.51 \
+            ghcr.io/rajatjindal/krew-release-bot:v0.0.50 \
             krew-release-bot template --tag "$tag" --template-file /tmp/.krew.yaml \
             > "$RUNNER_TEMP/kopiur.yaml"
           cat "$RUNNER_TEMP/kopiur.yaml"
