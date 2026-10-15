@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.10.15](https://github.com/home-operations/kopiur/compare/0.10.14...0.10.15) (2026-10-15)
+
+
+### Features
+
+* **npm:** update web ui dependencies ([#585](https://github.com/home-operations/kopiur/issues/585)) ([b8dd62f](https://github.com/home-operations/kopiur/commit/b8dd62f4c8c991c4684a5c2b0725922e5e6c35c8))
+
+
+### Bug Fixes
+
+* remove zero-width space from comment ([#589](https://github.com/home-operations/kopiur/issues/589)) ([f73e778](https://github.com/home-operations/kopiur/commit/f73e7788d538e83725caaae2ece9b751440172c2))
+* **rust:** update crate serde_json (1.0.151 → 1.0.152) ([#587](https://github.com/home-operations/kopiur/issues/587)) ([0b0b867](https://github.com/home-operations/kopiur/commit/0b0b86784a1c6b4010aa806715ae8553d96b1712))
+* **rust:** update crate tokio-util (0.7.19 → 0.7.20) ([#588](https://github.com/home-operations/kopiur/issues/588)) ([c523f55](https://github.com/home-operations/kopiur/commit/c523f55443510298a3d0bba9023a2c2f7d894bf0))
+
+
+### Continuous Integration
+
+* **release:** publish the kubectl plugin to krew-index via krew-release-bot ([#570](https://github.com/home-operations/kopiur/issues/570)) ([659bf29](https://github.com/home-operations/kopiur/commit/659bf29a3c976092a5066e821bcebd7c51c2a543))
+
 ## [0.10.14](https://github.com/home-operations/kopiur/compare/0.10.13...0.10.14) (2026-10-13)
 
 
