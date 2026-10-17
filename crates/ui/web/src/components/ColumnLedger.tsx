@@ -18,8 +18,13 @@ import {
   visibleColumns,
 } from "./tableColumns";
 
-/** Attributes a row may carry: its kind for the stripe, a state for styling. */
-type RowAttributes = Record<`data-${string}`, string | undefined>;
+/**
+ * Attributes a row may carry: its kind for the stripe, a state for styling, and
+ * its own classes (merged with the whole-row link class, never replaced by it).
+ */
+type RowAttributes = Record<`data-${string}`, string | undefined> & {
+  className?: string | undefined;
+};
 
 export interface ColumnLedgerProps<Row, Id extends string> {
   /** Names the table's stored layout; stable across releases. */
@@ -137,21 +142,26 @@ export function ColumnLedger<Row, Id extends string>({
             </tr>
           </thead>
           <tbody>
-            {shown.map((row) => (
-              <tr
-                key={rowKey(row)}
-                {...rowProps?.(row)}
-                {...(rowLinks
-                  ? { className: ROW_LINK_ROW, onClick: followRowLink, onAuxClick: followRowLink }
-                  : {})}
-              >
-                {visible.map((spec) => (
-                  <td key={spec.id} className={cellClass(spec)}>
-                    {cell(row, spec.id)}
-                  </td>
-                ))}
-              </tr>
-            ))}
+            {shown.map((row) => {
+              const props = rowProps?.(row);
+              const className =
+                [props?.className, rowLinks ? ROW_LINK_ROW : null].filter(Boolean).join(" ") ||
+                undefined;
+              return (
+                <tr
+                  key={rowKey(row)}
+                  {...props}
+                  className={className}
+                  {...(rowLinks ? { onClick: followRowLink, onAuxClick: followRowLink } : {})}
+                >
+                  {visible.map((spec) => (
+                    <td key={spec.id} className={cellClass(spec)}>
+                      {cell(row, spec.id)}
+                    </td>
+                  ))}
+                </tr>
+              );
+            })}
           </tbody>
         </table>
       </div>

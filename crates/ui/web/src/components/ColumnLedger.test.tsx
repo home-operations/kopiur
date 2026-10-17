@@ -351,7 +351,10 @@ describe("ColumnLedger — whole-row link", () => {
     }
   }
 
-  async function mountLinked(onRun: (name: string) => void = () => undefined) {
+  async function mountLinked(
+    onRun: (name: string) => void = () => undefined,
+    rowProps?: (name: string) => { className?: string | undefined },
+  ) {
     const ledger = (
       <ColumnLedger
         id="linked"
@@ -359,6 +362,7 @@ describe("ColumnLedger — whole-row link", () => {
         columns={LINK_COLUMNS}
         rows={NAMES}
         rowKey={(n) => n}
+        rowProps={rowProps}
         rowLinks
         cell={(name, id) => linkedCell(name, id, onRun)}
       />
@@ -387,6 +391,16 @@ describe("ColumnLedger — whole-row link", () => {
       expect(row).not.toHaveAttribute("tabindex");
       expect(row).not.toHaveAttribute("role");
     }
+  });
+
+  it("keeps a class the row's own props give it beside the link class", async () => {
+    const { rows } = await mountLinked(undefined, (name) => ({
+      className: name === "photos-1" ? "row--failing" : undefined,
+    }));
+    expect(nth(rows, 1)).toHaveClass("row--failing");
+    expect(nth(rows, 1)).toHaveClass("row--link");
+    expect(nth(rows, 0)).toHaveClass("row--link");
+    expect(nth(rows, 0)).not.toHaveClass("row--failing");
   });
 
   it("opens the clicked row's object from a plain cell — not the last row's", async () => {
