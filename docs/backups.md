@@ -895,6 +895,8 @@ Leave `schedule.timezone` unset and the schedule evaluates its cron in the targe
 
 `schedule.jitter` inherits the same way, from [`scheduleDefaults.jitter`](repositories.md#scheduledefaults--set-the-cron-timezone-and-jitter-once), with one difference: there is no built-in fallback. Absent at both levels simply means no spread. The window actually used is pinned in `status.nextSchedule.jitter`, and changing it, at either level, invalidates the pinned slot and recomputes it in the new window. So an edit takes effect on the *next* firing, not an arbitrary number of firings later. Matched policies whose repositories disagree on the window resolve to **no jitter** and log why, recommending an explicit `schedule.jitter`. Disagreement is not a value you can average.
 
+Editing `schedule.cron` itself works the same way. The expression a slot was computed from is pinned in `status.nextSchedule.cron`, so after an edit the slot is recomputed from the new expression straight away; the old one does not fire one last time.
+
 ///
 
 ### What `concurrencyPolicy: Replace` really cancels

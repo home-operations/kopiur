@@ -232,6 +232,15 @@ pub struct ScheduleRef {
     /// "unchanged" so an upgrade never churns an established pin.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub jitter: Option<String>,
+    /// The `spec.schedule.cron` expression this slot was computed from, as written
+    /// when it was pinned. Like `timezone` and `jitter`, only ever WRITTEN on
+    /// `nextSchedule`. Recorded so a cron edit invalidates the pinned slot at once
+    /// instead of letting the OLD expression fire one more time. Compared with
+    /// whitespace normalized, so re-spacing the expression is not a change. Absent
+    /// on pins written before this field existed, which is treated as "unchanged"
+    /// (the slot is recomputed with the new expression at its next natural re-pin).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cron: Option<String>,
 }
 
 /// A by-name reference to a `Snapshot` CR created by a schedule slot.

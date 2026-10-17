@@ -123,13 +123,17 @@ There is deliberately **no** `successfulJobsHistoryLimit`. Retention of successf
 | --- | --- |
 | `observedGeneration` | The `metadata.generation` this status reflects, for staleness detection. |
 | `lastSchedule` | The most recent firing, with cron and jitter already applied, and the `Snapshot` it produced. |
-| `nextSchedule` | The next firing slot the controller computed, plus the `timezone` and `jitter` it was computed with, so a change to either can invalidate and recompute the pinned slot. |
+| `nextSchedule` | The next firing slot the controller computed, plus the `cron`, `timezone` and `jitter` it was computed with, so a change to any of them can invalidate and recompute the pinned slot. |
 | `lastSuccessfulSchedule` | The most recent firing whose `Snapshot` succeeded. |
 | `consecutiveFailures` | How many runs failed back to back; resets on success. Drives alerting. |
 | `conditions` | Standard Kubernetes conditions carrying schedule health. |
 
 Each schedule slot is recorded as an `at`, the RFC 3339 instant it fired or is due to fire, plus an optional `snapshotRef` naming the `Snapshot` that slot produced.
 
-All three slots share one schema, so `timezone` and `jitter` appear on each. The controller only ever **writes** them on `nextSchedule`, because they describe a pin it may still have to invalidate rather than a record of a slot that already fired.
+All three slots share one schema, so `cron`, `timezone` and `jitter` appear on each. The controller only ever **writes** them on `nextSchedule`, because they describe a pin it may still have to invalidate rather than a record of a slot that already fired.
 
 If the schedule's effective timezone or jitter later changes, through a `schedule.timezone` or `schedule.jitter` edit or through an inherited repository `scheduleDefaults` change, the controller notices the mismatch and recomputes the pinned slot in the new zone or window. A recorded value that is absent counts as unchanged, so a pin written by an older operator is never churned on upgrade.
+
+The same goes for a `schedule.cron` edit: the pinned slot is recomputed from the new expression on the next reconcile, so the old expression never fires one last time. Re-spacing the expression is not a change. A pin with no recorded `cron` (written by an older operator, or on a cluster whose installed CRD predates the field and drops it) is left alone and picks up the new expression at its next firing.
+
+Any spec edit, including `suspend`, also brings `status.observedGeneration` and the `Ready` condition up to date straight away, so `Ready` reads `Suspended` as soon as you pause a schedule.
