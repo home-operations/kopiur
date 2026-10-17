@@ -5464,6 +5464,82 @@ async fn parallel_snapdel_jobs_never_share_a_persistent_cache_claim() {
 
 // --- #547: pin Job names fit the WorkloadWithJob `<job>-pgt-0` budget --------
 
+/// A repository's `moverDefaults.throttle` caps every mover that talks to its
+/// backend. The snapdel batch Job downloads the repository index like any other,
+/// so it must carry the throttle too, not a default (unthrottled) spec.
+#[tokio::test]
+async fn a_snapdel_batch_job_honors_the_repository_throttle() {
+    let log: RequestLog = Arc::default();
+    let ctx = Context::test_context(snapdel_cache_client(log));
+    let (repo_ref, mut repo) = snapdel_repo(serde_json::json!({}));
+    repo.mover_defaults = Some(
+        serde_json::from_value(serde_json::json!({
+            "throttle": { "downloadBytesPerSecond": 1048576, "readOpsPerSecond": 50 }
+        }))
+        .expect("valid moverDefaults"),
+    );
+    let members = [snapdel_member()];
+    let job_name = batch_job_name(&repo_ref, &members);
+
+    let job = build_batch_job(
+        &ctx,
+        "kopiur-system",
+        &job_name,
+        &repo_ref,
+        &repo,
+        &members,
+        "media",
+        "app-20260101000000",
+    )
+    .await
+    .expect("the batch Job builds");
+
+    let want = io::throttle_spec(repo.mover_defaults.as_ref());
+    assert_ne!(want, kopiur_mover::workspec::ThrottleSpec::default());
+    assert_eq!(job_work_spec(&job).throttle, want);
+}
+
+/// Source guard: no production mover work spec in the controller may hand kopia an
+/// unthrottled `ThrottleSpec::default()`. Every mover that connects to a repository
+/// takes `io::throttle_spec(repo.mover_defaults)`, so a repository's throttle caps
+/// all of its traffic (snapdel and pin once skipped it). Test modules are excluded.
+#[test]
+fn no_production_mover_work_spec_drops_the_repository_throttle() {
+    let sources = [
+        ("snapshot/mod.rs", include_str!("mod.rs")),
+        ("snapshot/build.rs", include_str!("build.rs")),
+        ("restore/mod.rs", include_str!("../restore/mod.rs")),
+        ("maintenance/mod.rs", include_str!("../maintenance/mod.rs")),
+        ("verification.rs", include_str!("../verification.rs")),
+        ("repository.rs", include_str!("../repository.rs")),
+        (
+            "cluster_repository.rs",
+            include_str!("../cluster_repository.rs"),
+        ),
+        (
+            "repository_replication.rs",
+            include_str!("../repository_replication.rs"),
+        ),
+        (
+            "snapshot_replication.rs",
+            include_str!("../snapshot_replication.rs"),
+        ),
+    ];
+    for (file, src) in sources {
+        let production = src.split("#[cfg(test)]\nmod tests {").next().unwrap_or(src);
+        for (i, line) in production.lines().enumerate() {
+            assert!(
+                !line
+                    .trim_start()
+                    .starts_with("throttle: Default::default()"),
+                "{file}:{}: a mover work spec drops the repository throttle; \
+                 use io::throttle_spec(repo.mover_defaults.as_ref())",
+                i + 1
+            );
+        }
+    }
+}
+
 #[test]
 fn a_short_snapshots_pin_job_keeps_its_name_and_needs_no_legacy_lookup() {
     assert_eq!(pin_job_names("db-1"), ("db-1-pin".to_string(), None));

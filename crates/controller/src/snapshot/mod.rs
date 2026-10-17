@@ -4288,7 +4288,7 @@ async fn build_batch_job(
         hook_plan: Default::default(),
         options: MoverOptions::default(),
         cache: crate::cache::cache_tuning(effective_cache.as_ref()),
-        throttle: Default::default(),
+        throttle: io::throttle_spec(repo.mover_defaults.as_ref()),
     };
     // Annotation: the SORTED member UID set — the single source of truth for
     // "which Snapshots".
@@ -4493,7 +4493,7 @@ async fn reconcile_pin(
         hook_plan: Default::default(),
         options: MoverOptions::default(),
         cache: Default::default(),
-        throttle: Default::default(),
+        throttle: io::throttle_spec(repo.mover_defaults.as_ref()),
     };
     let mut labels = run_labels(&config, origin);
     labels.insert(
