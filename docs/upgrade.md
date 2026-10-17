@@ -2,6 +2,12 @@
 
 This page covers upgrading the operator across releases. Most upgrades are a routine `helm upgrade`, or a Flux or Argo reconcile: bump the chart version, roll the Deployments, done. The one exception so far is **0.5.x → 0.6.0**, which moves the CustomResourceDefinitions (CRDs) between two Helm mechanisms and needs one deliberate step to avoid data loss. Read that section before you cross it.
 
+## `privilegedMode` grants capabilities to a root mover; it never changes the UID
+
+`privilegedMode: true` now adds the capabilities a backup or restore needs (backup `DAC_OVERRIDE`; restore `CHOWN`, `DAC_OVERRIDE`, `FOWNER`, `FSETID`), but **only when the mover already runs as root** (`runAsUser: 0`). It never sets or changes the UID. A mover with `privilegedMode: true` and no `runAsUser` keeps running as `65532`, exactly as before, and gets a `PrivilegedModeInert` warning. See [Security context → What `privilegedMode` grants](security-context.md#what-privilegedmode-grants).
+
+**Action:** to get the new capabilities, set `runAsUser: 0` and `runAsNonRoot: false` in the mover `securityContext`. Before you do, check where the repository lives. On a **filesystem repository** (NFS, hostPath) a root mover writes root-owned blobs that the other, non-root movers of that repository (maintenance, verify, snapshot delete, pin) cannot read, and an NFS export with `root_squash` refuses the root writes outright. Give root movers their own filesystem repository, or run every mover of that repository as root. Object-storage repositories are not affected.
+
 ## Mover Role names: only if your release name is long (over ~30 characters)
 
 The three mover identities — `<release>-mover`, `<release>-stream-mover` and `<release>-snapshot-replication-mover` — are now all built from one **pre-capped stem** instead of each being truncated to 63 characters after its suffix was appended. Appending after the cap meant a long enough `fullname` cut the suffix off, and two roles that must never share an identity collapsed onto one name: the `pods/exec`-carrying stream role could land on the same object name as the generic mover role every ordinary backup Job runs as.

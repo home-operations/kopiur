@@ -29,12 +29,12 @@ pub struct MoverSpec {
     /// combinable with `inheritSecurityContextFrom`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pod_security_context: Option<k8s_openapi::api::core::v1::PodSecurityContext>,
-    /// Opt-in, namespace-gated privileged mode. Runs the mover as root (when no layer pins
-    /// a `runAsUser`) and adds the capabilities the operation needs on top of
+    /// Opt-in, namespace-gated privileged mode. Never changes the UID. When the mover runs
+    /// as root (`runAsUser: 0`), adds the capabilities the operation needs on top of
     /// `drop: [ALL]`: `DAC_OVERRIDE` for a backup (read files owned by any uid/gid);
     /// `CHOWN`, `DAC_OVERRIDE`, `FOWNER`, `FSETID` for a restore (reproduce original
-    /// ownership). Grants nothing for maintenance, or when a non-zero `runAsUser` is
-    /// pinned (capabilities are inert for non-root).
+    /// ownership). Grants nothing for maintenance, or when the mover does not run as
+    /// root (capabilities are inert for non-root); set `runAsUser: 0` yourself.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub privileged_mode: Option<bool>,
     /// Copy the UID/GID security context from a live workload rather than hard-coding it.
@@ -73,12 +73,14 @@ impl MoverSpec {
     }
 
     /// Admission-time warning when `privilegedMode: true` would grant nothing because this
-    /// spec pins a non-zero `runAsUser` (capabilities are inert for non-root, #552).
+    /// spec does not run the mover as root — a non-zero `runAsUser`, or none at all
+    /// (capabilities are inert for non-root, and `privilegedMode` never picks a UID).
     ///
     /// Judged on `hardened ⊂ self` only: the repository's `moverDefaults` is invisible at
-    /// admission, and an `inheritSecurityContextFrom` identity resolves at reconcile time,
-    /// so both stay silent here — the controller raises a `PrivilegedModeInert` Event for
-    /// those. `None` when there is nothing to warn about.
+    /// admission (so a `moverDefaults` that pins `runAsUser: 0` makes this a false
+    /// positive — the controller's `PrivilegedModeInert` Event is authoritative), and an
+    /// `inheritSecurityContextFrom` identity resolves at reconcile time, so that case stays
+    /// silent here. `None` when there is nothing to warn about.
     pub fn privileged_mode_warning(&self, op: MoverOperation) -> Option<String> {
         if self.inherit_security_context_from.is_some() {
             return None;
@@ -423,17 +425,17 @@ pub fn resolve_mover(
 }
 
 impl ResolvedMover {
-    /// Apply `privilegedMode` for `op` to this resolved mover (#552): the mover runs as
-    /// root with the operation's capabilities added on top of `drop: [ALL]`. See
-    /// [`apply_privileged_mode`] for the contract. Re-runs the security-context
-    /// invariants afterwards (they are idempotent) so an implied `runAsUser: 0` clears the
-    /// hardened `runAsNonRoot: true`. A no-op unless `privileged_mode == Some(true)`.
+    /// Apply `privilegedMode` for `op` to this resolved mover (#552): a root mover gets the
+    /// operation's capabilities added on top of `drop: [ALL]`; the UID is never changed.
+    /// See [`apply_privileged_mode`] for the contract. Re-runs the (idempotent)
+    /// security-context invariants afterwards. A no-op unless `privileged_mode ==
+    /// Some(true)` and the effective UID is `0`.
     pub fn with_privileged_mode(self, privileged_mode: Option<bool>, op: MoverOperation) -> Self {
         self.with_privileged_mode_effect(privileged_mode, op).0
     }
 
     /// [`Self::with_privileged_mode`], also returning what was done, so a caller can
-    /// surface [`PrivilegedModeEffect::InertNonRootUid`] to the user.
+    /// surface an inert grant ([`PrivilegedModeEffect::warning`]) to the user.
     pub fn with_privileged_mode_effect(
         self,
         privileged_mode: Option<bool>,

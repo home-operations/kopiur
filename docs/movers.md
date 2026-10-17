@@ -242,7 +242,7 @@ The seed writes root-owned, owner-only files, the case that actually needs a roo
 --8<-- "deploy/examples/tryit/movers-privileged.yaml:seed"
 ```
 
-And the policy runs the mover as root, with `runAsUser: 0` and `runAsNonRoot: false`, plus `privilegedMode: true`. The seed files are owned by root, so root could read them as their owner. `privilegedMode` adds `DAC_OVERRIDE`, which is what lets root read files owned by *other* UIDs too (see [Security context → What `privilegedMode` grants](security-context.md#what-privilegedmode-grants)):
+And the policy runs the mover as root, with `runAsUser: 0` and `runAsNonRoot: false`, plus `privilegedMode: true`. The seed files are owned by root, so root could read them as their owner. `privilegedMode` adds `DAC_OVERRIDE` to that root mover, which is what lets it read files owned by *other* UIDs too. It never sets the UID itself, so `runAsUser: 0` is required (see [Security context → What `privilegedMode` grants](security-context.md#what-privilegedmode-grants)):
 
 ```yaml
 --8<-- "deploy/examples/tryit/movers-privileged.yaml:policy"

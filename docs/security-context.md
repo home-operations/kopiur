@@ -347,7 +347,7 @@ spec:
 
 #### What `privilegedMode` grants
 
-`privilegedMode: true` runs the mover as root and adds the Linux capabilities the operation needs, on top of `drop: ["ALL"]`:
+`privilegedMode: true` never changes the UID. When the mover runs as root (`runAsUser: 0`, which you set yourself), it adds the Linux capabilities the operation needs, on top of `drop: ["ALL"]`:
 
 | Operation | Capabilities added | Why |
 | --- | --- | --- |
@@ -357,8 +357,9 @@ spec:
 
 The rules:
 
-- **If no layer sets a `runAsUser`, `privilegedMode` sets it to `0`.** Capabilities do nothing for a non-root process.
-- **If a layer sets a non-zero `runAsUser`, that UID is kept and nothing is granted.** Kubernetes gives a non-root container no usable capabilities. The webhook warns at apply time when it can see the UID, and the operator emits a `PrivilegedModeInert` Warning Event on the `Snapshot` or `Restore` otherwise. Fix it by setting `runAsUser: 0` and `runAsNonRoot: false`, or by dropping `privilegedMode`.
+- **Capabilities are granted only when the effective `runAsUser` is `0`.** It can come from `securityContext`, `podSecurityContext`, the repository's `moverDefaults`, or an inherited context.
+- **Without a root UID, `privilegedMode` does nothing.** That covers a non-zero `runAsUser` and no `runAsUser` at all (the image runs as `65532`). Kubernetes gives a non-root container no usable capabilities, so nothing is granted and the UID is left alone. The webhook warns at apply time, and the operator emits a `PrivilegedModeInert` Warning Event on the `Snapshot` or `Restore`. Fix it by setting `runAsUser: 0` and `runAsNonRoot: false`, or by dropping `privilegedMode`.
+- **It never changes who writes the repository.** The mover's UID owns the blobs it writes to a filesystem repository (NFS, hostPath). A root mover writes root-owned blobs that a non-root maintenance, verify, delete or pin mover cannot read, and an NFS export with `root_squash` refuses root writes outright. Give a root mover its own filesystem repository, or run every mover of that repository as root. Object-storage repositories (S3, B2, Azure, GCS) are unaffected.
 - **Any `capabilities.add` you set is kept.** The grant is added to your list, never replacing it.
 
 Every capability above is on the Pod Security Standards [**baseline**](https://kubernetes.io/docs/concepts/security/pod-security-standards/#baseline) allow list, so a privileged mover is admitted in a `baseline`-enforced namespace. It is never admitted under `restricted`, which requires `runAsNonRoot: true`. Kopiur deliberately grants `DAC_OVERRIDE` rather than `DAC_READ_SEARCH` for backups: `DAC_READ_SEARCH` is narrower, but it is not on the baseline list.

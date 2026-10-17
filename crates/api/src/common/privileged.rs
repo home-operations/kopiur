@@ -13,16 +13,22 @@
 //!
 //! # The contract
 //!
+//! `privilegedMode` **never changes the UID**. Who the mover runs as decides who owns
+//! the repository blobs it writes; silently switching an existing `65532` mover to root
+//! would leave root-owned blobs on a filesystem repository that every other (non-root)
+//! mover then cannot read, and breaks outright on an NFS export with `root_squash`.
+//!
 //! When `privilegedMode` is `true`:
 //!
-//! - The mover runs as **root**. If no layer pins a `runAsUser`, it is set to `0`
-//!   (the image default would be the unprivileged `65532`, which capabilities do nothing
-//!   for). A layer that pins a **non-zero** UID is respected: Kubernetes sets no ambient
-//!   capabilities, so added capabilities are inert for a non-root process and nothing is
-//!   granted. That case is reported ([`PrivilegedModeEffect::InertNonRootUid`]) so the
-//!   webhook and the controller can tell the user.
-//! - The capabilities the [`MoverOperation`] needs are **added** on top of `drop: [ALL]`,
-//!   unioned with any `capabilities.add` a layer already set (never removing one).
+//! - If the effective (merged container/pod) `runAsUser` is **`0`**, the capabilities the
+//!   [`MoverOperation`] needs are **added** on top of `drop: [ALL]`, unioned with any
+//!   `capabilities.add` a layer already set (never removing one).
+//! - Otherwise — a pinned non-zero UID, or no UID at all (the image's unprivileged
+//!   `65532`) — it is inert: Kubernetes sets no ambient capabilities, so added
+//!   capabilities would do nothing for a non-root process. Nothing is granted and the
+//!   case is reported ([`PrivilegedModeEffect::InertNonRootUid`] /
+//!   [`PrivilegedModeEffect::InertUnsetUid`]) so the webhook and the controller can tell
+//!   the user to set `runAsUser: 0`.
 //!
 //! Every capability granted here is in the Pod Security Standards **baseline** allow
 //! list ("Adding additional capabilities beyond those listed below must be disallowed:
@@ -111,31 +117,34 @@ pub enum PrivilegedModeEffect {
     NotRequested,
     /// `privilegedMode` is `true` but the operation needs no capability; unchanged.
     NothingToGrant,
-    /// The operation's capabilities were added. `implied_root` is true when no layer
-    /// pinned a UID and the mover was set to `runAsUser: 0`.
-    Granted {
-        /// Whether `runAsUser: 0` was set by privilegedMode itself.
-        implied_root: bool,
-    },
+    /// The mover runs as root, so the operation's capabilities were added.
+    Granted,
     /// A layer pins a non-zero UID, so capabilities would be inert; nothing was granted.
     InertNonRootUid {
         /// The pinned effective UID.
         uid: i64,
     },
+    /// No layer pins a UID, so the mover runs as the image's non-root user and
+    /// capabilities would be inert; nothing was granted and the UID is left alone.
+    InertUnsetUid,
 }
 
 impl PrivilegedModeEffect {
-    /// A short user-facing message for the inert case (`None` otherwise).
+    /// A short user-facing message for the inert cases (`None` otherwise).
     pub fn warning(&self) -> Option<String> {
         match self {
             PrivilegedModeEffect::InertNonRootUid { uid } => Some(format!(
-                "privilegedMode: true has no effect while the mover runs as UID {uid}: Linux \
-                 capabilities only apply to root. Fix: set securityContext.runAsUser: 0 and \
-                 runAsNonRoot: false, or drop privilegedMode"
+                "privilegedMode grants capabilities only to a root mover; this one runs as \
+                 UID {uid}. Fix: set securityContext.runAsUser: 0."
             )),
+            PrivilegedModeEffect::InertUnsetUid => Some(
+                "privilegedMode grants capabilities only to a root mover. Fix: set \
+                 securityContext.runAsUser: 0."
+                    .to_string(),
+            ),
             PrivilegedModeEffect::NotRequested
             | PrivilegedModeEffect::NothingToGrant
-            | PrivilegedModeEffect::Granted { .. } => None,
+            | PrivilegedModeEffect::Granted => None,
         }
     }
 }
@@ -155,18 +164,14 @@ pub fn privileged_mode_effect(
         return PrivilegedModeEffect::NothingToGrant;
     }
     match effective_run_as_user(Some(sc), psc) {
-        None => PrivilegedModeEffect::Granted { implied_root: true },
-        Some(0) => PrivilegedModeEffect::Granted {
-            implied_root: false,
-        },
+        None => PrivilegedModeEffect::InertUnsetUid,
+        Some(0) => PrivilegedModeEffect::Granted,
         Some(uid) => PrivilegedModeEffect::InertNonRootUid { uid },
     }
 }
 
 /// Apply `privilegedMode` to a resolved mover context (see the module docs for the
-/// contract). Pure and idempotent. Run it BEFORE
-/// [`crate::invariants::enforce_security_context_invariants`]: an implied `runAsUser: 0`
-/// relies on INV-1 to clear the hardened `runAsNonRoot: true`.
+/// contract). Pure and idempotent. Only ever touches `capabilities` — never the UID.
 pub fn apply_privileged_mode(
     mut sc: SecurityContext,
     psc: Option<PodSecurityContext>,
@@ -179,10 +184,7 @@ pub fn apply_privileged_mode(
 ) {
     let effect = privileged_mode_effect(&sc, psc.as_ref(), privileged_mode, op);
     match &effect {
-        PrivilegedModeEffect::Granted { implied_root } => {
-            if *implied_root {
-                sc.run_as_user = Some(0);
-            }
+        PrivilegedModeEffect::Granted => {
             sc.capabilities = Some(add_capabilities(
                 sc.capabilities.take(),
                 op.privileged_capabilities(),
@@ -190,7 +192,8 @@ pub fn apply_privileged_mode(
         }
         PrivilegedModeEffect::NotRequested
         | PrivilegedModeEffect::NothingToGrant
-        | PrivilegedModeEffect::InertNonRootUid { .. } => {}
+        | PrivilegedModeEffect::InertNonRootUid { .. }
+        | PrivilegedModeEffect::InertUnsetUid => {}
     }
     (sc, psc, effect)
 }
@@ -325,17 +328,25 @@ mod tests {
         );
     }
 
-    /// No layer pins a UID: privilegedMode means root, so the grant is effective.
+    /// No layer pins a UID: privilegedMode never picks one (it never changes who writes
+    /// repository blobs), so the mover keeps the image's non-root user and is granted
+    /// nothing — and the user is told.
     #[test]
-    fn privileged_with_no_pinned_uid_implies_root() {
-        let m = resolved(None, Some(true), MoverOperation::Backup);
-        assert_eq!(m.security_context.run_as_user, Some(0));
-        assert_eq!(
-            m.security_context.run_as_non_root,
-            Some(false),
-            "INV-1 must clear the hardened runAsNonRoot for the implied root"
-        );
-        assert_eq!(adds(&m), vec!["DAC_OVERRIDE"]);
+    fn privileged_with_no_pinned_uid_keeps_the_uid_grants_nothing_and_warns() {
+        for op in [MoverOperation::Backup, MoverOperation::Restore] {
+            let base = resolve_mover(None, None, None, None, None, None);
+            let (m, effect) = base.clone().with_privileged_mode_effect(Some(true), op);
+            assert_eq!(m, base, "{op:?}: uid/runAsNonRoot/caps unchanged");
+            assert_eq!(m.security_context.run_as_user, None);
+            assert_eq!(m.security_context.run_as_non_root, Some(true));
+            assert!(adds(&m).is_empty());
+            assert_eq!(effect, PrivilegedModeEffect::InertUnsetUid);
+            let msg = effect.warning().expect("inert privilegedMode warns");
+            assert!(
+                msg.contains("root mover") && msg.contains("Fix: set securityContext.runAsUser: 0"),
+                "{msg}"
+            );
+        }
     }
 
     /// A pinned non-zero UID is respected, and nothing inert is added.
@@ -390,7 +401,7 @@ mod tests {
     }
 
     #[test]
-    fn admission_warning_only_for_a_pinned_non_root_uid() {
+    fn admission_warning_unless_the_spec_pins_root() {
         use crate::common::MoverSpec;
         let non_root = MoverSpec {
             security_context: Some(SecurityContext {
@@ -420,14 +431,15 @@ mod tests {
             root.privileged_mode_warning(MoverOperation::Restore)
                 .is_none()
         );
-        let implied = MoverSpec {
+        let unset = MoverSpec {
             privileged_mode: Some(true),
             ..Default::default()
         };
         assert!(
-            implied
+            unset
                 .privileged_mode_warning(MoverOperation::Backup)
-                .is_none()
+                .is_some(),
+            "privilegedMode with no runAsUser grants nothing, so it warns"
         );
         let off = MoverSpec {
             privileged_mode: Some(false),
@@ -442,7 +454,7 @@ mod tests {
     #[test]
     fn apply_is_idempotent() {
         for op in [MoverOperation::Backup, MoverOperation::Restore] {
-            let once = resolved(None, Some(true), op);
+            let once = resolved(Some(&root_sc()), Some(true), op);
             let twice = once.clone().with_privileged_mode(Some(true), op);
             assert_eq!(once, twice, "{op:?}");
         }

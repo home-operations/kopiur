@@ -147,8 +147,9 @@ spec:
     securityContext:
       runAsUser: 0 # root
       runAsNonRoot: false # required: runAsNonRoot:true + runAsUser:0 is rejected by the kubelet
-    # Adds DAC_OVERRIDE on top of drop:[ALL], so root can read files owned by ANY
-    # uid/gid (root alone keeps no capabilities). On a Restore it adds CHOWN,
+    # With runAsUser: 0 above, adds DAC_OVERRIDE on top of drop:[ALL], so root can read
+    # files owned by ANY uid/gid (root alone keeps no capabilities). It never sets the
+    # UID itself: without runAsUser: 0 it grants nothing. On a Restore it adds CHOWN,
     # DAC_OVERRIDE, FOWNER and FSETID so original ownership is reproduced.
     privilegedMode: true
 # --8<-- [end:policy]

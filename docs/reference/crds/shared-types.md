@@ -109,7 +109,7 @@ Per-recipe mover overrides, set on a recipe's `mover` field. Each field overlays
 - **`cache`** overrides the repository's [CacheDefaults](#cachedefaults).
 - **`securityContext`** is the container security context. Set only the fields you want to change.
 - **`podSecurityContext`** is the pod security context, notably `fsGroup`, which makes a freshly provisioned volume group-writable so an unprivileged mover can populate it on restore without root.
-- **`privilegedMode`** is opt-in and gated per namespace. It preserves UID and GID on restore.
+- **`privilegedMode`** is opt-in and gated per namespace. It never changes the UID; for a root mover (`runAsUser: 0`) it adds the capabilities the operation needs, which lets a restore preserve UID and GID.
 - **`inheritSecurityContextFrom`** is described below.
 - **`ttlSecondsAfterFinished`** overrides the Job TTL for this recipe.
 

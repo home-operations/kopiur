@@ -3509,16 +3509,33 @@ mod recorded_meta_tests {
         assert_eq!(meta.uid, Some(2000));
     }
 
-    /// #552: `privilegedMode: true` with no pinned UID runs the backup as root. The
-    /// recorded identity must say so (uid 0) and attribute it to the recipe, since its
-    /// `privilegedMode` is what chose root.
+    /// #552 follow-up: `privilegedMode: true` never picks a UID. With no pinned UID the
+    /// backup runs as the image's non-root user, so the recorded identity stays absent /
+    /// `src: defaults` — never a `uid: 0, src: explicit` a later
+    /// `inheritSecurityContextFrom: {snapshot: {}}` restore would replay as root.
     #[test]
-    fn privileged_mode_implied_root_records_uid_zero_src_explicit() {
+    fn privileged_mode_without_a_uid_records_no_uid_src_defaults() {
         let mover = MoverSpec {
             privileged_mode: Some(true),
             ..Default::default()
         };
         let resolved = resolve_mover(None, None, None, None, None, None)
+            .with_privileged_mode(Some(true), kopiur_api::common::MoverOperation::Backup);
+        let meta = recorded_meta(&resolved, &InheritOutcome::NotRequested, Some(&mover));
+        assert_eq!(meta.uid, None);
+        assert_eq!(meta.src, RecordedSrc::Defaults);
+    }
+
+    /// The other half: a recipe that pins `runAsUser: 0` itself and sets `privilegedMode`
+    /// records uid 0 attributed to the recipe, as any explicit UID would.
+    #[test]
+    fn privileged_mode_with_explicit_root_records_uid_zero_src_explicit() {
+        let mover = MoverSpec {
+            security_context: Some(sc_uid(0)),
+            privileged_mode: Some(true),
+            ..Default::default()
+        };
+        let resolved = resolve_mover(None, Some(&sc_uid(0)), None, None, None, None)
             .with_privileged_mode(Some(true), kopiur_api::common::MoverOperation::Backup);
         let meta = recorded_meta(&resolved, &InheritOutcome::NotRequested, Some(&mover));
         assert_eq!(meta.uid, Some(0));
@@ -4221,6 +4238,41 @@ fn privileged_mode_root_mover_job_carries_the_operation_capabilities() {
             added,
             want.iter().map(|c| c.to_string()).collect::<Vec<_>>(),
             "{op:?} {privileged_mode:?}"
+        );
+    }
+}
+
+/// #552 follow-up: `privilegedMode` with no pinned UID renders exactly the hardened
+/// non-root Job it would without `privilegedMode` — no capabilities, no `runAsUser`,
+/// `runAsNonRoot: true` kept.
+#[test]
+fn privileged_mode_without_a_uid_renders_the_unprivileged_container() {
+    use kopiur_api::common::MoverOperation;
+    for op in [MoverOperation::Backup, MoverOperation::Restore] {
+        let plain = kopiur_api::common::resolve_mover(None, None, None, None, None, None);
+        let privileged = plain.clone().with_privileged_mode(Some(true), op);
+        let sc_of = |r: &kopiur_api::common::ResolvedMover| {
+            render_mover_job(BTreeMap::new(), r)
+                .spec
+                .expect("spec")
+                .template
+                .spec
+                .expect("pod spec")
+                .containers[0]
+                .security_context
+                .clone()
+                .expect("container securityContext")
+        };
+        let sc = sc_of(&privileged);
+        assert_eq!(sc, sc_of(&plain), "{op:?}");
+        assert_eq!(sc.run_as_user, None, "{op:?}");
+        assert_eq!(sc.run_as_non_root, Some(true), "{op:?}");
+        assert!(
+            sc.capabilities
+                .and_then(|c| c.add)
+                .unwrap_or_default()
+                .is_empty(),
+            "{op:?}"
         );
     }
 }

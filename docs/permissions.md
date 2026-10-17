@@ -142,10 +142,10 @@ spec:
         securityContext:
             runAsUser: 0
             runAsNonRoot: false
-        privilegedMode: true # adds DAC_OVERRIDE (backup) or CHOWN/DAC_OVERRIDE/FOWNER/FSETID (restore)
+        privilegedMode: true # root only: adds DAC_OVERRIDE (backup) or CHOWN/DAC_OVERRIDE/FOWNER/FSETID (restore)
 ```
 
-You need `privilegedMode: true`, not just `runAsUser: 0`. The mover drops every Linux capability by default, and root without `DAC_OVERRIDE` gets `permission denied` on a `0660` file owned by another UID and GID, like anyone else. `privilegedMode` adds back only the capabilities the operation needs. If no layer sets `runAsUser`, it also sets it to `0`. If a layer sets a non-zero `runAsUser`, it grants nothing and Kopiur warns. The full table, and the `capabilities.add` workaround for older versions, are in [Security context → What `privilegedMode` grants](security-context.md#what-privilegedmode-grants).
+You need `privilegedMode: true`, not just `runAsUser: 0`. The mover drops every Linux capability by default, and root without `DAC_OVERRIDE` gets `permission denied` on a `0660` file owned by another UID and GID, like anyone else. `privilegedMode` adds back only the capabilities the operation needs, and only to a root mover. It never changes the UID: without `runAsUser: 0` it grants nothing and Kopiur warns. The full table, and the `capabilities.add` workaround for older versions, are in [Security context → What `privilegedMode` grants](security-context.md#what-privilegedmode-grants).
 
 A root, or otherwise elevated, mover is a **privileged mover**, and granting it is a per-namespace admin decision. If the namespace has not opted in, the `Snapshot` is refused with a clear `MoverPermitted=False` condition.
 

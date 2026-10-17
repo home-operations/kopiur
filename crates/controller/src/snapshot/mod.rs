@@ -1397,9 +1397,14 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
             .as_ref()
             .and_then(|m| m.ttl_seconds_after_finished),
     );
-    // `privilegedMode` grants a backup root + DAC_OVERRIDE so it can read files owned by
-    // any uid/gid (#552). Applied BEFORE the identity is recorded and the gate runs, so
-    // both see what the Job will actually run as.
+    // `privilegedMode` grants a ROOT backup (`runAsUser: 0`, set by the user — it never
+    // changes the UID) DAC_OVERRIDE so it can read files owned by any uid/gid (#552); for
+    // any other UID it is inert and warns. Applied BEFORE the identity is recorded and the
+    // gate runs, so both see what the Job will actually run as.
+    // Re-published on every pre-launch pass by design: the kube-runtime Recorder folds an
+    // identical Event (same reason/note/regarding, within its TTL) into ONE object with a
+    // climbing `series.count` (`io::event_ref` strips the churning resourceVersion so the
+    // key matches), so this never mints a new Event per pass.
     let (resolved_mover, privileged_effect) = resolved_mover
         .with_privileged_mode_effect(privileged_mode, kopiur_api::common::MoverOperation::Backup);
     if let Some(msg) = privileged_effect.warning() {

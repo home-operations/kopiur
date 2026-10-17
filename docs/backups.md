@@ -588,7 +588,7 @@ mover:
         mode: Ephemeral # Ephemeral (default) | Persistent (warm cache across runs)
         contentCacheSizeMb: 10000 # kopia --content-cache-size-mb budget
         metadataCacheSizeMb: 2000 # kopia --metadata-cache-size-mb budget
-    # privilegedMode: true           # opt-in, namespace-gated; root + DAC_OVERRIDE (backup) / CHOWN,DAC_OVERRIDE,FOWNER,FSETID (restore)
+    # privilegedMode: true           # opt-in, namespace-gated; with runAsUser: 0 adds DAC_OVERRIDE (backup) / CHOWN,DAC_OVERRIDE,FOWNER,FSETID (restore)
 ```
 
 | Value | What it does | When to change it |
@@ -600,7 +600,7 @@ mover:
 | `cache.capacity` / `storageClassName` | Back the kopia cache with a sized volume instead of an `emptyDir`. | Large repositories: a sized cache avoids re-downloading metadata each run. |
 | `cache.mode` | `Ephemeral` (fresh per run, GC'd with the Job) or `Persistent` (a controller-owned PVC reused across runs for a **warm** cache). | `Persistent` for big recurring backups where a warm cache speeds each run. It's `ReadWriteOnce`, so it assumes runs don't overlap. |
 | `cache.contentCacheSizeMb` / `metadataCacheSizeMb` | kopia's content/metadata cache budgets (MiB). | Tune kopia's memory/disk cache footprint independently of the volume size. |
-| `privilegedMode` | Runs the mover as root and adds the Linux capabilities the operation needs on top of `drop: ["ALL"]`: `DAC_OVERRIDE` for a backup (read any file), `CHOWN`, `DAC_OVERRIDE`, `FOWNER`, `FSETID` for a restore (reproduce original ownership). `runAsUser: 0` alone grants none of these. See [Security context → What `privilegedMode` grants](security-context.md#what-privilegedmode-grants). | Only when matching a single UID isn't enough (mixed ownership, `lost+found`). Namespace-gated; see below. |
+| `privilegedMode` | For a root mover (`runAsUser: 0`, set yourself; `privilegedMode` never changes the UID), adds the Linux capabilities the operation needs on top of `drop: ["ALL"]`: `DAC_OVERRIDE` for a backup (read any file), `CHOWN`, `DAC_OVERRIDE`, `FOWNER`, `FSETID` for a restore (reproduce original ownership). `runAsUser: 0` alone grants none of these, and `privilegedMode` without `runAsUser: 0` grants nothing. See [Security context → What `privilegedMode` grants](security-context.md#what-privilegedmode-grants). | Only when matching a single UID isn't enough (mixed ownership, `lost+found`). Namespace-gated; see below. |
 
 A repository can set `moverDefaults.cache` that every mover inherits, and `mover.cache` overlays it field by field, so you can, for example, bump only `capacity` per recipe. See [Repositories → moverDefaults.cache](repositories.md).
 

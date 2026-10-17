@@ -191,6 +191,18 @@ async fn privileged_root_mover_reads_files_owned_by_other_uids() {
         Some(true),
         "the privilegedMode overlay must land"
     );
+    // privilegedMode grants nothing to a non-root mover and never picks the UID itself,
+    // so the explicit runAsUser: 0 is what makes this a root mover.
+    assert_eq!(
+        landed
+            .spec
+            .mover
+            .as_ref()
+            .and_then(|m| m.security_context.as_ref())
+            .and_then(|sc| sc.run_as_user),
+        Some(0),
+        "the explicit runAsUser: 0 must land"
+    );
     let _ = backups
         .create(
             &PostParams::default(),

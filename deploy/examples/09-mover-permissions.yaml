@@ -117,9 +117,9 @@ spec:
     # the workload namespace must opt in first, or the Snapshot is refused:
     #   kubectl annotate namespace app kopiur.home-operations.com/privileged-movers=true
     # securityContext:
-    #   runAsUser: 0           # root — reads any file
+    #   runAsUser: 0           # root (privilegedMode never sets this for you)
     #   runAsNonRoot: false
-    # privilegedMode: true     # also preserves UID/GID ownership on RESTORE
+    # privilegedMode: true     # root only: reads any file; preserves UID/GID on RESTORE
 # --8<-- [end:mover]
 ---
 # ── Per-RUN override on a one-shot Snapshot (MERGES over the policy) ───────────

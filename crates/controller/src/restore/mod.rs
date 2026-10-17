@@ -3446,9 +3446,15 @@ async fn run_restore_mover(
             .as_ref()
             .and_then(|m| m.ttl_seconds_after_finished),
     );
-    // `privilegedMode` grants a restore root + CHOWN/DAC_OVERRIDE/FOWNER/FSETID so it can
-    // write anywhere in the target and reproduce each file's recorded owner and mode
-    // (#552). Applied before the gate so the gate and the Job see the same context.
+    // `privilegedMode` grants a ROOT restore (`runAsUser: 0`, set by the user — it never
+    // changes the UID) CHOWN/DAC_OVERRIDE/FOWNER/FSETID so it can write anywhere in the
+    // target and reproduce each file's recorded owner and mode (#552). For any other UID it
+    // is inert and warns. Applied before the gate so the gate and the Job see the same
+    // context.
+    // Re-published on every pre-launch pass by design: the kube-runtime Recorder folds an
+    // identical Event (same reason/note/regarding, within its TTL) into ONE object with a
+    // climbing `series.count` (`io::event_ref` strips the churning resourceVersion so the
+    // key matches), so this never mints a new Event per pass.
     let (resolved_mover, privileged_effect) = resolved_mover
         .with_privileged_mode_effect(privileged_mode, kopiur_api::common::MoverOperation::Restore);
     if let Some(msg) = privileged_effect.warning() {

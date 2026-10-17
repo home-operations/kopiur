@@ -250,7 +250,7 @@ mod tests {
 
     /// #552: admission judges the same `privilegedMode` grant the controller applies. A
     /// privileged root reads everything (root + DAC_OVERRIDE); plain root does not, and
-    /// `privilegedMode` alone implies root.
+    /// `privilegedMode` alone never picks a UID (it stays unpinned, so nothing to judge).
     #[test]
     fn the_admission_identity_applies_privileged_mode() {
         let root = SecurityContext {
@@ -281,9 +281,10 @@ mod tests {
             privileged_mode: Some(true),
             ..Default::default()
         };
-        let id = pinned_mover_identity(Some(&implied)).expect("privilegedMode implies uid 0");
-        assert_eq!(id.uid, Some(0));
-        assert!(id.reads_any_file);
+        assert!(
+            pinned_mover_identity(Some(&implied)).is_none(),
+            "privilegedMode alone pins no uid"
+        );
     }
 
     /// The resolve must NOT start warning about every default policy: the hardened base
