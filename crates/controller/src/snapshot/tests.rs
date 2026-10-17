@@ -5461,3 +5461,31 @@ async fn parallel_snapdel_jobs_never_share_a_persistent_cache_claim() {
         "the coerced ephemeral cache provisions no PVC"
     );
 }
+
+// --- #547: pin Job names fit the WorkloadWithJob `<job>-pgt-0` budget --------
+
+#[test]
+fn a_short_snapshots_pin_job_keeps_its_name_and_needs_no_legacy_lookup() {
+    assert_eq!(pin_job_names("db-1"), ("db-1-pin".to_string(), None));
+}
+
+#[test]
+fn a_long_scheduled_snapshots_pin_job_is_capped_with_a_legacy_fallback() {
+    // A scheduled Snapshot is `<schedule>-<14 digits>`: a 40-char schedule name
+    // makes a 55-char Snapshot, whose `-pin` Job (59) used to be valid but
+    // overflows once Kubernetes appends `-pgt-0`.
+    let snapshot = format!("{}-20260101000000", "s".repeat(40));
+    let (current, legacy) = pin_job_names(&snapshot);
+    assert!(current.len() + "-pgt-0".len() <= 63, "{current}");
+    assert_eq!(current, pin_job_names(&snapshot).0, "deterministic");
+    // The pre-#547 name is still looked up, so an in-flight pin finishes.
+    assert_eq!(legacy, Some(format!("{snapshot}-pin")));
+}
+
+#[test]
+fn an_uncreatable_legacy_pin_name_is_not_looked_up() {
+    // > 63 chars could never have been created, so there is nothing to find.
+    let (current, legacy) = pin_job_names(&"s".repeat(70));
+    assert!(current.len() <= kopiur_api::consts::JOB_NAME_MAX);
+    assert_eq!(legacy, None);
+}

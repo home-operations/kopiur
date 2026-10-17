@@ -626,6 +626,46 @@ pub fn schedule_cr_growth_warning(cron: &str) -> Option<String> {
     ))
 }
 
+/// A non-blocking admission WARNING (#547) when a CR's name is longer than
+/// [`crate::consts::JOB_NAME_MAX`] (57) and its mover `Job` takes that exact name
+/// (a `Snapshot`'s backup Job, a `Restore`'s Job). Kubernetes 1.37's
+/// `WorkloadWithJob` derives a `<job>-pgt-0` name that must fit 63 characters, so
+/// such a Job breaks there. The Job cannot simply be renamed (its name is the
+/// lookup key tying it to the CR), so admission says so up front. `None` when the
+/// name fits.
+pub fn job_name_length_warning(kind: &str, name: &str) -> Option<String> {
+    use crate::consts::JOB_NAME_MAX;
+    (name.len() > JOB_NAME_MAX).then(|| {
+        format!(
+            "{kind} name `{name}` is {} characters. Its mover Job uses the same name, and \
+             Kubernetes 1.37+ (WorkloadWithJob) needs Job names of at most {JOB_NAME_MAX} \
+             characters. Fix: use a {kind} name of {JOB_NAME_MAX} characters or fewer",
+            name.len()
+        )
+    })
+}
+
+/// The scheduled-run sibling of [`job_name_length_warning`] (#547): every fire of
+/// a `SnapshotSchedule` creates a `Snapshot` named `<schedule>-<YYYYMMDDHHMMSS>`
+/// (15 more characters), whose backup Job takes that name. `None` when those
+/// names fit [`crate::consts::JOB_NAME_MAX`].
+pub fn scheduled_job_name_length_warning(schedule_name: &str) -> Option<String> {
+    use crate::consts::JOB_NAME_MAX;
+    // `-` + the 14-digit `%Y%m%d%H%M%S` slot stamp.
+    const SLOT_SUFFIX: usize = 15;
+    let max = JOB_NAME_MAX - SLOT_SUFFIX;
+    (schedule_name.len() > max).then(|| {
+        format!(
+            "SnapshotSchedule name `{schedule_name}` is {} characters, so each run's Snapshot \
+             and backup Job get a {}-character name. Kubernetes 1.37+ (WorkloadWithJob) needs \
+             Job names of at most {JOB_NAME_MAX} characters. Fix: use a schedule name of {max} \
+             characters or fewer",
+            schedule_name.len(),
+            schedule_name.len() + SLOT_SUFFIX
+        )
+    })
+}
+
 /// Count how many times `cron` fires within one representative active hour. Pure and
 /// clock-free — anchored on the cron's FIRST fire from a fixed instant (not a fixed
 /// calendar hour), so a day-of-week / day-of-month constrained cron is measured

@@ -378,6 +378,18 @@ pub fn effective_max_concurrent_jobs(
         .and_then(|n| std::num::NonZeroUsize::new(n as usize))
 }
 
+/// The longest `Job` name that stays valid once Kubernetes derives child object
+/// names from it (#547): **57**, not 63.
+///
+/// Kubernetes 1.37's `WorkloadWithJob` creates a pod-group template named
+/// `<job>-pgt-0` for each Job, and that name must itself fit the 63-character
+/// DNS-label limit, so a Job name may use at most `63 - len("-pgt-0")` = 57.
+/// (Pod names are not the constraint: they come from `generateName`, which the
+/// apiserver truncates.) Generated Job names are capped to this; a Job whose name
+/// IS a user-chosen CR name (a `Snapshot`'s backup Job, a `Restore`'s Job) cannot
+/// be renamed, so admission warns when such a name is longer.
+pub const JOB_NAME_MAX: usize = 57;
+
 /// The per-repository snapshot-delete batch default when
 /// `concurrency.maxConcurrentDeleteJobs` is absent: one batch at a time
 /// (single-flight). See [`effective_max_concurrent_delete_jobs`].

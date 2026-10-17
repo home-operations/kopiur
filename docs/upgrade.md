@@ -22,6 +22,15 @@ kubectl delete serviceaccount <old-name> -n <ns>
 
 Doing this matters most for an old `…-stream-mover` ServiceAccount, whose RoleBinding carries `create pods/exec`.
 
+## Generated Job names are capped at 57 characters (Kubernetes 1.37 WorkloadWithJob)
+
+Kubernetes 1.37's `WorkloadWithJob` derives a `<job>-pgt-0` name from every Job, and that name must fit 63 characters. So the Jobs Kopiur names itself are now capped at **57** characters, with a hash suffix when they would be longer. This needs **no action**:
+
+- **Snapshot-delete batches (`snapdel-*`)** get shorter names. In-flight batches are found by label and by their member list, never by name, so a batch running across the upgrade is still recognized and nothing is deleted twice.
+- **Pin Jobs (`<snapshot>-pin`), `runJob` hook Jobs, and repository discovery Jobs (`<repo>-discovery`)** only change for long names. The operator first looks for a Job under the old name, so one running across the upgrade is finished, not started a second time.
+
+A backup Job takes its `Snapshot`'s name and a restore Job takes its `Restore`'s name, so those cannot be shortened. Admission now **warns** when a `Snapshot` or `Restore` name is longer than 57 characters, or a `SnapshotSchedule` name is longer than 42 (each run is `<schedule>-<14-digit timestamp>`). Pick shorter names if your cluster runs Kubernetes 1.37 or later. Two generated names can still reach 63 characters and are not capped yet: fanned-out or multi-repository `Snapshot` children (and so their backup Jobs), and populator restore Jobs (`<restore>-populate-<hash>`, when the `Restore` name is over 39 characters).
+
 ## Per-repository mover concurrency: what the first reconcile after the upgrade does
 
 The release that adds [`concurrency.maxConcurrentJobs`](repositories.md#concurrency--cap-the-mover-jobs-one-repository-runs-at-once) needs **no action**. With no cap set anywhere, which is the default, the gate costs one branch, performs no extra API calls, and changes nothing about backups. The notes below matter only once you set a cap, and only across the upgrade itself.

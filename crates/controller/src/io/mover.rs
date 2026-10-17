@@ -77,6 +77,26 @@ pub async fn delete_mover_run(
     delete_mover_run_with(client, namespace, job_name, &DeleteParams::background()).await
 }
 
+/// Which discovery (bootstrap / catalog-scan) Job name is live for repository
+/// `repo` in `namespace` (#547): the pre-#547 uncapped name when a Job by that name
+/// still exists (an upgrade landed mid-run: finish, read and recycle THAT Job and
+/// its result ConfigMap), else the current capped
+/// [`crate::naming::discovery_job_name`]. The common case (repository names under
+/// 48 characters) has no legacy name and costs no extra GET.
+pub async fn discovery_job_name_in_use(
+    client: &kube::Client,
+    namespace: &str,
+    repo: &str,
+) -> Result<String> {
+    if let Some(legacy) = crate::naming::legacy_discovery_job_name(repo) {
+        let job_api: Api<Job> = Api::namespaced(client.clone(), namespace);
+        if job_api.get_opt(&legacy).await?.is_some() {
+            return Ok(legacy);
+        }
+    }
+    Ok(crate::naming::discovery_job_name(repo))
+}
+
 async fn delete_mover_run_with(
     client: &kube::Client,
     namespace: &str,

@@ -4400,7 +4400,7 @@ async fn reconcile_pin(
     let observed = backup.status.as_ref().and_then(|s| s.pinned);
     let steady = Action::requeue(TERMINAL_SNAPSHOT_STEADY_REQUEUE);
     let action = pin_decision(desired, observed);
-    let job_name = format!("{name}-pin");
+    let (job_name, legacy_job_name) = pin_job_names(name);
 
     // Cost gate: the common never-pinned Snapshot (spec.pin unset, no pin ever
     // ran) skips the per-pass Job GET entirely. A pin mover may only exist once
@@ -4413,6 +4413,14 @@ async fn reconcile_pin(
     }
 
     let job_api: Api<Job> = Api::namespaced(ctx.client.clone(), namespace);
+    // #547 upgrade: a pin Job the previous release launched under the uncapped
+    // name is still this Snapshot's pin mover; finish it rather than launch a
+    // second one under the new name.
+    if let Some(legacy) = legacy_job_name.as_deref()
+        && let Some(job) = job_api.get_opt(legacy).await?
+    {
+        return handle_pin_job(backup, ctx, api, namespace, name, legacy, &job, action).await;
+    }
     if let Some(job) = job_api.get_opt(&job_name).await? {
         return handle_pin_job(backup, ctx, api, namespace, name, &job_name, &job, action).await;
     }
@@ -4576,6 +4584,17 @@ async fn reconcile_pin(
     io::apply_mover_objects(&ctx.client, namespace, &job_name, None, &job).await?;
     tracing::info!(backup = %name, %snapshot_id, ?action, "created SnapshotPin Job");
     Ok(Action::requeue(Duration::from_secs(15)))
+}
+
+/// The `SnapshotPin` mover Job's name for the `Snapshot` named `snapshot` —
+/// `<snapshot>-pin` capped to [`kopiur_api::consts::JOB_NAME_MAX`] (#547) — and,
+/// when that differs, the uncapped pre-#547 name an in-flight pin Job may still
+/// carry (looked up first, so an upgrade never launches a second pin mover).
+pub(crate) fn pin_job_names(snapshot: &str) -> (String, Option<String>) {
+    let full = format!("{snapshot}-pin");
+    let current = crate::naming::capped_job_name(&full);
+    let legacy = crate::naming::legacy_job_name(&full, &current);
+    (current, legacy)
 }
 
 /// Whether a `{name}-pin` mover Job may exist for this Snapshot — the cheap,

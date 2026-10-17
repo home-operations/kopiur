@@ -2658,6 +2658,25 @@ mod tests {
     /// fixture that records no cron (`None`) treats it as unchanged.
     const CRON: &str = "0 3 * * *";
 
+    /// #547: the admission warning's `<schedule>-<slot>` arithmetic must match
+    /// the name this controller actually mints, or it would warn at the wrong length.
+    #[test]
+    fn the_schedule_name_warning_matches_the_minted_snapshot_name_length() {
+        let slot = Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        for len in [42, 43] {
+            let schedule = "s".repeat(len);
+            let minted = scheduled_backup_name(&schedule, slot);
+            let warns =
+                kopiur_api::validate::scheduled_job_name_length_warning(&schedule).is_some();
+            assert_eq!(
+                warns,
+                minted.len() > kopiur_api::consts::JOB_NAME_MAX,
+                "{minted} ({} chars)",
+                minted.len()
+            );
+        }
+    }
+
     fn at(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> DateTime<Utc> {
         Utc.with_ymd_and_hms(y, mo, d, h, mi, 0).single().unwrap()
     }

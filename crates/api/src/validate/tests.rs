@@ -8699,3 +8699,30 @@ fn repository_concurrency_rejects_a_zero_delete_job_cap() {
     };
     assert!(validate_repository_concurrency(Some(&pool_zero), "Repository").is_empty());
 }
+
+// --- #547: Job-name length warnings (WorkloadWithJob `<job>-pgt-0`) -----------
+
+#[test]
+fn job_name_length_warning_only_past_the_job_name_budget() {
+    use crate::consts::JOB_NAME_MAX;
+    assert_eq!(job_name_length_warning("Snapshot", "db-1"), None);
+    assert_eq!(
+        job_name_length_warning("Restore", &"r".repeat(JOB_NAME_MAX)),
+        None
+    );
+    let long = "r".repeat(JOB_NAME_MAX + 1);
+    let w = job_name_length_warning("Restore", &long).expect("58 chars warns");
+    assert!(w.contains(&long), "{w}");
+    assert!(w.contains("58 characters"), "{w}");
+    assert!(w.contains("Fix:"), "{w}");
+    assert!(w.contains("57"), "{w}");
+}
+
+#[test]
+fn scheduled_job_name_length_warning_accounts_for_the_slot_stamp() {
+    // `<schedule>-<14 digits>` is 15 longer than the schedule name.
+    assert_eq!(scheduled_job_name_length_warning(&"s".repeat(42)), None);
+    let w = scheduled_job_name_length_warning(&"s".repeat(43)).expect("43 + 15 = 58 warns");
+    assert!(w.contains("58-character"), "{w}");
+    assert!(w.contains("Fix:"), "{w}");
+}

@@ -311,6 +311,21 @@ fn hook_job_spec(hook: &RunJobHook) -> k8s_openapi::api::batch::v1::JobSpec {
     spec
 }
 
+/// A `runJob` hook's Job name — `<snapshot>-<pre|post>-<index>` capped to
+/// [`kopiur_api::consts::JOB_NAME_MAX`] (#547) — and, when it differs, the
+/// `capped_name` (63) name the previous release used, which an in-flight hook Job
+/// may still carry.
+pub(crate) fn hook_job_names(
+    snapshot_name: &str,
+    phase: HookPhase,
+    index: usize,
+) -> (String, Option<String>) {
+    let full = format!("{snapshot_name}-{}-{index}", phase.job_infix());
+    let current = crate::naming::capped_job_name(&full);
+    let legacy = crate::naming::legacy_job_name(&crate::naming::capped_name(&full), &current);
+    (current, legacy)
+}
+
 /// Materialize the hook's `JobSpec` as a one-shot Job owned by the Snapshot, then
 /// wait for it to finish (bounded by the hook timeout).
 async fn run_job_hook(
@@ -322,8 +337,14 @@ async fn run_job_hook(
     index: usize,
     hook: &RunJobHook,
 ) -> Result<std::result::Result<(), String>> {
-    let name =
-        crate::snapshot::capped_name(&format!("{snapshot_name}-{}-{index}", phase.job_infix()));
+    let (current, legacy) = hook_job_names(snapshot_name, phase, index);
+    let jobs: Api<Job> = Api::namespaced(ctx.client.clone(), namespace);
+    // #547 upgrade: a hook Job the previous release created under its 63-char
+    // name IS this hook's run. Reuse it rather than run a side-effecting hook twice.
+    let name = match legacy {
+        Some(legacy) if jobs.get_opt(&legacy).await?.is_some() => legacy,
+        Some(_) | None => current,
+    };
     let job = Job {
         metadata: ObjectMeta {
             name: Some(name.clone()),
@@ -338,7 +359,6 @@ async fn run_job_hook(
         spec: Some(hook_job_spec(hook)),
         status: None,
     };
-    let jobs: Api<Job> = Api::namespaced(ctx.client.clone(), namespace);
     // Create-or-reuse: a requeue between create and terminal must watch the
     // SAME Job, not spawn a second run of a side-effecting hook.
     match jobs.create(&PostParams::default(), &job).await {
@@ -462,6 +482,32 @@ async fn run_http_hook(hook: &HttpRequestHook) -> std::result::Result<(), String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- #547: hook Job names fit the WorkloadWithJob `<job>-pgt-0` budget ---
+
+    #[test]
+    fn short_hook_job_names_are_unchanged_and_need_no_legacy_lookup() {
+        assert_eq!(
+            hook_job_names("db-1", HookPhase::Before, 0),
+            ("db-1-prehook-0".to_string(), None)
+        );
+        assert_eq!(
+            hook_job_names("db-1", HookPhase::After, 2),
+            ("db-1-posthook-2".to_string(), None)
+        );
+    }
+
+    #[test]
+    fn a_long_scheduled_snapshots_hook_job_is_capped_with_a_legacy_fallback() {
+        // `<schedule>-<14 digits>`: a 40-char schedule → 55-char Snapshot → a
+        // 70-char hook name, which the old 63 cap made 62-63 chars.
+        let snapshot = format!("{}-20260101000000", "s".repeat(40));
+        let (current, legacy) = hook_job_names(&snapshot, HookPhase::After, 0);
+        assert!(current.len() + "-pgt-0".len() <= 63, "{current}");
+        let full = format!("{snapshot}-posthook-0");
+        assert_eq!(legacy, Some(crate::naming::capped_name(&full)));
+        assert_ne!(Some(current), legacy);
+    }
 
     fn run_job_hook_spec(ttl: Option<i32>) -> RunJobHook {
         serde_json::from_value(serde_json::json!({

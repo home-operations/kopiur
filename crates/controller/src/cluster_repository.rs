@@ -971,13 +971,17 @@ async fn handle_cluster_deletion(
         ctx.operator_namespace.as_deref(),
     ) {
         Ok(job_ns) => {
-            let job_name = crate::naming::discovery_job_name(name);
-            if let Err(e) = io::delete_mover_run(&ctx.client, &job_ns, &job_name).await {
-                tracing::warn!(
-                    repo = %name, namespace = %job_ns, job = %job_name, error = %e,
-                    "could not delete the bootstrap Job while finalizing the ClusterRepository; \
-                     it may keep running until its own deadline"
-                );
+            // Both the current name and a pre-#547 uncapped one still in flight.
+            let names = std::iter::once(crate::naming::discovery_job_name(name))
+                .chain(crate::naming::legacy_discovery_job_name(name));
+            for job_name in names {
+                if let Err(e) = io::delete_mover_run(&ctx.client, &job_ns, &job_name).await {
+                    tracing::warn!(
+                        repo = %name, namespace = %job_ns, job = %job_name, error = %e,
+                        "could not delete the bootstrap Job while finalizing the \
+                         ClusterRepository; it may keep running until its own deadline"
+                    );
+                }
             }
         }
         // Not silently swallowed: if we cannot work out which namespace the Job
@@ -1115,8 +1119,9 @@ async fn bootstrap_cluster_via_mover(
     )?;
     // "discovery" (not "bootstrap"): the FIRST run does bootstrap the
     // repository, but every later run of this Job is a catalog re-scan — the
-    // name follows the recurring purpose users actually see.
-    let job_name = crate::naming::discovery_job_name(name);
+    // name follows the recurring purpose users actually see. Resolved against a
+    // pre-#547 uncapped name still in flight, so an upgrade never double-launches.
+    let job_name = io::discovery_job_name_in_use(&ctx.client, &job_ns, name).await?;
     let job_api: Api<Job> = Api::namespaced(ctx.client.clone(), &job_ns);
 
     // Honor a `Snapshot`'s reverify nudge: force a re-probe (ORs into the

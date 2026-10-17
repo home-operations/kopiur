@@ -587,9 +587,16 @@ fn within_byte_budget(mut sorted: Vec<PendingMember>) -> Vec<PendingMember> {
 
 /// Deterministic name: same member set (sorted UIDs) => same name. Joins the
 /// sorted UIDs with `-` (DNS-safe regardless of UID shape) and lets
-/// [`crate::naming::capped_name`] cap+hash — its internal hash is 64-bit
+/// [`crate::naming::capped_job_name`] cap+hash — its internal hash is 64-bit
 /// FNV-1a, avoiding the 32-bit `short_hash` collision risk for a set-identity
-/// name. DNS-63 safe by construction (`capped_name`'s own invariant).
+/// name. At most 57 characters, so Kubernetes 1.37's `<job>-pgt-0` pod-group
+/// template stays a valid name (#547; this was `capped_name`'s 62-63 before).
+///
+/// Changing the scheme is upgrade-safe: the name is only the 409 single-flight
+/// dedup key and the admission-ledger key. An in-flight Job created under the
+/// old name is still found (LIST by [`crate::consts::DELETE_REPO_LABEL`]) and
+/// still covers its members (the delete-members annotation), so it is never
+/// re-fired.
 ///
 /// PRECONDITION: `members` is non-empty. The only caller passes a
 /// [`BatchFire::Fire`] payload, which [`batch_fire_decision`] only ever produces
@@ -603,7 +610,7 @@ pub fn batch_job_name(repo: &RepositoryRef, members: &[PendingMember]) -> String
     let mut uids: Vec<&str> = members.iter().map(|m| m.uid.as_str()).collect();
     uids.sort_unstable();
     let full = format!("snapdel-{}-{}", repo_label(repo), uids.join("-"));
-    crate::naming::capped_name(&full)
+    crate::naming::capped_job_name(&full)
 }
 
 /// Requeue mapping for the deletion path (single source of truth): an enum ->
@@ -1992,6 +1999,77 @@ mod tests {
         let a = vec![member("uid-a", 1), member("uid-b", 2)];
         let b = vec![member("uid-a", 1), member("uid-c", 2)];
         assert_ne!(batch_job_name(&r, &a), batch_job_name(&r, &b));
+    }
+
+    /// #547: Kubernetes 1.37's WorkloadWithJob names a pod-group template
+    /// `<job>-pgt-0`, which must itself be a ≤63-char name. A realistic repository
+    /// name with real-shaped (36-char) UIDs always overflows the raw format, so the
+    /// capped name must leave room for the `-pgt-0` suffix.
+    #[test]
+    fn batch_job_name_leaves_room_for_the_workload_pod_group_suffix() {
+        let real_uids = [
+            "0b0f6a3e-4c1d-4b7a-9f2e-5d8c7a6b5e4f",
+            "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+        ];
+        for repo_name in [
+            "garage",
+            "nas-primary",
+            "backblaze-b2-offsite-media-library",
+        ] {
+            for kind in [
+                RepositoryKind::Repository,
+                RepositoryKind::ClusterRepository,
+            ] {
+                let ns = matches!(kind, RepositoryKind::Repository).then_some("backups");
+                let r = repo(kind, ns, repo_name);
+                for n in 1..=real_uids.len() {
+                    let members: Vec<_> = real_uids[..n].iter().map(|u| member(u, 1)).collect();
+                    let name = batch_job_name(&r, &members);
+                    assert!(
+                        name.len() + "-pgt-0".len() <= 63,
+                        "{name} ({} chars) + -pgt-0 overflows 63",
+                        name.len()
+                    );
+                    assert!(name.starts_with("snapdel-"), "{name}");
+                }
+            }
+        }
+    }
+
+    /// #547 upgrade safety: renaming the batch Job scheme must not make an
+    /// in-flight Job created by the previous release (62-63 chars, `capped_name`)
+    /// invisible. Discovery and coverage key on the delete-members annotation,
+    /// never the Job name, so its members stay covered (no second delete wave) and
+    /// classify against it exactly as before.
+    #[test]
+    fn an_old_format_in_flight_batch_still_covers_its_members_after_the_rename() {
+        let r = repo(RepositoryKind::ClusterRepository, None, "garage");
+        let uid = "0b0f6a3e-4c1d-4b7a-9f2e-5d8c7a6b5e4f";
+        let members = vec![member(uid, 1)];
+        let mut uids: Vec<&str> = members.iter().map(|m| m.uid.as_str()).collect();
+        uids.sort_unstable();
+        let legacy = crate::naming::capped_name(&format!(
+            "snapdel-{}-{}",
+            crate::naming::repo_label(&r),
+            uids.join("-")
+        ));
+        assert_ne!(
+            legacy,
+            batch_job_name(&r, &members),
+            "the scheme did change"
+        );
+        let views = vec![BatchJobView {
+            name: legacy,
+            members: vec![uid.to_string()],
+            state: BatchJobState::Live,
+            terminal_at: None,
+        }];
+        assert!(covered_uids(&views).contains(uid));
+        assert!(fireable_members(members, &covered_uids(&views)).is_empty());
+        assert_eq!(
+            member_disposition(uid, &views),
+            MemberDisposition::LiveMember
+        );
     }
 
     // --- deletion_requeue -------------------------------------------------
