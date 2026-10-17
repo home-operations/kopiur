@@ -125,6 +125,123 @@ async fn ignore_file_errors_lets_snapshot_complete() {
     );
 }
 
+/// #552: a `privilegedMode: true` root mover reads files it doesn't own. The `src-eh`
+/// source holds a root-owned `0000` file and a `0660` file owned by `4242:4242`; root
+/// under the hardened `drop: [ALL]` can read neither (the kernel still checks
+/// owner/group/other bits), so before the fix this exact config failed with
+/// `permission denied`. `privilegedMode` now adds `DAC_OVERRIDE`, so the backup — with
+/// NO `ignoreFileErrors` — must succeed and skip nothing.
+///
+/// Runs against its own repo subpath (`privroot`): a root mover writes root-owned kopia
+/// blobs, which a 65532 mover sharing the repo could not read afterwards.
+#[tokio::test]
+#[ignore = "requires the e2e harness (mise run //crates/e2e:test)"]
+async fn privileged_root_mover_reads_files_owned_by_other_uids() {
+    const SUBPATH: &str = "privroot";
+    const PRIV_REPO: &str = "e2e-privroot-repo";
+    const POLICY: &str = "e2e-privroot-cfg";
+    const BACKUP: &str = "e2e-privroot";
+    const OPT_IN: &str = "kopiur.home-operations.com/privileged-movers";
+
+    let Some(world) = World::connect().await else {
+        return;
+    };
+    world
+        .ensure(&[Need::ErrorSource])
+        .await
+        .expect("fixtures ready");
+    let client = world.client().clone();
+    ensure_repo(&client, SUBPATH).await;
+    let repos: Api<Repository> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let _ = repos
+        .create(
+            &PostParams::default(),
+            &cr(repository_json(PRIV_REPO, SUBPATH, serde_json::json!({}))),
+        )
+        .await;
+    wait_phase(&repos, PRIV_REPO, "Ready")
+        .await
+        .expect("privroot repository should reach Ready");
+    kopiur_e2e::annotate_namespace(&client, E2E_NAMESPACE, OPT_IN, "true")
+        .await
+        .expect("opt the namespace into privileged movers");
+
+    let configs: Api<SnapshotPolicy> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let backups: Api<Snapshot> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let jobs: Api<Job> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let cfg = snapshot_policy_json(
+        E2E_NAMESPACE,
+        POLICY,
+        "Repository",
+        PRIV_REPO,
+        serde_json::json!({
+            "sources": [ { "pvc": { "name": consts::PVC_SRC_EH } } ],
+            "mover": {
+                "securityContext": { "runAsUser": 0, "runAsNonRoot": false },
+                "privilegedMode": true
+            }
+        }),
+    );
+    let _ = configs.create(&PostParams::default(), &cr(cfg)).await;
+    // Read it back: the overlay must have landed (a dropped `mover` would re-run the
+    // default 65532 mover and fail for an unrelated reason).
+    let landed = configs.get(POLICY).await.expect("read the policy back");
+    assert_eq!(
+        landed.spec.mover.as_ref().and_then(|m| m.privileged_mode),
+        Some(true),
+        "the privilegedMode overlay must land"
+    );
+    let _ = backups
+        .create(
+            &PostParams::default(),
+            &cr(snapshot_json(
+                E2E_NAMESPACE,
+                BACKUP,
+                POLICY,
+                serde_json::json!({ "failurePolicy": { "backoffLimit": 0 } }),
+            )),
+        )
+        .await;
+
+    // The rendered mover carries the grant on top of drop:[ALL].
+    let job = common::wait_for_job(&jobs, BACKUP).await;
+    let sc = common::job_container_sc(&job).expect("mover container securityContext");
+    let caps = sc.capabilities.clone().expect("capabilities");
+    assert_eq!(sc.run_as_user, Some(0));
+    assert_eq!(caps.drop, Some(vec!["ALL".to_string()]));
+    assert_eq!(caps.add, Some(vec!["DAC_OVERRIDE".to_string()]));
+
+    // THE regression: the root mover reads both foreign-owned files.
+    wait_phase(&backups, BACKUP, "Succeeded").await.expect(
+        "a privilegedMode root mover must read the 0000 root-owned and 0660 4242-owned \
+         files; before #552 it held no DAC_OVERRIDE and failed with permission denied",
+    );
+    let done = backups.get(BACKUP).await.expect("read the Snapshot back");
+    let status = done.status.as_ref().expect("status");
+    assert!(
+        status
+            .snapshot
+            .as_ref()
+            .is_some_and(|s| !s.kopia_snapshot_id.is_empty()),
+        "a Succeeded Snapshot carries the real kopia snapshot ID: {status:#?}"
+    );
+    assert_eq!(
+        status
+            .stats
+            .as_ref()
+            .and_then(|s| s.files_failed)
+            .unwrap_or(0),
+        0,
+        "nothing may be skipped as unreadable: {status:#?}"
+    );
+
+    // Cleanup; reset the opt-in so it doesn't leak to other tests.
+    let _ = backups.delete(BACKUP, &DeleteParams::default()).await;
+    let _ = configs.delete(POLICY, &DeleteParams::default()).await;
+    let _ = repos.delete(PRIV_REPO, &DeleteParams::default()).await;
+    let _ = kopiur_e2e::annotate_namespace(&client, E2E_NAMESPACE, OPT_IN, "false").await;
+}
+
 /// `compression` + `upload` knobs reach the controller→mover work-spec (the
 /// Job-embedded contract the mover's `kopia policy set` consumes — its flag
 /// is unit-tested in `crates/kopia`), and kopia accepts them (`Succeeded`: a bad

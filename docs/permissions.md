@@ -134,7 +134,7 @@ A healthy backup ends `Succeeded` with non-zero files and bytes in `status`. A b
 
 ## When you can't match the UID: the root mover
 
-If the data is owned by **assorted UIDs you cannot match**, such as a `lost+found`, a multi-user volume, or an app that writes as root, a **root mover** reads everything. Set:
+If the data is owned by **assorted UIDs you cannot match**, such as a `lost+found`, a multi-user volume, or an app that writes as root, a **privileged root mover** reads everything. Set:
 
 ```yaml
 spec:
@@ -142,8 +142,10 @@ spec:
         securityContext:
             runAsUser: 0
             runAsNonRoot: false
-        privilegedMode: true # also preserves UID/GID ownership on RESTORE
+        privilegedMode: true # adds DAC_OVERRIDE (backup) or CHOWN/DAC_OVERRIDE/FOWNER/FSETID (restore)
 ```
+
+You need `privilegedMode: true`, not just `runAsUser: 0`. The mover drops every Linux capability by default, and root without `DAC_OVERRIDE` gets `permission denied` on a `0660` file owned by another UID and GID, like anyone else. `privilegedMode` adds back only the capabilities the operation needs. If no layer sets `runAsUser`, it also sets it to `0`. If a layer sets a non-zero `runAsUser`, it grants nothing and Kopiur warns. The full table, and the `capabilities.add` workaround for older versions, are in [Security context → What `privilegedMode` grants](security-context.md#what-privilegedmode-grants).
 
 A root, or otherwise elevated, mover is a **privileged mover**, and granting it is a per-namespace admin decision. If the namespace has not opted in, the `Snapshot` is refused with a clear `MoverPermitted=False` condition.
 
@@ -192,7 +194,7 @@ A restore writes files into the **target** PVC, so the same rules apply in rever
 
 - **`Restore.spec.mover.securityContext`** sets the UID and GID the restore mover writes as, so the restored files land owned correctly and the mover can write the target. Before this field existed the restore mover always ran as UID `65532`. For a freshly created target PVC, meaning `target.pvc`, the default is usually fine. For an existing PVC, meaning `target.pvcRef`, match the UID that owns it.
 - **`Restore.spec.mover.inheritSecurityContextFrom`** copies the `securityContext` from a live workload pod by label selector, instead of hard-coding it. It combines with `securityContext`, which overrides it field by field, and it needs the workload to pin `runAsUser`. It is handy for "restore as whatever the app runs as", and is covered fully in [Security context → Inherit it from the workload](security-context.md#2-inherit-it-from-the-workload).
-- **Preserving original ownership.** Kopia restores files with the UID and GID they had when snapshotted. Reproducing that ownership requires a privileged root mover with `privilegedMode: true`; an unprivileged mover writes files owned by its own UID instead. An elevated restore mover, whether root, `privilegedMode`, or inherited from a root pod, is gated by the same `privileged-movers` namespace opt-in a backup uses.
+- **Preserving original ownership.** Kopia restores files with the UID and GID they had when snapshotted. Reproducing that ownership requires a root mover with `privilegedMode: true`, which grants `CHOWN`, `DAC_OVERRIDE`, `FOWNER` and `FSETID`. An unprivileged mover writes files owned by its own UID instead. A root mover without `privilegedMode` holds no capabilities, so with the default `ignorePermissionErrors: true` it completes but leaves every file owned by root. An elevated restore mover, whether root, `privilegedMode`, or inherited from a root pod, is gated by the same `privileged-movers` namespace opt-in a backup uses.
 - **`spec.options.ignorePermissionErrors`**, default `true`, lets a restore complete and *report* permission problems through a condition rather than failing hard. Set it `false` to fail closed when exact permissions matter.
 
 See [Restores → Mover, cache & failure policy](restores.md#mover-cache--failure-policy) for the full restore mover surface, and [example 12](examples.md#example-12--restore-mover-cache--failure-policy).
@@ -272,7 +274,7 @@ The `status.stats` numbers and the `app-data-manual-abc12` and `<mover-pod>` nam
 | Symptom                                        | Where it shows                 | Cause                                                      | Fix                                                                                                                |
 | ---------------------------------------------- | ------------------------------ | ---------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
 | Backup `Succeeded` but **0 files / 0 bytes**   | `Snapshot` `.status`             | Mover UID can't read the source files.                     | Match `spec.mover.securityContext.runAsUser/Group` to the data owner (Steps 1–2). To try a UID without touching the shared recipe, set it on a one-shot `Snapshot.spec.mover`. |
-| Mover log: `permission denied` reading source  | Mover pod logs                 | Same as above: partial read.                              | Same as above; or a root mover if UIDs can't be matched.                                                           |
+| Mover log: `permission denied` reading source  | Mover pod logs                 | Same as above: partial read.                              | Same as above; or a root mover with `privilegedMode: true` if UIDs can't be matched. Root alone holds no `DAC_OVERRIDE`. |
 | Backup stuck `Pending`, `MoverPermitted=False`, reason `PrivilegedMoverNotPermitted` | `Snapshot` condition / Event     | The **merged** mover requests privilege; namespace not opted in. The message names the layer that carries it — `moverDefaults`, the policy's `spec.mover`, an inherited workload context, or a per-run `Snapshot.spec.mover`. | Drop the elevated context from the object the message names. Only reach for `kubectl annotate namespace <ns> kopiur.home-operations.com/privileged-movers=true` if you mean to allow it for **every** mover in that namespace. |
 | `Repository` `Failed`, `PermissionDenied`      | `Repository` Event / condition | Filesystem repo path not writable by the operator UID.     | `chown -R <uid> <path>` (the Event names the UID), then reconcile.                                                 |
 | Restored files unreadable by the app           | After restore                  | Files restored as the mover's UID, not the original owner. | Set `Restore.spec.mover.securityContext.runAsUser/Group` to the app's UID (or `inheritSecurityContextFrom`); use a root mover with `privilegedMode: true` to preserve the original ownership exactly. |
@@ -289,7 +291,7 @@ The `status.stats` numbers and the `app-data-manual-abc12` and `<mover-pod>` nam
 | Inherit UID/GID from a workload  | `spec.mover.inheritSecurityContextFrom`: `pvcConsumer: {}` (backup: auto-derive from the PVC's consumer) or `workloadSelector` (by label; required on a Restore). Needs the workload to pin `runAsUser`; combines with `securityContext` (explicit wins). See [Security context](security-context.md#2-inherit-it-from-the-workload) |
 | Mover cache size / warm cache    | `spec.mover.cache` (`capacity`, `storageClassName`, `mode: Ephemeral`/`Persistent`, `content`/`metadataCacheSizeMb`); inherits `Repository.spec.moverDefaults.cache`. A per-run `Snapshot.spec.mover.cache` is run-scoped: it moves that run's budgets and, under `mode: Ephemeral`, that Job's cache-volume `capacity`/`storageClassName`. It cannot change `mode`, nor a `Persistent` cache PVC's spec — both are policy-owned, since that PVC is shared by every sibling `Snapshot` |
 | `fsGroup`                        | `spec.mover.podSecurityContext.fsGroup`, which **defaults to `65532`** (keeps the cache writable); override to make a fresh restore volume writable by a mover running as a different UID |
-| Root / preserve-ownership        | `runAsUser: 0` + `privilegedMode: true` (needs the namespace opt-in)                |
+| Root / preserve-ownership        | `runAsUser: 0` + `runAsNonRoot: false` + `privilegedMode: true` (needs the namespace opt-in). `privilegedMode` is what grants the capabilities: backup `DAC_OVERRIDE`, restore `CHOWN`/`DAC_OVERRIDE`/`FOWNER`/`FSETID` |
 | Privileged-mover opt-in          | `kubectl annotate namespace <ns> kopiur.home-operations.com/privileged-movers=true` |
 | Stream-exec opt-in (`stream` / `streamExec`) | `kubectl annotate namespace <ns> kopiur.home-operations.com/stream-exec-movers=true`. Separate from, and not implied by, the privileged-mover annotation: it authorizes `pods/exec` in that namespace, which is arbitrary code execution in every pod there. Fails **closed** — including when the Namespace cannot be read. See [Streamed command sources](stream-sources.md) |
 | Revoking the stream-exec opt-in | Removing the annotation stops new runs but does **not** revoke the grant. Also `kubectl delete rolebinding <release>-stream-mover -n <ns>` and `kubectl delete serviceaccount <release>-stream-mover -n <ns>`. See [Revoking the opt-in](stream-sources.md#revoking-the-opt-in) |

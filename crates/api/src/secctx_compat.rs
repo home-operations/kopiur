@@ -61,6 +61,11 @@ pub struct MoverIdentity {
     /// tree to it — on the read-only default it grants nothing. Symmetric with
     /// [`MoverWriteIdentity::fs_group`].
     pub fs_group: Option<i64>,
+    /// The mover runs as root AND can bypass file permission checks: `privileged: true`,
+    /// or `DAC_OVERRIDE`/`DAC_READ_SEARCH` added (which `privilegedMode` grants a backup,
+    /// #552). Root under the hardened `drop: [ALL]` without either is just uid 0 — the
+    /// kernel still applies owner/group/other checks, so it does NOT read everything.
+    pub reads_any_file: bool,
 }
 
 /// The mover's effective identity for **write** reasoning (restore target).
@@ -213,10 +218,12 @@ pub fn mover_identity(sc: &SecurityContext, psc: Option<&PodSecurityContext>) ->
             groups.extend(sup.iter().copied());
         }
     }
+    let uid = effective_run_as_user(Some(sc), psc);
     MoverIdentity {
-        uid: effective_run_as_user(Some(sc), psc),
+        uid,
         groups,
         fs_group: psc.and_then(|p| p.fs_group),
+        reads_any_file: uid == Some(0) && crate::common::bypasses_read_permission_checks(sc),
     }
 }
 
@@ -399,8 +406,10 @@ pub fn assess_read_compat(
     workloads: &[WorkloadIdentity],
     source_read_only: bool,
 ) -> MoverReadCompat {
-    // Root reads everything — independent of any workload (so this holds even with no pod).
-    if mover.uid == Some(0) {
+    // Root that bypasses permission checks reads everything — independent of any workload
+    // (so this holds even with no pod). Plain root under `drop: [ALL]` does not (#552); it
+    // falls through to the ordinary uid/gid assessment below like any other UID.
+    if mover.reads_any_file {
         return MoverReadCompat::Compatible {
             basis: CompatBasis::RootMover,
         };
@@ -516,7 +525,9 @@ impl MoverReadCompat {
         match self {
             MoverReadCompat::Compatible {
                 basis: CompatBasis::RootMover,
-            } => format!("mover runs as root ({mover_uid_render}) and can read all source files"),
+            } => format!(
+                "mover runs as root ({mover_uid_render}) with DAC_OVERRIDE (or equivalent), so it can read all source files"
+            ),
             MoverReadCompat::Compatible {
                 basis: CompatBasis::ExactUidMatch,
             } => format!(
@@ -622,22 +633,96 @@ mod tests {
         }
     }
 
+    /// A root container context adding `caps` on top of the hardened `drop: [ALL]`.
+    fn root_with(caps: &[&str]) -> SecurityContext {
+        SecurityContext {
+            capabilities: Some(k8s_openapi::api::core::v1::Capabilities {
+                add: Some(caps.iter().map(|c| c.to_string()).collect()),
+                drop: Some(vec!["ALL".into()]),
+            }),
+            ..sc(Some(0), None, Some(false))
+        }
+    }
+
+    /// A root mover that can bypass permission checks (here: `privilegedMode`'s
+    /// `DAC_OVERRIDE`) reads everything, independent of any workload.
     #[test]
-    fn root_mover_is_compatible_even_with_no_consumer() {
-        let m = mover_identity(&sc(Some(0), None, Some(false)), None);
+    fn root_mover_with_dac_override_is_compatible_even_with_no_consumer() {
+        for caps in [&["DAC_OVERRIDE"][..], &["CAP_DAC_READ_SEARCH"][..]] {
+            let m = mover_identity(&root_with(caps), None);
+            assert!(m.reads_any_file, "{caps:?}");
+            assert!(matches!(
+                assess_read_compat(&m, &[], true),
+                MoverReadCompat::Compatible {
+                    basis: CompatBasis::RootMover
+                }
+            ));
+        }
+    }
+
+    /// #552: root with `drop: [ALL]` and nothing added holds no `DAC_OVERRIDE`, so the
+    /// kernel applies normal permission checks to it. It must NOT be reported as
+    /// "reads everything" — it falls through to the ordinary uid/gid assessment.
+    #[test]
+    fn root_mover_without_capabilities_is_not_root_compatible() {
+        let m = mover_identity(&root_with(&[]), None);
+        assert!(!m.reads_any_file);
         assert!(matches!(
             assess_read_compat(&m, &[], true),
-            MoverReadCompat::Compatible {
-                basis: CompatBasis::RootMover
+            MoverReadCompat::Unknown {
+                why: UnknownReason::NoConsumerPod
             }
         ));
+        // A workload writing as root: uid 0 matches every writer, so ownership reads.
+        let w = workload_identity(&pod("app-0", "ns", Some(0), None, "data"));
+        assert!(matches!(
+            assess_read_compat(&m, std::slice::from_ref(&w), true),
+            MoverReadCompat::Compatible {
+                basis: CompatBasis::ExactUidMatch
+            }
+        ));
+        // A workload writing as 1000 with no shared group: near-certain unreadable.
+        let w = workload_identity(&pod("app-0", "ns", Some(1000), None, "data"));
+        assert!(matches!(
+            assess_read_compat(&m, &[w], true),
+            MoverReadCompat::LikelyIncompatible { mover_uid: 0, .. }
+        ));
+    }
+
+    /// The full #552 path: `privilegedMode` on a root backup mover yields a `RootMover`
+    /// verdict; the same root mover without it does not.
+    #[test]
+    fn privileged_mode_is_what_makes_a_root_backup_read_everything() {
+        let root = sc(Some(0), None, Some(false));
+        for (pm, expect_root) in [(Some(true), true), (None, false)] {
+            let resolved = crate::common::resolve_mover(None, Some(&root), None, None, None, None)
+                .with_privileged_mode(pm, crate::common::MoverOperation::Backup);
+            let m = mover_identity(
+                &resolved.security_context,
+                resolved.pod_security_context.as_ref(),
+            );
+            assert_eq!(
+                matches!(
+                    assess_read_compat(&m, &[], true),
+                    MoverReadCompat::Compatible {
+                        basis: CompatBasis::RootMover
+                    }
+                ),
+                expect_root,
+                "{pm:?}"
+            );
+        }
     }
 
     #[test]
     fn pod_level_root_mover_is_root() {
         // Container UID unset, pod UID 0 → effective root (the precedence bug guard).
+        // `privileged: true` is what lets that root bypass permission checks.
         let m = mover_identity(
-            &SecurityContext::default(),
+            &SecurityContext {
+                privileged: Some(true),
+                ..Default::default()
+            },
             Some(&psc(Some(0), None, vec![])),
         );
         assert_eq!(m.uid, Some(0));
@@ -983,7 +1068,7 @@ mod tests {
     #[test]
     fn a_writable_source_does_not_mask_a_provable_compatible() {
         let root = mover_identity(
-            &sc(Some(0), None, Some(false)),
+            &root_with(&["DAC_OVERRIDE"]),
             Some(&psc(None, Some(65532), vec![])),
         );
         let w = workload_identity(&pod("app-0", "ns", Some(1000), Some(1000), "data"));

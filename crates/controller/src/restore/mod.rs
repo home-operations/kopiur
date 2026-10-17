@@ -3446,6 +3446,14 @@ async fn run_restore_mover(
             .as_ref()
             .and_then(|m| m.ttl_seconds_after_finished),
     );
+    // `privilegedMode` grants a restore root + CHOWN/DAC_OVERRIDE/FOWNER/FSETID so it can
+    // write anywhere in the target and reproduce each file's recorded owner and mode
+    // (#552). Applied before the gate so the gate and the Job see the same context.
+    let (resolved_mover, privileged_effect) = resolved_mover
+        .with_privileged_mode_effect(privileged_mode, kopiur_api::common::MoverOperation::Restore);
+    if let Some(msg) = privileged_effect.warning() {
+        io::publish_warning_event(ctx, restore, "PrivilegedModeInert", "Reconcile", &msg).await;
+    }
 
     // Privileged-mover gate (ADR §4.11/§G16, VolSync-parity): an elevated restore mover
     // (root/privileged/added caps/`privilegedMode`, container- OR pod-level) requires the

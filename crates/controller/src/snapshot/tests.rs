@@ -3509,6 +3509,22 @@ mod recorded_meta_tests {
         assert_eq!(meta.uid, Some(2000));
     }
 
+    /// #552: `privilegedMode: true` with no pinned UID runs the backup as root. The
+    /// recorded identity must say so (uid 0) and attribute it to the recipe, since its
+    /// `privilegedMode` is what chose root.
+    #[test]
+    fn privileged_mode_implied_root_records_uid_zero_src_explicit() {
+        let mover = MoverSpec {
+            privileged_mode: Some(true),
+            ..Default::default()
+        };
+        let resolved = resolve_mover(None, None, None, None, None, None)
+            .with_privileged_mode(Some(true), kopiur_api::common::MoverOperation::Backup);
+        let meta = recorded_meta(&resolved, &InheritOutcome::NotRequested, Some(&mover));
+        assert_eq!(meta.uid, Some(0));
+        assert_eq!(meta.src, RecordedSrc::Explicit);
+    }
+
     #[test]
     fn moverdefaults_pinned_uid_records_src_defaults() {
         let defaults = MoverDefaults {
@@ -4154,6 +4170,59 @@ fn render_mover_job(
         readiness_exec: None,
     })
     .expect("the Job builds")
+}
+
+/// #552: a `privilegedMode: true` root mover's rendered container must actually carry the
+/// capabilities that let root bypass permission checks — added on top of `drop: [ALL]` —
+/// or it is uid 0 with no power over a `0660` file owned by someone else. Pinned through
+/// the same `resolve_mover` → `with_privileged_mode` → `build_job` path the backup and
+/// restore reconcilers take.
+#[test]
+fn privileged_mode_root_mover_job_carries_the_operation_capabilities() {
+    use k8s_openapi::api::core::v1::SecurityContext;
+    use kopiur_api::common::MoverOperation;
+    let root = SecurityContext {
+        run_as_user: Some(0),
+        run_as_non_root: Some(false),
+        ..Default::default()
+    };
+    let cases: [(MoverOperation, Option<bool>, &[&str]); 4] = [
+        (MoverOperation::Backup, Some(true), &["DAC_OVERRIDE"]),
+        (
+            MoverOperation::Restore,
+            Some(true),
+            &["CHOWN", "DAC_OVERRIDE", "FOWNER", "FSETID"],
+        ),
+        (MoverOperation::Backup, None, &[]),
+        (MoverOperation::Restore, None, &[]),
+    ];
+    for (op, privileged_mode, want) in cases {
+        let resolved = kopiur_api::common::resolve_mover(None, Some(&root), None, None, None, None)
+            .with_privileged_mode(privileged_mode, op);
+        let job = render_mover_job(BTreeMap::new(), &resolved);
+        let sc = job
+            .spec
+            .as_ref()
+            .expect("spec")
+            .template
+            .spec
+            .as_ref()
+            .expect("pod spec")
+            .containers[0]
+            .security_context
+            .clone()
+            .expect("container securityContext");
+        assert_eq!(sc.run_as_user, Some(0), "{op:?}");
+        assert_eq!(sc.run_as_non_root, Some(false), "{op:?}");
+        let caps = sc.capabilities.expect("capabilities");
+        assert_eq!(caps.drop, Some(vec!["ALL".to_string()]), "{op:?}");
+        let added = caps.add.unwrap_or_default();
+        assert_eq!(
+            added,
+            want.iter().map(|c| c.to_string()).collect::<Vec<_>>(),
+            "{op:?} {privileged_mode:?}"
+        );
+    }
 }
 
 fn rendered_labels(job: &k8s_openapi::api::batch::v1::Job) -> BTreeMap<String, String> {

@@ -1397,6 +1397,14 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
             .as_ref()
             .and_then(|m| m.ttl_seconds_after_finished),
     );
+    // `privilegedMode` grants a backup root + DAC_OVERRIDE so it can read files owned by
+    // any uid/gid (#552). Applied BEFORE the identity is recorded and the gate runs, so
+    // both see what the Job will actually run as.
+    let (resolved_mover, privileged_effect) = resolved_mover
+        .with_privileged_mode_effect(privileged_mode, kopiur_api::common::MoverOperation::Backup);
+    if let Some(msg) = privileged_effect.warning() {
+        io::publish_warning_event(ctx, backup, "PrivilegedModeInert", "Reconcile", &msg).await;
+    }
 
     // Record the RESOLVED mover identity on the kopia snapshot itself (the
     // `kopiur-meta` tag) AND on `status.recorded` below — one value feeds both,
@@ -4963,7 +4971,7 @@ async fn assess_backup_security_context(
         // "by construction" claim hide the fact that nothing had been checked.
         let message = match basis {
             kopiur_api::secctx_compat::CompatBasis::RootMover => {
-                "the mover runs as root (uid 0), so it can read any file".to_string()
+                "the mover runs as root (uid 0) with DAC_OVERRIDE (or equivalent), so it can read any file".to_string()
             }
             kopiur_api::secctx_compat::CompatBasis::ExactUidMatch => format!(
                 "the mover's uid ({}) matches every workload writing to source PVC `{claim}`",

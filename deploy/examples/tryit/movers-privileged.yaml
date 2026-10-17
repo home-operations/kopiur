@@ -141,13 +141,16 @@ spec:
     keepDaily: 7
     keepWeekly: 4
   # ── Root mover (LAST RESORT) ─────────────────────────────────────────────────
-  # The data is root-owned 0600, so no unprivileged UID can read it. A root mover
-  # reads everything. This is ELEVATED — it requires the namespace opt-in above.
+  # The data is root-owned 0600, so no unprivileged UID can read it. A privileged
+  # root mover reads everything. This is ELEVATED — it requires the namespace opt-in above.
   mover:
     securityContext:
-      runAsUser: 0 # root — reads any file
+      runAsUser: 0 # root
       runAsNonRoot: false # required: runAsNonRoot:true + runAsUser:0 is rejected by the kubelet
-    privilegedMode: true # also preserves UID/GID ownership on RESTORE
+    # Adds DAC_OVERRIDE on top of drop:[ALL], so root can read files owned by ANY
+    # uid/gid (root alone keeps no capabilities). On a Restore it adds CHOWN,
+    # DAC_OVERRIDE, FOWNER and FSETID so original ownership is reproduced.
+    privilegedMode: true
 # --8<-- [end:policy]
 ---
 # --8<-- [start:snapshot]

@@ -332,7 +332,7 @@ Full, apply-ready example (a SnapshotPolicy plus the same knob on a `Restore`):
 
 ### 3. Go root (privileged mover)
 
-When the data is owned by **assorted UIDs you can't match**, such as a `lost+found`, a multi-user volume, or an app that writes as root, a root mover reads everything. On restore it can also reproduce original ownership. It is **elevated** and gated, as covered below:
+When the data is owned by **assorted UIDs you can't match**, such as a `lost+found`, a multi-user volume, or an app that writes as root, a privileged root mover reads everything. On restore it can also reproduce original ownership. It is **elevated** and gated, as covered below:
 
 ```yaml
 spec:
@@ -340,8 +340,44 @@ spec:
     securityContext:
       runAsUser: 0
       runAsNonRoot: false
-    privilegedMode: true # also preserves UID/GID ownership on RESTORE
+    privilegedMode: true # grants the capabilities root needs; see below
 ```
+
+`runAsUser: 0` on its own is **not** enough. The mover keeps the hardened `capabilities.drop: ["ALL"]`, and root without capabilities is subject to the same owner/group/other permission checks as any other user. A `0660` file owned by `1000:1000` is unreadable to it. `privilegedMode: true` is what adds the capabilities back.
+
+#### What `privilegedMode` grants
+
+`privilegedMode: true` runs the mover as root and adds the Linux capabilities the operation needs, on top of `drop: ["ALL"]`:
+
+| Operation | Capabilities added | Why |
+| --- | --- | --- |
+| Backup (`SnapshotPolicy` / `Snapshot`) | `DAC_OVERRIDE` | Read every file and directory, whatever its owner and mode. |
+| Restore | `CHOWN`, `DAC_OVERRIDE`, `FOWNER`, `FSETID` | Write anywhere in the target, give each file its recorded owner, then set its mode and times without losing setuid/setgid bits. |
+| Maintenance | none | It only talks to the repository, never to a source or target volume. |
+
+The rules:
+
+- **If no layer sets a `runAsUser`, `privilegedMode` sets it to `0`.** Capabilities do nothing for a non-root process.
+- **If a layer sets a non-zero `runAsUser`, that UID is kept and nothing is granted.** Kubernetes gives a non-root container no usable capabilities. The webhook warns at apply time when it can see the UID, and the operator emits a `PrivilegedModeInert` Warning Event on the `Snapshot` or `Restore` otherwise. Fix it by setting `runAsUser: 0` and `runAsNonRoot: false`, or by dropping `privilegedMode`.
+- **Any `capabilities.add` you set is kept.** The grant is added to your list, never replacing it.
+
+Every capability above is on the Pod Security Standards [**baseline**](https://kubernetes.io/docs/concepts/security/pod-security-standards/#baseline) allow list, so a privileged mover is admitted in a `baseline`-enforced namespace. It is never admitted under `restricted`, which requires `runAsNonRoot: true`. Kopiur deliberately grants `DAC_OVERRIDE` rather than `DAC_READ_SEARCH` for backups: `DAC_READ_SEARCH` is narrower, but it is not on the baseline list.
+
+/// note | Older Kopiur versions
+
+Before this behavior, `privilegedMode` granted no capabilities. A root mover then failed with `permission denied` on files it did not own, and a restore silently wrote every file owned by root. If you run an older version, add the capabilities yourself:
+
+```yaml
+spec:
+  mover:
+    securityContext:
+      runAsUser: 0
+      runAsNonRoot: false
+      capabilities:
+        add: ["DAC_OVERRIDE"] # restore: ["CHOWN", "DAC_OVERRIDE", "FOWNER", "FSETID"]
+```
+
+///
 
 /// tip | Prefer matching the UID over going root
 
@@ -356,7 +392,7 @@ A mover that can't read the data it's backing up is the classic footgun. By defa
 1. **At `kubectl apply` (admission warning).** When a SnapshotPolicy's `source.pvc` is mounted by a workload whose UID the mover's explicit `runAsUser` clearly can't match, meaning no shared UID or group, the webhook attaches a non-blocking **warning** to the apply. It is best-effort: it can't see file modes, and the workload may not be running yet.
 
 2. **On reconcile (status condition).** A Backup's `SecurityContextCompatible` condition is **positive-only and certain**. It is never a guess:
-   - `True`: provably fine, checked against the *resolved* mover identity and the live workloads mounting the source. Either the mover is root, or its UID exactly matches **every** container that writes the source, init containers included. Using `inheritSecurityContextFrom` is **not** itself a basis: inheriting only helps if the workload actually pins a `runAsUser`, and the condition says `True` only once it has confirmed the UIDs match.
+   - `True`: provably fine, checked against the *resolved* mover identity and the live workloads mounting the source. Either the mover is root with `DAC_OVERRIDE` (which `privilegedMode` grants; plain `runAsUser: 0` is not enough), or its UID exactly matches **every** container that writes the source, init containers included. Using `inheritSecurityContextFrom` is **not** itself a basis: inheriting only helps if the workload actually pins a `runAsUser`, and the condition says `True` only once it has confirmed the UIDs match.
    - `False`: set **only** by the certain post-run signal, number 3 below, which is that the completed backup actually excluded unreadable entries. It is never set from an up-front heuristic, so a successful backup of world-readable data is never falsely flagged.
    - **Absent**: the common case. Not provable from the spec alone, because nobody pinned a UID, or several UIDs write the volume. Absence is not a warning. It means "no claim", and the run proceeds.
 
@@ -406,7 +442,7 @@ Why the gate exists, and the revoke path, are covered in [Movers → Privileged 
 
 ### Preserving original ownership on restore
 
-kopia records each file's original UID and GID in the snapshot. An **unprivileged** restore mover writes everything owned by its own UID instead. That is fine when one UID owns everything, and wrong for multi-user data. To restore files with their **original** ownership, the mover must be able to `chown` to arbitrary UIDs, which needs root:
+kopia records each file's original UID and GID in the snapshot. An **unprivileged** restore mover writes everything owned by its own UID instead. That is fine when one UID owns everything, and wrong for multi-user data. To restore files with their **original** ownership, the mover must be able to `chown` to arbitrary UIDs, which needs root with `CHOWN` and `FOWNER`. `privilegedMode: true` grants those (see [What `privilegedMode` grants](#what-privilegedmode-grants)):
 
 ```yaml
 spec:
@@ -415,15 +451,17 @@ spec:
     privilegedMode: true
 ```
 
+A root restore mover **without** `privilegedMode` holds no capabilities. kopia's `ignorePermissionErrors` defaults to `true`, so such a restore completes but every file stays owned by root.
+
 This is the same elevation the gate covers, so the restore namespace must opt in. There is an inherent trade-off: *"preserve arbitrary ownership exactly"* and *"run unprivileged"* are largely mutually exclusive.
 
 ### ReadWriteMany / multi-writer volumes
 
-`fsGroup` ownership-remapping through `spec.mover.podSecurityContext.fsGroup` is most effective on `ReadWriteOnce` volumes. On `ReadWriteMany` it may be a no-op, or ignored, depending on the CSI driver. For ReadWriteMany, match the owning UID and GID directly in the container `securityContext`. If the volume holds files from several UIDs, use a root mover to read and write regardless of owner.
+`fsGroup` ownership-remapping through `spec.mover.podSecurityContext.fsGroup` is most effective on `ReadWriteOnce` volumes. On `ReadWriteMany` it may be a no-op, or ignored, depending on the CSI driver. For ReadWriteMany, match the owning UID and GID directly in the container `securityContext`. If the volume holds files from several UIDs, use a root mover with `privilegedMode: true` to read and write regardless of owner.
 
 ### Mixed ownership, `lost+found`, root-written data
 
-If `stat` shows several different owners and some files are owner-only (`0600`), no single non-root UID can read them all. A root mover is the pragmatic answer. Pair it with `privilegedMode: true` if you also need restores to land with the original ownership.
+If `stat` shows several different owners and some files are owner-only (`0600`), no single non-root UID can read them all. A root mover with `privilegedMode: true` is the pragmatic answer: it reads every file on backup and restores the original ownership.
 
 ### NFS sources and filesystem repositories
 
@@ -562,7 +600,7 @@ That's the behavior when the recipe has **nothing else to go on**, as here. Add 
 | The mover must… | **read** the source PVC | **write** the target PVC |
 | Set the UID/GID to… | an identity that can read the data | the identity that should **own** the restored files |
 | Default if unset | UID `65532` (reads world-readable / `65532`-owned only), pod `fsGroup: 65532` | UID `65532` (files land owned by `65532`), pod `fsGroup: 65532` |
-| Preserve original ownership | n/a (kopia records it) | needs root + `privilegedMode: true` |
+| Preserve original ownership | n/a (kopia records it) | needs root + `privilegedMode: true` (grants `CHOWN`, `DAC_OVERRIDE`, `FOWNER`, `FSETID`) |
 | Inherit from workload | `SnapshotPolicy.spec.mover.inheritSecurityContextFrom` (`pvcConsumer`/`workloadSelector`) | `Restore.spec.mover.inheritSecurityContextFrom` (`workloadSelector`, or `snapshot: {}`, the backup's recorded identity, no live pod) |
 | Override it for ONE run | `Snapshot.spec.mover`, merged field-wise over the policy's — see [Backups → `mover` for one run](backups.md#mover--override-the-recipes-mover-for-one-run) | a `Restore` **is** the invocation, so `Restore.spec.mover` is already per-run |
 | Elevated context | namespace `privileged-movers` opt-in | same opt-in |
@@ -599,7 +637,7 @@ A backup that reports **`Succeeded` but zero files and bytes** is the classic si
 | Set the UID/GID | `securityContext.runAsUser` / `runAsGroup` (match the data owner) |
 | Inherit from a workload | `inheritSecurityContextFrom.podSelector` (+ optional `container`); copies container **and** pod context (UID + fsGroup). Needs the workload to pin `runAsUser`; combines with `securityContext`/`podSecurityContext`, which override it field-wise and act as the fallback |
 | Inherit the backup's recorded identity (restore) | `inheritSecurityContextFrom: { snapshot: {} }`: replay the uid/gid/fsGroup recorded on the backup (`Snapshot.status.recorded`); works with every source, needs no live pod, holds on `MissingRecordedIdentity` until the catalog scan lands |
-| Root / preserve ownership | `runAsUser: 0` + `runAsNonRoot: false` (+ `privilegedMode: true` for restore ownership) |
+| Root / preserve ownership | `runAsUser: 0` + `runAsNonRoot: false` + `privilegedMode: true` (backup gets `DAC_OVERRIDE`; restore gets `CHOWN`, `DAC_OVERRIDE`, `FOWNER`, `FSETID`). Root without `privilegedMode` holds no capabilities |
 | Privileged-mover opt-in | `kubectl annotate namespace <ns> kopiur.home-operations.com/privileged-movers=true` |
 | Find the owning UID | [Permissions → Find the UID/GID](permissions.md#step-1--find-the-uidgid-that-owns-your-data) |
 

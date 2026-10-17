@@ -1134,7 +1134,13 @@ spec:
                             type: object
                         type: object
                       privilegedMode:
-                        description: Opt-in, namespace-gated privileged mode; preserves UID/GID on restore.
+                        description: |-
+                          Opt-in, namespace-gated privileged mode. Runs the mover as root (when no layer pins
+                          a `runAsUser`) and adds the capabilities the operation needs on top of
+                          `drop: [ALL]`: `DAC_OVERRIDE` for a backup (read files owned by any uid/gid);
+                          `CHOWN`, `DAC_OVERRIDE`, `FOWNER`, `FSETID` for a restore (reproduce original
+                          ownership). Grants nothing for maintenance, or when a non-zero `runAsUser` is
+                          pinned (capabilities are inert for non-root).
                         nullable: true
                         type: boolean
                       resources:
@@ -5402,7 +5408,13 @@ spec:
                             type: object
                         type: object
                       privilegedMode:
-                        description: Opt-in, namespace-gated privileged mode; preserves UID/GID on restore.
+                        description: |-
+                          Opt-in, namespace-gated privileged mode. Runs the mover as root (when no layer pins
+                          a `runAsUser`) and adds the capabilities the operation needs on top of
+                          `drop: [ALL]`: `DAC_OVERRIDE` for a backup (read files owned by any uid/gid);
+                          `CHOWN`, `DAC_OVERRIDE`, `FOWNER`, `FSETID` for a restore (reproduce original
+                          ownership). Grants nothing for maintenance, or when a non-zero `runAsUser` is
+                          pinned (capabilities are inert for non-root).
                         nullable: true
                         type: boolean
                       resources:
@@ -9187,7 +9199,13 @@ spec:
                         type: object
                     type: object
                   privilegedMode:
-                    description: Opt-in, namespace-gated privileged mode; preserves UID/GID on restore.
+                    description: |-
+                      Opt-in, namespace-gated privileged mode. Runs the mover as root (when no layer pins
+                      a `runAsUser`) and adds the capabilities the operation needs on top of
+                      `drop: [ALL]`: `DAC_OVERRIDE` for a backup (read files owned by any uid/gid);
+                      `CHOWN`, `DAC_OVERRIDE`, `FOWNER`, `FSETID` for a restore (reproduce original
+                      ownership). Grants nothing for maintenance, or when a non-zero `runAsUser` is
+                      pinned (capabilities are inert for non-root).
                     nullable: true
                     type: boolean
                   resources:
@@ -10699,7 +10717,13 @@ spec:
                         type: object
                     type: object
                   privilegedMode:
-                    description: Opt-in, namespace-gated privileged mode; preserves UID/GID on restore.
+                    description: |-
+                      Opt-in, namespace-gated privileged mode. Runs the mover as root (when no layer pins
+                      a `runAsUser`) and adds the capabilities the operation needs on top of
+                      `drop: [ALL]`: `DAC_OVERRIDE` for a backup (read files owned by any uid/gid);
+                      `CHOWN`, `DAC_OVERRIDE`, `FOWNER`, `FSETID` for a restore (reproduce original
+                      ownership). Grants nothing for maintenance, or when a non-zero `runAsUser` is
+                      pinned (capabilities are inert for non-root).
                     nullable: true
                     type: boolean
                   resources:
@@ -12228,7 +12252,13 @@ spec:
                         type: object
                     type: object
                   privilegedMode:
-                    description: Opt-in, namespace-gated privileged mode; preserves UID/GID on restore.
+                    description: |-
+                      Opt-in, namespace-gated privileged mode. Runs the mover as root (when no layer pins
+                      a `runAsUser`) and adds the capabilities the operation needs on top of
+                      `drop: [ALL]`: `DAC_OVERRIDE` for a backup (read files owned by any uid/gid);
+                      `CHOWN`, `DAC_OVERRIDE`, `FOWNER`, `FSETID` for a restore (reproduce original
+                      ownership). Grants nothing for maintenance, or when a non-zero `runAsUser` is
+                      pinned (capabilities are inert for non-root).
                     nullable: true
                     type: boolean
                   resources:
@@ -13587,7 +13617,13 @@ spec:
                         type: object
                     type: object
                   privilegedMode:
-                    description: Opt-in, namespace-gated privileged mode; preserves UID/GID on restore.
+                    description: |-
+                      Opt-in, namespace-gated privileged mode. Runs the mover as root (when no layer pins
+                      a `runAsUser`) and adds the capabilities the operation needs on top of
+                      `drop: [ALL]`: `DAC_OVERRIDE` for a backup (read files owned by any uid/gid);
+                      `CHOWN`, `DAC_OVERRIDE`, `FOWNER`, `FSETID` for a restore (reproduce original
+                      ownership). Grants nothing for maintenance, or when a non-zero `runAsUser` is
+                      pinned (capabilities are inert for non-root).
                     nullable: true
                     type: boolean
                   resources:
@@ -14869,7 +14905,13 @@ spec:
                         type: object
                     type: object
                   privilegedMode:
-                    description: Opt-in, namespace-gated privileged mode; preserves UID/GID on restore.
+                    description: |-
+                      Opt-in, namespace-gated privileged mode. Runs the mover as root (when no layer pins
+                      a `runAsUser`) and adds the capabilities the operation needs on top of
+                      `drop: [ALL]`: `DAC_OVERRIDE` for a backup (read files owned by any uid/gid);
+                      `CHOWN`, `DAC_OVERRIDE`, `FOWNER`, `FSETID` for a restore (reproduce original
+                      ownership). Grants nothing for maintenance, or when a non-zero `runAsUser` is
+                      pinned (capabilities are inert for non-root).
                     nullable: true
                     type: boolean
                   resources:
@@ -15741,7 +15783,13 @@ spec:
                         type: object
                     type: object
                   privilegedMode:
-                    description: Opt-in, namespace-gated privileged mode; preserves UID/GID on restore.
+                    description: |-
+                      Opt-in, namespace-gated privileged mode. Runs the mover as root (when no layer pins
+                      a `runAsUser`) and adds the capabilities the operation needs on top of
+                      `drop: [ALL]`: `DAC_OVERRIDE` for a backup (read files owned by any uid/gid);
+                      `CHOWN`, `DAC_OVERRIDE`, `FOWNER`, `FSETID` for a restore (reproduce original
+                      ownership). Grants nothing for maintenance, or when a non-zero `runAsUser` is
+                      pinned (capabilities are inert for non-root).
                     nullable: true
                     type: boolean
                   resources:

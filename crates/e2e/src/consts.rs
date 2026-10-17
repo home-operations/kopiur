@@ -249,6 +249,10 @@ pub const REPO_SUBPATHS: &[&str] = &[
     // object, and sharing the namespaced repository's dir would put two CRs on
     // one kopia repo.
     "ui-cluster",
+    // #552 privileged root mover (policy_knobs.rs). Its own dir because a root
+    // mover writes root-owned kopia blobs that a 65532 mover sharing the repo
+    // could no longer read.
+    "privroot",
 ];
 // --- web console (kopiur-ui) roles and bindings ---------------------------------
 /// The aggregate human ClusterRole the chart renders (`ui.rbac.userRoles`). Bound
@@ -299,7 +303,9 @@ pub const HOSTPATH_SRC: &str = "/kopiur-e2e/src";
 pub const HOSTPATH_RO_REPO: &str = "/kopiur-e2e/ro-repo";
 /// Source dir with one UNREADABLE file (root-owned `0000` `secret.bin`, set after
 /// the global 0777) for the `errorHandling.ignoreFileErrors` e2e: a default
-/// backup of it fails; one with the flag succeeds. Kept SEPARATE from
+/// backup of it fails; one with the flag succeeds. Also holds `foreign.bin`, a `0660`
+/// file owned by `4242:4242`, for the #552 privileged-root-mover e2e (only a mover with
+/// `DAC_OVERRIDE` reads both). Kept SEPARATE from
 /// [`HOSTPATH_SRC`] so the poison file can't break every other backup test.
 pub const HOSTPATH_SRC_EH: &str = "/kopiur-e2e/src-eh";
 /// hostPath PV over [`HOSTPATH_SRC_EH`], operator namespace.

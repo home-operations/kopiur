@@ -301,6 +301,11 @@ async fn handle_snapshot_policy(
         warnings.extend(outcome.warnings);
     }
 
+    warnings.extend(
+        spec.mover
+            .as_ref()
+            .and_then(|m| m.privileged_mode_warning(api::common::MoverOperation::Backup)),
+    );
     // Best-effort, non-blocking securityContext-compatibility warning (the earliest surface).
     warnings.extend(
         crate::secctx::backup_warnings(
@@ -429,11 +434,17 @@ async fn handle_snapshot(
             // context this Snapshot has overridden. Same fail-open contract as the
             // SnapshotPolicy surface: the policy GET above already happened, so this
             // costs one Pod LIST and nothing else.
+            let effective_mover = api::snapshot::effective_backup_mover(&spec, &policy.spec);
+            warnings.extend(
+                effective_mover
+                    .as_ref()
+                    .and_then(|m| m.privileged_mode_warning(api::common::MoverOperation::Backup)),
+            );
             warnings.extend(
                 crate::secctx::backup_warnings(
                     Some(client),
                     Some(ns),
-                    api::snapshot::effective_backup_mover(&spec, &policy.spec).as_ref(),
+                    effective_mover.as_ref(),
                     assessable_sources(&spec, &policy.spec),
                 )
                 .await,
@@ -753,13 +764,21 @@ async fn handle_restore(
             None
         }
     };
-    let warnings = crate::secctx::restore_warnings(
-        client,
-        req.namespace.as_deref(),
-        spec.mover.as_ref(),
-        target_pvc,
-    )
-    .await;
+    let mut warnings: Vec<String> = spec
+        .mover
+        .as_ref()
+        .and_then(|m| m.privileged_mode_warning(api::common::MoverOperation::Restore))
+        .into_iter()
+        .collect();
+    warnings.extend(
+        crate::secctx::restore_warnings(
+            client,
+            req.namespace.as_deref(),
+            spec.mover.as_ref(),
+            target_pvc,
+        )
+        .await,
+    );
     Ok(with_warnings(resp, warnings))
 }
 

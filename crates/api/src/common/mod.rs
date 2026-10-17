@@ -10,10 +10,12 @@ use serde::{Deserialize, Serialize};
 
 mod cache;
 mod mover;
+mod privileged;
 mod secctx;
 
 pub use cache::*;
 pub use mover::*;
+pub use privileged::*;
 pub use secctx::*;
 
 /// serde `default` for a `bool` field whose absent value is `true`. Used by
