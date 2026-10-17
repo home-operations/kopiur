@@ -84,6 +84,13 @@ spec:
               value: {{ include "kopiur.image" (dict "root" $ "img" .Values.mover.image) | quote }}
             - name: KOPIUR_MOVER_PULL_POLICY
               value: {{ .Values.mover.image.pullPolicy | quote }}
+            {{- with include "kopiur.imagePullSecretNames" . }}
+            # Names of the merged global + top-level imagePullSecrets, stamped on
+            # every mover Job and kopia server pod. They resolve in each pod's own
+            # namespace: the Secret must exist wherever movers run (not copied).
+            - name: KOPIUR_MOVER_IMAGE_PULL_SECRETS
+              value: {{ . | quote }}
+            {{- end }}
             # The mover PATCHes Backup/Restore .status, so its Job pods run as a
             # dedicated least-privilege ServiceAccount (NOT the operator SA and NOT
             # the namespace default). The controller mints this SA + a RoleBinding to

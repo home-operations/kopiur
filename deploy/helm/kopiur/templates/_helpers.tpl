@@ -194,6 +194,22 @@ imagePullSecrets:
 {{- end }}
 
 {{/*
+The same merged image pull secrets as a comma-separated list of NAMES, for the
+KOPIUR_MOVER_IMAGE_PULL_SECRETS env var (the controller stamps them on mover
+Jobs and kopia server pods; the console on browse-session pods). Duplicates are
+dropped. Emits nothing when both lists are empty.
+*/}}
+{{- define "kopiur.imagePullSecretNames" -}}
+{{- $names := list -}}
+{{- range concat (.Values.global.imagePullSecrets | default list) (.Values.imagePullSecrets | default list) -}}
+{{- $name := "" -}}
+{{- if kindIs "string" . -}}{{- $name = . -}}{{- else if kindIs "map" . -}}{{- $name = get . "name" -}}{{- end -}}
+{{- if $name -}}{{- $names = append $names $name -}}{{- end -}}
+{{- end -}}
+{{- $names | uniq | join "," -}}
+{{- end }}
+
+{{/*
 Global-merge helpers for the two named components (root = controller, webhook.*).
 Map-valued globals (nodeSelector, affinity) take the component value when it is
 set, else the global. List-valued globals (tolerations, topologySpreadConstraints)
@@ -562,6 +578,11 @@ left blank is simply omitted here rather than rendered as "".
 # deliberately grants no `apps/deployments` read.
 - name: KOPIUR_MOVER_IMAGE
   value: {{ include "kopiur.image" (dict "root" . "img" .Values.mover.image) | quote }}
+{{- with include "kopiur.imagePullSecretNames" . }}
+# Pinned alongside the image: browse-session pods need the same pull secrets.
+- name: KOPIUR_MOVER_IMAGE_PULL_SECRETS
+  value: {{ . | quote }}
+{{- end }}
 - name: KOPIUR_UI_CACHE
   value: {{ $ui.cache.enabled | quote }}
 - name: KOPIUR_UI_SESSION_TTL

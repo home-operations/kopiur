@@ -20,10 +20,11 @@ use crate::workspec::MoverWorkSpec;
 use k8s_openapi::api::batch::v1::{Job, JobSpec};
 use k8s_openapi::api::core::v1::{
     Affinity, ConfigMap, Container, EmptyDirVolumeSource, EnvFromSource, EphemeralVolumeSource,
-    NFSVolumeSource, NodeAffinity, NodeSelector, NodeSelectorRequirement, NodeSelectorTerm,
-    PersistentVolumeClaimSpec, PersistentVolumeClaimTemplate, PersistentVolumeClaimVolumeSource,
-    PodSecurityContext, PodSpec, PodTemplateSpec, ResourceRequirements, SecretEnvSource,
-    SecurityContext, Toleration, Volume, VolumeMount, VolumeResourceRequirements,
+    LocalObjectReference, NFSVolumeSource, NodeAffinity, NodeSelector, NodeSelectorRequirement,
+    NodeSelectorTerm, PersistentVolumeClaimSpec, PersistentVolumeClaimTemplate,
+    PersistentVolumeClaimVolumeSource, PodSecurityContext, PodSpec, PodTemplateSpec,
+    ResourceRequirements, SecretEnvSource, SecurityContext, Toleration, Volume, VolumeMount,
+    VolumeResourceRequirements,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, OwnerReference};
@@ -290,6 +291,13 @@ pub struct MoverJobInputs<'a> {
     /// Image pull policy (e.g. `IfNotPresent` for a locally-loaded e2e image).
     /// `None` lets Kubernetes default it.
     pub image_pull_policy: Option<&'a str>,
+    /// `imagePullSecrets` for the mover pod — the NAMES of registry Secrets
+    /// (the chart's merged `global.imagePullSecrets` + `imagePullSecrets`,
+    /// parsed by [`parse_image_pull_secrets`]). They resolve in the POD's
+    /// namespace, so each Secret must exist wherever the mover runs; kopiur
+    /// never copies them. Empty renders no `imagePullSecrets` at all, keeping
+    /// the Job byte-identical for installs without a private registry.
+    pub image_pull_secrets: &'a [LocalObjectReference],
     /// Job retry/deadline limits.
     pub limits: JobLimits,
     /// Resolved resource requests/limits for the mover container (after the
@@ -680,6 +688,7 @@ pub fn build_job(inputs: &MoverJobInputs<'_>) -> Result<Job, BuildJobError> {
         containers: vec![container],
         volumes: Some(volumes),
         service_account_name: inputs.service_account.map(str::to_string),
+        image_pull_secrets: image_pull_secrets_field(inputs.image_pull_secrets),
         // Pod-level securityContext (e.g. fsGroup) so an unprivileged mover can write
         // a freshly-provisioned restore volume. `None` leaves the pod spec minimal.
         security_context: inputs.pod_security_context.clone(),
@@ -733,6 +742,45 @@ pub fn build_job(inputs: &MoverJobInputs<'_>) -> Result<Job, BuildJobError> {
         }),
         status: None,
     })
+}
+
+/// Parse a comma-separated list of registry Secret NAMES (the value of the
+/// controller's/console's `KOPIUR_MOVER_IMAGE_PULL_SECRETS`) into pod
+/// `imagePullSecrets` references: entries are trimmed, empties dropped, and
+/// duplicates removed keeping the first occurrence's order. `"a, ,b,a"` →
+/// `[a, b]`; `""` → `[]`.
+pub fn parse_image_pull_secrets(raw: &str) -> Vec<LocalObjectReference> {
+    image_pull_secret_refs(&parse_image_pull_secret_names(raw))
+}
+
+/// [`parse_image_pull_secrets`] as bare names, for callers whose config types
+/// keep `Eq` (k8s-openapi's `LocalObjectReference` is `PartialEq` only).
+pub fn parse_image_pull_secret_names(raw: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for name in raw.split(',').map(str::trim).filter(|n| !n.is_empty()) {
+        if !out.iter().any(|seen| seen == name) {
+            out.push(name.to_string());
+        }
+    }
+    out
+}
+
+/// Secret names → pod `imagePullSecrets` references, order preserved.
+pub fn image_pull_secret_refs(names: &[String]) -> Vec<LocalObjectReference> {
+    names
+        .iter()
+        .map(|name| LocalObjectReference { name: name.clone() })
+        .collect()
+}
+
+/// The pod-spec `imagePullSecrets` value: `None` when there are none, so a pod
+/// without a private registry renders exactly as it did before the field was
+/// wired (no `imagePullSecrets: []`). Shared by the mover Job and the kopia
+/// server Deployment.
+pub fn image_pull_secrets_field(
+    secrets: &[LocalObjectReference],
+) -> Option<Vec<LocalObjectReference>> {
+    (!secrets.is_empty()).then(|| secrets.to_vec())
 }
 
 /// The well-known node label carrying a node's hostname — the topology key a
@@ -953,6 +1001,7 @@ mod tests {
             work_spec: ws,
             image: DEFAULT_MOVER_IMAGE,
             image_pull_policy: None,
+            image_pull_secrets: &[],
             limits,
             resources: None,
             // The caller always supplies a fully-resolved SC; default to the hardened
@@ -977,6 +1026,51 @@ mod tests {
             scratch_volume: None,
             readiness_exec: None,
         }
+    }
+
+    #[test]
+    fn image_pull_secrets_reach_the_mover_pod_and_are_absent_when_empty() {
+        // #579: the chart's imagePullSecrets never reached mover pods, so a
+        // mover image in a private registry failed every Job with ErrImagePull.
+        let ws = sample_work_spec();
+        let job = build_job(&inputs(&ws, JobLimits::default())).unwrap();
+        assert_eq!(
+            job.spec.unwrap().template.spec.unwrap().image_pull_secrets,
+            None,
+            "no pull secrets configured → no imagePullSecrets key (unchanged output)"
+        );
+
+        let secrets = parse_image_pull_secrets("regcred,mirror-creds");
+        let mut i = inputs(&ws, JobLimits::default());
+        i.image_pull_secrets = &secrets;
+        let job = build_job(&i).unwrap();
+        let names: Vec<String> = job
+            .spec
+            .unwrap()
+            .template
+            .spec
+            .unwrap()
+            .image_pull_secrets
+            .expect("imagePullSecrets rendered")
+            .into_iter()
+            .map(|r| r.name)
+            .collect();
+        assert_eq!(names, vec!["regcred", "mirror-creds"]);
+    }
+
+    #[test]
+    fn image_pull_secret_names_are_trimmed_deduped_and_ordered() {
+        let names = |raw: &str| -> Vec<String> {
+            parse_image_pull_secrets(raw)
+                .into_iter()
+                .map(|r| r.name)
+                .collect()
+        };
+        assert_eq!(names(""), Vec::<String>::new());
+        assert_eq!(names(" , ,"), Vec::<String>::new());
+        assert_eq!(names("a"), vec!["a"]);
+        assert_eq!(names(" b , a,,b, c "), vec!["b", "a", "c"]);
+        assert_eq!(image_pull_secrets_field(&[]), None);
     }
 
     #[test]

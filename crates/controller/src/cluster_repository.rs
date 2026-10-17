@@ -907,6 +907,7 @@ async fn reconcile_cluster_server(
         is_cluster: true,
         image: &ctx.mover_image,
         image_pull_policy: ctx.mover_pull_policy(),
+        image_pull_secrets: &ctx.mover_image_pull_secrets,
         service_account: ctx.mover_service_account.as_deref(),
     };
 
@@ -1719,6 +1720,7 @@ async fn bootstrap_cluster_via_mover(
         work_spec: &work_spec,
         image: &ctx.mover_image,
         image_pull_policy: ctx.mover_pull_policy(),
+        image_pull_secrets: &ctx.mover_image_pull_secrets,
         // Bound the bootstrap Job so a pod that never schedules (missing mover SA,
         // image-pull failure) becomes terminal-`Failed` instead of hanging — then
         // `finalize_cluster_bootstrap` runs and surfaces a Warning Event. Shared with

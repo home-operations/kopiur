@@ -42,6 +42,7 @@ fn inputs<'a>(ns: &'a str, auth: ResolvedAuth) -> ServerBuildInputs<'a> {
         extra_labels: BTreeMap::new(),
         image: "ghcr.io/home-operations/kopiur-mover:test",
         image_pull_policy: Some("IfNotPresent"),
+        image_pull_secrets: &[],
         service_account: Some("kopiur-controller"),
         repository: RepositoryConnect::S3 {
             bucket: "b".into(),
@@ -453,6 +454,35 @@ fn server_pod_carries_hardened_fsgroup_by_default() {
     assert!(
         psc.supplemental_groups.is_none(),
         "no supplemental groups unless configured"
+    );
+}
+
+#[test]
+fn server_pod_carries_the_mover_image_pull_secrets_only_when_set() {
+    // #579: the kopia server runs the mover image, so a private-registry mover
+    // needs the same imagePullSecrets on the server pod.
+    let dep = build_server_deployment(&inputs("ns", gen_auth()));
+    assert_eq!(
+        dep.spec.unwrap().template.spec.unwrap().image_pull_secrets,
+        None,
+        "no pull secrets → no imagePullSecrets key"
+    );
+
+    let secrets = crate::jobs::parse_image_pull_secrets("regcred");
+    let mut i = inputs("ns", gen_auth());
+    i.image_pull_secrets = &secrets;
+    let dep = build_server_deployment(&i);
+    let refs = dep
+        .spec
+        .unwrap()
+        .template
+        .spec
+        .unwrap()
+        .image_pull_secrets
+        .expect("imagePullSecrets rendered");
+    assert_eq!(
+        refs.into_iter().map(|r| r.name).collect::<Vec<_>>(),
+        vec!["regcred"]
     );
 }
 

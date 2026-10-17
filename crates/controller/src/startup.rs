@@ -355,6 +355,7 @@ pub async fn run(config: config::ControllerConfig) -> anyhow::Result<()> {
         config.mover_image.clone(),
         config.mover_image_overridden,
         config.mover_pull_policy,
+        config.mover_image_pull_secrets.clone(),
         config.mover_service_account.clone(),
         config.mover_clusterrole.clone(),
         config.mover_role_kind,

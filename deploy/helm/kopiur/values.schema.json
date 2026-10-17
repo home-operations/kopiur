@@ -93,7 +93,7 @@
           "type": "object"
         },
         "imagePullSecrets": {
-          "description": "Concatenated with the top-level imagePullSecrets; reaches controller,\nwebhook, and mover Jobs.",
+          "description": "Concatenated with the top-level imagePullSecrets. Set on the controller,\nwebhook and console pods, and the NAMES are passed to every mover pod\n(backup/restore/maintenance Jobs, kopia server, browse sessions). A name\nresolves in the pod's own namespace and kopiur never copies Secrets, so the\nSecret must exist in each namespace movers run in (see imagePullSecrets).",
           "items": {
             "required": []
           },
@@ -158,7 +158,7 @@
       "type": "object"
     },
     "imagePullSecrets": {
-      "description": "Image pull secrets for the controller pod (concatenated with\nglobal.imagePullSecrets; also reaches the webhook pod and mover Jobs).",
+      "description": "Image pull secrets (concatenated with global.imagePullSecrets) for the\ncontroller, webhook and console pods. Their NAMES are also passed to every\nmover pod, but a name resolves in the pod's own namespace and kopiur does not\ncopy Secrets: create the Secret in each namespace movers run in — every\nnamespace with a SnapshotPolicy/Snapshot/Restore (backup, restore, verify and\nbrowse-session pods run beside the workload), each Repository's namespace\n(bootstrap, delete, pin, replication, kopia server), the Maintenance CR's\nnamespace, and the operator namespace (ClusterRepository bootstrap/delete).",
       "items": {
         "required": []
       },

@@ -31,6 +31,38 @@ tests:
   # identity headers to anyone who can set them.
   # =========================================================================
 
+  # #579: browse-session pods run the mover image too, so the console pins the
+  # pull-secret names next to the image (it never reads the controller env).
+  - it: pins the merged imagePullSecrets names for browse-session pods
+    set:
+      ui.enabled: true
+      ui.auth.userHeader: X-Forwarded-User
+      ui.auth.acknowledgeNoProxySecret: true
+      global.imagePullSecrets:
+        - name: global-creds
+      imagePullSecrets:
+        - name: local-creds
+    template: ui-deployment.tpl
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: KOPIUR_MOVER_IMAGE_PULL_SECRETS
+            value: global-creds,local-creds
+
+  - it: omits the browse pull-secrets env when no imagePullSecrets are set
+    set:
+      ui.enabled: true
+      ui.auth.userHeader: X-Forwarded-User
+      ui.auth.acknowledgeNoProxySecret: true
+    template: ui-deployment.tpl
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: KOPIUR_MOVER_IMAGE_PULL_SECRETS
+          any: true
+
   - it: never renders an Ingress or a route, with every optional piece turned on
     set:
       ui.enabled: true

@@ -30,8 +30,11 @@ fullnameOverride: ""
 # only when the component leaves its own value empty; commonLabels are added to
 # every rendered object.
 global:
-  # -- Concatenated with the top-level imagePullSecrets; reaches controller,
-  # webhook, and mover Jobs.
+  # -- Concatenated with the top-level imagePullSecrets. Set on the controller,
+  # webhook and console pods, and the NAMES are passed to every mover pod
+  # (backup/restore/maintenance Jobs, kopia server, browse sessions). A name
+  # resolves in the pod's own namespace and kopiur never copies Secrets, so the
+  # Secret must exist in each namespace movers run in (see imagePullSecrets).
   imagePullSecrets: []
   # -- Scheduling defaults every kopiur pod inherits unless the component
   # (root = controller, webhook.*) sets its own.
@@ -102,8 +105,14 @@ image:
   # -- Image pull policy for the controller.
   pullPolicy: IfNotPresent
 
-# -- Image pull secrets for the controller pod (concatenated with
-# global.imagePullSecrets; also reaches the webhook pod and mover Jobs).
+# -- Image pull secrets (concatenated with global.imagePullSecrets) for the
+# controller, webhook and console pods. Their NAMES are also passed to every
+# mover pod, but a name resolves in the pod's own namespace and kopiur does not
+# copy Secrets: create the Secret in each namespace movers run in — every
+# namespace with a SnapshotPolicy/Snapshot/Restore (backup, restore, verify and
+# browse-session pods run beside the workload), each Repository's namespace
+# (bootstrap, delete, pin, replication, kopia server), the Maintenance CR's
+# namespace, and the operator namespace (ClusterRepository bootstrap/delete).
 imagePullSecrets: []
 #  - name: my-registry-creds
 

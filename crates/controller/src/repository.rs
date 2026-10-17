@@ -761,6 +761,7 @@ async fn reconcile_repository_server(
         is_cluster: false,
         image: &ctx.mover_image,
         image_pull_policy: ctx.mover_pull_policy(),
+        image_pull_secrets: &ctx.mover_image_pull_secrets,
         service_account: ctx.mover_service_account.as_deref(),
     };
 
@@ -1721,6 +1722,7 @@ async fn bootstrap_via_mover(
         work_spec: &work_spec,
         image: &ctx.mover_image,
         image_pull_policy: ctx.mover_pull_policy(),
+        image_pull_secrets: &ctx.mover_image_pull_secrets,
         // Bound the bootstrap Job: a pod that never schedules (missing mover SA,
         // image-pull failure) otherwise never reaches a `Failed` condition, so the
         // controller never finalizes and the repository hangs `Initializing` with

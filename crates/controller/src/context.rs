@@ -154,6 +154,10 @@ pub struct Context {
     /// Explicit `imagePullPolicy` for mover Jobs (`KOPIUR_MOVER_PULL_POLICY`);
     /// `None` → inferred (see [`crate::config::effective_mover_pull_policy`]).
     pub mover_pull_policy: Option<crate::config::PullPolicy>,
+    /// `imagePullSecrets` (Secret NAMES) stamped on every mover `Job` pod and
+    /// kopia server `Deployment` (`KOPIUR_MOVER_IMAGE_PULL_SECRETS`, #579).
+    /// Names resolve in the pod's namespace; never copied. Empty → none.
+    pub mover_image_pull_secrets: Vec<k8s_openapi::api::core::v1::LocalObjectReference>,
     /// ServiceAccount the mover `Job` pods run as (configurable via
     /// `KOPIUR_MOVER_SERVICE_ACCOUNT`). The mover PATCHes the owning CR's
     /// `.status`, so this SA must be bound to the operator's status-patch rules.
@@ -318,6 +322,7 @@ impl Context {
         mover_image: String,
         mover_image_overridden: bool,
         mover_pull_policy: Option<crate::config::PullPolicy>,
+        mover_image_pull_secrets: Vec<k8s_openapi::api::core::v1::LocalObjectReference>,
         mover_service_account: Option<String>,
         mover_clusterrole: String,
         mover_role_kind: crate::config::RoleKind,
@@ -339,6 +344,7 @@ impl Context {
             mover_image,
             mover_image_overridden,
             mover_pull_policy,
+            mover_image_pull_secrets,
             mover_service_account,
             mover_clusterrole,
             mover_role_kind,
@@ -435,6 +441,7 @@ impl Context {
             "example.com/kopiur-mover:test".to_string(),
             false,
             None,
+            Vec::new(),
             None,
             crate::config::DEFAULT_MOVER_NAME.to_string(),
             crate::config::DEFAULT_MOVER_ROLE_KIND,

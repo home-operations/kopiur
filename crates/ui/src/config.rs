@@ -182,6 +182,12 @@ pub const OPERATOR_NAMESPACE_ENV: &str = "KOPIUR_NAMESPACE";
 /// one chart value stamps both.
 pub const MOVER_IMAGE_ENV: &str = "KOPIUR_MOVER_IMAGE";
 
+/// Comma-separated registry Secret NAMES set as `imagePullSecrets` on
+/// browse-session pods. Shares the controller's env name so one chart value
+/// (the merged `global.imagePullSecrets` + `imagePullSecrets`) stamps both
+/// (#579). Each Secret must exist in the namespace the session pod runs in.
+pub const MOVER_IMAGE_PULL_SECRETS_ENV: &str = "KOPIUR_MOVER_IMAGE_PULL_SECRETS";
+
 /// Whether to back reads with watch-fed reflector stores under the UI's own
 /// ServiceAccount (SAR-gated per identity) instead of one impersonated LIST per
 /// request. On by default: it is the difference between a page load costing one
@@ -490,6 +496,10 @@ pub struct UiArgs {
     #[arg(long, env = MOVER_IMAGE_ENV)]
     pub mover_image: Option<String>,
 
+    /// Comma-separated imagePullSecrets names for browse-session pods.
+    #[arg(long, env = MOVER_IMAGE_PULL_SECRETS_ENV)]
+    pub mover_image_pull_secrets: Option<String>,
+
     /// Back reads with watch-fed reflector stores instead of per-request LISTs.
     #[arg(long, env = CACHE_ENV, action = ArgAction::Set,
           num_args = 0..=1, default_value_t = true, default_missing_value = "true",
@@ -578,6 +588,9 @@ pub struct UiConfig {
     pub operator_namespace: Option<String>,
     /// Container image browse-session pods run, when overridden.
     pub mover_image: Option<String>,
+    /// `imagePullSecrets` names for browse-session pods, used with a pinned
+    /// [`mover_image`](Self::mover_image) (trimmed, deduplicated in order).
+    pub mover_image_pull_secrets: Vec<String>,
     /// Whether reads go through watch-fed reflector stores.
     pub cache_enabled: bool,
     /// Browse-session lifetimes and concurrency caps.
@@ -1070,6 +1083,9 @@ impl UiArgs {
             },
             operator_namespace: nonempty(self.operator_namespace),
             mover_image: nonempty(self.mover_image),
+            mover_image_pull_secrets: kopiur_ops::browse::session::parse_image_pull_secret_names(
+                self.mover_image_pull_secrets.as_deref().unwrap_or_default(),
+            ),
             cache_enabled: self.cache,
             session,
             download_max_bytes: self.max_download_bytes,
@@ -1316,6 +1332,28 @@ mod tests {
             "the fixture must differ from the default, or this proves nothing"
         );
         assert_ne!(limits.manifest_max_bytes, DEFAULT_MAX_MANIFEST_BYTES as i64);
+    }
+
+    /// #579: browse-session pods run the mover image, so the console takes the
+    /// same pull-secret list the chart gives the controller.
+    #[test]
+    #[serial]
+    fn mover_image_pull_secrets_resolve_trimmed_and_deduped() {
+        assert_eq!(
+            MOVER_IMAGE_PULL_SECRETS_ENV,
+            "KOPIUR_MOVER_IMAGE_PULL_SECRETS"
+        );
+        let cfg = resolve(&header_mode(&[])).expect("defaults resolve");
+        assert!(cfg.mover_image_pull_secrets.is_empty());
+        let cfg = resolve(&header_mode(&[
+            "--mover-image-pull-secrets",
+            " global-creds,local-creds,,global-creds",
+        ]))
+        .expect("pull secrets resolve");
+        assert_eq!(
+            cfg.mover_image_pull_secrets,
+            vec!["global-creds", "local-creds"]
+        );
     }
 
     /// A cap larger than `i64::MAX` saturates rather than wrapping. Wrapping

@@ -2008,6 +2008,7 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
         work_spec: &work_spec,
         image: &ctx.mover_image,
         image_pull_policy: ctx.mover_pull_policy(),
+        image_pull_secrets: &ctx.mover_image_pull_secrets,
         limits,
         resources: resolved_mover.resources.clone(),
         // The fully-merged contexts (hardened ⊂ moverDefaults ⊂ recipe) — the same
@@ -4305,6 +4306,7 @@ async fn build_batch_job(
         work_spec: &work_spec,
         image: &ctx.mover_image,
         image_pull_policy: ctx.mover_pull_policy(),
+        image_pull_secrets: &ctx.mover_image_pull_secrets,
         limits,
         resources: resolved_mover.resources.clone(),
         security_context: resolved_mover.security_context.clone(),
@@ -4508,6 +4510,7 @@ async fn reconcile_pin(
         work_spec: &work_spec,
         image: &ctx.mover_image,
         image_pull_policy: ctx.mover_pull_policy(),
+        image_pull_secrets: &ctx.mover_image_pull_secrets,
         limits,
         resources: resolved_mover.resources.clone(),
         security_context: resolved_mover.security_context.clone(),

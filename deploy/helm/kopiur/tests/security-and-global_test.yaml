@@ -76,6 +76,35 @@ tests:
           path: metadata.labels.fleet
           value: kopiur-prod
 
+  # #579: the pull secrets must reach mover Jobs, which the controller builds —
+  # so their NAMES ride the controller env, merged global + top-level, deduped.
+  - it: passes the merged imagePullSecrets names to the controller for mover pods
+    template: deployment.tpl
+    set:
+      global.imagePullSecrets:
+        - name: global-creds
+        - name: shared-creds
+      imagePullSecrets:
+        - name: local-creds
+        - name: shared-creds
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: KOPIUR_MOVER_IMAGE_PULL_SECRETS
+            value: global-creds,shared-creds,local-creds
+
+  - it: omits the mover pull-secrets env when no imagePullSecrets are set
+    template: deployment.tpl
+    asserts:
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: KOPIUR_MOVER_IMAGE_PULL_SECRETS
+          any: true
+      - notExists:
+          path: spec.template.spec.imagePullSecrets
+
   - it: global + top-level imagePullSecrets are concatenated
     template: deployment.tpl
     set:

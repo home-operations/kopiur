@@ -3817,6 +3817,7 @@ async fn run_restore_mover(
         work_spec: &work_spec,
         image: &ctx.mover_image,
         image_pull_policy: ctx.mover_pull_policy(),
+        image_pull_secrets: &ctx.mover_image_pull_secrets,
         limits: {
             let mut l = restore_job_limits(restore);
             if l.ttl_seconds_after_finished.is_none() {

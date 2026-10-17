@@ -51,7 +51,7 @@ use kopiur_api::common::RepositoryKind;
 use kopiur_kopia::{DirEntry, ObjectId, SessionCmd};
 use kopiur_ops::browse::resolve::{BrowseTarget, OperatorNamespace, resolve_with};
 use kopiur_ops::browse::session::{
-    ExecSession, MoverImageSource, TracingProgress, delete_session, find_session_job,
+    ExecSession, MoverImage, MoverImageSource, TracingProgress, delete_session, find_session_job,
     job_is_terminal,
 };
 use kopiur_ops::browse::{SnapshotAccess, validate_rel_path, walk_to_dir, walk_to_file};
@@ -873,7 +873,10 @@ async fn resolve_target(
 /// otherwise the fail-closed lookup on the controller Deployment.
 fn mover_image(cfg: &UiConfig) -> MoverImageSource {
     match &cfg.mover_image {
-        Some(image) => MoverImageSource::Fixed(image.clone()),
+        Some(image) => MoverImageSource::Fixed(MoverImage {
+            image: image.clone(),
+            pull_secrets: cfg.mover_image_pull_secrets.clone(),
+        }),
         None => MoverImageSource::DiscoverFromControllerDeployment,
     }
 }
@@ -2101,6 +2104,7 @@ mod router_tests {
             },
             operator_namespace: Some("kopiur-system".to_string()),
             mover_image: None,
+            mover_image_pull_secrets: Vec::new(),
             cache_enabled: false,
             session: SessionLimits {
                 ttl: Duration::from_secs(900),

@@ -310,6 +310,30 @@ $ kubectl -n media get snapshot <new-name> \
 
 Re-add the annotation, either by re-applying the bundle's `namespace` section or with `kubectl annotate … =true`, and the blocked Snapshot proceeds within seconds. No re-apply needed.
 
+## Pulling the mover image from a private registry
+
+If you mirror the mover image into a private registry, list the registry Secret in the chart's `imagePullSecrets` (or `global.imagePullSecrets`):
+
+```yaml
+imagePullSecrets:
+  - name: my-registry-creds
+```
+
+The chart sets that list on the controller, webhook and console pods, and passes the **names** to the controller and console in `KOPIUR_MOVER_IMAGE_PULL_SECRETS`. Kopiur then sets them as `imagePullSecrets` on every pod that runs the mover image: backup, restore, verify, maintenance, bootstrap, delete, pin and replication Jobs, the [kopia server](server.md), and browse sessions.
+
+/// warning | The Secret must exist in every namespace a mover runs in
+
+A pod can only use a pull Secret from its **own** namespace, and Kopiur does not copy pull Secrets. Create `my-registry-creds` in each namespace below, or sync it with a tool such as [Reflector](https://github.com/emberstack/kubernetes-reflector) or [External Secrets](https://external-secrets.io).
+
+- Every workload namespace with a `Snapshot`, `SnapshotPolicy` or `Restore`. Backup, restore, verify and browse pods run beside the workload.
+- Each `Repository`'s namespace: bootstrap, snapshot delete, pin, replication and the kopia server run there.
+- Each `Maintenance` CR's namespace.
+- The operator namespace, where `ClusterRepository` bootstrap and delete Jobs run.
+
+If the Secret is missing, the mover pod sits in `ErrImagePull` / `ImagePullBackOff`.
+
+///
+
 ## Extra pod labels & annotations
 
 Cluster machinery frequently keys off pod metadata that Kopiur has no field of its own for: a queueing system's queue name, a `NetworkPolicy` or monitoring selector, a service-mesh exclusion. `moverDefaults.podLabels` and `moverDefaults.podAnnotations` on the `Repository` or `ClusterRepository` put arbitrary keys on **every** mover that repository spawns:
@@ -404,6 +428,7 @@ The mover preconditions surface on the `Snapshot` or `Restore` status as conditi
 | Backup stuck `Pending`, no Job                                                  | `CredentialsAvailable=False` / `MissingCredentialsSecret` | The credential Secret isn't in the workload namespace.          | Create the Secret there (replicate it for a `ClusterRepository`). |
 | Backup stuck `Pending`, no Job                                                  | `MoverPermitted=False` / `PrivilegedMoverNotPermitted`    | The mover requests privilege but the namespace hasn't opted in. | Annotate the namespace, or drop the elevated `securityContext`.   |
 | Job created but pod never appears, `FailedCreate: serviceaccount ... not found` | (pre-fix only)                                            | The mover ServiceAccount isn't in the namespace.                | Upgrade the operator; it now mints the ServiceAccount automatically. |
+| Mover pod stuck in `ErrImagePull` / `ImagePullBackOff`                          | Pod events                                                | The private-registry pull Secret isn't in the pod's namespace.  | Create it there. See [private registry](#pulling-the-mover-image-from-a-private-registry). |
 
 /// info | Where to look
 

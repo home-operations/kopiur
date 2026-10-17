@@ -158,6 +158,9 @@ pub struct ServerBuildInputs<'a> {
     pub image: &'a str,
     /// Image pull policy (e.g. `IfNotPresent` for a kind-loaded image).
     pub image_pull_policy: Option<&'a str>,
+    /// `imagePullSecrets` (Secret names) for the server pod — the same list the
+    /// mover Jobs get (#579). Empty renders none.
+    pub image_pull_secrets: &'a [k8s_openapi::api::core::v1::LocalObjectReference],
     /// ServiceAccount for the server pod (it never PATCHes CR status, so a minimal
     /// SA suffices; `None` uses the namespace default).
     pub service_account: Option<&'a str>,
@@ -475,6 +478,7 @@ pub fn build_server_deployment(inputs: &ServerBuildInputs<'_>) -> Deployment {
         containers: vec![container],
         volumes: Some(volumes),
         service_account_name: inputs.service_account.map(str::to_string),
+        image_pull_secrets: crate::jobs::image_pull_secrets_field(inputs.image_pull_secrets),
         security_context: Some(pod_sec_ctx),
         ..Default::default()
     };
@@ -796,6 +800,8 @@ pub struct ServerReconcileCtx<'a> {
     pub image: &'a str,
     /// Image pull policy (e.g. `IfNotPresent` for a kind-loaded image).
     pub image_pull_policy: Option<&'a str>,
+    /// `imagePullSecrets` (Secret names) for the server pod (#579).
+    pub image_pull_secrets: &'a [k8s_openapi::api::core::v1::LocalObjectReference],
     /// ServiceAccount for the server pod (`None` → namespace default).
     pub service_account: Option<&'a str>,
 }
@@ -1070,6 +1076,7 @@ async fn ensure_in(
         extra_labels: rc.extra_labels.clone(),
         image: rc.image,
         image_pull_policy: rc.image_pull_policy,
+        image_pull_secrets: rc.image_pull_secrets,
         service_account: identity.service_account.as_deref(),
         repository,
         read_only,

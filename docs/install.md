@@ -182,6 +182,16 @@ If you use the [web UI](server.md), meaning `spec.server` on a `Repository` or `
 
 ///
 
+## Private registries
+
+To pull the Kopiur images from a private registry, set `imagePullSecrets` (or `global.imagePullSecrets`) to the registry Secret names. They apply to the controller, webhook and console pods, and to every mover pod the operator starts.
+
+/// warning | Mover pods need the Secret in their own namespace
+
+Movers run in workload and repository namespaces, not only in the operator namespace, and a pod can only use a pull Secret from its own namespace. Kopiur passes the names but does not copy the Secrets. See [Movers → private registry](movers.md#pulling-the-mover-image-from-a-private-registry) for the list of namespaces.
+
+///
+
 ## Runtime tuning
 
 The chart's defaults are sized for a typical homelab to mid-size cluster. A handful of top-level values tune the controller's runtime footprint and its load on the API server. The full rationale is in the [developer docs](dev/watch-and-reconcile.md#memory-footprint).

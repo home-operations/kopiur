@@ -343,6 +343,7 @@ mod tests {
             },
             operator_namespace: None,
             mover_image: None,
+            mover_image_pull_secrets: Vec::new(),
             cache_enabled: true,
             session: SessionLimits {
                 ttl: Duration::from_secs(900),

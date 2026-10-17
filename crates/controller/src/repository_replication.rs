@@ -792,6 +792,7 @@ async fn spawn_replication_job(
         work_spec: &work_spec,
         image: &ctx.mover_image,
         image_pull_policy: ctx.mover_pull_policy(),
+        image_pull_secrets: &ctx.mover_image_pull_secrets,
         limits,
         resources: resolved_mover.resources.clone(),
         security_context: resolved_mover.security_context.clone(),

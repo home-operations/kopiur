@@ -23,6 +23,16 @@ pub const MOVER_IMAGE_ENV: &str = "KOPIUR_MOVER_IMAGE";
 /// [`effective_mover_pull_policy`].
 pub const MOVER_PULL_POLICY_ENV: &str = "KOPIUR_MOVER_PULL_POLICY";
 
+/// Comma-separated NAMES of registry `Secret`s stamped as `imagePullSecrets`
+/// on every mover `Job` pod and kopia server `Deployment` the controller
+/// creates. The chart renders it from the merged `global.imagePullSecrets` +
+/// `imagePullSecrets` (#579). Names resolve in each POD's namespace — the
+/// controller never copies the Secrets, so each must exist wherever movers
+/// run. Unset/empty → no `imagePullSecrets`. Parsed by
+/// [`crate::jobs::parse_image_pull_secrets`] (trimmed, empties dropped,
+/// deduplicated in order).
+pub const MOVER_IMAGE_PULL_SECRETS_ENV: &str = "KOPIUR_MOVER_IMAGE_PULL_SECRETS";
+
 /// ServiceAccount the mover `Job` pods run as. A dedicated least-privilege SA
 /// (NOT the operator SA): the controller mints it — plus a `RoleBinding` to the
 /// mover role named by [`MOVER_CLUSTERROLE_ENV`] — in each mover Job's namespace,
@@ -375,6 +385,11 @@ pub struct ControllerArgs {
     // meaning "unset"; parsed to `PullPolicy` in `resolve()`.
     #[arg(long, env = MOVER_PULL_POLICY_ENV)]
     pub mover_pull_policy: Option<String>,
+
+    /// Comma-separated registry Secret names set as imagePullSecrets on mover
+    /// pods. Each Secret must exist in every namespace a mover runs in.
+    #[arg(long, env = MOVER_IMAGE_PULL_SECRETS_ENV)]
+    pub mover_image_pull_secrets: Option<String>,
 
     /// ServiceAccount mover Job pods run as; the controller creates it plus a
     /// RoleBinding in each Job's namespace. Unset → the namespace's `default`
@@ -793,6 +808,9 @@ pub struct ControllerConfig {
     /// Explicit `imagePullPolicy` for mover Jobs; `None` → inferred (see
     /// [`effective_mover_pull_policy`]).
     pub mover_pull_policy: Option<PullPolicy>,
+    /// `imagePullSecrets` for mover pods (parsed from
+    /// [`MOVER_IMAGE_PULL_SECRETS_ENV`]); empty → none rendered.
+    pub mover_image_pull_secrets: Vec<k8s_openapi::api::core::v1::LocalObjectReference>,
     /// ServiceAccount for mover Job pods; `None` → `default` SA, no minting.
     pub mover_service_account: Option<String>,
     /// Name of the mover ClusterRole/Role the minted RoleBinding references.
@@ -926,6 +944,9 @@ impl ControllerArgs {
                 .unwrap_or_else(|| crate::jobs::DEFAULT_MOVER_IMAGE.to_string()),
             mover_image_overridden,
             mover_pull_policy,
+            mover_image_pull_secrets: crate::jobs::parse_image_pull_secrets(
+                self.mover_image_pull_secrets.as_deref().unwrap_or_default(),
+            ),
             mover_service_account: nonempty(self.mover_service_account),
             mover_clusterrole,
             mover_role_kind,
@@ -1438,6 +1459,46 @@ mod tests {
         // The chart quotes `image.mover.pullPolicy`; an explicit "" keeps
         // meaning "unset" like every other empty-rendered env value.
         assert_eq!(resolve(&["--mover-pull-policy="]).mover_pull_policy, None);
+    }
+
+    #[test]
+    #[serial]
+    fn mover_image_pull_secrets_parse_from_the_chart_list() {
+        // #579: the chart passes the merged global + top-level pull-secret
+        // names as one comma-separated env value.
+        let names = |cfg: ControllerConfig| -> Vec<String> {
+            cfg.mover_image_pull_secrets
+                .into_iter()
+                .map(|r| r.name)
+                .collect()
+        };
+        assert!(resolve(&[]).mover_image_pull_secrets.is_empty());
+        assert!(
+            resolve(&["--mover-image-pull-secrets="])
+                .mover_image_pull_secrets
+                .is_empty()
+        );
+        assert_eq!(
+            names(resolve(&[
+                "--mover-image-pull-secrets",
+                " global-cred, local-cred,,global-cred "
+            ])),
+            vec!["global-cred", "local-cred"]
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn mover_image_pull_secrets_env_is_the_chart_contract() {
+        assert_eq!(
+            MOVER_IMAGE_PULL_SECRETS_ENV,
+            "KOPIUR_MOVER_IMAGE_PULL_SECRETS"
+        );
+        // SAFETY: test-only, `#[serial]` like every other env-mutating test.
+        unsafe { std::env::set_var(MOVER_IMAGE_PULL_SECRETS_ENV, "a,b") };
+        let cfg = resolve(&[]);
+        unsafe { std::env::remove_var(MOVER_IMAGE_PULL_SECRETS_ENV) };
+        assert_eq!(cfg.mover_image_pull_secrets.len(), 2);
     }
 
     #[test]

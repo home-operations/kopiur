@@ -1065,6 +1065,7 @@ mod tests {
                 },
                 operator_namespace: None,
                 mover_image: None,
+                mover_image_pull_secrets: Vec::new(),
                 cache_enabled: false,
                 session: SessionLimits {
                     ttl: std::time::Duration::from_secs(900),

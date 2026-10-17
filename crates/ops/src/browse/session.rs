@@ -47,6 +47,10 @@ const READY_WAIT: Duration = Duration::from_secs(300);
 /// The env var on the controller Deployment naming the mover image (mirrors
 /// `kopiur_controller::config::MOVER_IMAGE_ENV` without a controller dep).
 const MOVER_IMAGE_ENV: &str = "KOPIUR_MOVER_IMAGE";
+/// The env var on the controller Deployment listing the mover pods'
+/// `imagePullSecrets` names, comma-separated (mirrors
+/// `kopiur_controller::config::MOVER_IMAGE_PULL_SECRETS_ENV`, #579).
+const MOVER_IMAGE_PULL_SECRETS_ENV: &str = "KOPIUR_MOVER_IMAGE_PULL_SECRETS";
 /// The chart labels identifying THE controller Deployment. Shared by the
 /// mover-image lookup ([`resolve_mover_image`]) and the operator-namespace
 /// discovery ([`super::resolve::resolve_ca_bundle`]); both demand exactly one
@@ -59,10 +63,33 @@ pub const CONTROLLER_DEPLOYMENT_SELECTOR: &str =
 /// does not (the CLI) asks for the fail-closed discovery below.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MoverImageSource {
-    /// A pinned image reference, used verbatim.
-    Fixed(String),
-    /// Read it from the single controller Deployment's `KOPIUR_MOVER_IMAGE`.
+    /// A pinned image (and its pull secrets), used verbatim.
+    Fixed(MoverImage),
+    /// Read both from the single controller Deployment's `KOPIUR_MOVER_IMAGE`
+    /// and `KOPIUR_MOVER_IMAGE_PULL_SECRETS`.
     DiscoverFromControllerDeployment,
+}
+
+/// The mover image a session pod runs, plus the registry Secret NAMES set as
+/// its `imagePullSecrets` (the same list the operator stamps on its own
+/// movers). The names resolve in the session pod's namespace — nothing is
+/// copied — so each Secret must exist there. Empty → no `imagePullSecrets`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MoverImage {
+    /// The image reference.
+    pub image: String,
+    /// `imagePullSecrets` names, in order, deduplicated.
+    pub pull_secrets: Vec<String>,
+}
+
+impl From<&str> for MoverImage {
+    /// An image with no pull secrets (a public registry).
+    fn from(image: &str) -> Self {
+        MoverImage {
+            image: image.to_string(),
+            pull_secrets: Vec::new(),
+        }
+    }
 }
 
 /// **Pure.** The image when the caller already knows it, or `None` when the
@@ -70,11 +97,23 @@ pub enum MoverImageSource {
 /// bypass the cluster lookup?" decision is exhaustive over
 /// [`MoverImageSource`] and directly testable — a new variant that silently
 /// fell through to discovery would be a fail-open change to a fail-closed path.
-pub fn pinned_mover_image(source: &MoverImageSource) -> Option<&str> {
+pub fn pinned_mover_image(source: &MoverImageSource) -> Option<&MoverImage> {
     match source {
-        MoverImageSource::Fixed(pinned) => Some(pinned.as_str()),
+        MoverImageSource::Fixed(pinned) => Some(pinned),
         MoverImageSource::DiscoverFromControllerDeployment => None,
     }
+}
+
+/// Parse a comma-separated `KOPIUR_MOVER_IMAGE_PULL_SECRETS` value into
+/// [`MoverImage::pull_secrets`] names — re-exported so a caller that pins the
+/// image (the console) parses exactly like the operator does.
+pub use kopiur_mover::jobs::parse_image_pull_secret_names;
+
+/// **Pure.** The session pod's `imagePullSecrets` references for `mover`.
+pub fn session_pull_secrets(
+    mover: &MoverImage,
+) -> Vec<k8s_openapi::api::core::v1::LocalObjectReference> {
+    jobs::image_pull_secret_refs(&mover.pull_secrets)
 }
 
 /// Progress notifications while a session is being established. A session is
@@ -211,8 +250,10 @@ pub fn session_repo_label_value(kind: RepositoryKind, name: &str) -> String {
 
 /// Pull the mover image out of the controller Deployment's
 /// `KOPIUR_MOVER_IMAGE` env (any container), so session pods run the exact
-/// image the operator stamps into its own movers. Pure.
-pub fn mover_image_from_deployments(deployments: &[Deployment]) -> Option<String> {
+/// image the operator stamps into its own movers — plus that same container's
+/// `KOPIUR_MOVER_IMAGE_PULL_SECRETS` (absent → none), so a private-registry
+/// image can actually be pulled. Pure.
+pub fn mover_image_from_deployments(deployments: &[Deployment]) -> Option<MoverImage> {
     deployments.iter().find_map(|d| {
         d.spec
             .as_ref()?
@@ -222,10 +263,16 @@ pub fn mover_image_from_deployments(deployments: &[Deployment]) -> Option<String
             .containers
             .iter()
             .find_map(|c| {
-                c.env.as_ref()?.iter().find_map(|e| {
-                    (e.name == MOVER_IMAGE_ENV)
-                        .then(|| e.value.clone())
-                        .flatten()
+                let env = c.env.as_ref()?;
+                let value = |name: &str| {
+                    env.iter()
+                        .find_map(|e| (e.name == name).then(|| e.value.clone()).flatten())
+                };
+                Some(MoverImage {
+                    image: value(MOVER_IMAGE_ENV)?,
+                    pull_secrets: jobs::parse_image_pull_secret_names(
+                        &value(MOVER_IMAGE_PULL_SECRETS_ENV).unwrap_or_default(),
+                    ),
                 })
             })
     })
@@ -480,7 +527,8 @@ async fn create_session_job(
         .collect();
     let projection = session_projection_metadata(&creds, &target.snapshot);
     let work_spec = session_work_spec(target, ttl);
-    let image = resolve_mover_image(ctx, image).await?;
+    let mover = resolve_mover_image(ctx, image).await?;
+    let pull_secrets = session_pull_secrets(&mover);
 
     // The repository volume (filesystem backends) is mounted READ-ONLY — the
     // kopia connect is already read-only; this makes the mount match.
@@ -515,8 +563,9 @@ async fn create_session_job(
         namespace: ns,
         owner: owner_ref_for_repo(&target.repo),
         work_spec: &work_spec,
-        image: &image,
+        image: &mover.image,
         image_pull_policy: None,
+        image_pull_secrets: &pull_secrets,
         limits: JobLimits {
             backoff_limit: 0,
             // The TTL bounds the session; the deadline backstops a pod that
@@ -643,9 +692,12 @@ fn owner_ref_for_repo(repo: &RepoHandle) -> OwnerReference {
 ///
 /// Deliberately resolve-only for the CLI: there is no `--image` flag, so a
 /// session always runs what the operator runs.
-async fn resolve_mover_image(ctx: &OpsCtx, image: &MoverImageSource) -> Result<String, OpsError> {
+async fn resolve_mover_image(
+    ctx: &OpsCtx,
+    image: &MoverImageSource,
+) -> Result<MoverImage, OpsError> {
     if let Some(pinned) = pinned_mover_image(image) {
-        return Ok(pinned.to_string());
+        return Ok(pinned.clone());
     }
     let selector = CONTROLLER_DEPLOYMENT_SELECTOR;
     let api: Api<Deployment> = Api::all(ctx.client.clone());
@@ -1043,10 +1095,54 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(
-            mover_image_from_deployments(&[dep]).as_deref(),
-            Some("ghcr.io/home-operations/kopiur-mover:v9")
+            mover_image_from_deployments(&[dep]),
+            Some(MoverImage {
+                image: "ghcr.io/home-operations/kopiur-mover:v9".into(),
+                // No pull-secrets env on the controller → none on the session.
+                pull_secrets: Vec::new(),
+            })
         );
         assert_eq!(mover_image_from_deployments(&[]), None);
+    }
+
+    #[test]
+    fn mover_image_pull_secrets_resolve_from_the_controller_env() {
+        // #579: a private-registry mover image needs the chart's pull secrets
+        // on browse-session pods too, discovered the same way as the image.
+        let dep: Deployment = serde_json::from_value(serde_json::json!({
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": { "name": "kopiur" },
+            "spec": {
+                "selector": { "matchLabels": { "app": "kopiur" } },
+                "template": { "spec": { "containers": [{
+                    "name": "controller",
+                    "image": "registry.example/kopiur-controller:v9",
+                    "env": [
+                        { "name": "KOPIUR_MOVER_IMAGE", "value": "registry.example/kopiur-mover:v9" },
+                        { "name": "KOPIUR_MOVER_IMAGE_PULL_SECRETS", "value": "global-cred, regcred,global-cred" }
+                    ]
+                }] } }
+            }
+        }))
+        .unwrap();
+        let mover = mover_image_from_deployments(&[dep]).expect("image discovered");
+        assert_eq!(mover.image, "registry.example/kopiur-mover:v9");
+        assert_eq!(mover.pull_secrets, vec!["global-cred", "regcred"]);
+    }
+
+    #[test]
+    fn session_job_carries_the_resolved_pull_secrets() {
+        let mover = MoverImage {
+            image: "registry.example/kopiur-mover:v9".into(),
+            pull_secrets: vec!["regcred".into()],
+        };
+        let refs = session_pull_secrets(&mover);
+        assert_eq!(
+            refs.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+            vec!["regcred"]
+        );
+        assert!(session_pull_secrets(&MoverImage::from("m")).is_empty());
     }
 
     #[test]
@@ -1346,9 +1442,13 @@ mod tests {
 
     #[test]
     fn a_pinned_mover_image_bypasses_the_cluster_lookup() {
+        let pinned = MoverImage {
+            image: "ghcr.io/x/mover:1.2.3".into(),
+            pull_secrets: vec!["regcred".into()],
+        };
         assert_eq!(
-            pinned_mover_image(&MoverImageSource::Fixed("ghcr.io/x/mover:1.2.3".into())),
-            Some("ghcr.io/x/mover:1.2.3")
+            pinned_mover_image(&MoverImageSource::Fixed(pinned.clone())),
+            Some(&pinned)
         );
         // Discovery must NOT resolve to a default here: returning None is what
         // sends `resolve_mover_image` to the fail-closed cluster lookup.
