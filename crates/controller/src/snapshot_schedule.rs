@@ -1217,7 +1217,13 @@ async fn reconcile_inner(schedule: &SnapshotSchedule, ctx: &Context) -> Result<A
             parked: parked_hold.is_some(),
             other_run: other_run.is_some(),
         };
-        if wait_needs_status_patch(schedule, &resolution, wait_now) {
+        // The hold events below are gated on THIS write: an event fires only on the
+        // pass that records its condition. A `Degraded` pass writes nothing, so it
+        // must emit nothing either — otherwise the unrecorded condition never arms
+        // the transition guard and the event repeats on every requeue (15s for the
+        // other-run hold, 1s for the parked one) for as long as resolution fails.
+        let status_written = wait_needs_status_patch(schedule, &resolution, wait_now);
+        if status_written {
             let (conditions, generation) =
                 schedule_ready_status(schedule, tz_ambiguity.as_ref(), hold, None);
             io::patch_status(
@@ -1238,7 +1244,7 @@ async fn reconcile_inner(schedule: &SnapshotSchedule, ctx: &Context) -> Result<A
         // snapshots` with no explanation. Transition-gated on the condition just
         // written, so it fires once on entering the hold, not once per 1s requeue.
         if let Some(parked) = parked_hold {
-            if !held_recorded {
+            if status_written && !held_recorded {
                 io::publish_normal_event(
                     ctx,
                     schedule,
@@ -1258,11 +1264,12 @@ async fn reconcile_inner(schedule: &SnapshotSchedule, ctx: &Context) -> Result<A
                  mover-Job concurrency cap"
             );
         }
-        // Held by a run this schedule did not start (#584). Normal, not Warning:
-        // it clears by itself. Transition-gated on the condition, like the parked
-        // hold above, so it fires once on entering the hold.
+        // Held by a running run this schedule did not start (#584). Normal, not
+        // Warning: it clears when that run finishes. Transition-gated on the
+        // condition just written, like the parked hold above, so it fires once on
+        // entering the hold.
         if let Some(other) = other_run.as_deref() {
-            if !other_recorded {
+            if status_written && !other_recorded {
                 io::publish_normal_event(
                     ctx,
                     schedule,
@@ -6292,6 +6299,80 @@ mod tests {
             .unwrap()
             .clone();
         assert_eq!(cond["status"], "False");
+    }
+
+    /// Drive `reconcile_inner` `passes` times for `schedule` with the repository
+    /// unreadable, so every pass resolves `Degraded`. Returns every request made.
+    async fn degraded_passes(
+        schedule: SnapshotSchedule,
+        rows: Vec<Snapshot>,
+        passes: usize,
+    ) -> Vec<(String, serde_json::Value)> {
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let client = body_recording_client(log.clone(), |method, path| {
+            if path.contains("/snapshotpolicies/") {
+                return (StatusCode::OK, policy_body("apps", "pg"));
+            }
+            if path.contains("/repositories/") {
+                return (StatusCode::INTERNAL_SERVER_ERROR, ok_status());
+            }
+            if path.contains("/snapshotschedules/") {
+                return (StatusCode::OK, schedule_body("apps", "nightly"));
+            }
+            if method != http::Method::DELETE && path.contains("/snapshots/") {
+                return (StatusCode::OK, live_snapshot_body("apps", "run"));
+            }
+            (StatusCode::OK, ok_status())
+        });
+        let ctx = Context::test_context(client);
+        prime_snapshot_store(&ctx, rows, true);
+        for _ in 0..passes {
+            reconcile_inner(&schedule, &ctx)
+                .await
+                .expect("a degraded pass must not fail the reconcile");
+        }
+        log.lock().unwrap().clone()
+    }
+
+    /// A `Degraded` pass writes no status, so it must not emit the hold event
+    /// either: the event is gated on the recorded condition, and an unrecorded one
+    /// would re-event every 15s requeue for as long as the referent is unreadable.
+    #[tokio::test]
+    async fn a_degraded_pass_neither_records_nor_events_the_other_run_hold() {
+        let manual = manual_run("pg-manual-1", "pg", Some(SnapshotPhase::Running));
+        let requests =
+            degraded_passes(due_schedule(ConcurrencyPolicy::Forbid), vec![manual], 3).await;
+        let lines: Vec<&str> = requests.iter().map(|(l, _)| l.as_str()).collect();
+        assert!(mints(&requests).is_empty(), "{lines:?}");
+        assert!(status_patch(&requests).is_none(), "{lines:?}");
+        assert!(
+            !lines.iter().any(|l| l.contains("/events")),
+            "no hold event on a degraded pass: {lines:?}"
+        );
+    }
+
+    /// Same guard for `Replace` held behind its own parked run (1s requeue).
+    #[tokio::test]
+    async fn a_degraded_pass_neither_records_nor_events_the_parked_run_hold() {
+        let mut own = parked_run("nightly-prior", Some(SnapshotPhase::Pending));
+        own.metadata.namespace = Some("apps".into());
+        own.metadata.labels = Some(BTreeMap::from([(
+            crate::consts::SCHEDULE_LABEL.to_string(),
+            "nightly".to_string(),
+        )]));
+        own.spec.policy_ref = Some(PolicyRef {
+            name: "pg".into(),
+            namespace: None,
+        });
+        let requests =
+            degraded_passes(due_schedule(ConcurrencyPolicy::Replace), vec![own], 3).await;
+        let lines: Vec<&str> = requests.iter().map(|(l, _)| l.as_str()).collect();
+        assert!(mints(&requests).is_empty(), "{lines:?}");
+        assert!(!lines.iter().any(|l| l.starts_with("DELETE ")), "{lines:?}");
+        assert!(
+            !lines.iter().any(|l| l.contains("/events")),
+            "no hold event on a degraded pass: {lines:?}"
+        );
     }
 
     /// `Allow` is unchanged: it runs beside anything.
