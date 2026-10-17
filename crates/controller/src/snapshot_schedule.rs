@@ -1308,6 +1308,25 @@ async fn reconcile_inner(schedule: &SnapshotSchedule, ctx: &Context) -> Result<A
         .and_then(|s| s.last_schedule.as_ref())
         .is_some();
     if should_run_on_create(&schedule.spec.schedule, already_ran) {
+        // #584: the creation run is a FIRE like any due slot, so `Forbid`/`Replace`
+        // hold it behind a `Running` run of the same policy this schedule did not
+        // start. Nothing is pinned while held, so this branch re-runs and the
+        // creation run still fires once that run finishes. Same pure helpers as the
+        // pinned path; a read error fails CLOSED by propagating.
+        if needs_other_run_check(
+            schedule.spec.schedule.concurrency_policy,
+            SlotDisposition::Fire,
+        ) {
+            let own = children?;
+            let targets = target_policy_refs(ctx, schedule, &namespace).await?;
+            let rows = io::namespace_snapshots(ctx, &namespace).await?;
+            if let Some(other) =
+                first_foreign_run(&slot_blockers(&rows, &own, &namespace, &targets))
+            {
+                return hold_run_on_create(ctx, &api, schedule, &namespace, &other, &tz_ambiguity)
+                    .await;
+            }
+        }
         // metadata.creationTimestamp is a k8s-openapi `Time` wrapping a jiff
         // `Timestamp`; convert via unix seconds to chrono (matches snapshot_policy).
         let anchor = schedule
@@ -1359,6 +1378,57 @@ async fn reconcile_inner(schedule: &SnapshotSchedule, ctx: &Context) -> Result<A
     .await?;
     let until = (next - now).to_std().unwrap_or(StdDuration::from_secs(60));
     Ok(Action::requeue(until.max(StdDuration::from_secs(1))))
+}
+
+/// Hold a `runOnCreate` first fire behind `other`, a `Running` run of the same
+/// policy this schedule did not start (#584). Records `HeldByOtherRun=True` and
+/// emits one Normal event on entering the hold. Nothing is pinned, so the next
+/// pass re-enters the first-pin branch and fires the creation run once `other`
+/// finishes. Transition-gated like the pinned path: while the hold is already
+/// recorded and the generation is current, a pass writes and emits nothing.
+async fn hold_run_on_create(
+    ctx: &Context,
+    api: &Api<SnapshotSchedule>,
+    schedule: &SnapshotSchedule,
+    namespace: &str,
+    other: &str,
+    tz_ambiguity: &Option<TimezoneAmbiguity>,
+) -> Result<Action> {
+    let recorded = recorded_held_by_other_run(schedule);
+    let generation_stale = schedule.status.as_ref().and_then(|s| s.observed_generation)
+        != schedule.metadata.generation;
+    if !recorded || generation_stale {
+        let (conditions, generation) = schedule_ready_status(
+            schedule,
+            tz_ambiguity.as_ref(),
+            Some(ScheduleHold::OtherRun(other)),
+            None,
+        );
+        io::patch_status(
+            api,
+            &schedule.name_any(),
+            serde_json::json!({
+                "observedGeneration": generation,
+                "conditions": conditions,
+            }),
+        )
+        .await?;
+        if !recorded {
+            io::publish_normal_event(
+                ctx,
+                schedule,
+                kopiur_api::consts::OTHER_RUN_ACTIVE_REASON,
+                "AwaitOtherRun",
+                &other_run_message(namespace, other),
+            )
+            .await;
+        }
+    }
+    tracing::debug!(
+        namespace = %namespace, schedule = %schedule.name_any(), other_run = %other,
+        "holding the runOnCreate fire behind a run of the same policy this schedule did not start"
+    );
+    Ok(Action::requeue(OTHER_RUN_HOLD_REQUEUE))
 }
 
 /// A deterministic, slot-stamped Snapshot name so the same slot is idempotent
@@ -6213,6 +6283,100 @@ mod tests {
         assert!(
             requests.iter().any(|(l, _)| l.contains("/events")),
             "a Normal event says why the slot is held"
+        );
+    }
+
+    /// A brand-new schedule (no `nextSchedule` pin yet) with `runOnCreate`.
+    fn fresh_run_on_create_schedule(policy: ConcurrencyPolicy) -> SnapshotSchedule {
+        let mut s = inheriting_pinned_schedule(None);
+        s.spec.schedule.concurrency_policy = policy;
+        s.spec.schedule.run_on_create = true;
+        s.status = None;
+        s
+    }
+
+    /// #584 (PR review): the `runOnCreate` first fire must honour `Forbid` too. A
+    /// fresh schedule created while a manual run of its policy is `Running` holds
+    /// instead of starting a second mover, records `HeldByOtherRun`, and does NOT
+    /// pin — so the creation run still happens once the manual run finishes.
+    #[tokio::test]
+    async fn run_on_create_holds_behind_a_running_manual_run_of_the_same_policy() {
+        for policy in [ConcurrencyPolicy::Forbid, ConcurrencyPolicy::Replace] {
+            let manual = manual_run("pg-manual-1", "pg", Some(SnapshotPhase::Running));
+            let requests =
+                reconcile_with_rows(fresh_run_on_create_schedule(policy), vec![manual]).await;
+            assert!(
+                mints(&requests).is_empty(),
+                "{policy:?}: runOnCreate must not fire beside a manual run: {:?}",
+                mints(&requests)
+            );
+            let lines: Vec<&str> = requests.iter().map(|(l, _)| l.as_str()).collect();
+            assert!(
+                !lines.iter().any(|l| l.starts_with("DELETE ")),
+                "{policy:?}: never cancels a run it does not own: {lines:?}"
+            );
+            let status = status_patch(&requests).expect("entering the hold writes status");
+            assert!(
+                status.get("nextSchedule").is_none() && status.get("lastSchedule").is_none(),
+                "{policy:?}: no pin and no lastSchedule, so the creation run fires later: {status}"
+            );
+            let held = status["conditions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|c| c["type"] == "HeldByOtherRun")
+                .expect("HeldByOtherRun condition");
+            assert_eq!(held["status"], "True");
+            assert!(lines.iter().any(|l| l.contains("/events")), "{lines:?}");
+        }
+    }
+
+    /// Already holding: the recorded `HeldByOtherRun` and a current generation make
+    /// the 15s re-check a no-op — no status write and no repeated event.
+    #[tokio::test]
+    async fn a_recorded_run_on_create_hold_is_patch_and_event_free() {
+        let manual = manual_run("pg-manual-1", "pg", Some(SnapshotPhase::Running));
+        let first = reconcile_with_rows(
+            fresh_run_on_create_schedule(ConcurrencyPolicy::Forbid),
+            vec![manual.clone()],
+        )
+        .await;
+        let recorded = status_patch(&first).expect("the hold is recorded");
+        let mut held = fresh_run_on_create_schedule(ConcurrencyPolicy::Forbid);
+        held.status = Some(serde_json::from_value(recorded).expect("the recorded status decodes"));
+        let again = reconcile_with_rows(held, vec![manual]).await;
+        let lines: Vec<&str> = again.iter().map(|(l, _)| l.as_str()).collect();
+        assert!(mints(&again).is_empty(), "{lines:?}");
+        assert!(status_patch(&again).is_none(), "no status write: {lines:?}");
+        assert!(
+            !lines.iter().any(|l| l.contains("/events")),
+            "no repeat event: {lines:?}"
+        );
+    }
+
+    /// The runOnCreate hold is policy-gated and run-gated like a pinned slot's:
+    /// `Allow` fires beside the manual run, and with no foreign run every policy
+    /// fires its creation run.
+    #[tokio::test]
+    async fn run_on_create_fires_under_allow_or_with_no_running_foreign_run() {
+        let manual = manual_run("pg-manual-1", "pg", Some(SnapshotPhase::Running));
+        let requests = reconcile_with_rows(
+            fresh_run_on_create_schedule(ConcurrencyPolicy::Allow),
+            vec![manual],
+        )
+        .await;
+        assert_eq!(mints(&requests).len(), 1, "{:?}", mints(&requests));
+        let pending = manual_run("pg-manual-2", "pg", Some(SnapshotPhase::Pending));
+        let requests = reconcile_with_rows(
+            fresh_run_on_create_schedule(ConcurrencyPolicy::Forbid),
+            vec![pending],
+        )
+        .await;
+        assert_eq!(
+            mints(&requests).len(),
+            1,
+            "a Pending foreign run does not hold: {:?}",
+            mints(&requests)
         );
     }
 
