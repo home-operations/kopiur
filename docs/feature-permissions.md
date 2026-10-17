@@ -17,7 +17,7 @@ A feature is configured in **two places**: the CRD field that turns it on, such 
 ## The two flags
 
 ```yaml
---8<-- "deploy/helm/kopiur/values.yaml:337:354"
+--8<-- "deploy/helm/kopiur/values.yaml:346:363"
 ```
 
 | CRD field you set… | …needs this Helm flag | Grants the operator `secrets` |

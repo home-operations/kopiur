@@ -1433,7 +1433,7 @@ pub fn classify_active_runs(items: &[Snapshot]) -> ActiveRuns {
 /// may only ever cancel an [`ActiveRun::Own`] run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ActiveRun {
-    /// One of this schedule's own children (the [`schedule_children`]
+    /// One of this schedule's own children (the `schedule_children`
     /// population). Gated by [`classify_active_runs`] and, under `Replace`,
     /// cancellable by [`replace_plan`].
     Own(String),
