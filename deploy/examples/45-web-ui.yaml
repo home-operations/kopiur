@@ -23,11 +23,13 @@
 #   A. oauth2-proxy           sections: values, proxy-secret, oauth2-proxy,
 #                             ingress | httproute, bindings
 #   B. Envoy Gateway (OIDC)   sections: envoy-values, envoy-proxy-secret,
-#                             envoy-gateway
+#                             envoy-gateway; on Envoy Gateway older than
+#                             v1.4, envoy-route-header-modifier instead of
+#                             the route + HTTPRouteFilter in envoy-gateway
 #
 # Their field names belong to oauth2-proxy / Envoy Gateway (oauth2-proxy's
-# alpha config is explicitly alpha; Envoy Gateway's SecurityPolicy is
-# v1alpha1), so check them against the versions you run. Any proxy that
+# alpha config is explicitly alpha; Envoy Gateway's SecurityPolicy and
+# HTTPRouteFilter are v1alpha1), so check them against the versions you run. Any proxy that
 # authenticates a user and sets the headers works just as well.
 #
 # THIS FILE IS NOT ONE `kubectl apply`. The first document is Helm values
@@ -357,15 +359,17 @@ ui:
     groupsFormat: base64Json
     emailHeader: x-user-email
 
-    # The HTTPRoute below sets X-Kopiur-Proxy-Token on every request it
-    # forwards, from this same value.
+    # The HTTPRouteFilter below injects X-Kopiur-Proxy-Token on every request
+    # the route forwards, from this same Secret. Envoy Gateway only reads the
+    # key `credential`, so the console reads that key too.
     proxySecret:
       existingSecret: kopiur-ui-proxy-token
-      key: token
+      key: credential
 
     # OPTIONAL. Only these groups are forwarded to Kubernetes; the rest are
-    # dropped (the user menu lists them under "Not forwarded"). This RESTRICTS —
-    # it grants nothing. Leave it empty to forward every group.
+    # dropped (the user menu has a collapsed "N groups not forwarded" line
+    # naming them). This RESTRICTS — it grants nothing. Leave it empty to
+    # forward every group.
     allowedGroups: [Admins, Domain Users]
 
   rbac:
@@ -413,10 +417,12 @@ stringData:
   client-id: kopiur-ui
   client-secret: REPLACE_ME
 ---
-# The shared token, in the console's namespace. Generate it with
-# `openssl rand -hex 32`. Envoy does not read Secrets for header values, so the
-# SAME value also appears in the HTTPRoute below — keep that file encrypted
-# (SOPS) or templated from your secret store, like any other credential in Git.
+# The shared token, in the console's namespace — the same namespace as the
+# HTTPRoute and HTTPRouteFilter below. Generate it with `openssl rand -hex 32`.
+# ONE Secret serves both sides: the console reads it (ui.auth.proxySecret) and
+# Envoy injects it into the header (the HTTPRouteFilter). Envoy Gateway reads
+# ONLY the key `credential`, and sends its value as the whole header value —
+# so store the bare token, with no "Bearer " in front.
 apiVersion: v1
 kind: Secret
 metadata:
@@ -424,14 +430,15 @@ metadata:
   namespace: kopiur-system
 type: Opaque
 stringData:
-  token: REPLACE_ME
+  credential: REPLACE_ME
 # --8<-- [end:envoy-proxy-secret]
 
 # --8<-- [start:envoy-gateway]
 ---
 # The route: your Gateway → the console Service directly (Envoy is the proxy).
-# The RequestHeaderModifier `set` REPLACES any X-Kopiur-Proxy-Token a browser
-# sent, so only requests that went through this route carry the right one.
+# Its one filter hands every request to the HTTPRouteFilter below, which sets
+# X-Kopiur-Proxy-Token from the Secret. The token itself never appears in this
+# manifest.
 apiVersion: gateway.networking.k8s.io/v1
 kind: HTTPRoute
 metadata:
@@ -449,11 +456,32 @@ spec:
         - name: kopiur-ui
           port: 8090
       filters:
-        - type: RequestHeaderModifier
-          requestHeaderModifier:
-            set:
-              - name: X-Kopiur-Proxy-Token
-                value: REPLACE_ME # the same token as the Secret above
+        - type: ExtensionRef
+          extensionRef:
+            group: gateway.envoyproxy.io
+            kind: HTTPRouteFilter
+            name: kopiur-ui # the HTTPRouteFilter below
+---
+# Credential injection (Envoy Gateway v1.4+): copy the token from the Secret
+# into the header on every request this route forwards. If the Secret or its
+# `credential` key is missing, Envoy Gateway answers the route with a 500 —
+# it fails closed, never forwarding without the token.
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: HTTPRouteFilter
+metadata:
+  name: kopiur-ui
+  namespace: kopiur-system # the route's namespace, and the Secret's
+spec:
+  credentialInjection:
+    # Defaults to Authorization when omitted — set it.
+    header: X-Kopiur-Proxy-Token
+    # Defaults to false, which would keep a token the BROWSER sent. true
+    # replaces it, so only requests that went through this route carry the
+    # right one.
+    overwrite: true
+    credential:
+      valueRef:
+        name: kopiur-ui-proxy-token # the Secret above; key `credential`
 ---
 # The login and the identity headers.
 #
@@ -504,3 +532,35 @@ spec:
           - claim: email # → ui.auth.emailHeader (display only)
             header: x-user-email
 # --8<-- [end:envoy-gateway]
+
+# --8<-- [start:envoy-route-header-modifier]
+---
+# FALLBACK for Envoy Gateway older than v1.4, which has no credential
+# injection. Use this route INSTEAD OF the HTTPRoute and HTTPRouteFilter above
+# (the SecurityPolicy stays as it is). The RequestHeaderModifier `set` REPLACES
+# any X-Kopiur-Proxy-Token a browser sent. The cost: a route filter cannot read
+# a Secret, so the token is written into this manifest — keep it encrypted
+# (SOPS) or templated from your secret store, like any other credential in Git.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: kopiur-ui
+  namespace: kopiur-system
+spec:
+  parentRefs:
+    - name: external
+      namespace: gateway
+      sectionName: https
+  hostnames:
+    - backups.example.com
+  rules:
+    - backendRefs:
+        - name: kopiur-ui
+          port: 8090
+      filters:
+        - type: RequestHeaderModifier
+          requestHeaderModifier:
+            set:
+              - name: X-Kopiur-Proxy-Token
+                value: REPLACE_ME # the same value as `credential` in the Secret above
+# --8<-- [end:envoy-route-header-modifier]

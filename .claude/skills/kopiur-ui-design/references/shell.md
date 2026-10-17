@@ -70,6 +70,11 @@ height, `padding: 14px 12px`. Top to bottom:
    identity source — "anonymous", or the trusted-headers group the proxy sent),
    chevron. Clicking opens a popover **upward** with:
    - avatar, user, "signed in as <source> · groups: …", email if any;
+   - only when `ui.auth.allowedGroups` dropped some of the proxy's groups
+     (`Me.droppedGroups`): one muted, collapsed line under the identity — "N
+     groups not forwarded" — that opens to the names and why they grant
+     nothing. Never a row of the identity itself: a dropped group is
+     troubleshooting, not who you are (#571);
    - "In <scope> you can · N of 13", the capability list in two columns
      (`Check` in healthy-fg / `X` in failed-fg with the label struck through,
      plus visually-hidden "permitted"/"not permitted");

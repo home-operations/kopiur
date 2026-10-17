@@ -66,18 +66,6 @@ export function UserChip({ namespace }: { namespace: string | undefined }) {
           <dd>{data.user}</dd>
           <dt>Groups</dt>
           <dd>{data.groups.length > 0 ? data.groups.join(", ") : "—"}</dd>
-          {data.droppedGroups.length > 0 ? (
-            <>
-              <dt>Not forwarded</dt>
-              <dd>
-                {data.droppedGroups.join(", ")}
-                <span className="identity__note">
-                  Your proxy sent these, but they are not in ui.auth.allowedGroups, so they grant
-                  nothing here.
-                </span>
-              </dd>
-            </>
-          ) : null}
           {data.email ? (
             <>
               <dt>Email</dt>
@@ -89,6 +77,7 @@ export function UserChip({ namespace }: { namespace: string | undefined }) {
           <dt>Scope</dt>
           <dd>{namespace ?? data.namespace ?? "cluster-wide"}</dd>
         </dl>
+        <DroppedGroups groups={data.droppedGroups} />
         <p className="identity__count">
           {allowed} of {CAPABILITY_KEYS.length} actions permitted {scopeWord}. Cluster-repository
           actions are always answered cluster-wide.
@@ -131,6 +120,30 @@ export function UserChip({ namespace }: { namespace: string | undefined }) {
           <ThemeSwitch />
         </div>
       </div>
+    </details>
+  );
+}
+
+/**
+ * The groups the proxy sent that `ui.auth.allowedGroups` dropped.
+ *
+ * Not part of the identity above — a dropped group grants nothing, and
+ * listing it beside the groups that do read as noise (#571). It stays one
+ * muted line, collapsed, because it is the answer to "my group arrived, so
+ * why can't I do anything?"; nothing at all when no group was dropped.
+ */
+function DroppedGroups({ groups }: { groups: readonly string[] }) {
+  if (groups.length === 0) return null;
+  return (
+    <details className="identity__dropped">
+      <summary>
+        {groups.length} {groups.length === 1 ? "group" : "groups"} not forwarded
+      </summary>
+      <p>{groups.join(", ")}</p>
+      <p className="identity__note">
+        Your proxy sent these, but they are not in ui.auth.allowedGroups, so they grant nothing
+        here.
+      </p>
     </details>
   );
 }

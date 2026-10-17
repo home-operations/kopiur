@@ -142,8 +142,8 @@ Complete, working wiring for both common proxies is in
 Leave `ui.auth.allowedGroups` empty unless you have a reason. Set it, and:
 
 - every group **not** on the list is dropped before the console talks to
-  Kubernetes (the user menu shows them under **Not forwarded**, so it is never
-  silent);
+  Kubernetes (the user menu has a collapsed **N groups not forwarded** line
+  that opens to their names, so it is never silent);
 - the same list is pinned into the console's own RBAC, so Kubernetes refuses
   any other group even if the console's parsing were somehow fooled.
 
@@ -188,7 +188,7 @@ shows exactly what the console read and what Kubernetes allows:
 | **Groups** lists your IdP groups, and actions are permitted | Everything works. | — |
 | **Groups** shows one long unreadable value, e.g. `WyJEb21h…` | The groups header is base64 JSON but is being read as `delimited`. | `ui.auth.groupsFormat: base64Json` (Envoy Gateway). |
 | **Groups** shows only `system:authenticated` | No groups arrived. Either the proxy is not sending the groups header, or `ui.auth.groupsHeader` names a different header. | Check the header name; request the `groups` scope from your IdP. |
-| **Not forwarded** lists the group you expected | It arrived, but `ui.auth.allowedGroups` dropped it. | Add it to `allowedGroups`, or empty `allowedGroups`. |
+| **N groups not forwarded** (open it) names the group you expected | It arrived, but `ui.auth.allowedGroups` dropped it. | Add it to `allowedGroups`, or empty `allowedGroups`. |
 | Groups look right, but every screen says **Forbidden** | No role is bound to those groups — or one was just added: permission answers are cached for up to `ui.limits.sarTtl` (60s). | Add a `ui.rbac.bindings` entry (step 3), wait a minute, reload. |
 | Every request fails with `invalid-header-value` | A header is not in the format configured. The error names the header and the format. | Set `groupsFormat` to what your proxy sends (step 1). |
 
@@ -544,10 +544,11 @@ Two things differ from oauth2-proxy, and both are handled below:
 
 1. **The groups header is base64 JSON**, because Envoy encodes every list claim
    that way. Hence `groupsFormat: base64Json`.
-2. **The shared token is set by the route**, with a `RequestHeaderModifier`.
-   Envoy cannot read a Kubernetes Secret into a header value, so the token
-   appears in the `HTTPRoute` itself — treat that manifest as a secret (SOPS, or
-   templated from your secret store).
+2. **Envoy injects the shared token itself**, from a Kubernetes Secret, with an
+   `HTTPRouteFilter` (`credentialInjection`) that the `HTTPRoute` references.
+   The token stays in the Secret and never appears in the route manifest. This
+   needs **Envoy Gateway v1.4 or later**; for older versions see
+   [the fallback](#older-envoy-gateway-token-in-the-route) below.
 
 The Helm values, including the bindings that grant `Admins` and `Domain Users`
 their access:
@@ -556,18 +557,40 @@ their access:
 --8<-- "deploy/examples/45-web-ui.yaml:envoy-values"
 ```
 
-The shared token:
+The shared token. One Secret serves both sides — the console reads it through
+`ui.auth.proxySecret`, and Envoy injects it — so its key must be `credential`,
+the only key Envoy Gateway reads, and `ui.auth.proxySecret.key` says so:
 
 ```yaml
 --8<-- "deploy/examples/45-web-ui.yaml:envoy-proxy-secret"
 ```
 
-The route and the login. Each `claimToHeaders` header must match the
-corresponding `ui.auth.*Header` value above:
+The route, the filter that injects the token, and the login. Each
+`claimToHeaders` header must match the corresponding `ui.auth.*Header` value
+above:
 
 ```yaml
 --8<-- "deploy/examples/45-web-ui.yaml:envoy-gateway"
 ```
+
+/// note | How the credential injection is wired
+
+- **Secret key `credential`.** Envoy Gateway reads only that key and sends its
+  value as the whole header value — store the bare token, with no `Bearer `
+  in front.
+- **Same namespace.** Keep the Secret in the namespace of the `HTTPRoute` and
+  the `HTTPRouteFilter` (`kopiur-system` here). A Secret elsewhere needs a
+  `ReferenceGrant` from that namespace.
+- **`header: X-Kopiur-Proxy-Token`** — without it Envoy writes the token into
+  `Authorization`.
+- **`overwrite: true`** — without it (the default is `false`) Envoy keeps an
+  `X-Kopiur-Proxy-Token` the *browser* sent instead of replacing it.
+- **It fails closed.** If the Secret or its `credential` key is missing, Envoy
+  Gateway marks the filter invalid and answers the route with a `500`; it never
+  forwards a request without the token.
+
+///
+
 
 /// warning | The claims must be in the ID token, every time
 
@@ -602,6 +625,20 @@ identity_providers:
 Other IdPs have an equivalent "include in ID token" setting for each claim.
 
 ///
+
+#### Older Envoy Gateway: token in the route
+
+Before v1.4, Envoy Gateway cannot inject a credential from a Secret. Use this
+route **instead of** the `HTTPRoute` and `HTTPRouteFilter` above; the
+`SecurityPolicy` is unchanged. Its `RequestHeaderModifier` `set` replaces any
+`X-Kopiur-Proxy-Token` the browser sent — but a route filter cannot read a
+Secret, so the token is written into the `HTTPRoute` itself. Treat that
+manifest as a secret (SOPS, or templated from your secret store), and keep the
+value identical to the Secret's `credential`:
+
+```yaml
+--8<-- "deploy/examples/45-web-ui.yaml:envoy-route-header-modifier"
+```
 
 
 /// warning | The console image is published separately, and starts out private

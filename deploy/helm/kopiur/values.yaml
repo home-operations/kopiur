@@ -759,7 +759,8 @@ ui:
     # — bind a role for that (ui.rbac.bindings). Empty (the
     # default) means "whatever groups the proxy asserts". Set, every other
     # group the proxy sends is dropped before it reaches Kubernetes (the user
-    # menu lists them under "Not forwarded"), and the list is enforced twice:
+    # menu names them behind a collapsed "N groups not forwarded" line), and
+    # the list is enforced twice:
     # the console filters inbound groups, and the same list is pinned as
     # `resourceNames` on the impersonate rule so the apiserver enforces it even
     # if the console did not. Use it when your IdP sends many groups and only a

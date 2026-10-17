@@ -842,7 +842,7 @@
               "type": "boolean"
             },
             "allowedGroups": {
-              "description": "Optional allow-list of groups the console may impersonate. It only\nrestricts, it never grants: listing `Admins` here gives Admins no access\n— bind a role for that (ui.rbac.bindings). Empty (the\ndefault) means \"whatever groups the proxy asserts\". Set, every other\ngroup the proxy sends is dropped before it reaches Kubernetes (the user\nmenu lists them under \"Not forwarded\"), and the list is enforced twice:\nthe console filters inbound groups, and the same list is pinned as\n`resourceNames` on the impersonate rule so the apiserver enforces it even\nif the console did not. Use it when your IdP sends many groups and only a\nfew matter. Names are exact and case-sensitive, and may not contain a\ncomma.",
+              "description": "Optional allow-list of groups the console may impersonate. It only\nrestricts, it never grants: listing `Admins` here gives Admins no access\n— bind a role for that (ui.rbac.bindings). Empty (the\ndefault) means \"whatever groups the proxy asserts\". Set, every other\ngroup the proxy sends is dropped before it reaches Kubernetes (the user\nmenu names them behind a collapsed \"N groups not forwarded\" line), and\nthe list is enforced twice:\nthe console filters inbound groups, and the same list is pinned as\n`resourceNames` on the impersonate rule so the apiserver enforces it even\nif the console did not. Use it when your IdP sends many groups and only a\nfew matter. Names are exact and case-sensitive, and may not contain a\ncomma.",
               "items": {
                 "required": []
               },

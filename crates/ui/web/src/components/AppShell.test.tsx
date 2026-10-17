@@ -336,21 +336,38 @@ describe("AppShell", () => {
     expect(called).toContain("/api/v1/me?namespace=prod");
   });
 
-  it("names the groups allowedGroups dropped, and says nothing when none were", async () => {
+  it("keeps the groups allowedGroups dropped out of the identity, behind one collapsed line", async () => {
     mockShell({ ...alice, droppedGroups: ["Domain Users", "Qsync"] });
     mountAt("/maintenance");
     await screen.findByText("alice", { selector: ".identity__user" });
-    const term = screen.getByText("Not forwarded");
-    expect(term.closest(".identity")).not.toBeNull();
-    expect(term.nextElementSibling).toHaveTextContent("Domain Users, Qsync");
-    expect(term.nextElementSibling).toHaveTextContent("ui.auth.allowedGroups");
+    // Not a row of the identity summary: what grants access is listed there,
+    // and a dropped group grants nothing.
+    const grid = document.querySelector<HTMLElement>(".identity__grid");
+    if (grid === null) throw new Error("no identity grid");
+    expect(grid).not.toHaveTextContent("Domain Users");
+    expect(within(grid).queryByText("Not forwarded")).toBeNull();
+    // The troubleshooting answer is still one click away, collapsed.
+    const line = screen.getByText("2 groups not forwarded");
+    const disclosure = line.closest("details");
+    expect(disclosure).toHaveClass("identity__dropped");
+    expect(disclosure).not.toHaveAttribute("open");
+    expect(disclosure).toHaveTextContent("Domain Users, Qsync");
+    expect(disclosure).toHaveTextContent("ui.auth.allowedGroups");
   });
 
-  it("has no 'Not forwarded' row when every asserted group was kept", async () => {
+  it("says one group in the singular", async () => {
+    mockShell({ ...alice, droppedGroups: ["Qsync"] });
+    mountAt("/maintenance");
+    await screen.findByText("alice", { selector: ".identity__user" });
+    expect(screen.getByText("1 group not forwarded")).toBeInTheDocument();
+  });
+
+  it("has no not-forwarded line when every asserted group was kept", async () => {
     mockShell();
     mountAt("/maintenance");
     await screen.findByText("alice", { selector: ".identity__user" });
-    expect(screen.queryByText("Not forwarded")).toBeNull();
+    expect(screen.queryByText(/not forwarded/i)).toBeNull();
+    expect(document.querySelector(".identity__dropped")).toBeNull();
   });
 
   it("lists every capability with a check or a cross and the word", async () => {

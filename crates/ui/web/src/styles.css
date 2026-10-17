@@ -2633,6 +2633,23 @@ html:has(dialog.side-panel[open]) {
   color: var(--fg-muted);
 }
 
+/* The groups allowedGroups dropped: troubleshooting, not identity, so one
+   muted line that opens to the names. */
+.identity__dropped {
+  color: var(--fg-muted);
+  font-size: var(--text-sm);
+}
+
+.identity__dropped > summary {
+  width: fit-content;
+  cursor: pointer;
+}
+
+.identity__dropped > p {
+  margin: 4px 0 0;
+  overflow-wrap: anywhere;
+}
+
 .identity__count {
   margin: 0;
   color: var(--fg-muted);
