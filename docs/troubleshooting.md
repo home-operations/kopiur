@@ -167,17 +167,17 @@ There is also a one-off `WaitingForRepositorySlot` Normal event on the schedule 
 
 ### `HeldByOtherRun=True` — a scheduled slot waits for a manual run
 
-A `SnapshotSchedule` with `concurrencyPolicy: Forbid`, the default, or `Replace` does not start a run beside an unfinished run of the same policy, even one it did not start. That covers a `kubectl kopiur snapshot now`, a run from another schedule, or a hand-written `Snapshot`. The slot waits for it and then fires.
+A `SnapshotSchedule` with `concurrencyPolicy: Forbid`, the default, or `Replace` does not start a run beside a **`Running`** run of the same policy, even one it did not start. That covers a `kubectl kopiur snapshot now`, a run from another schedule, or a hand-written `Snapshot`. The slot waits for it and then fires. A run of that kind that is only `Pending` (for example stuck on `MoverPermitted=False` or a missing repository) does not hold the slot.
 
 ```console
 $ kubectl get snapshotschedule <name> -n <ns> \
     -o jsonpath='{.status.conditions[?(@.type=="HeldByOtherRun")]}{"\n"}'
-{"type":"HeldByOtherRun","status":"True","reason":"OtherRunActive","message":"waiting: Snapshot `pg-manual-...` is still backing up the same policy, ..."}
+{"type":"HeldByOtherRun","status":"True","reason":"OtherRunActive","message":"Waiting for Snapshot <ns>/pg-manual-... (a manual or other run of this policy) to finish."}
 ```
 
 There is a one-off `OtherRunActive` Normal event when the hold starts. `Replace` never cancels a run it did not start, so it waits the same way.
 
-**This clears itself** when the named `Snapshot` finishes. Held slots still age against `startingDeadlineSeconds`, so a long manual run plus a short deadline skips the slot. If you want scheduled and manual runs to overlap, use `concurrencyPolicy: Allow`; the repository's `concurrency.maxConcurrentJobs` still caps the total.
+It clears when the named `Snapshot` leaves `Running`. If that run is stuck, fix or delete it. Held slots still age against `startingDeadlineSeconds`, so a long manual run plus a short deadline skips the slot. If you want scheduled and manual runs to overlap, use `concurrencyPolicy: Allow`; the repository's `concurrency.maxConcurrentJobs` still caps the total.
 
 ### `CredentialsAvailable=False` — Secret missing in the workload namespace
 

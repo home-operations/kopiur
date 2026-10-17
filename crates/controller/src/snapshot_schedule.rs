@@ -640,7 +640,7 @@ fn schedule_ready_status(
     let (other_reason, other_message) = match other {
         Some(run) => (
             kopiur_api::consts::OTHER_RUN_ACTIVE_REASON,
-            other_run_message(run),
+            other_run_message(&schedule.namespace().unwrap_or_default(), run),
         ),
         None => (
             kopiur_api::consts::NO_OTHER_RUN_ACTIVE_REASON,
@@ -713,19 +713,18 @@ enum ScheduleHold<'a> {
     /// `concurrencyPolicy: Replace` waiting on a run parked behind its
     /// repository's concurrency cap — `ReplacementHeld=True`. Self-clears.
     ParkedRun(&'a str),
-    /// `Forbid`/`Replace` waiting on a run of the same policy that this schedule
-    /// did not start (manual, another schedule, hand-written) —
-    /// `HeldByOtherRun=True` (#584). Self-clears.
+    /// `Forbid`/`Replace` waiting on a `Running` run of the same policy that this
+    /// schedule did not start (manual, another schedule, hand-written) —
+    /// `HeldByOtherRun=True` (#584). Clears when that run finishes.
     OtherRun(&'a str),
 }
 
 /// The user-facing text for a slot held by another run: names the blocking
-/// `Snapshot` and says it was not started by this schedule.
-fn other_run_message(run: &str) -> String {
+/// `Snapshot` (always in the schedule's namespace) and says it was not started by
+/// this schedule. Only a `Running` foreign run holds a slot ([`slot_blockers`]).
+fn other_run_message(namespace: &str, run: &str) -> String {
     format!(
-        "waiting: Snapshot `{run}` is still backing up the same policy, and this schedule \
-         did not start it (a manual run or another schedule). This slot runs when it \
-         finishes. This clears on its own."
+        "Waiting for Snapshot {namespace}/{run} (a manual or other run of this policy) to finish."
     )
 }
 
@@ -1269,7 +1268,7 @@ async fn reconcile_inner(schedule: &SnapshotSchedule, ctx: &Context) -> Result<A
                     schedule,
                     kopiur_api::consts::OTHER_RUN_ACTIVE_REASON,
                     "AwaitOtherRun",
-                    &other_run_message(other),
+                    &other_run_message(&namespace, other),
                 )
                 .await;
             }
@@ -1464,15 +1463,20 @@ fn runs_target_policy(snapshot: &Snapshot, namespace: &str, targets: &[PolicyRef
 }
 
 /// **Pure** (#584). Which `Snapshot`s in the schedule's namespace block a due
-/// slot: every unfinished, non-terminating row that is either one of this
-/// schedule's own children (`own`) or targets one of the slot's `targets`
-/// policies, classified [`ActiveRun::Own`] / [`ActiveRun::Foreign`] and sorted
-/// by name so the reported blocker is deterministic.
+/// slot, classified [`ActiveRun::Own`] / [`ActiveRun::Foreign`] and sorted by
+/// name so the reported blocker is deterministic. Non-terminating rows only; rows
+/// outside `namespace` are ignored (the store is install-wide).
 ///
-/// "Unfinished" is the concurrency gate's set (`None` / `Pending` / `Running`),
-/// matched exhaustively. An `Unknown` phase counts as unfinished (fail closed,
-/// as in [`classify_active_runs`]): a phase written by a newer operator may be a
-/// live run. Rows outside `namespace` are ignored (the store is install-wide).
+/// - **Own** children (`own`) block while unfinished — the concurrency gate's set
+///   (`None` / `Pending` / `Running`), plus `Unknown` (fail closed, as in
+///   [`classify_active_runs`]: a phase written by a newer operator may be a live
+///   run of ours).
+/// - **Foreign** runs of one of the slot's `targets` block only while `Running`,
+///   i.e. actually moving data. A `None`/`Pending` foreign run may be stuck there
+///   indefinitely (no privileged opt-in, missing repository) and must not silence
+///   the schedule; an `Unknown` one is someone else's run and must not wedge us.
+///   Failing open for a foreign run only risks the pre-#584 overlap, never data
+///   loss.
 pub fn slot_blockers(
     rows: &[Snapshot],
     own: &[Snapshot],
@@ -1487,27 +1491,42 @@ pub fn slot_blockers(
         {
             continue;
         }
-        let unfinished = match row.status.as_ref().and_then(|s| s.phase.as_ref()) {
-            None
-            | Some(SnapshotPhase::Pending | SnapshotPhase::Running | SnapshotPhase::Unknown(_)) => {
-                true
-            }
-            Some(
-                SnapshotPhase::Succeeded
-                | SnapshotPhase::Failed
-                | SnapshotPhase::Deleting
-                | SnapshotPhase::Discovered
-                | SnapshotPhase::Unchanged,
-            ) => false,
-        };
-        if !unfinished {
-            continue;
-        }
+        let phase = row.status.as_ref().and_then(|s| s.phase.as_ref());
         let name = row.name_any();
         if own.iter().any(|o| o.name_any() == name) {
-            out.push(ActiveRun::Own(name));
+            let unfinished = match phase {
+                None
+                | Some(
+                    SnapshotPhase::Pending | SnapshotPhase::Running | SnapshotPhase::Unknown(_),
+                ) => true,
+                Some(
+                    SnapshotPhase::Succeeded
+                    | SnapshotPhase::Failed
+                    | SnapshotPhase::Deleting
+                    | SnapshotPhase::Discovered
+                    | SnapshotPhase::Unchanged,
+                ) => false,
+            };
+            if unfinished {
+                out.push(ActiveRun::Own(name));
+            }
         } else if runs_target_policy(row, namespace, targets) {
-            out.push(ActiveRun::Foreign(name));
+            let moving_data = match phase {
+                Some(SnapshotPhase::Running) => true,
+                None
+                | Some(
+                    SnapshotPhase::Pending
+                    | SnapshotPhase::Unknown(_)
+                    | SnapshotPhase::Succeeded
+                    | SnapshotPhase::Failed
+                    | SnapshotPhase::Deleting
+                    | SnapshotPhase::Discovered
+                    | SnapshotPhase::Unchanged,
+                ) => false,
+            };
+            if moving_data {
+                out.push(ActiveRun::Foreign(name));
+            }
         }
     }
     out.sort_by(|a, b| active_run_name(a).cmp(active_run_name(b)));
@@ -5902,12 +5921,55 @@ mod tests {
         let blockers = slot_blockers(&rows, &[], "apps", &pg_target());
         assert_eq!(blockers, vec![ActiveRun::Foreign("pg-manual-1".into())]);
         assert_eq!(first_foreign_run(&blockers).as_deref(), Some("pg-manual-1"));
-        // Pending and phase-less (just created) runs are in flight too.
+    }
+
+    /// A foreign run that is not moving data must never hold the slot: a manual
+    /// Snapshot stuck `Pending` forever (no privileged opt-in, missing repository)
+    /// would otherwise silence the schedule indefinitely. Failing open here only
+    /// risks the pre-#584 overlap, never data loss.
+    #[test]
+    fn a_foreign_run_that_is_not_running_does_not_block() {
         for phase in [None, Some(SnapshotPhase::Pending)] {
-            let rows = [manual_run("m", "pg", phase)];
+            let rows = [manual_run("stuck", "pg", phase.clone())];
+            assert!(
+                slot_blockers(&rows, &[], "apps", &pg_target()).is_empty(),
+                "a {phase:?} foreign run must not hold the slot"
+            );
+        }
+    }
+
+    /// An unreadable phase on a FOREIGN run is someone else's run (likely a newer
+    /// operator's): it must not wedge this schedule.
+    #[test]
+    fn an_unknown_phase_foreign_run_does_not_block() {
+        let rows = [manual_run(
+            "newer",
+            "pg",
+            Some(SnapshotPhase::Unknown("Copying".into())),
+        )];
+        assert!(slot_blockers(&rows, &[], "apps", &pg_target()).is_empty());
+    }
+
+    /// Own runs keep the concurrency gate's unfinished set, `Unknown` included
+    /// (fail closed — that gate is `BlockedOnUnreadable`).
+    #[test]
+    fn own_runs_keep_the_unfinished_set() {
+        for phase in [
+            None,
+            Some(SnapshotPhase::Pending),
+            Some(SnapshotPhase::Running),
+            Some(SnapshotPhase::Unknown("Copying".into())),
+        ] {
+            let own = manual_run("nightly-1", "pg", phase.clone());
             assert_eq!(
-                first_foreign_run(&slot_blockers(&rows, &[], "apps", &pg_target())).as_deref(),
-                Some("m")
+                slot_blockers(
+                    std::slice::from_ref(&own),
+                    std::slice::from_ref(&own),
+                    "apps",
+                    &pg_target()
+                ),
+                vec![ActiveRun::Own("nightly-1".into())],
+                "{phase:?}"
             );
         }
     }
@@ -5956,16 +6018,6 @@ mod tests {
                 k8s_openapi::jiff::Timestamp::from_second(1_700_000_000).unwrap(),
             ));
         assert!(slot_blockers(&[leaving], &[], "apps", &pg_target()).is_empty());
-        // An unreadable phase fails closed: it may be a live run.
-        let rows = [manual_run(
-            "newer",
-            "pg",
-            Some(SnapshotPhase::Unknown("Copying".into())),
-        )];
-        assert_eq!(
-            first_foreign_run(&slot_blockers(&rows, &[], "apps", &pg_target())).as_deref(),
-            Some("newer")
-        );
     }
 
     #[test]
@@ -6055,8 +6107,11 @@ mod tests {
         assert_eq!(c["status"], "True");
         assert_eq!(c["reason"], "OtherRunActive");
         let msg = c["message"].as_str().unwrap();
-        assert!(msg.contains("`pg-manual-1`"), "{msg}");
-        assert!(msg.contains("manual run or another schedule"), "{msg}");
+        assert_eq!(
+            msg,
+            "Waiting for Snapshot apps/pg-manual-1 (a manual or other run of this policy) \
+             to finish."
+        );
         let (clear, _) = schedule_ready_status(&schedule, None, None, None);
         assert_eq!(find(&clear)["status"], "False");
     }
@@ -6142,7 +6197,12 @@ mod tests {
             .find(|c| c["type"] == "HeldByOtherRun")
             .expect("HeldByOtherRun condition");
         assert_eq!(held["status"], "True");
-        assert!(held["message"].as_str().unwrap().contains("`pg-manual-1`"));
+        assert!(
+            held["message"]
+                .as_str()
+                .unwrap()
+                .contains("Snapshot apps/pg-manual-1")
+        );
         assert!(
             requests.iter().any(|(l, _)| l.contains("/events")),
             "a Normal event says why the slot is held"
