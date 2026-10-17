@@ -338,9 +338,9 @@ url = "https://github.com/prometheus/prometheus/releases/download/v3.15.0/promet
 url_api = "https://api.github.com/repos/prometheus/prometheus/releases/assets/587860828"
 
 [[tools.rust]]
-version = "1.98.1"
+version = "1.99.0"
 backend = "core:rust"
-specifiers = ["1.98.1"]
+specifiers = ["1.99.0"]
 
 [tools.rust.options]
 components = "clippy,llvm-tools,rustfmt"
