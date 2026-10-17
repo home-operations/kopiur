@@ -51,6 +51,14 @@ use crate::io;
 /// enough to be noticed without becoming the noise.
 const UNREADABLE_RUN_HOLD_REQUEUE: StdDuration = StdDuration::from_secs(10 * 60);
 
+/// Requeue while a due slot is held by a run this schedule did not start
+/// (`HeldByOtherRun=True`, #584). The schedule OWNS its own children, so their
+/// status changes wake it at once; a manual or other-schedule run is not owned,
+/// so nothing wakes the schedule when it finishes. Poll instead — often enough
+/// that the held slot fires soon after, rarely enough not to spin for the hours
+/// a large backup can take.
+const OTHER_RUN_HOLD_REQUEUE: StdDuration = StdDuration::from_secs(15);
+
 /// Parse Go-style duration strings used in the CRD (`30m`, `1h`, `90s`).
 /// Re-exported from `kopiur-api` so the admission validator and every
 /// reconciler (schedules, maintenance, replication, restore `waitTimeout`)
@@ -526,13 +534,14 @@ fn schedule_ready_status(
         REPLACEMENT_NOT_HELD_REASON, SCHEDULE_REPLACEMENT_HELD_CONDITION,
         WAITING_FOR_REPOSITORY_SLOT_REASON,
     };
-    // Split the one hold into the two independent conditions it feeds, so each
+    // Split the one hold into the independent conditions it feeds, so each
     // is written from a single place with BOTH polarities (a set-only condition
     // would report a resolved outage forever). Exhaustive over `ScheduleHold`.
-    let (blocked, parked) = match hold {
-        None => (None, None),
-        Some(ScheduleHold::Unreadable(b)) => (Some(b), None),
-        Some(ScheduleHold::ParkedRun(name)) => (None, Some(name)),
+    let (blocked, parked, other) = match hold {
+        None => (None, None, None),
+        Some(ScheduleHold::Unreadable(b)) => (Some(b), None, None),
+        Some(ScheduleHold::ParkedRun(name)) => (None, Some(name), None),
+        Some(ScheduleHold::OtherRun(name)) => (None, None, Some(name)),
     };
     let existing = schedule
         .status
@@ -626,6 +635,26 @@ fn schedule_ready_status(
         &parked_message,
         Some(generation),
     );
+    // Held by a run this schedule did not start (#584). Both polarities, for the
+    // same reason as the parked marker: it is the event's transition guard.
+    let (other_reason, other_message) = match other {
+        Some(run) => (
+            kopiur_api::consts::OTHER_RUN_ACTIVE_REASON,
+            other_run_message(run),
+        ),
+        None => (
+            kopiur_api::consts::NO_OTHER_RUN_ACTIVE_REASON,
+            "no run outside this schedule is holding it".to_string(),
+        ),
+    };
+    let conditions = io::upsert_condition(
+        &conditions,
+        kopiur_api::consts::SCHEDULE_HELD_BY_OTHER_RUN_CONDITION,
+        other.is_some(),
+        other_reason,
+        &other_message,
+        Some(generation),
+    );
     // Fan-out cap condition (#368): asserted (both polarities, so a fixed
     // recipe self-clears) ONLY on fire passes — `None` on wait/hold passes
     // leaves the recorded value untouched, so the condition persists between
@@ -684,6 +713,34 @@ enum ScheduleHold<'a> {
     /// `concurrencyPolicy: Replace` waiting on a run parked behind its
     /// repository's concurrency cap — `ReplacementHeld=True`. Self-clears.
     ParkedRun(&'a str),
+    /// `Forbid`/`Replace` waiting on a run of the same policy that this schedule
+    /// did not start (manual, another schedule, hand-written) —
+    /// `HeldByOtherRun=True` (#584). Self-clears.
+    OtherRun(&'a str),
+}
+
+/// The user-facing text for a slot held by another run: names the blocking
+/// `Snapshot` and says it was not started by this schedule.
+fn other_run_message(run: &str) -> String {
+    format!(
+        "waiting: Snapshot `{run}` is still backing up the same policy, and this schedule \
+         did not start it (a manual run or another schedule). This slot runs when it \
+         finishes. This clears on its own."
+    )
+}
+
+/// Whether `status.conditions` already records the held-by-another-run state —
+/// the transition guard for its Normal event (see
+/// [`recorded_held_by_parked_run`]).
+fn recorded_held_by_other_run(schedule: &SnapshotSchedule) -> bool {
+    schedule
+        .status
+        .as_ref()
+        .map(|s| s.conditions.as_slice())
+        .unwrap_or_default()
+        .iter()
+        .find(|c| c.type_ == kopiur_api::consts::SCHEDULE_HELD_BY_OTHER_RUN_CONDITION)
+        .is_some_and(|c| c.status == "True")
 }
 
 /// Whether `status.conditions` already records the `Replace`-held-by-parked-run
@@ -711,6 +768,8 @@ struct WaitFacts {
     tz_ambiguous: bool,
     /// Whether `Replace` is holding this slot behind a parked run.
     parked: bool,
+    /// Whether a run this schedule did not start is holding this slot (#584).
+    other_run: bool,
 }
 
 /// Whether `status.observedGeneration` lags `metadata.generation` — a spec edit
@@ -740,6 +799,7 @@ fn wait_needs_status_patch(
             now.tz_ambiguous != recorded_tz_ambiguous(schedule)
                 || recorded_blocked_on_unreadable(schedule)
                 || now.parked != recorded_held_by_parked_run(schedule)
+                || now.other_run != recorded_held_by_other_run(schedule)
                 || observed_generation_stale(schedule)
         }
     }
@@ -922,6 +982,27 @@ async fn reconcile_inner(schedule: &SnapshotSchedule, ctx: &Context) -> Result<A
         };
         let runs = classify_active_runs(&items);
         let disposition = slot_disposition(&schedule.spec.schedule, slot, now, runs.active);
+        // #584: `Forbid` and `Replace` must also see runs this schedule did not
+        // start — a manual `snapshot now`, another schedule, a hand-written CR —
+        // for the same target policy. Only read when the slot is about to fire
+        // (the store read is in-process; a cold store falls back to a live LIST,
+        // and a read error fails CLOSED by propagating, never "nothing running").
+        // A foreign run downgrades the Fire to a Wait BEFORE the `Replace` plan
+        // below is computed, so `Replace` deletes nothing: it never cancels a run
+        // it does not own, and holding the whole slot (its own prior run included)
+        // until the foreign run finishes is the safe answer.
+        let other_run =
+            if needs_other_run_check(schedule.spec.schedule.concurrency_policy, disposition) {
+                let targets = target_policy_refs(ctx, schedule, &namespace).await?;
+                let rows = io::namespace_snapshots(ctx, &namespace).await?;
+                first_foreign_run(&slot_blockers(&rows, &items, &namespace, &targets))
+            } else {
+                None
+            };
+        let disposition = match other_run {
+            Some(_) => SlotDisposition::Wait,
+            None => disposition,
+        };
         // `concurrencyPolicy: Replace` — what to do with the runs this slot is
         // about to replace, decided from the SAME children slice (no extra
         // LIST). Computed BEFORE the blocker filter below because two of its
@@ -958,10 +1039,11 @@ async fn reconcile_inner(schedule: &SnapshotSchedule, ctx: &Context) -> Result<A
         // The ONE hold fact every status write below asserts (or clears). The
         // unreadable gate wins when both could apply — `replace_plan` already
         // gives it precedence, so this only re-states that ordering.
-        let hold = match (blocker, parked_hold) {
-            (Some(b), _) => Some(ScheduleHold::Unreadable(b)),
-            (None, Some(p)) => Some(ScheduleHold::ParkedRun(p)),
-            (None, None) => None,
+        let hold = match (blocker, parked_hold, other_run.as_deref()) {
+            (Some(b), _, _) => Some(ScheduleHold::Unreadable(b)),
+            (None, Some(p), _) => Some(ScheduleHold::ParkedRun(p)),
+            (None, None, Some(o)) => Some(ScheduleHold::OtherRun(o)),
+            (None, None, None) => None,
         };
         // A slot expired past `startingDeadlineSeconds` must re-pin forward, or the
         // wait branch below computes `(slot - now)` for a past instant and requeues
@@ -1130,9 +1212,11 @@ async fn reconcile_inner(schedule: &SnapshotSchedule, ctx: &Context) -> Result<A
         // without this the status — and Ready's reason — would keep describing the
         // old spec until the next fire.
         let held_recorded = recorded_held_by_parked_run(schedule);
+        let other_recorded = recorded_held_by_other_run(schedule);
         let wait_now = WaitFacts {
             tz_ambiguous: tz_ambiguity.is_some(),
             parked: parked_hold.is_some(),
+            other_run: other_run.is_some(),
         };
         if wait_needs_status_patch(schedule, &resolution, wait_now) {
             let (conditions, generation) =
@@ -1174,6 +1258,26 @@ async fn reconcile_inner(schedule: &SnapshotSchedule, ctx: &Context) -> Result<A
                 "concurrencyPolicy: Replace is holding this slot behind the repository's \
                  mover-Job concurrency cap"
             );
+        }
+        // Held by a run this schedule did not start (#584). Normal, not Warning:
+        // it clears by itself. Transition-gated on the condition, like the parked
+        // hold above, so it fires once on entering the hold.
+        if let Some(other) = other_run.as_deref() {
+            if !other_recorded {
+                io::publish_normal_event(
+                    ctx,
+                    schedule,
+                    kopiur_api::consts::OTHER_RUN_ACTIVE_REASON,
+                    "AwaitOtherRun",
+                    &other_run_message(other),
+                )
+                .await;
+            }
+            tracing::debug!(
+                namespace = %namespace, schedule = %sched_name, other_run = %other,
+                "holding a due slot behind a run of the same policy this schedule did not start"
+            );
+            return Ok(Action::requeue(OTHER_RUN_HOLD_REQUEUE));
         }
         let until = (slot - now).to_std().unwrap_or(StdDuration::from_secs(1));
         return Ok(Action::requeue(until.max(StdDuration::from_secs(1))));
@@ -1321,6 +1425,123 @@ pub fn classify_active_runs(items: &[Snapshot]) -> ActiveRuns {
         out.active |= unfinished;
     }
     out
+}
+
+/// An unfinished, non-terminating `Snapshot` that bears on a due slot's
+/// concurrency gate, by who started it (#584). An enum, not a bool, so every
+/// consumer must say what it does with each kind — in particular that `Replace`
+/// may only ever cancel an [`ActiveRun::Own`] run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActiveRun {
+    /// One of this schedule's own children (the [`schedule_children`]
+    /// population). Gated by [`classify_active_runs`] and, under `Replace`,
+    /// cancellable by [`replace_plan`].
+    Own(String),
+    /// A run of one of this slot's target policies that this schedule did not
+    /// start: a manual `snapshot now`, another schedule's child, a hand-written
+    /// CR. Holds the slot under `Forbid` and `Replace`; never cancelled.
+    Foreign(String),
+}
+
+/// **Pure.** Whether `snapshot`'s typed `spec.policyRef` names one of `targets`.
+/// Both sides resolve an absent `namespace` to their own: the Snapshot's
+/// namespace for its ref, the schedule's for a target. Deliberately the typed
+/// spec reference, never the `CONFIG_LABEL` — labels are user-editable and are
+/// not trusted to identify a recipe.
+fn runs_target_policy(snapshot: &Snapshot, namespace: &str, targets: &[PolicyRef]) -> bool {
+    let Some(pref) = snapshot.spec.policy_ref.as_ref() else {
+        return false;
+    };
+    let snap_ns = snapshot.namespace();
+    let pref_ns = pref
+        .namespace
+        .as_deref()
+        .or(snap_ns.as_deref())
+        .unwrap_or(namespace);
+    targets
+        .iter()
+        .any(|t| t.name == pref.name && t.namespace.as_deref().unwrap_or(namespace) == pref_ns)
+}
+
+/// **Pure** (#584). Which `Snapshot`s in the schedule's namespace block a due
+/// slot: every unfinished, non-terminating row that is either one of this
+/// schedule's own children (`own`) or targets one of the slot's `targets`
+/// policies, classified [`ActiveRun::Own`] / [`ActiveRun::Foreign`] and sorted
+/// by name so the reported blocker is deterministic.
+///
+/// "Unfinished" is the concurrency gate's set (`None` / `Pending` / `Running`),
+/// matched exhaustively. An `Unknown` phase counts as unfinished (fail closed,
+/// as in [`classify_active_runs`]): a phase written by a newer operator may be a
+/// live run. Rows outside `namespace` are ignored (the store is install-wide).
+pub fn slot_blockers(
+    rows: &[Snapshot],
+    own: &[Snapshot],
+    namespace: &str,
+    targets: &[PolicyRef],
+) -> Vec<ActiveRun> {
+    use kopiur_api::SnapshotPhase;
+    let mut out: Vec<ActiveRun> = Vec::new();
+    for row in rows {
+        if row.namespace().as_deref() != Some(namespace)
+            || row.metadata.deletion_timestamp.is_some()
+        {
+            continue;
+        }
+        let unfinished = match row.status.as_ref().and_then(|s| s.phase.as_ref()) {
+            None
+            | Some(SnapshotPhase::Pending | SnapshotPhase::Running | SnapshotPhase::Unknown(_)) => {
+                true
+            }
+            Some(
+                SnapshotPhase::Succeeded
+                | SnapshotPhase::Failed
+                | SnapshotPhase::Deleting
+                | SnapshotPhase::Discovered
+                | SnapshotPhase::Unchanged,
+            ) => false,
+        };
+        if !unfinished {
+            continue;
+        }
+        let name = row.name_any();
+        if own.iter().any(|o| o.name_any() == name) {
+            out.push(ActiveRun::Own(name));
+        } else if runs_target_policy(row, namespace, targets) {
+            out.push(ActiveRun::Foreign(name));
+        }
+    }
+    out.sort_by(|a, b| active_run_name(a).cmp(active_run_name(b)));
+    out
+}
+
+/// The `Snapshot` name an [`ActiveRun`] carries, whoever started it.
+fn active_run_name(run: &ActiveRun) -> &str {
+    match run {
+        ActiveRun::Own(name) | ActiveRun::Foreign(name) => name,
+    }
+}
+
+/// **Pure** (#584). The first run in `blockers` this schedule did not start —
+/// the one a held slot names. Own runs are skipped: they are gated by
+/// [`classify_active_runs`] / [`replace_plan`], which already account for them.
+pub fn first_foreign_run(blockers: &[ActiveRun]) -> Option<String> {
+    blockers.iter().find_map(|run| match run {
+        ActiveRun::Own(_) => None,
+        ActiveRun::Foreign(name) => Some(name.clone()),
+    })
+}
+
+/// **Pure** (#584). Whether this pass must look for runs this schedule did not
+/// start. Only a slot that would otherwise FIRE needs the check, and only under
+/// a policy that refuses to overlap runs. Exhaustive over the policy: `Allow`
+/// runs beside anything, as before.
+pub fn needs_other_run_check(policy: ConcurrencyPolicy, disposition: SlotDisposition) -> bool {
+    match policy {
+        ConcurrencyPolicy::Allow => false,
+        ConcurrencyPolicy::Forbid | ConcurrencyPolicy::Replace => {
+            disposition == SlotDisposition::Fire
+        }
+    }
 }
 
 /// What `concurrencyPolicy: Replace` must do with a due slot, given this
@@ -5624,5 +5845,382 @@ mod tests {
             repinned.is_none(),
             "a transient referent failure must never move an established pin, got {repinned:?}"
         );
+    }
+
+    // --- #584: runs this schedule did not start hold Forbid/Replace ----------
+
+    /// An unfinished run in `apps` naming `policy` through its typed
+    /// `spec.policyRef` — the shape `kubectl kopiur snapshot now` mints (origin
+    /// label `manual`, no schedule label).
+    fn manual_run(name: &str, policy: &str, phase: Option<SnapshotPhase>) -> Snapshot {
+        let mut s = run_in_phase(name, phase, false);
+        s.metadata.namespace = Some("apps".into());
+        s.metadata.labels = Some(BTreeMap::from([(
+            ORIGIN_LABEL.to_string(),
+            "manual".to_string(),
+        )]));
+        s.spec.policy_ref = Some(PolicyRef {
+            name: policy.into(),
+            namespace: None,
+        });
+        s
+    }
+
+    fn pg_target() -> Vec<PolicyRef> {
+        vec![PolicyRef {
+            name: "pg".into(),
+            namespace: None,
+        }]
+    }
+
+    #[test]
+    fn a_manual_run_of_the_target_policy_blocks_the_slot() {
+        let rows = [manual_run(
+            "pg-manual-1",
+            "pg",
+            Some(SnapshotPhase::Running),
+        )];
+        let blockers = slot_blockers(&rows, &[], "apps", &pg_target());
+        assert_eq!(blockers, vec![ActiveRun::Foreign("pg-manual-1".into())]);
+        assert_eq!(first_foreign_run(&blockers).as_deref(), Some("pg-manual-1"));
+        // Pending and phase-less (just created) runs are in flight too.
+        for phase in [None, Some(SnapshotPhase::Pending)] {
+            let rows = [manual_run("m", "pg", phase)];
+            assert_eq!(
+                first_foreign_run(&slot_blockers(&rows, &[], "apps", &pg_target())).as_deref(),
+                Some("m")
+            );
+        }
+    }
+
+    #[test]
+    fn a_run_of_a_different_policy_does_not_block() {
+        let rows = [manual_run("other", "redis", Some(SnapshotPhase::Running))];
+        assert!(slot_blockers(&rows, &[], "apps", &pg_target()).is_empty());
+        // A row with no policyRef (a discovered catalog row) never matches.
+        let mut discovered = manual_run("disc", "pg", Some(SnapshotPhase::Running));
+        discovered.spec.policy_ref = None;
+        assert!(slot_blockers(&[discovered], &[], "apps", &pg_target()).is_empty());
+    }
+
+    #[test]
+    fn the_policy_match_is_the_typed_ref_not_the_labels() {
+        // Labels claim `pg`, the typed ref says `redis`: not a blocker.
+        let mut lying = manual_run("lying", "redis", Some(SnapshotPhase::Running));
+        lying
+            .metadata
+            .labels
+            .as_mut()
+            .unwrap()
+            .insert(kopiur_api::consts::CONFIG_LABEL.to_string(), "pg".into());
+        assert!(slot_blockers(&[lying], &[], "apps", &pg_target()).is_empty());
+    }
+
+    #[test]
+    fn finished_or_terminating_runs_do_not_block() {
+        for phase in [
+            SnapshotPhase::Succeeded,
+            SnapshotPhase::Failed,
+            SnapshotPhase::Deleting,
+            SnapshotPhase::Discovered,
+            SnapshotPhase::Unchanged,
+        ] {
+            let rows = [manual_run("done", "pg", Some(phase.clone()))];
+            assert!(
+                slot_blockers(&rows, &[], "apps", &pg_target()).is_empty(),
+                "{phase:?} must not block"
+            );
+        }
+        let mut leaving = manual_run("leaving", "pg", Some(SnapshotPhase::Running));
+        leaving.metadata.deletion_timestamp =
+            Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+                k8s_openapi::jiff::Timestamp::from_second(1_700_000_000).unwrap(),
+            ));
+        assert!(slot_blockers(&[leaving], &[], "apps", &pg_target()).is_empty());
+        // An unreadable phase fails closed: it may be a live run.
+        let rows = [manual_run(
+            "newer",
+            "pg",
+            Some(SnapshotPhase::Unknown("Copying".into())),
+        )];
+        assert_eq!(
+            first_foreign_run(&slot_blockers(&rows, &[], "apps", &pg_target())).as_deref(),
+            Some("newer")
+        );
+    }
+
+    #[test]
+    fn slot_blockers_scope_to_the_namespace_and_resolve_ref_namespaces() {
+        // Same policy name in another namespace: not ours.
+        let mut elsewhere = manual_run("x", "pg", Some(SnapshotPhase::Running));
+        elsewhere.metadata.namespace = Some("other".into());
+        assert!(slot_blockers(&[elsewhere], &[], "apps", &pg_target()).is_empty());
+        // An explicit ref namespace equal to the default resolves the same.
+        let mut explicit = manual_run("y", "pg", Some(SnapshotPhase::Running));
+        explicit.spec.policy_ref.as_mut().unwrap().namespace = Some("apps".into());
+        assert_eq!(
+            slot_blockers(&[explicit], &[], "apps", &pg_target()),
+            vec![ActiveRun::Foreign("y".into())]
+        );
+        // A ref to `pg` in ANOTHER namespace is a different policy.
+        let mut cross = manual_run("z", "pg", Some(SnapshotPhase::Running));
+        cross.spec.policy_ref.as_mut().unwrap().namespace = Some("db".into());
+        assert!(slot_blockers(&[cross], &[], "apps", &pg_target()).is_empty());
+    }
+
+    #[test]
+    fn own_runs_are_classified_own_and_never_reported_as_foreign() {
+        let mut own = manual_run("nightly-20260804030000", "pg", Some(SnapshotPhase::Running));
+        own.metadata.labels = Some(BTreeMap::from([(
+            crate::consts::SCHEDULE_LABEL.to_string(),
+            "nightly".to_string(),
+        )]));
+        let manual = manual_run("pg-manual-1", "pg", Some(SnapshotPhase::Running));
+        let blockers = slot_blockers(
+            &[own.clone(), manual.clone()],
+            std::slice::from_ref(&own),
+            "apps",
+            &pg_target(),
+        );
+        assert_eq!(
+            blockers,
+            vec![
+                ActiveRun::Own("nightly-20260804030000".into()),
+                ActiveRun::Foreign("pg-manual-1".into()),
+            ]
+        );
+        assert_eq!(first_foreign_run(&blockers).as_deref(), Some("pg-manual-1"));
+        // Own runs alone: no foreign hold (the own gate handles them).
+        let only_own = slot_blockers(
+            std::slice::from_ref(&own),
+            std::slice::from_ref(&own),
+            "apps",
+            &pg_target(),
+        );
+        assert_eq!(first_foreign_run(&only_own), None);
+    }
+
+    #[test]
+    fn only_a_firing_forbid_or_replace_slot_checks_for_other_runs() {
+        use ConcurrencyPolicy::{Allow, Forbid, Replace};
+        use SlotDisposition::{Fire, SkipExpired, Wait};
+        for policy in [Forbid, Replace] {
+            assert!(needs_other_run_check(policy, Fire), "{policy:?}");
+            assert!(!needs_other_run_check(policy, Wait), "{policy:?}");
+            assert!(!needs_other_run_check(policy, SkipExpired), "{policy:?}");
+        }
+        for d in [Fire, Wait, SkipExpired] {
+            assert!(!needs_other_run_check(Allow, d), "Allow is unchanged");
+        }
+    }
+
+    #[test]
+    fn the_other_run_hold_is_set_and_cleared_from_the_same_fact() {
+        let schedule = schedule_fixture("apps", "nightly", ConcurrencyPolicy::Forbid);
+        let find = |conds: &serde_json::Value| {
+            conds
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|c| c["type"] == "HeldByOtherRun")
+                .cloned()
+                .unwrap()
+        };
+        let (held, _) = schedule_ready_status(
+            &schedule,
+            None,
+            Some(ScheduleHold::OtherRun("pg-manual-1")),
+            None,
+        );
+        let c = find(&held);
+        assert_eq!(c["status"], "True");
+        assert_eq!(c["reason"], "OtherRunActive");
+        let msg = c["message"].as_str().unwrap();
+        assert!(msg.contains("`pg-manual-1`"), "{msg}");
+        assert!(msg.contains("manual run or another schedule"), "{msg}");
+        let (clear, _) = schedule_ready_status(&schedule, None, None, None);
+        assert_eq!(find(&clear)["status"], "False");
+    }
+
+    /// Drive `reconcile_inner` for `schedule` (pinned to a DUE slot) with the
+    /// Snapshot store primed with `rows`. Snapshot reads/applies answer with a
+    /// real `Snapshot` so a fire can complete; returns every request made.
+    async fn reconcile_with_rows(
+        schedule: SnapshotSchedule,
+        rows: Vec<Snapshot>,
+    ) -> Vec<(String, serde_json::Value)> {
+        let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let client = body_recording_client(log.clone(), |method, path| {
+            if path.contains("/snapshotpolicies/") {
+                return (StatusCode::OK, policy_body("apps", "pg"));
+            }
+            if path.contains("/repositories/") {
+                return (
+                    StatusCode::OK,
+                    repository_body("apps", "repo", serde_json::json!({})),
+                );
+            }
+            if path.contains("/snapshotschedules/") {
+                return (StatusCode::OK, schedule_body("apps", "nightly"));
+            }
+            if method != http::Method::DELETE && path.contains("/snapshots/") {
+                return (StatusCode::OK, live_snapshot_body("apps", "run"));
+            }
+            (StatusCode::OK, ok_status())
+        });
+        let ctx = Context::test_context(client);
+        prime_snapshot_store(&ctx, rows, true);
+        reconcile_inner(&schedule, &ctx)
+            .await
+            .expect("reconcile must succeed");
+        log.lock().unwrap().clone()
+    }
+
+    /// A schedule under `policy` whose pinned slot is DUE.
+    fn due_schedule(policy: ConcurrencyPolicy) -> SnapshotSchedule {
+        let mut s = inheriting_pinned_schedule(None);
+        s.spec.schedule.concurrency_policy = policy;
+        s.status
+            .as_mut()
+            .and_then(|st| st.next_schedule.as_mut())
+            .unwrap()
+            .at = Some((Utc::now() - chrono::Duration::minutes(5)).to_rfc3339());
+        s
+    }
+
+    fn mints(requests: &[(String, serde_json::Value)]) -> Vec<&str> {
+        requests
+            .iter()
+            .map(|(l, _)| l.as_str())
+            .filter(|l| l.starts_with("PATCH ") && l.contains("/snapshots/"))
+            .collect()
+    }
+
+    /// **#584, end to end.** A `Forbid` schedule's slot comes due while a manual
+    /// `snapshot now` of the same policy is still running. Pre-fix the gate only
+    /// looked at the schedule's own children and fired beside it. Now the slot
+    /// is held, the condition names the blocking Snapshot, and one Normal event
+    /// says why.
+    #[tokio::test]
+    async fn forbid_holds_a_due_slot_behind_a_manual_run_of_the_same_policy() {
+        let manual = manual_run("pg-manual-1", "pg", Some(SnapshotPhase::Running));
+        let requests =
+            reconcile_with_rows(due_schedule(ConcurrencyPolicy::Forbid), vec![manual]).await;
+        assert!(
+            mints(&requests).is_empty(),
+            "Forbid must not fire beside a manual run: {:?}",
+            mints(&requests)
+        );
+        let status = status_patch(&requests).expect("entering the hold writes status");
+        assert!(
+            status.get("nextSchedule").is_none(),
+            "the pin is kept: {status}"
+        );
+        let held = status["conditions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["type"] == "HeldByOtherRun")
+            .expect("HeldByOtherRun condition");
+        assert_eq!(held["status"], "True");
+        assert!(held["message"].as_str().unwrap().contains("`pg-manual-1`"));
+        assert!(
+            requests.iter().any(|(l, _)| l.contains("/events")),
+            "a Normal event says why the slot is held"
+        );
+    }
+
+    /// The hold is about the SAME policy: a manual run of another policy does
+    /// not hold the slot, which fires normally.
+    #[tokio::test]
+    async fn forbid_fires_beside_a_manual_run_of_a_different_policy() {
+        let other = manual_run("redis-manual-1", "redis", Some(SnapshotPhase::Running));
+        let requests =
+            reconcile_with_rows(due_schedule(ConcurrencyPolicy::Forbid), vec![other]).await;
+        assert_eq!(mints(&requests).len(), 1, "{:?}", mints(&requests));
+    }
+
+    /// `Replace` never cancels a run it does not own. With its own prior run AND
+    /// a manual run in flight, it deletes nothing and fires nothing: the whole
+    /// slot waits for the manual run, then replaces its own run as usual.
+    #[tokio::test]
+    async fn replace_holds_behind_a_foreign_run_and_deletes_nothing() {
+        let mut own = run_in_phase("nightly-prior", Some(SnapshotPhase::Running), false);
+        own.metadata.namespace = Some("apps".into());
+        own.metadata.labels = Some(BTreeMap::from([(
+            crate::consts::SCHEDULE_LABEL.to_string(),
+            "nightly".to_string(),
+        )]));
+        own.spec.policy_ref = Some(PolicyRef {
+            name: "pg".into(),
+            namespace: None,
+        });
+        let manual = manual_run("pg-manual-1", "pg", Some(SnapshotPhase::Running));
+        for rows in [vec![manual.clone()], vec![own, manual]] {
+            let requests =
+                reconcile_with_rows(due_schedule(ConcurrencyPolicy::Replace), rows).await;
+            let lines: Vec<&str> = requests.iter().map(|(l, _)| l.as_str()).collect();
+            assert!(
+                !lines.iter().any(|l| l.starts_with("DELETE ")),
+                "Replace must never cancel anything while a foreign run holds: {lines:?}"
+            );
+            assert!(mints(&requests).is_empty(), "{lines:?}");
+            let status = status_patch(&requests).expect("the hold is recorded");
+            let held = status["conditions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|c| c["type"] == "HeldByOtherRun")
+                .unwrap()
+                .clone();
+            assert_eq!(held["status"], "True");
+        }
+    }
+
+    /// The hold is transition-gated and self-clearing: while it is already
+    /// recorded, a still-running manual run raises no second event; once the
+    /// manual run finishes, the held slot fires and the condition clears.
+    #[tokio::test]
+    async fn the_other_run_hold_events_once_and_clears_when_the_run_finishes() {
+        let held = |mut s: SnapshotSchedule| {
+            let (conds, _) =
+                schedule_ready_status(&s, None, Some(ScheduleHold::OtherRun("pg-manual-1")), None);
+            s.status.as_mut().unwrap().conditions = serde_json::from_value(conds).unwrap();
+            s
+        };
+        let schedule = held(due_schedule(ConcurrencyPolicy::Forbid));
+        let running = manual_run("pg-manual-1", "pg", Some(SnapshotPhase::Running));
+        let requests = reconcile_with_rows(schedule.clone(), vec![running]).await;
+        assert!(mints(&requests).is_empty());
+        assert!(
+            !requests.iter().any(|(l, _)| l.contains("/events")),
+            "an already-recorded hold must not re-event every requeue"
+        );
+
+        let done = manual_run("pg-manual-1", "pg", Some(SnapshotPhase::Succeeded));
+        let requests = reconcile_with_rows(schedule, vec![done]).await;
+        assert_eq!(
+            mints(&requests).len(),
+            1,
+            "the held slot fires once it is free"
+        );
+        let status = status_patch(&requests).unwrap();
+        let cond = status["conditions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["type"] == "HeldByOtherRun")
+            .unwrap()
+            .clone();
+        assert_eq!(cond["status"], "False");
+    }
+
+    /// `Allow` is unchanged: it runs beside anything.
+    #[tokio::test]
+    async fn allow_still_fires_beside_a_manual_run() {
+        let manual = manual_run("pg-manual-1", "pg", Some(SnapshotPhase::Running));
+        let requests =
+            reconcile_with_rows(due_schedule(ConcurrencyPolicy::Allow), vec![manual]).await;
+        assert_eq!(mints(&requests).len(), 1, "{:?}", mints(&requests));
     }
 }

@@ -64,11 +64,13 @@ With `true`, skip future firings. Runs in flight and runs already finished are u
 
 #### `schedule.concurrencyPolicy`
 
-What to do when a slot fires while an earlier run from this schedule is still in flight:
+What to do when a slot fires while an earlier run of the same policy is still in flight:
 
-- **`Forbid`**, the default, skips the new run and raises a condition, rather than letting runs pile up.
+- **`Forbid`**, the default, holds the new run rather than letting runs pile up.
 - **`Allow`** starts the new run alongside the in-flight one.
-- **`Replace`** cancels the in-flight runs and starts the new one in their place.
+- **`Replace`** cancels this schedule's own in-flight runs and starts the new one in their place.
+
+`Forbid` and `Replace` also wait for unfinished runs this schedule did **not** start, as long as they back up one of the slot's target policies: a manual `kubectl kopiur snapshot now`, another schedule's run, or a hand-written `Snapshot`. The match is on the `Snapshot`'s `spec.policyRef`, not its labels. Such a run is never cancelled, not even by `Replace`. The slot waits for it, then fires. While it waits, the schedule records `HeldByOtherRun=True` (reason `OtherRunActive`) naming the blocking `Snapshot`, and emits one `OtherRunActive` Normal event. It clears on its own. `Allow` ignores other runs, as it always has. To cap how many runs hit a repository at once across manual and scheduled runs, use the repository's [`spec.concurrency.maxConcurrentJobs`](../../backups.md#limiting-concurrent-jobs-per-repository).
 
 This default is also written into the stored object and shows up in `kubectl explain`.
 
@@ -92,10 +94,11 @@ The snapshot then exists in the repository with nothing tracking it, and reclaim
 
 ///
 
-Two situations make `Replace` decline to replace anything. In both it waits rather than firing.
+Three situations make `Replace` decline to replace anything. In each it waits rather than firing.
 
 - **A child at an unrecognized phase.** If a run sits at a `status.phase` this operator build does not know, which almost always means a newer operator wrote it, the schedule refuses to delete what it cannot classify. It raises `ScheduleRunnable=False` with reason `BlockedOnUnreadableRun`, exactly as `Forbid` does. Finish the operator upgrade, or delete that `Snapshot` if the run is genuinely over.
 - **A child parked behind the repository's concurrency cap.** A run holding `RepositorySlotAvailable=False` is queued, not running. Cancelling it would free no capacity and the replacement would immediately queue in its place, so `Replace` behaves like `Forbid` until the pool drains. The schedule records `ReplacementHeld=True` with reason `WaitingForRepositorySlot`, and emits one `WaitingForRepositorySlot` Normal event when it enters the hold, not one per retry. Unlike `ScheduleRunnable=False` this is not a structural gate: it clears on its own and needs no action from you.
+- **A run of the same policy that this schedule did not start.** `Replace` never cancels a run it does not own. It holds the whole slot, cancelling nothing, its own previous run included, until that run finishes, and records `HeldByOtherRun=True` as described under [`schedule.concurrencyPolicy`](#scheduleconcurrencypolicy).
 
 #### `schedule.startingDeadlineSeconds`
 

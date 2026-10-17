@@ -108,7 +108,7 @@ What "per repository" means in practice:
 - **Captures are independent, not a single point in time across repositories.** Each repository's child stages and reads the source on its own, so the N snapshots of one slot are *close* in time but not one consistent instant across repositories. For a multi-PVC selector with `groupBy: VolumeGroupSnapshot`, each repository gets its **own** VolumeGroupSnapshot per slot, so budget **N times** the CSI snapshot quota and storage-side load.
 - **Deletion protection is per repository.** Deleting a multi-repo policy's history trips each repository's [mass-deletion breaker](repositories.md#deletionprotection--the-mass-deletion-circuit-breaker) independently, so expect **one acknowledgement per repository**, not one total. `kubectl kopiur doctor` groups the held sets per repo with the exact acknowledgement command for each.
 - **Restores must pick a repository.** A `fromPolicy` restore against a multi-repo policy is refused until `spec.repository` names **one member** of the policy's set, and the message lists the valid choices. A ref that isn't a member is refused too. Kopiur never guesses repository number 1, because the N captures can diverge. See [Restores](restores.md).
-- **`concurrencyPolicy: Forbid`, the schedule default, holds the whole slot.** One-at-a-time is per *schedule*: while any child of the previous slot is still running, and one slow or unreachable repository is enough, the next slot is skipped for **all** repositories. Use `Allow` if a lagging repository must not delay the healthy ones' cadence.
+- **`concurrencyPolicy: Forbid`, the schedule default, holds the whole slot.** While any child of the previous slot is still running, and one slow or unreachable repository is enough, the next slot waits for **all** repositories. The same goes for any other unfinished run of the policy, such as a manual `kubectl kopiur snapshot now`. Use `Allow` if a lagging repository must not delay the healthy ones' cadence.
 - **The cross product is capped at 400 children per slot**, meaning sources times repositories. A slot over the cap is skipped whole, never partially created, with a `FanoutCapped` condition on the schedule and a `doctor` finding.
 - `kubectl get snapshotpolicy` renders the single-repo `Repository` column **blank** for a multi-repo policy. The `Repositories` column, from `status.repositorySummary`, lists the set.
 
@@ -885,7 +885,7 @@ The schedule stage above is minimal. The full set of settings, `timezone`, `susp
 | `schedule.timezone`                | IANA timezone the cron is evaluated in. Absent, it inherits the target policy's repository [`scheduleDefaults.timezone`](repositories.md#scheduledefaults--set-the-cron-timezone-and-jitter-once), else UTC (see the tip below).                                                          |
 | `schedule.runOnCreate`             | `false` (default) means applying the schedule does **not** fire immediately, which is GitOps-friendly. Set `true` to backup the moment it's created. |
 | `schedule.suspend`                 | `true` pauses future firings (in-flight and past runs are untouched).                                                                        |
-| `schedule.concurrencyPolicy`       | What to do if a run is still in flight: `Forbid` (default, skip), `Allow` (run anyway), `Replace` (cancel the old one; see below).           |
+| `schedule.concurrencyPolicy`       | What to do if a run of the same policy is still in flight: `Forbid` (default, wait), `Allow` (run anyway), `Replace` (cancel this schedule's old run; see below). `Forbid` and `Replace` also wait for runs this schedule did not start, such as a manual `snapshot now`. |
 | `schedule.startingDeadlineSeconds` | If a slot is missed by more than this (operator was down), skip it rather than fire late.                                                    |
 | `failedJobsHistoryLimit`           | How many **failed** `Snapshot` CRs from this schedule to keep. Successful retention is GFS on the `SnapshotPolicy`.                              |
 
@@ -917,10 +917,11 @@ Before cancelling, Kopiur re-reads each run and skips any that has finished in t
 
 ///
 
-`Replace` will also decline to replace anything and simply wait, in two cases:
+`Replace` will also decline to replace anything and simply wait, in three cases:
 
 - **The old run's phase is one this operator doesn't recognize.** That is nearly always because a newer Kopiur wrote it during a partial upgrade. Rather than delete a run it can't understand, the schedule stops and raises `ScheduleRunnable=False` with reason `BlockedOnUnreadableRun` so you can see it. Finish the upgrade, or delete that `Snapshot` if the run is really over.
 - **The old run is queued behind the repository's concurrency cap**, showing `RepositorySlotAvailable=False`. It isn't running; it's waiting in line. Cancelling it would free nothing and the replacement would go straight to the back of the same line, so `Replace` behaves like `Forbid` until the queue drains. The schedule says so, with `ReplacementHeld=True` in its conditions plus a one-off `WaitingForRepositorySlot` event, so a schedule that has quietly stopped firing always tells you why. This one resolves itself. If it keeps happening, raise the repository's mover concurrency.
+- **A run this schedule didn't start is still going**, for the same policy: a manual `kubectl kopiur snapshot now`, another schedule's run, or a `Snapshot` you wrote by hand. `Replace` only ever cancels its **own** runs, so it never touches that one. It waits for it instead, exactly like `Forbid`, and cancels nothing in the meantime, not even its own previous run. Once the other run finishes, the slot replaces its own run as usual. The schedule records `HeldByOtherRun=True` naming the blocking `Snapshot`, plus a one-off `OtherRunActive` event. This resolves itself.
 
 ### `policyRef` or `policySelector` — one recipe or many
 
@@ -967,6 +968,8 @@ spec:
 ```
 
 Absent, or `0`, means unlimited, which is the default and the behavior every previous release had. Setting it costs nothing until it binds.
+
+This cap is the one hard limit on how much runs at once against a repository. It counts every mover Job, whether a schedule fired it or you started it with `kubectl kopiur snapshot now` or the console. A schedule's `concurrencyPolicy` only keeps that schedule from overlapping runs of its own policies; it does not limit anything else.
 
 ### One pool, not one per work kind
 
@@ -1053,7 +1056,7 @@ A `Job` with `spec.suspend: true`, or a `Suspended=True` condition, has no pod a
 
 ### How the cap interacts with `concurrencyPolicy`
 
-A `SnapshotSchedule` applies its `concurrencyPolicy` to *its own* previous run, while the cap applies to the repository. They compose, and two combinations surprise people:
+A `SnapshotSchedule` applies its `concurrencyPolicy` to runs of *its own target policies*: its own previous run, and, under `Forbid` and `Replace`, any other unfinished run of the same policy, such as a manual `snapshot now`. The cap applies to the repository. It is the only absolute limit: it counts every mover Job against the repository, manual and scheduled alike, whatever any schedule's `concurrencyPolicy` says. They compose, and two combinations surprise people:
 
 - **`Forbid`, the default, plus a full pool.** The previous run is parked, not finished, so `Forbid` skips the new slot, as designed. A parked child therefore holds the next slot, and the one after, until the queue drains. This is the cap doing its job: the alternative would be an unbounded pile of `Pending` Snapshots for a repository that is already at capacity.
 - **`Replace` plus a parked victim.** Cancelling a queued run frees nothing, because it holds no slot, and the replacement would re-queue behind the same line. So `Replace` degrades to `Forbid`-like waiting. The schedule says so: `ReplacementHeld=True` with a one-off `WaitingForRepositorySlot` event. It clears itself once a slot frees. See [what `Replace` really cancels](#what-concurrencypolicy-replace-really-cancels).

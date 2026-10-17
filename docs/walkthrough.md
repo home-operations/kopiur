@@ -196,7 +196,7 @@ This is also identical in both tracks. Why these values:
 - **`cron: "H 2 * * *"`.** `H` is a Jenkins-style placeholder. It resolves to a fixed minute derived from the schedule's identity, so this fires at, say, 02:17 _every_ night. Fifty teams writing "nightly at 2" then stop stampeding the repository at 02:00:00, with nobody coordinating. The resolved next firing is pinned to `status.nextSchedule.at`.
 - **`jitter: 30m`** spreads the start across a window on top of `H`. It is kinder to the backend when many policies share it, and it costs you nothing for a nightly backup.
 - **`runOnCreate: false`**, the default, means applying this manifest does **not** immediately fire a backup. That is what you want under GitOps, where a re-applied manifest shouldn't mean a surprise snapshot at 3 pm. The trade-off is that your first backup waits for tonight, which is why the next step triggers one by hand.
-- **`concurrencyPolicy: Forbid`**, the default, skips a firing if the previous one is somehow still running, rather than stacking movers on the same PVC.
+- **`concurrencyPolicy: Forbid`**, the default, holds a firing while an earlier run of the same policy is still going, rather than stacking movers on the same PVC. That includes a run you started by hand with `kubectl kopiur snapshot now`: the scheduled slot waits for it, then fires. The repository's `spec.concurrency.maxConcurrentJobs` is the hard cap on how many runs, manual and scheduled, hit the repository at once.
 
 ```console
 $ kubectl -n demo get snapshotschedule app-data-nightly \

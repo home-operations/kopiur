@@ -650,6 +650,22 @@ pub const WAITING_FOR_REPOSITORY_SLOT_REASON: &str = "WaitingForRepositorySlot";
 /// `reason` for [`SCHEDULE_REPLACEMENT_HELD_CONDITION`] = `False` (not held).
 pub const REPLACEMENT_NOT_HELD_REASON: &str = "ReplacementNotHeld";
 
+/// `SnapshotSchedule` condition recording that `concurrencyPolicy: Forbid` (or
+/// `Replace`) is holding a due slot because a run this schedule did NOT start —
+/// a manual `kubectl kopiur snapshot now`, another schedule's run, or a
+/// hand-written `Snapshot` — is still in flight for one of the slot's target
+/// policies (#584). The slot fires once that run finishes; `Replace` never
+/// cancels a run it does not own.
+///
+/// Deliberately **not** a registered structural gate: it needs no human and
+/// clears on its own. It exists so the wait is visible in `status`, and so the
+/// accompanying Normal event fires once on entering the hold.
+pub const SCHEDULE_HELD_BY_OTHER_RUN_CONDITION: &str = "HeldByOtherRun";
+/// `reason`/Event reason for [`SCHEDULE_HELD_BY_OTHER_RUN_CONDITION`] = `True`.
+pub const OTHER_RUN_ACTIVE_REASON: &str = "OtherRunActive";
+/// `reason` for [`SCHEDULE_HELD_BY_OTHER_RUN_CONDITION`] = `False` (not held).
+pub const NO_OTHER_RUN_ACTIVE_REASON: &str = "NoOtherRunActive";
+
 /// `Restore` condition recording whether the object this restore's repository
 /// is DERIVED from exists. Set `False` (with
 /// [`RESTORE_REFERENT_MISSING_REASON`]) when the readiness gate cannot even

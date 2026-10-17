@@ -279,6 +279,28 @@ pub(crate) async fn snapshot_children(
     Ok(api.list(&lp).await?.items)
 }
 
+/// Every `Snapshot` in `namespace`, whatever its labels: the reflector store
+/// when published AND synced (namespace-filtered, C4), else a live LIST of the
+/// namespace. Same cold-cache rule as [`snapshot_children`] (R2): an unsynced
+/// store is never read as "no Snapshots" — a schedule's concurrency gate reads
+/// this to find runs it did not start (#584), and an empty answer would let it
+/// fire beside them.
+pub(crate) async fn namespace_snapshots(ctx: &Context, namespace: &str) -> Result<Vec<Snapshot>> {
+    let store = ctx.snapshot_store.get();
+    if read_from_store(store.is_some(), ctx.snapshot_synced.load(Ordering::Acquire))
+        && let Some(store) = store
+    {
+        return Ok(store
+            .state()
+            .iter()
+            .filter(|row| row.namespace().as_deref() == Some(namespace))
+            .map(|row| (**row).clone())
+            .collect());
+    }
+    let api: Api<Snapshot> = Api::namespaced(ctx.client.clone(), namespace);
+    Ok(api.list(&ListParams::default()).await?.items)
+}
+
 /// **Pure** (#382 M3, audits C2/C6): the trust-cache-for-selection /
 /// verify-live-before-acting skip decision. A row selected from the reflector
 /// store is actionable only if the LIVE read still finds it and it is not

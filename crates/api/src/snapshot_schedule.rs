@@ -158,12 +158,15 @@ pub struct ScheduleSpec {
 /// ```
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default, JsonSchema)]
 pub enum ConcurrencyPolicy {
-    /// Skip the new run rather than let runs pile up (default).
+    /// Hold the new run while a run of the same policy is in flight, whether this
+    /// schedule started it or not (a manual run, another schedule), rather than
+    /// let runs pile up (default).
     #[default]
     Forbid,
     /// Allow the new run to start alongside the in-flight one.
     Allow,
-    /// Cancel the in-flight run and start the new one in its place.
+    /// Cancel this schedule's in-flight run and start the new one in its place.
+    /// A run this schedule did not start is never cancelled; the slot waits for it.
     Replace,
 }
 

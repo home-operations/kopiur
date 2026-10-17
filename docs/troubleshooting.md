@@ -165,6 +165,20 @@ There is also a one-off `WaitingForRepositorySlot` Normal event on the schedule 
 
 ///
 
+### `HeldByOtherRun=True` — a scheduled slot waits for a manual run
+
+A `SnapshotSchedule` with `concurrencyPolicy: Forbid`, the default, or `Replace` does not start a run beside an unfinished run of the same policy, even one it did not start. That covers a `kubectl kopiur snapshot now`, a run from another schedule, or a hand-written `Snapshot`. The slot waits for it and then fires.
+
+```console
+$ kubectl get snapshotschedule <name> -n <ns> \
+    -o jsonpath='{.status.conditions[?(@.type=="HeldByOtherRun")]}{"\n"}'
+{"type":"HeldByOtherRun","status":"True","reason":"OtherRunActive","message":"waiting: Snapshot `pg-manual-...` is still backing up the same policy, ..."}
+```
+
+There is a one-off `OtherRunActive` Normal event when the hold starts. `Replace` never cancels a run it did not start, so it waits the same way.
+
+**This clears itself** when the named `Snapshot` finishes. Held slots still age against `startingDeadlineSeconds`, so a long manual run plus a short deadline skips the slot. If you want scheduled and manual runs to overlap, use `concurrencyPolicy: Allow`; the repository's `concurrency.maxConcurrentJobs` still caps the total.
+
 ### `CredentialsAvailable=False` — Secret missing in the workload namespace
 
 The mover loads credentials with `envFrom`, and `envFrom` is **namespace-local**. So the credential Secret must exist in the namespace where the data and the mover Job live, not just where the repository is defined.
