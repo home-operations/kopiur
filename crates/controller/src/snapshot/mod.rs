@@ -896,6 +896,11 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
                 // standing by a Job-creation patch that failed after the Job was
                 // already created. See `heal_slot_condition_in_flight`.
                 heal_slot_condition_in_flight(&api, backup, &name).await;
+                // #194 defense in depth: the Job exists, so a standing
+                // `MoverPermitted` != True is stale. Live-based patch, after the
+                // store-copy `snapshot_ready_status` write above; a no-op (no GET)
+                // in the steady state.
+                io::clear_stale_mover_permitted_in_flight(&api, backup).await;
                 return Ok(Action::requeue(Duration::from_secs(30)));
             }
         }
@@ -1532,10 +1537,13 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
     }
     // Permitted: clear any stale `MoverPermitted=False` from a prior reconcile.
     // Live-based (see `io::clear_work_condition_if_stale`) — the #464 heal ran
-    // above and this patch replaces the array it wrote.
+    // above and this patch replaces the array it wrote. `StaleCheck::Live`: the
+    // start-of-pass store copy may predate our own `MoverPermitted=False` echo, and
+    // a clear skipped here is never revisited once the Job exists (#194).
     io::clear_work_condition_if_stale(
         &api,
         backup,
+        io::StaleCheck::Live,
         MOVER_PERMITTED_CONDITION,
         "Permitted",
         "the mover is permitted in this namespace",
@@ -1652,8 +1660,16 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
             "credentials Secret(s) present in the mover namespace",
         )
     };
-    io::clear_work_condition_if_stale(&api, backup, CREDENTIALS_AVAILABLE_CONDITION, reason, note)
-        .await?;
+    // Live for the same #194 reason as the MoverPermitted clear above.
+    io::clear_work_condition_if_stale(
+        &api,
+        backup,
+        io::StaleCheck::Live,
+        CREDENTIALS_AVAILABLE_CONDITION,
+        reason,
+        note,
+    )
+    .await?;
     let creds_secrets = io::plain_creds(creds.names);
 
     // ADR §4.8: beforeSnapshot hooks (quiesce/flush) run to completion BEFORE the

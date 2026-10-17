@@ -3176,6 +3176,7 @@ async fn run_restore_mover(
         if outgoing {
             return Ok(MoverOutcome::Running { created: false });
         }
+        io::clear_stale_mover_permitted_in_flight(api, restore).await;
         return observe_restore_mover(ctx, restore, namespace, job_name, &job).await;
     }
 
@@ -3525,10 +3526,13 @@ async fn run_restore_mover(
     }
     // Permitted: clear any stale `MoverPermitted=False` from a prior reconcile.
     // Live-based (see `io::clear_work_condition_if_stale`) — the #464 heal ran
-    // above and this patch replaces the array it wrote.
+    // above and this patch replaces the array it wrote. `StaleCheck::Live`: the
+    // start-of-pass store copy may predate our own `MoverPermitted=False` echo, and
+    // a clear skipped here is never revisited once the Job exists (#194).
     io::clear_work_condition_if_stale(
         api,
         restore,
+        io::StaleCheck::Live,
         MOVER_PERMITTED_CONDITION,
         "Permitted",
         "the mover is permitted in this namespace",
@@ -3654,8 +3658,16 @@ async fn run_restore_mover(
             "credentials Secret(s) present in the mover namespace",
         )
     };
-    io::clear_work_condition_if_stale(api, restore, CREDENTIALS_AVAILABLE_CONDITION, reason, note)
-        .await?;
+    // Live for the same #194 reason as the MoverPermitted clear above.
+    io::clear_work_condition_if_stale(
+        api,
+        restore,
+        io::StaleCheck::Live,
+        CREDENTIALS_AVAILABLE_CONDITION,
+        reason,
+        note,
+    )
+    .await?;
     let creds_secrets = io::plain_creds(creds.names);
 
     let identity = MoverIdentity {

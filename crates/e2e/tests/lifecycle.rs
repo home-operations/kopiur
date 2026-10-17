@@ -681,7 +681,7 @@ async fn privileged_mover_requires_namespace_optin() {
     )
     .await
     .expect("annotate namespace for privileged movers");
-    wait_until(
+    if let Err(e) = wait_until(
         "e2e-priv-backup MoverPermitted=True (watch-delivered, beats the 300s backstop)",
         Duration::from_secs(240),
         poll_interval(),
@@ -691,7 +691,19 @@ async fn privileged_mover_requires_namespace_optin() {
         },
     )
     .await
-    .expect("the namespace opt-in must un-stick the Snapshot via the Namespace watch");
+    {
+        // #194: leave evidence. A still-`Pending` object with the refusal means the
+        // wake-up was lost; a `Running`/terminal one still carrying `False` means
+        // the pre-launch clear was skipped and never revisited.
+        let s = status_json(&backups, "e2e-priv-backup").await;
+        panic!(
+            "the namespace opt-in must un-stick the Snapshot via the Namespace watch: {e:#}\n\
+             final status.phase={}\nfinal status.conditions={}",
+            s.get("phase").unwrap_or(&serde_json::Value::Null),
+            serde_json::to_string_pretty(s.get("conditions").unwrap_or(&serde_json::Value::Null))
+                .unwrap_or_default(),
+        );
+    }
 
     // Cleanup.
     let _ = crepos

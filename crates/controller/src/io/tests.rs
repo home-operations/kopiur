@@ -5077,6 +5077,7 @@ fn the_inherit_heal_precedes_every_non_terminal_gate_it_could_shadow() {
             "io::upsert_gate(",
             "io::upsert_condition(",
             "io::clear_work_condition_if_stale(",
+            "io::clear_stale_mover_permitted_in_flight(",
             "\"conditions\":",
         ] {
             assert!(
@@ -5431,4 +5432,218 @@ fn the_not_annotated_refusal_names_the_annotation() {
         !msg.contains("403"),
         "a readable namespace's refusal must not mention a 403: {msg}"
     );
+}
+
+// --- #194: the pre-launch clear must not trust the reconcile-start store copy ---
+
+mod stale_work_condition_clear {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    use http::{Request, Response, StatusCode};
+    use kube::client::Body;
+    use kube::{Api, Client};
+
+    use crate::consts::MOVER_PERMITTED_CONDITION;
+
+    fn cond(type_: &str, status: &str) -> Condition {
+        Condition {
+            type_: type_.into(),
+            status: status.into(),
+            reason: "X".into(),
+            message: "m".into(),
+            last_transition_time: Time(k8s_openapi::jiff::Timestamp::from_second(0).unwrap()),
+            observed_generation: None,
+        }
+    }
+
+    #[test]
+    fn live_check_never_skips_the_read() {
+        // The #194 store copy: the controller's own `MoverPermitted=False` echo has
+        // not been ingested yet, so the copy shows nothing to clear.
+        assert!(!may_skip_live_read(
+            StaleCheck::Live,
+            &[],
+            MOVER_PERMITTED_CONDITION
+        ));
+        assert!(!may_skip_live_read(
+            StaleCheck::Live,
+            &[cond(MOVER_PERMITTED_CONDITION, "True")],
+            MOVER_PERMITTED_CONDITION
+        ));
+    }
+
+    #[test]
+    fn store_copy_check_skips_only_when_the_copy_shows_no_block() {
+        assert!(may_skip_live_read(
+            StaleCheck::StoreCopy,
+            &[],
+            MOVER_PERMITTED_CONDITION
+        ));
+        assert!(may_skip_live_read(
+            StaleCheck::StoreCopy,
+            &[
+                cond(MOVER_PERMITTED_CONDITION, "True"),
+                cond("Ready", "False")
+            ],
+            MOVER_PERMITTED_CONDITION
+        ));
+        assert!(!may_skip_live_read(
+            StaleCheck::StoreCopy,
+            &[cond(MOVER_PERMITTED_CONDITION, "False")],
+            MOVER_PERMITTED_CONDITION
+        ));
+    }
+
+    fn restore_json(conditions: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": "kopiur.home-operations.com/v1alpha1",
+            "kind": "Restore",
+            "metadata": { "name": "r", "namespace": "ns", "generation": 1 },
+            "spec": {
+                "source": { "snapshotRef": { "name": "b" } },
+                "target": { "pvcRef": { "name": "t" } }
+            },
+            "status": { "phase": "Pending", "conditions": conditions }
+        })
+    }
+
+    type Log = Arc<Mutex<Vec<(String, serde_json::Value)>>>;
+
+    /// A Client answering every request with `live`, recording `(method, body)`.
+    fn mock_api(live: serde_json::Value, log: Log) -> Api<kopiur_api::Restore> {
+        let live = Arc::new(live);
+        let svc = tower::service_fn(move |req: Request<Body>| {
+            let live = live.clone();
+            let log = log.clone();
+            async move {
+                let method = req.method().as_str().to_string();
+                let bytes = http_body_util::BodyExt::collect(req.into_body())
+                    .await
+                    .expect("collect request body")
+                    .to_bytes();
+                let body: serde_json::Value =
+                    serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+                log.lock().unwrap().push((method, body));
+                let resp = Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&*live).unwrap()))
+                    .unwrap();
+                Ok::<_, std::convert::Infallible>(resp)
+            }
+        });
+        Api::namespaced(Client::new(svc, "ns"), "ns")
+    }
+
+    fn live_blocked() -> serde_json::Value {
+        restore_json(serde_json::json!([{
+            "type": MOVER_PERMITTED_CONDITION, "status": "False",
+            "reason": "PrivilegedMoverNotPermitted", "message": "m",
+            "lastTransitionTime": "2026-01-01T00:00:00Z"
+        }]))
+    }
+
+    fn methods(log: &Log) -> Vec<String> {
+        log.lock().unwrap().iter().map(|(m, _)| m.clone()).collect()
+    }
+
+    /// THE #194 regression: the reconcile-start copy has no conditions (the echo
+    /// is not in the store yet) while the LIVE object carries `MoverPermitted=False`.
+    /// A `Live` check must read and clear it; a `StoreCopy` check (the old
+    /// unconditional behavior at the pre-launch sites) silently skips — which was
+    /// permanent once the Job existed.
+    #[tokio::test]
+    async fn live_check_clears_a_block_the_store_copy_has_not_seen() {
+        let stale_copy: kopiur_api::Restore =
+            serde_json::from_value(restore_json(serde_json::json!([]))).unwrap();
+
+        let log: Log = Arc::default();
+        let api = mock_api(live_blocked(), log.clone());
+        clear_work_condition_if_stale(
+            &api,
+            &stale_copy,
+            StaleCheck::Live,
+            MOVER_PERMITTED_CONDITION,
+            "Permitted",
+            "ok",
+        )
+        .await
+        .unwrap();
+        assert_eq!(methods(&log), vec!["GET", "PATCH"]);
+        let patch = log.lock().unwrap()[1].1.clone();
+        let mp = patch["status"]["conditions"]
+            .as_array()
+            .expect("conditions")
+            .iter()
+            .find(|c| c["type"] == MOVER_PERMITTED_CONDITION)
+            .cloned()
+            .expect("MoverPermitted written");
+        assert_eq!(mp["status"], "True");
+
+        let log: Log = Arc::default();
+        let api = mock_api(live_blocked(), log.clone());
+        clear_work_condition_if_stale(
+            &api,
+            &stale_copy,
+            StaleCheck::StoreCopy,
+            MOVER_PERMITTED_CONDITION,
+            "Permitted",
+            "ok",
+        )
+        .await
+        .unwrap();
+        assert!(
+            methods(&log).is_empty(),
+            "StoreCopy trusts the copy: no request"
+        );
+    }
+
+    /// The steady state stays write-free under `Live`: one GET, no PATCH, when the
+    /// live object carries no block.
+    #[tokio::test]
+    async fn live_check_writes_nothing_when_nothing_is_blocked() {
+        let copy: kopiur_api::Restore =
+            serde_json::from_value(restore_json(serde_json::json!([]))).unwrap();
+        let log: Log = Arc::default();
+        let api = mock_api(restore_json(serde_json::json!([])), log.clone());
+        clear_work_condition_if_stale(
+            &api,
+            &copy,
+            StaleCheck::Live,
+            MOVER_PERMITTED_CONDITION,
+            "Permitted",
+            "ok",
+        )
+        .await
+        .unwrap();
+        assert_eq!(methods(&log), vec!["GET"]);
+    }
+
+    /// Source guard: every pre-launch gate clear in both work reconcilers passes
+    /// `StaleCheck::Live`. A `StoreCopy` there reintroduces #194 (a stale
+    /// `MoverPermitted=False`/`CredentialsAvailable=False` that is never revisited
+    /// once the mover Job exists).
+    #[test]
+    fn pre_launch_gate_clears_read_live() {
+        const SNAPSHOT_SRC: &str = include_str!("../snapshot/mod.rs");
+        const RESTORE_SRC: &str = include_str!("../restore/mod.rs");
+        const CALL: &str = "io::clear_work_condition_if_stale(";
+        for (kind, src) in [("snapshot", SNAPSHOT_SRC), ("restore", RESTORE_SRC)] {
+            let sites: Vec<usize> = src.match_indices(CALL).map(|(i, _)| i).collect();
+            assert_eq!(
+                sites.len(),
+                2,
+                "{kind}: expected the MoverPermitted + CredentialsAvailable clears"
+            );
+            for at in sites {
+                let args_end = at + src[at..].find(".await").expect("awaited");
+                assert!(
+                    src[at..args_end].contains("io::StaleCheck::Live"),
+                    "{kind}: a pre-launch `clear_work_condition_if_stale` must pass \
+                     `io::StaleCheck::Live` (#194)"
+                );
+            }
+        }
+    }
 }

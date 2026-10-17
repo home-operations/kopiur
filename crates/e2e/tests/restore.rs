@@ -739,9 +739,19 @@ async fn privileged_restore_mover_requires_namespace_optin() {
     annotate_namespace(&client, RESTORE_NS, PRIVILEGED_ANNOTATION, "true")
         .await
         .expect("annotate restore namespace");
-    wait_condition(&restores, "e2e-privr-restore", "MoverPermitted", "True")
-        .await
-        .expect("MoverPermitted clears once the namespace opts in");
+    if let Err(e) = wait_condition(&restores, "e2e-privr-restore", "MoverPermitted", "True").await {
+        // #194: leave evidence. A still-`Pending` Restore with the refusal means the
+        // wake-up was lost; a `Restoring`/terminal one still carrying `False` means
+        // the pre-launch clear was skipped and never revisited.
+        let s = status_json(&restores, "e2e-privr-restore").await;
+        panic!(
+            "MoverPermitted clears once the namespace opts in: {e:#}\n\
+             final status.phase={}\nfinal status.conditions={}",
+            s.get("phase").unwrap_or(&serde_json::Value::Null),
+            serde_json::to_string_pretty(s.get("conditions").unwrap_or(&serde_json::Value::Null))
+                .unwrap_or_default(),
+        );
+    }
 
     let _ = crepos
         .delete("e2e-privr-crepo", &DeleteParams::default())

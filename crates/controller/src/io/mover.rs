@@ -1585,15 +1585,51 @@ where
     Ok(())
 }
 
+/// How [`clear_work_condition_if_stale`] decides whether a clear is needed before
+/// it pays for a live read. Exhaustive at every call site so the cost/soundness
+/// trade-off is chosen explicitly, never by a defaulted bool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StaleCheck {
+    /// Trust the reconcile-start (reflector-store) copy: no non-`True` entry there
+    /// means no GET and no write. Sound ONLY where the store has demonstrably
+    /// caught up with this controller's own earlier condition writes — the
+    /// Job-exists observe paths, which run on a later pass than the pre-launch
+    /// gate that wrote the block (and are re-polled every ~30s until terminal,
+    /// so a still-lagging store is retried, not trusted forever).
+    StoreCopy,
+    /// Always re-read live. Required at the PRE-LAUNCH gate sites: the first
+    /// post-unblock pass can run off a store copy older than the controller's own
+    /// `<condition>=False` echo, and a skipped clear there was permanent — the
+    /// mover Job then exists, the gate is never revisited, and the stale block
+    /// rides the object to its terminal phase (#194). Costs one GET per
+    /// pre-launch pass per condition, i.e. roughly once per backup/restore, since
+    /// these sites stop running once the Job exists.
+    Live,
+}
+
+/// Whether [`clear_work_condition_if_stale`] may return without a live read:
+/// only under [`StaleCheck::StoreCopy`], and only when the store copy carries no
+/// non-`True` `condition`. Pure, so the #194 decision is unit-tested directly.
+pub(crate) fn may_skip_live_read(
+    check: StaleCheck,
+    store_conditions: &[Condition],
+    condition: &str,
+) -> bool {
+    match check {
+        StaleCheck::StoreCopy => !condition_is_not_true(store_conditions, condition),
+        StaleCheck::Live => false,
+    }
+}
+
 /// Clear a standing `<condition>=False` on a `Snapshot`/`Restore` whose blocker is
 /// now gone — the shared shape behind the `MoverPermitted` and
 /// `CredentialsAvailable` clears on both work kinds.
 ///
 /// Two-stage on purpose, the [`crate::snapshot::clear_source_pvc_gate_if_parked`]
 /// discipline:
-/// 1. a cheap pre-check on the reconcile-start copy, so the overwhelming majority
-///    of runs (which never tripped the gate) pay no live GET and write nothing at
-///    all; then
+/// 1. an optional cheap pre-check on the reconcile-start copy (see [`StaleCheck`]
+///    for when that copy may be trusted), so runs that never tripped the gate pay
+///    no live GET and write nothing at all; then
 /// 2. a live re-read as the patch BASE and a re-check against it, because a
 ///    `conditions` patch REPLACES the array and this clear is never the first
 ///    conditions writer of its pass — the #464 inherit heal runs ahead of it, and
@@ -1602,10 +1638,13 @@ where
 ///    made `kubectl kopiur doctor` name a scaled-up workload as the blocker while
 ///    the real one (a missing Secret) sat one slot later in the same array.
 ///
-/// Returns without writing when the object vanished mid-reconcile.
+/// Either way a run whose LIVE array has no non-`True` `condition` writes nothing,
+/// so the steady state stays a no-op. Returns without writing when the object
+/// vanished mid-reconcile.
 pub async fn clear_work_condition_if_stale<K>(
     api: &Api<K>,
     obj: &K,
+    check: StaleCheck,
     condition: &str,
     reason: &str,
     message: &str,
@@ -1623,7 +1662,7 @@ where
             .and_then(|v| v.get("status").cloned())
             .as_ref(),
     );
-    if !condition_is_not_true(&stale, condition) {
+    if may_skip_live_read(check, &stale, condition) {
         return Ok(());
     }
     let name = obj.name_any();
@@ -1649,6 +1688,42 @@ where
     );
     super::patch_status(api, &name, serde_json::json!({ "conditions": conditions })).await?;
     Ok(())
+}
+
+/// Defense in depth for #194, called from the Job-EXISTS observe paths of both work
+/// kinds: a mover Job existing proves the privileged-movers gate passed, so any
+/// standing `MoverPermitted` that is not `True` is stale by construction — clear it.
+///
+/// [`StaleCheck::StoreCopy`] is sound here (the store has caught up with the
+/// pre-launch pass's echo by now, and an in-flight Job is re-polled every ~30s), and it
+/// keeps the steady state a true no-op: no GET, no write. Best-effort — a failed
+/// clear must not abort the observation of the run's outcome; the next poll retries.
+/// Must run AFTER any status write in the same pass that rebuilds `conditions` from
+/// the reconcile-start copy, or that write would resurrect the block.
+pub async fn clear_stale_mover_permitted_in_flight<K>(api: &Api<K>, obj: &K)
+where
+    K: kube::Resource<DynamicType = ()>
+        + Clone
+        + serde::Serialize
+        + serde::de::DeserializeOwned
+        + std::fmt::Debug,
+{
+    if let Err(e) = clear_work_condition_if_stale(
+        api,
+        obj,
+        StaleCheck::StoreCopy,
+        crate::consts::MOVER_PERMITTED_CONDITION,
+        "Permitted",
+        "the mover is permitted in this namespace",
+    )
+    .await
+    {
+        tracing::debug!(
+            name = %obj.name_any(),
+            error = %e,
+            "could not clear stale MoverPermitted on an in-flight run; will retry"
+        );
+    }
 }
 
 /// Whether `conditions` carries `condition` at a non-`True` status — i.e. a stale

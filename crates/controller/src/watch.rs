@@ -809,46 +809,61 @@ pub fn cluster_repository_to_pending_snapshots(
     select(store, snapshot_awaiting_launch)
 }
 
-// --- Namespace -> privileged-mover-blocked Snapshot / Restore ----------------
+// --- Namespace -> not-yet-launched Snapshot / Restore ------------------------
+//
+// A Namespace event (the `kopiur.home-operations.com/privileged-movers` opt-in
+// landing) re-enqueues every NOT-YET-LAUNCHED Snapshot/Restore in it. The filter
+// is deliberately the object's PHASE, not its `MoverPermitted=False` condition:
+// that condition is the controller's OWN echo, and when the Namespace event beats
+// the reflector's ingestion of it the blocked object read as unblocked and the
+// wake-up was dropped — recovery then waited out the 300s structural backoff
+// (#194). Phase-based selection still excludes Running/terminal/Discovered, so the
+// hundreds of retained GFS Snapshots in a namespace are never enqueued; a spurious
+// reconcile of an unblocked pending object is idempotent.
 
-/// Whether `conditions` carry a `MoverPermitted != True` entry — the marker a
-/// reconciler leaves when it refuses a privileged mover because the namespace
-/// has not opted in (`kopiur.home-operations.com/privileged-movers`).
-fn mover_blocked(conditions: &[k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition]) -> bool {
-    conditions
-        .iter()
-        .any(|c| c.type_ == crate::consts::MOVER_PERMITTED_CONDITION && c.status != "True")
+/// Whether a `Restore` has not launched its mover Job yet — the only Restores a
+/// privileged-movers opt-in can unblock. `None`/`Pending`/`Resolving` are
+/// pre-launch; `Restoring` has a Job, `Completed`/`Failed` are terminal, and an
+/// unrecognized phase is not knowably pre-launch. Not deleting, as for
+/// [`snapshot_awaiting_launch`]. Exhaustive over
+/// [`kopiur_api::restore::RestorePhase`], so a new phase must decide here.
+fn restore_awaiting_launch(r: &Restore) -> bool {
+    use kopiur_api::restore::RestorePhase;
+    if r.metadata.deletion_timestamp.is_some() {
+        return false;
+    }
+    match r.status.as_ref().and_then(|st| st.phase.as_ref()) {
+        None | Some(RestorePhase::Pending | RestorePhase::Resolving) => true,
+        Some(
+            RestorePhase::Restoring
+            | RestorePhase::Completed
+            | RestorePhase::Failed
+            | RestorePhase::Unknown(_),
+        ) => false,
+    }
 }
 
-/// Snapshots in the changed `Namespace` that are blocked on the
-/// privileged-movers opt-in. Re-enqueued so the annotation takes effect the
-/// moment an admin adds it — the blocked CR's own requeue is only a slow
+/// Not-yet-launched Snapshots in the changed `Namespace` — the set a
+/// privileged-movers opt-in can unblock. Re-enqueued so the annotation takes
+/// effect the moment an admin adds it; the blocked CR's own requeue is only a slow
 /// watch-desync backstop (`Error::BlockedOnGrant`).
 pub fn namespace_to_snapshots(
     store: &Store<Snapshot>,
     namespace: &PartialObjectMeta<Namespace>,
 ) -> Vec<ObjectRef<Snapshot>> {
     let ns = namespace.name_any();
-    select(store, |s: &Snapshot| {
-        s.namespace().as_deref() == Some(ns.as_str())
-            && s.status
-                .as_ref()
-                .is_some_and(|st| mover_blocked(&st.conditions))
-    })
+    select(store, |s: &Snapshot| pending_snapshot_in_namespace(s, &ns))
 }
 
-/// Restores in the changed `Namespace` blocked on the privileged-movers opt-in
-/// (same contract as [`namespace_to_snapshots`]).
+/// Not-yet-launched Restores in the changed `Namespace` (same contract as
+/// [`namespace_to_snapshots`]).
 pub fn namespace_to_restores(
     store: &Store<Restore>,
     namespace: &PartialObjectMeta<Namespace>,
 ) -> Vec<ObjectRef<Restore>> {
     let ns = namespace.name_any();
     select(store, |r: &Restore| {
-        r.namespace().as_deref() == Some(ns.as_str())
-            && r.status
-                .as_ref()
-                .is_some_and(|st| mover_blocked(&st.conditions))
+        restore_awaiting_launch(r) && r.namespace().as_deref() == Some(ns.as_str())
     })
 }
 
@@ -941,32 +956,123 @@ mod tests {
         ));
     }
 
+    /// A `Namespace` metadata event, as the namespace watch delivers it.
+    fn ns_event(name: &str) -> PartialObjectMeta<Namespace> {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "Namespace",
+            "metadata": { "name": name },
+        }))
+        .expect("namespace meta fixture")
+    }
+
+    /// A Restore in `ns` at `phase` (`None` = no status at all), carrying NO
+    /// conditions — exactly what the reflector holds when the Namespace event beats
+    /// its ingestion of the controller's own `MoverPermitted=False` echo (#194).
+    fn restore_at(name: &str, ns: &str, phase: Option<&str>) -> Restore {
+        let mut v = serde_json::json!({
+            "apiVersion": "kopiur.home-operations.com/v1alpha1",
+            "kind": "Restore",
+            "metadata": { "name": name, "namespace": ns },
+            "spec": {
+                "source": { "snapshotRef": { "name": "b" } },
+                "target": { "pvcRef": { "name": "t" } }
+            },
+        });
+        if let Some(p) = phase {
+            v["status"] = serde_json::json!({ "phase": p });
+        }
+        serde_json::from_value(v).expect("restore fixture")
+    }
+
+    /// #194: the namespace mapper must not depend on the controller's own
+    /// `MoverPermitted=False` echo having reached the store. A not-yet-launched
+    /// Restore with NO conditions is still re-enqueued when the opt-in lands;
+    /// launched/terminal ones and other namespaces are not.
     #[test]
-    fn namespace_mapper_targets_only_mover_blocked_objects() {
-        use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
-        let refused = Condition {
-            type_: crate::consts::MOVER_PERMITTED_CONDITION.into(),
-            status: "False".into(),
-            reason: crate::consts::PRIVILEGED_MOVER_NOT_PERMITTED_REASON.into(),
-            message: String::new(),
-            last_transition_time: Time(k8s_openapi::jiff::Timestamp::now()),
-            observed_generation: None,
+    fn namespace_mapper_enqueues_unlaunched_restores_without_the_echo() {
+        use kube::runtime::reflector::store;
+        use kube::runtime::watcher::Event;
+        let (reader, mut writer) = store::<Restore>();
+        for r in [
+            restore_at("pending-no-conds", "media", Some("Pending")),
+            restore_at("no-status", "media", None),
+            restore_at("resolving", "media", Some("Resolving")),
+            restore_at("restoring", "media", Some("Restoring")),
+            restore_at("completed", "media", Some("Completed")),
+            restore_at("failed", "media", Some("Failed")),
+            restore_at("future-phase", "media", Some("Staging")),
+            restore_at("pending-elsewhere", "other", Some("Pending")),
+        ] {
+            writer.apply_watcher_event(&Event::Apply(r));
+        }
+        let mut hits: Vec<String> = namespace_to_restores(&reader, &ns_event("media"))
+            .into_iter()
+            .map(|r| r.name)
+            .collect();
+        hits.sort();
+        assert_eq!(hits, vec!["no-status", "pending-no-conds", "resolving"]);
+    }
+
+    /// #194, Snapshot side: same contract, and the hundreds of retained GFS
+    /// Snapshots (Succeeded/Discovered/…) in a namespace are never enqueued.
+    #[test]
+    fn namespace_mapper_enqueues_unlaunched_snapshots_without_the_echo() {
+        use kopiur_api::snapshot::SnapshotPhase;
+        use kube::runtime::reflector::store;
+        use kube::runtime::watcher::Event;
+        let at = |name: &str, ns: &str, phase: Option<SnapshotPhase>| {
+            let mut s = snap(name, false, true, None);
+            s.metadata.namespace = Some(ns.into());
+            if let Some(st) = s.status.as_mut() {
+                st.phase = phase;
+            }
+            s
         };
-        // The refusal marker → mapped (the namespace grant must re-enqueue it).
-        assert!(mover_blocked(std::slice::from_ref(&refused)));
-        // Permitted (True) or unrelated conditions → not mapped: a namespace
-        // event must not re-enqueue every Snapshot in the namespace.
-        let permitted = Condition {
-            status: "True".into(),
-            ..refused.clone()
-        };
-        assert!(!mover_blocked(&[permitted]));
-        let unrelated = Condition {
-            type_: "Ready".into(),
-            ..refused
-        };
-        assert!(!mover_blocked(&[unrelated]));
-        assert!(!mover_blocked(&[]));
+        let (reader, mut writer) = store::<Snapshot>();
+        for s in [
+            at("pending-no-conds", "media", Some(SnapshotPhase::Pending)),
+            at("no-phase", "media", None),
+            at("running", "media", Some(SnapshotPhase::Running)),
+            at("succeeded", "media", Some(SnapshotPhase::Succeeded)),
+            at("discovered", "media", Some(SnapshotPhase::Discovered)),
+            at("pending-elsewhere", "other", Some(SnapshotPhase::Pending)),
+        ] {
+            writer.apply_watcher_event(&Event::Apply(s));
+        }
+        let mut hits: Vec<String> = namespace_to_snapshots(&reader, &ns_event("media"))
+            .into_iter()
+            .map(|r| r.name)
+            .collect();
+        hits.sort();
+        assert_eq!(hits, vec!["no-phase", "pending-no-conds"]);
+    }
+
+    #[test]
+    fn restore_awaiting_launch_is_pre_launch_phases_only() {
+        assert!(restore_awaiting_launch(&restore_at("a", "n", None)));
+        assert!(restore_awaiting_launch(&restore_at(
+            "a",
+            "n",
+            Some("Pending")
+        )));
+        assert!(restore_awaiting_launch(&restore_at(
+            "a",
+            "n",
+            Some("Resolving")
+        )));
+        for p in ["Restoring", "Completed", "Failed", "Staging"] {
+            assert!(
+                !restore_awaiting_launch(&restore_at("a", "n", Some(p))),
+                "{p}"
+            );
+        }
+        let mut deleting = restore_at("a", "n", Some("Pending"));
+        deleting.metadata.deletion_timestamp =
+            Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+                k8s_openapi::jiff::Timestamp::from_second(1_700_000_000).unwrap(),
+            ));
+        assert!(!restore_awaiting_launch(&deleting));
     }
 
     // --- M4: repository -> deleting Snapshots (ack drain) ----------------
