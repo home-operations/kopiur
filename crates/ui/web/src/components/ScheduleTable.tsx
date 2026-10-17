@@ -35,6 +35,7 @@ export function ScheduleTable({ schedules, renderAction, now = new Date() }: Sch
   return (
     <ColumnLedger
       id="schedules"
+      rowLinks
       label="Schedules"
       className="schedule-table"
       columns={renderAction === undefined ? SCHEDULE_COLUMNS : SCHEDULE_COLUMNS_WITH_ACTION}

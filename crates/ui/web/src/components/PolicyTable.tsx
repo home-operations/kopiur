@@ -33,6 +33,7 @@ export function PolicyTable({ policies, now = new Date() }: PolicyTableProps) {
   return (
     <ColumnLedger
       id="policies"
+      rowLinks
       label="Policies"
       className="policy-table"
       columns={POLICY_COLUMNS}

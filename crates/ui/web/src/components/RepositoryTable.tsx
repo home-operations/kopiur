@@ -45,6 +45,7 @@ export function RepositoryTable({ repositories, caption = "Repositories" }: Repo
   return (
     <ColumnLedger
       id="repositories"
+      rowLinks
       label={caption}
       className="repo-table"
       columns={REPOSITORY_COLUMNS}

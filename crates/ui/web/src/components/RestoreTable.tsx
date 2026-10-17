@@ -33,6 +33,7 @@ export function RestoreTable({ restores, now = new Date() }: RestoreTableProps) 
   return (
     <ColumnLedger
       id="restores"
+      rowLinks
       label="Restores"
       className="restore-table"
       columns={RESTORE_COLUMNS}

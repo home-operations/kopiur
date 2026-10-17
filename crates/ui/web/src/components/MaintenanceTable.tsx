@@ -52,6 +52,7 @@ export function MaintenanceTable({ rows, renderAction, now = new Date() }: Maint
   return (
     <ColumnLedger
       id="maintenance"
+      rowLinks
       label="Maintenance"
       className="maintenance-table"
       columns={renderAction === undefined ? MAINTENANCE_COLUMNS : MAINTENANCE_COLUMNS_WITH_ACTION}

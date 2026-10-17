@@ -54,6 +54,7 @@ export function ReplicationTable({ rows, now = new Date() }: ReplicationTablePro
   return (
     <ColumnLedger
       id="replications"
+      rowLinks
       label="Replications"
       className="replication-table"
       columns={REPLICATION_COLUMNS}

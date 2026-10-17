@@ -9,6 +9,7 @@ import { InspectLink } from "../../InspectLink";
 import { KindChip } from "../../KindMark";
 import { snapshotCount, retentionRules } from "../../policy";
 import { LastSuccess } from "../../PolicyTable";
+import { ROW_LINK_ROW, followRowLink } from "../../rowLink";
 import { snapshotPhaseLamp } from "../../snapshot";
 import { DrawerSection } from "../DrawerSection";
 
@@ -216,7 +217,13 @@ function RecentSnapshots({ snapshots, now }: { snapshots: readonly SnapshotRow[]
         </thead>
         <tbody>
           {snapshots.map((snapshot) => (
-            <tr key={`${snapshot.namespace}/${snapshot.name}`} data-kind="snapshot">
+            <tr
+              key={`${snapshot.namespace}/${snapshot.name}`}
+              data-kind="snapshot"
+              className={ROW_LINK_ROW}
+              onClick={followRowLink}
+              onAuxClick={followRowLink}
+            >
               <td className="has-stripe">
                 <div className="table__object">
                   <KindChip kind="snapshot" size="sm" />

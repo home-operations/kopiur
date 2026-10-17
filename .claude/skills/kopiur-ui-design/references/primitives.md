@@ -507,12 +507,12 @@ first cell; related objects as references; numbers right-aligned.
       </tr>
     </thead>
     <tbody>
-      <tr data-kind="snapshot">
+      <tr data-kind="snapshot" class="row--link">
         <td class="has-stripe">
           <span class="table__object"
             ><span class="kind-chip kind-chip--sm" aria-hidden="true"><svg /></span>
             <span
-              ><a href="…"><code>app-data-manual</code></a
+              ><a class="row-link" href="…"><code>app-data-manual</code></a
               ><span class="object-ns">kopiur-dev</span></span
             ></span
           >
@@ -581,6 +581,44 @@ Rows arrive in the server's order (namespace, then name; snapshots newest
 first) until someone sorts them. A wide table scrolls
 inside `.ledger-scroll` rather than starving a column. Long names wrap at `/` and `-`
 (`overflow-wrap: anywhere` on `code`), never ellipsised in a table.
+
+### Whole-row link (a click handler, never a stretched cover)
+
+A list row opens its object from anywhere in the row. The row's name is its one
+real link, `<a class="row-link">` (an `InspectLink`) — the keyboard and
+screen-reader path. A pointer click on a plain part of the row is forwarded to
+that anchor by `followRowLink` (`components/rowLink.ts`); the `<tr>` opts in
+with `class="row--link"` (the pointer and the hover tint — a class, not
+`:has()`), `onClick={followRowLink}` and `onAuxClick={followRowLink}`. A
+`ColumnLedger` does all three when given `rowLinks`; a hand-drawn table (the
+policy drawer's recent snapshots) sets them itself.
+
+- A click inside another link, button, `summary`, form control, `label` or
+  `[role=button]`-like control keeps its own meaning, and so does a click
+  inside something the row portals out of the table (a popover's clicks still
+  bubble through React).
+- A click that ends a text selection does nothing, so a name can be selected
+  and copied.
+- The click is re-dispatched on the link **with its modifier keys**, so the
+  router's `Link` treats it exactly as a click on the name: plain opens the
+  drawer, ctrl/⌘/shift/alt are left to the browser (new tab, new window). A
+  middle-click (`auxclick`, button 1) opens the link's address in a new tab.
+- **Never** give the `<tr>` a `tabindex` or a `role` — the anchor is the one
+  focus stop per row.
+
+**Do not stretch the link's `::after` over a table row** (`tr { position:
+relative }` + `.row-link::after { position: absolute; inset: 0 }`). Shipping
+Safari does not make a `<tr>` a containing block ([WebKit bug
+240961](https://bugs.webkit.org/show_bug.cgi?id=240961)) and Firefox ESR 115 has
+no `:has()`, so the cover sized against the table, every row's cover filled
+it, and the last row's won: every row opened the last object (#583). It passed
+in Chromium, which is why it shipped. `components/rowLink.test.ts` fails if a
+`.row-link::after` cover or a `tr…:has()` selector comes back, or if a table
+that renders a `row-link` does not opt in; `ColumnLedger.test.tsx` and
+`drawer/policy/PolicyTabs.test.tsx` click plain cells of the first and last
+rows. The overview's attention and activity rows are positioned grid blocks,
+not table rows, so they keep the stretched cover (scoped to
+`.attention-row`/`.activity-row`), with their other links lifted above it.
 
 ### Sorting
 

@@ -246,17 +246,21 @@ td.has-stripe::before {
   background: var(--kc);
 }
 
-/* A whole-row link: the row's name link is stretched over the row, so the
-   row is one target; any other link or button in it sits above the cover and
-   keeps its own click. The stripe cell gives up its own positioning so the
-   cover — and the stripe — measure from the row. */
-tr:has(.row-link) {
-  position: relative;
+/* A whole-row link in a table: the row's name is its one real link, and a
+   click anywhere else in the row is forwarded to it by `followRowLink`
+   (components/rowLink.ts), which the row opts into with this class.
+
+   Never stretch the link's ::after over a <tr> instead. Shipping Safari does
+   not make a table row a containing block (WebKit bug 240961), and Firefox
+   ESR 115 has no :has(), so the cover sized against the table, every row's
+   cover filled it and the last row's won: every row opened the last object
+   (#583). Nothing here may depend on a positioned <tr> or on :has(). */
+tr.row--link {
   cursor: pointer;
 }
 
-tr:has(.row-link) td.has-stripe {
-  position: static;
+tr.row--link:hover > td {
+  background: var(--bg-hover);
 }
 
 /* The row is the link, so its name needs no underline to say so. */
@@ -264,19 +268,14 @@ tr:has(.row-link) td.has-stripe {
   text-decoration: none;
 }
 
-.row-link::after {
+/* The overview's rows are positioned grid blocks, not table rows, so their
+   name can still be stretched over them; their other links and buttons sit
+   above the cover (below, with the rows). */
+.attention-row .row-link::after,
+.activity-row .row-link::after {
   content: "";
   position: absolute;
   inset: 0;
-}
-
-tr:has(.row-link) :is(a, button, summary, input, select):not(.row-link) {
-  position: relative;
-  z-index: 1;
-}
-
-tr:has(.row-link):hover > td {
-  background: var(--bg-hover);
 }
 
 /* ---- base ---------------------------------------------------------------- */

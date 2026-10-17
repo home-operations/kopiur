@@ -4,12 +4,14 @@ import {
   createRootRoute,
   createRouter,
 } from "@tanstack/react-router";
-import { act, fireEvent, render, screen, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { beforeEach, describe, expect, it } from "vitest";
+import { createPortal } from "react-dom";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { bodyRows, nth } from "../test-utils";
 import { ColumnLedger } from "./ColumnLedger";
+import { InspectLink } from "./InspectLink";
 import { COLUMNS_KEY, forgetColumnPrefs, setHidden } from "./columnPrefs";
 import type { ColumnSpec } from "./tableColumns";
 
@@ -290,5 +292,202 @@ describe("ColumnLedger", () => {
       fireEvent.click(handle);
       expect(search(table).sort).toBeUndefined();
     });
+  });
+});
+
+/*
+ * The whole row opens its object — without a stretched `::after` cover.
+ *
+ * Shipping Safari does not make a `<tr>` a containing block (WebKit bug
+ * 240961), so a cover meant to fill the row filled the table instead and every
+ * row opened the LAST one (#583). The row now forwards a click on a plain cell
+ * to its own `a.row-link`; these pin that each row reaches its own object and
+ * that nothing else in the row is hijacked.
+ */
+describe("ColumnLedger — whole-row link", () => {
+  type LinkId = "name" | "phase" | "repo" | "run";
+  const LINK_COLUMNS: readonly ColumnSpec<LinkId>[] = [
+    { id: "name", label: "Snapshot", width: 200, min: 120, locked: true, stripe: true },
+    { id: "phase", label: "Phase", width: 120, min: 90 },
+    { id: "repo", label: "Repository", width: 160, min: 120 },
+    { id: "run", label: "Run", width: 90, min: 90, locked: true, resizable: false },
+  ];
+  const NAMES = ["photos-0", "photos-1", "photos-2"];
+
+  function linkedCell(name: string, id: LinkId, onRun: (name: string) => void) {
+    switch (id) {
+      case "name":
+        return (
+          <InspectLink className="row-link" target={{ kind: "snapshot", namespace: "media", name }}>
+            {name}
+          </InspectLink>
+        );
+      case "phase":
+        return (
+          <>
+            <span>Succeeded {name}</span>
+            {/* A popover a cell portals out (a confirm, a menu): React still
+                bubbles its clicks through the row. */}
+            {createPortal(<p>popover for {name}</p>, document.body)}
+          </>
+        );
+      case "repo":
+        return (
+          <InspectLink target={{ kind: "repository", namespace: "media", name: "nas" }}>
+            nas
+          </InspectLink>
+        );
+      case "run":
+        return (
+          <button
+            type="button"
+            onClick={() => {
+              onRun(name);
+            }}
+          >
+            Run {name}
+          </button>
+        );
+    }
+  }
+
+  async function mountLinked(onRun: (name: string) => void = () => undefined) {
+    const ledger = (
+      <ColumnLedger
+        id="linked"
+        label="Linked table"
+        columns={LINK_COLUMNS}
+        rows={NAMES}
+        rowKey={(n) => n}
+        rowLinks
+        cell={(name, id) => linkedCell(name, id, onRun)}
+      />
+    );
+    const router = createRouter({
+      routeTree: createRootRoute({ component: () => ledger }),
+      history: createMemoryHistory({ initialEntries: ["/snapshots?namespace=media"] }),
+    });
+    render(<RouterProvider router={router} />);
+    const table = await screen.findByRole("table", { name: "Linked table" });
+    const inspect = () => (router.state.location.search as Record<string, unknown>).inspect;
+    return { rows: bodyRows(table), inspect };
+  }
+
+  afterEach(() => {
+    window.getSelection()?.removeAllRanges();
+    vi.restoreAllMocks();
+  });
+
+  it("marks each row as a link target with a class, not a :has() selector", async () => {
+    const { rows } = await mountLinked();
+    for (const row of rows) {
+      expect(row).toHaveClass("row--link");
+      // The anchor stays the keyboard and screen-reader path; the row is not
+      // made focusable or given a role of its own.
+      expect(row).not.toHaveAttribute("tabindex");
+      expect(row).not.toHaveAttribute("role");
+    }
+  });
+
+  it("opens the clicked row's object from a plain cell — not the last row's", async () => {
+    const { rows, inspect } = await mountLinked();
+    await userEvent.click(within(nth(rows, 0)).getByText("Succeeded photos-0"));
+    await waitFor(() => {
+      expect(inspect()).toBe("snapshot/media/photos-0");
+    });
+  });
+
+  it("opens the third row's object from anywhere in the third row", async () => {
+    const { rows, inspect } = await mountLinked();
+    await userEvent.click(nth(Array.from(nth(rows, 2).querySelectorAll("td")), 1));
+    await waitFor(() => {
+      expect(inspect()).toBe("snapshot/media/photos-2");
+    });
+  });
+
+  it("leaves another link in the row to open its own object", async () => {
+    const { rows, inspect } = await mountLinked();
+    await userEvent.click(within(nth(rows, 1)).getByRole("link", { name: "nas" }));
+    await waitFor(() => {
+      expect(inspect()).toBe("repository/media/nas");
+    });
+  });
+
+  it("leaves a button in the row to do its own thing", async () => {
+    const onRun = vi.fn();
+    const { rows, inspect } = await mountLinked(onRun);
+    await userEvent.click(within(nth(rows, 1)).getByRole("button", { name: "Run photos-1" }));
+    expect(onRun).toHaveBeenCalledExactlyOnceWith("photos-1");
+    expect(inspect()).toBeUndefined();
+  });
+
+  it("ignores a click inside something the row portals out of the table", async () => {
+    const { inspect } = await mountLinked();
+    await userEvent.click(screen.getByText("popover for photos-1"));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(inspect()).toBeUndefined();
+  });
+
+  it("does nothing when the click ends a text selection", async () => {
+    const { rows, inspect } = await mountLinked();
+    const text = within(nth(rows, 0)).getByText("Succeeded photos-0");
+    const range = document.createRange();
+    range.selectNodeContents(text);
+    window.getSelection()?.addRange(range);
+    fireEvent.click(text);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(inspect()).toBeUndefined();
+  });
+
+  it("forwards modifier keys to the row's link, so ctrl/⌘/shift-click act as on the link", async () => {
+    const { rows, inspect } = await mountLinked();
+    const row = nth(rows, 1);
+    const seen: MouseEvent[] = [];
+    within(row)
+      .getByRole("link", { name: "photos-1" })
+      .addEventListener("click", (event) => {
+        seen.push(event);
+        // jsdom cannot open a tab; stand in for the browser's own default.
+        event.preventDefault();
+      });
+    const cell = within(row).getByText("Succeeded photos-1");
+    fireEvent.click(cell, { ctrlKey: true });
+    fireEvent.click(cell, { metaKey: true });
+    fireEvent.click(cell, { shiftKey: true });
+    expect(seen.map((e) => [e.ctrlKey, e.metaKey, e.shiftKey])).toEqual([
+      [true, false, false],
+      [false, true, false],
+      [false, false, true],
+    ]);
+    // A modified click is the browser's (new tab / window), never an in-page open.
+    expect(inspect()).toBeUndefined();
+  });
+
+  it("opens the row's link in a new tab on a middle-click, as the link itself would", async () => {
+    const open = vi.spyOn(window, "open").mockReturnValue(null);
+    const { rows, inspect } = await mountLinked();
+    const row = nth(rows, 2);
+    const link = within(row).getByRole<HTMLAnchorElement>("link", { name: "photos-2" });
+    fireEvent(
+      within(row).getByText("Succeeded photos-2"),
+      new MouseEvent("auxclick", { bubbles: true, cancelable: true, button: 1 }),
+    );
+    expect(open).toHaveBeenCalledExactlyOnceWith(link.href, "_blank", "noopener");
+    expect(inspect()).toBeUndefined();
+  });
+
+  it("leaves a middle-click on a link in the row to the browser", async () => {
+    const open = vi.spyOn(window, "open").mockReturnValue(null);
+    const { rows } = await mountLinked();
+    fireEvent(
+      within(nth(rows, 0)).getByRole("link", { name: "nas" }),
+      new MouseEvent("auxclick", { bubbles: true, cancelable: true, button: 1 }),
+    );
+    expect(open).not.toHaveBeenCalled();
+  });
+
+  it("is not a link target unless the table says its rows carry one", async () => {
+    const table = await mount();
+    expect(nth(bodyRows(table), 0)).not.toHaveClass("row--link");
   });
 });

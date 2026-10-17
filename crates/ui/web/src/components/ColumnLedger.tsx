@@ -4,6 +4,7 @@ import { type ReactNode, useEffect, useState } from "react";
 import { ColumnHeader } from "./ColumnHeader";
 import { ColumnPicker } from "./ColumnPicker";
 import { useColumnPrefs } from "./columnPrefs";
+import { ROW_LINK_ROW, followRowLink } from "./rowLink";
 import {
   type ColumnSpec,
   type SortValue,
@@ -31,6 +32,12 @@ export interface ColumnLedgerProps<Row, Id extends string> {
   rows: readonly Row[];
   rowKey: (row: Row) => string;
   rowProps?: ((row: Row) => RowAttributes) | undefined;
+  /**
+   * Every row carries an `a.row-link` to its object, and a click anywhere
+   * else in the row follows it (`rowLink.ts`). Required wherever a cell
+   * renders a `row-link` — the stylesheet no longer stretches the link.
+   */
+  rowLinks?: boolean | undefined;
   /** One cell's content. A `switch` over `Id`, so a new column cannot go undrawn. */
   cell: (row: Row, id: Id) => ReactNode;
   /**
@@ -69,6 +76,7 @@ export function ColumnLedger<Row, Id extends string>({
   rows,
   rowKey,
   rowProps,
+  rowLinks = false,
   cell,
   sortValue,
   serverSorted = false,
@@ -130,7 +138,13 @@ export function ColumnLedger<Row, Id extends string>({
           </thead>
           <tbody>
             {shown.map((row) => (
-              <tr key={rowKey(row)} {...rowProps?.(row)}>
+              <tr
+                key={rowKey(row)}
+                {...rowProps?.(row)}
+                {...(rowLinks
+                  ? { className: ROW_LINK_ROW, onClick: followRowLink, onAuxClick: followRowLink }
+                  : {})}
+              >
                 {visible.map((spec) => (
                   <td key={spec.id} className={cellClass(spec)}>
                     {cell(row, spec.id)}

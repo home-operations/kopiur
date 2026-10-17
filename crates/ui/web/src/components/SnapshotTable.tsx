@@ -56,6 +56,7 @@ export function SnapshotTable({
   return (
     <ColumnLedger
       id="snapshots"
+      rowLinks
       label={caption}
       className="snapshot-table"
       columns={SNAPSHOT_COLUMNS}
