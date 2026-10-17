@@ -72,15 +72,15 @@ impl MoverSpec {
         )
     }
 
-    /// Admission-time warning when `privilegedMode: true` would grant nothing because this
-    /// spec does not run the mover as root — a non-zero `runAsUser`, or none at all
-    /// (capabilities are inert for non-root, and `privilegedMode` never picks a UID).
+    /// Admission-time warning when `privilegedMode: true` would certainly grant nothing:
+    /// this spec pins a non-zero `runAsUser` (capabilities are inert for non-root, and
+    /// `privilegedMode` never picks a UID).
     ///
-    /// Judged on `hardened ⊂ self` only: the repository's `moverDefaults` is invisible at
-    /// admission (so a `moverDefaults` that pins `runAsUser: 0` makes this a false
-    /// positive — the controller's `PrivilegedModeInert` Event is authoritative), and an
-    /// `inheritSecurityContextFrom` identity resolves at reconcile time, so that case stays
-    /// silent here. `None` when there is nothing to warn about.
+    /// Judged on `hardened ⊂ self` only. A spec with no `runAsUser` stays silent: the
+    /// repository's `moverDefaults` may pin `runAsUser: 0` and is invisible here, so
+    /// warning would be a false positive. The controller's `PrivilegedModeInert` Event,
+    /// which sees the merged context, reports that case. An `inheritSecurityContextFrom`
+    /// identity resolves at reconcile time, so it stays silent too.
     pub fn privileged_mode_warning(&self, op: MoverOperation) -> Option<String> {
         if self.inherit_security_context_from.is_some() {
             return None;
@@ -93,13 +93,23 @@ impl MoverSpec {
             None,
             None,
         );
-        privileged_mode_effect(
+        let effect = privileged_mode_effect(
             &resolved.security_context,
             resolved.pod_security_context.as_ref(),
             self.privileged_mode,
             op,
-        )
-        .warning()
+        );
+        match effect {
+            // A non-root uid pinned on this object stays non-root whatever the
+            // repository's moverDefaults say, so it is certainly inert.
+            PrivilegedModeEffect::InertNonRootUid { .. } => effect.warning(),
+            // No uid here: moverDefaults (invisible at admission) may pin root. Leave
+            // it to the controller's PrivilegedModeInert Event, which sees the merge.
+            PrivilegedModeEffect::InertUnsetUid
+            | PrivilegedModeEffect::NotRequested
+            | PrivilegedModeEffect::NothingToGrant
+            | PrivilegedModeEffect::Granted => None,
+        }
     }
 
     /// Overlay `self` — the **HIGHER** layer — onto `base`, field by field, producing

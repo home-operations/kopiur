@@ -435,11 +435,15 @@ mod tests {
             privileged_mode: Some(true),
             ..Default::default()
         };
+        // No uid on the object itself: the repository's moverDefaults may still pin
+        // root, which admission cannot see, so it stays silent rather than warn on a
+        // config that may be correct. The controller's PrivilegedModeInert Event,
+        // which sees the merged context, reports the truly-inert case.
         assert!(
             unset
                 .privileged_mode_warning(MoverOperation::Backup)
-                .is_some(),
-            "privilegedMode with no runAsUser grants nothing, so it warns"
+                .is_none(),
+            "admission must not guess about a uid moverDefaults may pin"
         );
         let off = MoverSpec {
             privileged_mode: Some(false),
