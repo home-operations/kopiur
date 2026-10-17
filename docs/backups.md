@@ -743,6 +743,8 @@ Pending deletions for a repository accumulate for a short **quiet window** of ab
 
 **One batch at a time per repository.** The next batch for a repository starts only when the running one finishes. kopia serializes manifest deletes on the repository's index anyway, so parallel batches against one backend add no throughput and only multiply index downloads. The limit is `spec.concurrency.maxConcurrentDeleteJobs` on the `Repository` or `ClusterRepository`, default `1`; see [Repositories → `concurrency`](repositories.md#concurrency--cap-the-mover-jobs-one-repository-runs-at-once). A batch Job that runs longer than 30 minutes is failed, and its members fire again in a fresh batch, so one wedged Job cannot stall a repository's deletions for long.
 
+Delete Jobs take the repository's `moverDefaults.cache`. With `mode: Persistent` and the default single-flight limit, they share one warm cache PVC dedicated to that repository's deletes, so each batch does not re-download the index. See [Repositories → snapshot-delete Jobs use `moverDefaults.cache` too](repositories.md#moverdefaults--one-place-to-configure-every-mover).
+
 An optional cluster-wide cap additionally bounds how many batch Jobs may run at once across **every** repository. That is `KOPIUR_MAX_CONCURRENT_DELETE_JOBS`, or the Helm chart's top-level `maxConcurrentDeleteJobs` value, default **`0`, meaning no cluster-wide cap**. The per-repository limit is the primary defense, so leave this at `0` unless your cluster itself cannot host that many concurrent delete pods.
 
 /// note | Post-fire, `skip-snapshot-cleanup` only releases the CR: it can't pull a Snapshot out of an in-flight batch

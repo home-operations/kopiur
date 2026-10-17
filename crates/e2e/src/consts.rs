@@ -137,6 +137,8 @@ pub const REPO_SUBPATHS: &[&str] = &[
     // Final-review flagship counterexample (mass_deletion.rs scenario 9): a held
     // external wave must not be swept into a concurrent breaker-exempt prune's batch.
     "massdel-heldprune",
+    // #582: a Persistent moverDefaults.cache gives snapdel Jobs a warm cache PVC.
+    "massdel-cache",
     // Policy-cascade + adoption scenarios (feat/policy-cascade-adoption, M8). Each
     // needs its OWN kopia repository so adoption/retention/cascade counts never leak
     // between scenarios. adoption.rs: the #210 adopt-then-prune acceptance test

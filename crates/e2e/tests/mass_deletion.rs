@@ -44,6 +44,9 @@
 //! 10. `raised_delete_cap_allows_overlapping_batches` — `spec.concurrency
 //!     .maxConcurrentDeleteJobs: 2` lets the second wave run WHILE the first does,
 //!     and never more than two; the field really raises the per-repository cap.
+//! 11. `snapdel_jobs_mount_the_persistent_repository_cache` — #582: a repository with
+//!     `moverDefaults.cache.mode: Persistent` gives its batch delete Jobs a dedicated,
+//!     Repository-owned warm cache PVC (reused across waves) instead of an emptyDir.
 //!
 //! Scenarios 1-3 assert OUTCOMES (CRs drained, kopia counts, conditions/events); 5-8
 //! additionally assert the batch Job wire shape (op label, `delete-members`).
@@ -2959,5 +2962,170 @@ async fn schedule_and_policy_simultaneous_delete_drains_to_retain() {
             .delete(&r.name_any(), &DeleteParams::default())
             .await;
     }
+    let _ = repos.delete(REPO, &DeleteParams::default()).await;
+}
+
+// --- Scenario 11: snapdel Jobs honor a Persistent moverDefaults.cache (#582) ---
+
+const CACHE_SUBPATH: &str = "massdel-cache";
+/// The dedicated snapdel cache PVC's name prefix (`naming::snapdel_cache_pvc_name`
+/// in the controller crate, which this crate does not depend on). A deliberate
+/// literal: a rename must fail this scenario.
+const SNAPDEL_CACHE_PVC_PREFIX: &str = "kopiur-cache-snapdel-";
+
+/// #582: a repository whose `moverDefaults.cache` is `mode: Persistent` (default
+/// `maxConcurrentDeleteJobs: 1`) must give its batch delete Jobs a warm, dedicated
+/// cache PVC instead of an `emptyDir` that re-downloads the whole index per Job.
+/// One manual delete → the batch Job's pod template mounts a
+/// `kopiur-cache-snapdel-*` claim; that PVC exists, is owned by the `Repository`, is
+/// sized from `capacity`, is NOT the Maintenance cache PVC; and the delete still
+/// drains (the mounted cache works, kopia -1). A second wave reuses the SAME claim.
+#[tokio::test]
+#[ignore = "requires the e2e harness (mise run //crates/e2e:test): kind + built images + helm install"]
+async fn snapdel_jobs_mount_the_persistent_repository_cache() {
+    use k8s_openapi::api::core::v1::PersistentVolumeClaim;
+
+    let Some(world) = World::connect().await else {
+        return;
+    };
+    world
+        .ensure(&[Need::Filesystem])
+        .await
+        .expect("provision filesystem fixtures");
+    let client: Client = world.client().clone();
+    ensure_repo(&client, CACHE_SUBPATH).await;
+
+    let repos: Api<Repository> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let policies: Api<SnapshotPolicy> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let backups: Api<Snapshot> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let jobs: Api<Job> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+
+    const REPO: &str = "e2e-massdel-cache-repo";
+    const POLICY: &str = "e2e-massdel-cache-pol";
+    const SNAPS: [&str; 2] = ["e2e-massdel-cache-1", "e2e-massdel-cache-2"];
+
+    repos
+        .create(
+            &PostParams::default(),
+            &cr(repository_json(
+                REPO,
+                CACHE_SUBPATH,
+                serde_json::json!({
+                    "maintenance": { "enabled": false },
+                    "moverDefaults": {
+                        "cache": { "mode": "Persistent", "capacity": "256Mi" }
+                    },
+                }),
+            )),
+        )
+        .await
+        .expect("create Repository");
+    // The overlay must actually land (bare spec fields, not a `spec:` wrapper).
+    wait_phase(&repos, REPO, "Ready")
+        .await
+        .expect("Repository should reach Ready");
+    let repo = repos.get(REPO).await.expect("get Repository");
+    let repo_json = serde_json::to_value(&repo).unwrap_or_default();
+    assert_eq!(
+        repo_json.pointer("/spec/moverDefaults/cache/mode"),
+        Some(&serde_json::json!("Persistent")),
+        "the Persistent cache overlay must land on the Repository: {repo_json:#}"
+    );
+    let repo_uid = repo.uid().expect("Repository uid");
+
+    policies
+        .create(
+            &PostParams::default(),
+            &cr(snapshot_policy_json(
+                E2E_NAMESPACE,
+                POLICY,
+                "Repository",
+                REPO,
+                serde_json::json!({ "retention": { "keepLatest": 20 } }),
+            )),
+        )
+        .await
+        .expect("create SnapshotPolicy");
+
+    seed_manual_snapshots(&backups, POLICY, &SNAPS).await;
+    let kopia_before =
+        observed_snapshot_count(&client, "e2e-massdel-cache-verify-1", CACHE_SUBPATH).await;
+    assert_eq!(
+        kopia_before, 2,
+        "both manual snapshots exist in kopia first"
+    );
+
+    let mut claims = BTreeSet::new();
+    for snap in SNAPS {
+        let uid = BTreeSet::from([snapshot_uid(&backups, snap).await]);
+        delete_and_settle(&backups, &[snap]).await;
+        let job = find_batch_with_members(&jobs, &uid)
+            .await
+            .expect("the delete must produce a batch Job");
+        let claim = job
+            .spec
+            .as_ref()
+            .and_then(|s| s.template.spec.as_ref())
+            .and_then(|p| p.volumes.as_ref())
+            .and_then(|vs| {
+                vs.iter()
+                    .find_map(|v| v.persistent_volume_claim.as_ref())
+                    .map(|c| c.claim_name.clone())
+            })
+            .unwrap_or_else(|| {
+                panic!(
+                    "the snapdel Job must mount the persistent repository cache, not an \
+                     emptyDir (#582); volumes: {:?}",
+                    job.spec
+                        .as_ref()
+                        .and_then(|s| s.template.spec.as_ref())
+                        .and_then(|p| p.volumes.clone())
+                )
+            });
+        assert!(
+            claim.starts_with(SNAPDEL_CACHE_PVC_PREFIX),
+            "the snapdel cache is the dedicated claim, never a backup/Maintenance one: {claim}"
+        );
+        wait_all_drained(&backups, &[snap], Duration::from_secs(180)).await;
+        claims.insert(claim);
+    }
+    assert_eq!(
+        claims.len(),
+        1,
+        "every delete wave reuses the SAME warm cache claim: {claims:?}"
+    );
+    let claim = claims.into_iter().next().unwrap();
+    let pvc = pvcs
+        .get(&claim)
+        .await
+        .expect("the snapdel cache PVC exists in the Job namespace");
+    let owners = pvc.metadata.owner_references.clone().unwrap_or_default();
+    assert!(
+        owners
+            .iter()
+            .any(|o| o.kind == "Repository" && o.name == REPO && o.uid == repo_uid),
+        "the snapdel cache PVC is owned by its Repository (GC'd with it): {owners:?}"
+    );
+    assert_eq!(
+        pvc.spec
+            .as_ref()
+            .and_then(|s| s.resources.as_ref())
+            .and_then(|r| r.requests.as_ref())
+            .and_then(|r| r.get("storage"))
+            .map(|q| q.0.as_str()),
+        Some("256Mi"),
+        "sized from moverDefaults.cache.capacity"
+    );
+
+    let kopia_after =
+        observed_snapshot_count(&client, "e2e-massdel-cache-verify-2", CACHE_SUBPATH).await;
+    assert_eq!(
+        kopia_after,
+        kopia_before - 2,
+        "the cache-backed batch deletes really removed the kopia snapshots"
+    );
+
+    let _ = policies.delete(POLICY, &DeleteParams::default()).await;
     let _ = repos.delete(REPO, &DeleteParams::default()).await;
 }

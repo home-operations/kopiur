@@ -4204,8 +4204,9 @@ async fn launch_batch_job(
 /// lives), the repository's `moverDefaults` inheritance, and RBAC minting — but
 /// with per-member items, NO `ttlSecondsAfterFinished` (explicit reaping), the
 /// sorted-UID members annotation, and an ownerRef ONLY for a namespaced
-/// `Repository` (a `ClusterRepository`'s cluster-scoped owner would be an
-/// un-GC'able ref on a namespaced Job — labels + the reaper stand in instead).
+/// `Repository` (labels + the reaper stand in for a `ClusterRepository`; see the
+/// strip below), and the repository's effective kopia cache (#582,
+/// [`crate::cache::snapdel_cache_plan`]).
 ///
 /// `src_namespace`/`src_name` are the TRIGGERING CR's coordinates, used only to
 /// enrich a credentials-resolution error with the stuck-finalizer escape hatch.
@@ -4227,9 +4228,12 @@ async fn build_batch_job(
             anchor: m.anchor.clone(),
         })
         .collect();
-    // A ClusterRepository owner is cluster-scoped — the resulting ownerRef on a
-    // namespaced Job is invalid and never GC'd. Only a namespaced Repository owns
-    // its batch Job; the ownerRef is stripped below for a ClusterRepository.
+    // The repository CR. It owns the dedicated persistent cache PVC for either kind
+    // (Kubernetes GC lets a namespaced dependent name a cluster-scoped owner; only
+    // the reverse, a cluster-scoped dependent with a namespaced owner, is invalid).
+    // The batch JOB keeps it only for a namespaced Repository: for a
+    // ClusterRepository it is stripped below and the Job is reaped by label + the
+    // explicit reaper, which is what every placement relies on anyway.
     let owner = repo.owner_ref.clone();
     // Creds in the placement namespace with projection HARDCODED OFF (same
     // rationale as the retired cross-namespace path): the batch runs at the
@@ -4253,6 +4257,18 @@ async fn build_batch_job(
         ctx.metrics.inc_secrets_projected(job_ns, creds.projected);
     }
     let creds_secrets = io::plain_creds(creds.names);
+    // #582: honor the repository's `moverDefaults.cache` (volume AND budgets). A
+    // delete loads the repository index like a backup does, so an always-emptyDir
+    // cache re-downloaded the whole index on every batch Job.
+    let effective_cache = crate::cache::effective_cache(repo, None);
+    let cache_plan = crate::cache::snapdel_cache_plan(
+        effective_cache.as_ref(),
+        kopiur_api::consts::effective_max_concurrent_delete_jobs(repo.concurrency.as_ref()),
+        &crate::naming::snapdel_cache_pvc_name(repo_ref),
+    );
+    let cache_volume =
+        crate::cache::resolve_snapdel_cache_volume(&ctx.client, job_ns, owner.clone(), &cache_plan)
+            .await?;
     let work_spec = MoverWorkSpec {
         version: 1,
         operation: Operation::SnapshotDeleteBatch(SnapshotDeleteBatchOp { items }),
@@ -4271,7 +4287,7 @@ async fn build_batch_job(
         },
         hook_plan: Default::default(),
         options: MoverOptions::default(),
-        cache: Default::default(),
+        cache: crate::cache::cache_tuning(effective_cache.as_ref()),
         throttle: Default::default(),
     };
     // Annotation: the SORTED member UID set — the single source of truth for
@@ -4335,13 +4351,13 @@ async fn build_batch_job(
         passthrough_env: ctx.mover_env_passthrough.clone(),
         extra_env: Vec::new(),
         annotations,
-        cache_volume: Default::default(),
+        cache_volume,
         scratch_volume: None,
         readiness_exec: None,
     };
     let mut job = jobs::build_job(&inputs)?;
-    // ClusterRepository: drop the cluster-scoped (un-GC'able) ownerRef; the Job is
-    // reaped by label + the explicit reaper instead.
+    // ClusterRepository: the Job carries no ownerRef and is reaped by label + the
+    // explicit reaper instead (the reaper is the only cleanup for every placement).
     if repo_ref.kind == RepositoryKind::ClusterRepository {
         job.metadata.owner_references = None;
     }

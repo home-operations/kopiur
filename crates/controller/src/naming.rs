@@ -100,6 +100,20 @@ pub fn repo_label(r: &RepositoryRef) -> String {
     format!("{short}-{hash}")
 }
 
+/// The dedicated persistent kopia-cache PVC for ONE repository's batch
+/// snapshot-delete (`snapdel-*`) Jobs (#582): `kopiur-cache-snapdel-<repo_label>`.
+///
+/// Keyed by [`repo_label`] (so a namespaced `Repository` and a `ClusterRepository`
+/// of the same name, or two same-named repositories in different namespaces, never
+/// share a cache) and capped by [`capped_name`]. `repo_label` keeps up to 40 chars
+/// of the repository name, which may contain `.`; that is mapped to `-` so the
+/// result is a single DNS-1123 label (a `.-` sequence would be an invalid
+/// subdomain). Needs a NORMALIZED ref, like `repo_label`.
+pub fn snapdel_cache_pvc_name(r: &RepositoryRef) -> String {
+    let label = repo_label(r).replace('.', "-").to_ascii_lowercase();
+    capped_name(&format!("kopiur-cache-snapdel-{label}"))
+}
+
 /// 64-bit FNV-1a over the string's bytes.
 fn fnv1a(s: &str) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
@@ -138,6 +152,56 @@ mod tests {
         // upgrade. Pin a literal.
         let long_a = format!("{}-snap-a-delete", "n".repeat(80));
         assert!(capped_name(&long_a).ends_with("-78b92bff1e6d5c26"));
+    }
+
+    // --- snapdel_cache_pvc_name (#582) --------------------------------------
+
+    fn rref(kind: RepositoryKind, ns: Option<&str>, name: &str) -> RepositoryRef {
+        RepositoryRef {
+            kind,
+            name: name.into(),
+            namespace: ns.map(str::to_string),
+        }
+    }
+
+    fn is_dns1123_label(s: &str) -> bool {
+        !s.is_empty()
+            && s.len() <= 63
+            && s.chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+            && !s.starts_with('-')
+            && !s.ends_with('-')
+    }
+
+    #[test]
+    fn snapdel_cache_pvc_name_is_per_repository_and_dns_safe() {
+        let garage = rref(RepositoryKind::ClusterRepository, None, "garage");
+        let n = snapdel_cache_pvc_name(&garage);
+        assert_eq!(n, format!("kopiur-cache-snapdel-{}", repo_label(&garage)));
+        assert!(is_dns1123_label(&n), "{n}");
+        assert_eq!(n, snapdel_cache_pvc_name(&garage), "deterministic");
+        // Never the Maintenance PVC (`kopiur-cache-<maintenance>`) for the same repo.
+        assert_ne!(n, "kopiur-cache-garage");
+        // A namespaced Repository of the same name gets its own cache.
+        assert_ne!(
+            n,
+            snapdel_cache_pvc_name(&rref(RepositoryKind::Repository, Some("b"), "garage"))
+        );
+        assert_ne!(
+            snapdel_cache_pvc_name(&rref(RepositoryKind::Repository, Some("a"), "garage")),
+            snapdel_cache_pvc_name(&rref(RepositoryKind::Repository, Some("b"), "garage"))
+        );
+    }
+
+    #[test]
+    fn snapdel_cache_pvc_name_bounds_long_and_dotted_repository_names() {
+        let dotted = rref(
+            RepositoryKind::ClusterRepository,
+            None,
+            "s3.eu-central-1.backups.example.com.very-long-bucket-name-here",
+        );
+        let n = snapdel_cache_pvc_name(&dotted);
+        assert!(is_dns1123_label(&n), "{n} ({} chars)", n.len());
     }
 
     // --- short_hash -----------------------------------------------------------

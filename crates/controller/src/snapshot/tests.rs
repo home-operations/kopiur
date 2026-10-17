@@ -5211,3 +5211,253 @@ fn the_missing_source_pvc_park_does_not_resurrect_the_inherit_hold() {
         "the park must not re-report a block that has cleared: {status:#}"
     );
 }
+
+// --- #582: snapdel batch Jobs honor the repository's mover cache ------------
+
+type RequestLog = Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>>;
+
+/// A request-logging mock apiserver for `build_batch_job`: the persistent cache PVC
+/// is absent (GET → 404) and its CREATE succeeds; every other call is a 500, so an
+/// unexpected API dependency fails the test loudly instead of passing by accident.
+fn snapdel_cache_client(log: RequestLog) -> kube::Client {
+    use http::{Request, Response, StatusCode};
+    use kube::client::Body;
+    let svc = tower::service_fn(move |req: Request<Body>| {
+        let log = log.clone();
+        async move {
+            let (method, path) = (req.method().clone(), req.uri().path().to_string());
+            let bytes = http_body_util::BodyExt::collect(req.into_body())
+                .await
+                .map(|c| c.to_bytes())
+                .unwrap_or_default();
+            let body: serde_json::Value =
+                serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+            log.lock()
+                .unwrap()
+                .push((format!("{method} {path}"), body.clone()));
+            let pvc_path = path.contains("/persistentvolumeclaims");
+            let not_found = serde_json::json!({
+                "kind": "Status", "apiVersion": "v1", "status": "Failure",
+                "reason": "NotFound", "code": 404,
+            });
+            let (status, response) = if method == http::Method::GET && path.ends_with("/secrets") {
+                // The stale-projected-copy sweep: nothing to reap.
+                (
+                    StatusCode::OK,
+                    serde_json::json!({
+                        "kind": "SecretList", "apiVersion": "v1", "metadata": {}, "items": [],
+                    }),
+                )
+            } else if method == http::Method::GET && path.ends_with("/secrets/creds") {
+                // The repository password Secret exists in the Job namespace.
+                (
+                    StatusCode::OK,
+                    serde_json::json!({
+                        "kind": "PartialObjectMetadata", "apiVersion": "meta.k8s.io/v1",
+                        "metadata": { "name": "creds", "namespace": "kopiur-system" },
+                    }),
+                )
+            } else if method == http::Method::GET && path.contains("/secrets/") {
+                (StatusCode::NOT_FOUND, not_found)
+            } else if pvc_path && method == http::Method::GET {
+                (
+                    StatusCode::NOT_FOUND,
+                    serde_json::json!({
+                        "kind": "Status", "apiVersion": "v1", "status": "Failure",
+                        "reason": "NotFound", "code": 404,
+                    }),
+                )
+            } else if pvc_path && method == http::Method::POST {
+                (StatusCode::CREATED, body)
+            } else {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    serde_json::json!({
+                        "kind": "Status", "apiVersion": "v1", "status": "Failure", "code": 500,
+                    }),
+                )
+            };
+            Ok::<_, std::convert::Infallible>(
+                Response::builder()
+                    .status(status)
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&response).unwrap()))
+                    .unwrap(),
+            )
+        }
+    });
+    kube::Client::new(svc, "default")
+}
+
+/// The #582 reporter's repository: a `ClusterRepository` whose `moverDefaults.cache`
+/// is `cache`, with its credentials in the operator namespace (where its snapdel
+/// Jobs run).
+fn snapdel_repo(cache: serde_json::Value) -> (RepositoryRef, io::ResolvedRepository) {
+    let mut repo = resolved_s3_repo();
+    repo.kind = RepositoryKind::ClusterRepository;
+    repo.repo_namespace = None;
+    repo.encryption.password_secret_ref.namespace = Some("kopiur-system".into());
+    repo.owner_ref = OwnerReference {
+        api_version: crate::consts::API_VERSION.into(),
+        kind: "ClusterRepository".into(),
+        name: "garage".into(),
+        uid: "uid-garage".into(),
+        controller: Some(true),
+        block_owner_deletion: Some(false),
+    };
+    repo.mover_defaults = Some(
+        serde_json::from_value(serde_json::json!({ "cache": cache })).expect("valid moverDefaults"),
+    );
+    let repo_ref = RepositoryRef {
+        kind: RepositoryKind::ClusterRepository,
+        name: "garage".into(),
+        namespace: None,
+    };
+    (repo_ref, repo)
+}
+
+fn snapdel_member() -> PendingMember {
+    PendingMember {
+        namespace: "media".into(),
+        name: "app-20260101000000".into(),
+        uid: "0b0f6a3e-4c1d-4b7a-9f2e-5d8c7a6b5e4f".into(),
+        snapshot_id: "k0123456789abcdef".into(),
+        anchor: kopiur_mover::workspec::SnapshotAnchor::default(),
+        external: false,
+        deletion_timestamp: chrono::DateTime::from_timestamp(1, 0).unwrap(),
+        pinned: true,
+        schedule_owned: false,
+    }
+}
+
+fn job_cache_claim(job: &Job) -> Option<String> {
+    job.spec
+        .as_ref()?
+        .template
+        .spec
+        .as_ref()?
+        .volumes
+        .as_ref()?
+        .iter()
+        .find_map(|v| {
+            v.persistent_volume_claim
+                .as_ref()
+                .map(|p| p.claim_name.clone())
+        })
+}
+
+fn job_work_spec(job: &Job) -> MoverWorkSpec {
+    let pod = job.spec.as_ref().unwrap().template.spec.as_ref().unwrap();
+    let raw = pod.containers[0]
+        .env
+        .as_ref()
+        .unwrap()
+        .iter()
+        .find(|e| e.name == kopiur_mover::jobs::WORK_SPEC_ENV)
+        .and_then(|e| e.value.clone())
+        .expect("work spec rides the env");
+    serde_json::from_str(&raw).expect("work spec decodes")
+}
+
+#[tokio::test]
+async fn a_persistent_repo_cache_gives_snapdel_a_dedicated_owned_pvc() {
+    let log: RequestLog = Arc::default();
+    let ctx = Context::test_context(snapdel_cache_client(log.clone()));
+    let (repo_ref, repo) = snapdel_repo(serde_json::json!({
+        "mode": "Persistent", "capacity": "10Gi", "storageClassName": "local-hostpath",
+        "metadataCacheSizeMb": 2048, "contentCacheSizeMb": 512,
+    }));
+    let members = [snapdel_member()];
+    let job_name = batch_job_name(&repo_ref, &members);
+
+    let job = build_batch_job(
+        &ctx,
+        "kopiur-system",
+        &job_name,
+        &repo_ref,
+        &repo,
+        &members,
+        "media",
+        "app-20260101000000",
+    )
+    .await
+    .expect("the batch Job builds");
+
+    let claim = crate::naming::snapdel_cache_pvc_name(&repo_ref);
+    // The Job mounts the dedicated warm cache, not an emptyDir...
+    assert_eq!(job_cache_claim(&job).as_deref(), Some(claim.as_str()));
+    // ...and the cache budgets reach the work spec.
+    let ws = job_work_spec(&job);
+    assert_eq!(ws.cache.metadata_cache_size_mb, Some(2048));
+    assert_eq!(ws.cache.content_cache_size_mb, Some(512));
+
+    // The PVC was created in the Job's namespace, owned by the ClusterRepository.
+    let log = log.lock().unwrap();
+    let (_, created) = log
+        .iter()
+        .find(|(req, _)| req.starts_with("POST") && req.contains("/persistentvolumeclaims"))
+        .expect("the dedicated cache PVC is created");
+    let pvc: k8s_openapi::api::core::v1::PersistentVolumeClaim =
+        serde_json::from_value(created.clone()).expect("a PVC body");
+    assert_eq!(pvc.metadata.name.as_deref(), Some(claim.as_str()));
+    assert_eq!(pvc.metadata.namespace.as_deref(), Some("kopiur-system"));
+    let owners = pvc.metadata.owner_references.unwrap();
+    assert_eq!(owners.len(), 1);
+    assert_eq!(owners[0].kind, "ClusterRepository");
+    assert_eq!(owners[0].uid, "uid-garage");
+    let spec = pvc.spec.unwrap();
+    assert_eq!(spec.storage_class_name.as_deref(), Some("local-hostpath"));
+    assert_eq!(
+        spec.access_modes.as_deref(),
+        Some(&["ReadWriteOnce".to_string()][..])
+    );
+    assert_eq!(
+        spec.resources.unwrap().requests.unwrap()["storage"].0,
+        "10Gi"
+    );
+}
+
+#[tokio::test]
+async fn parallel_snapdel_jobs_never_share_a_persistent_cache_claim() {
+    let log: RequestLog = Arc::default();
+    let ctx = Context::test_context(snapdel_cache_client(log.clone()));
+    let (repo_ref, mut repo) = snapdel_repo(serde_json::json!({
+        "mode": "Persistent", "capacity": "10Gi", "storageClassName": "local-hostpath",
+    }));
+    repo.concurrency = Some(kopiur_api::common::ConcurrencySpec {
+        max_concurrent_delete_jobs: Some(2),
+        ..Default::default()
+    });
+    let members = [snapdel_member()];
+    let job_name = batch_job_name(&repo_ref, &members);
+    let job = build_batch_job(
+        &ctx,
+        "kopiur-system",
+        &job_name,
+        &repo_ref,
+        &repo,
+        &members,
+        "media",
+        "app-20260101000000",
+    )
+    .await
+    .expect("the batch Job builds");
+
+    assert_eq!(job_cache_claim(&job), None, "no shared RWO claim");
+    let pod = job.spec.unwrap().template.spec.unwrap();
+    let eph = pod
+        .volumes
+        .unwrap()
+        .into_iter()
+        .find_map(|v| v.ephemeral)
+        .expect("a sized ephemeral cache instead");
+    let tmpl = eph.volume_claim_template.unwrap().spec;
+    assert_eq!(tmpl.storage_class_name.as_deref(), Some("local-hostpath"));
+    assert!(
+        !log.lock()
+            .unwrap()
+            .iter()
+            .any(|(req, _)| req.contains("/persistentvolumeclaims")),
+        "the coerced ephemeral cache provisions no PVC"
+    );
+}

@@ -131,6 +131,123 @@ pub fn verify_cache_volume(effective: Option<&CacheDefaults>) -> CacheVolume {
     }
 }
 
+/// How a repository's `SnapshotDeleteBatch` (`snapdel-*`) Jobs get their kopia cache
+/// (#582): the cache volume to mount, plus, only for a persistent claim, the PVC the
+/// controller must ensure first. A typed plan rather than a bare [`CacheVolume`] so
+/// the "ensure this PVC" step can never be reached without the capacity it needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SnapdelCachePlan {
+    /// Mount this per-run volume (`emptyDir` or a sized generic ephemeral volume);
+    /// nothing to provision.
+    Volume(CacheVolume),
+    /// Ensure the repository's dedicated persistent cache PVC, then mount it.
+    Persistent {
+        /// The dedicated claim (see [`crate::naming::snapdel_cache_pvc_name`]).
+        claim_name: String,
+        /// PVC size (e.g. `10Gi`).
+        capacity: String,
+        /// StorageClass; `None` uses the cluster default.
+        storage_class: Option<String>,
+    },
+}
+
+impl SnapdelCachePlan {
+    /// The volume the Job mounts under this plan.
+    pub fn volume(&self) -> CacheVolume {
+        match self {
+            Self::Volume(v) => v.clone(),
+            Self::Persistent { claim_name, .. } => CacheVolume::Pvc {
+                claim_name: claim_name.clone(),
+            },
+        }
+    }
+}
+
+/// Decide the kopia cache for a repository's batch snapshot-delete Jobs from the
+/// repository's **effective** cache (`moverDefaults.cache`; a delete has no recipe
+/// layer) and its effective `maxConcurrentDeleteJobs` (#582).
+///
+/// A delete Job connects to the repository and loads its index exactly like a
+/// backup does, so an `emptyDir` cache re-downloads the whole index on every run
+/// (gigabytes per Job on a large repository). The repository's cache settings are
+/// therefore honored here too:
+/// - no config, or no `capacity` → `emptyDir` (same as every other mover);
+/// - `mode: Ephemeral` + `capacity` → a sized generic ephemeral volume, fresh each run;
+/// - `mode: Persistent` + `capacity`, with at most ONE delete Job per repository at a
+///   time (`maxConcurrentDeleteJobs: 1`, the default) → a dedicated warm PVC for this
+///   repository's delete Jobs (`claim_name`). Never the backup's policy-owned PVC or
+///   the `Maintenance` PVC: those belong to lifecycles that run concurrently with
+///   deletes, and the mover keeps `repository.config` on the cache volume, so two
+///   pods sharing one claim would clobber each other;
+/// - `mode: Persistent` + `capacity` with `maxConcurrentDeleteJobs > 1` → coerced to
+///   a sized ephemeral volume (as verification does): several delete Jobs may run at
+///   once, and they cannot share one `ReadWriteOnce` claim.
+///
+/// Pure; [`resolve_snapdel_cache_volume`] does the IO.
+pub fn snapdel_cache_plan(
+    effective: Option<&CacheDefaults>,
+    max_concurrent_delete_jobs: std::num::NonZeroUsize,
+    claim_name: &str,
+) -> SnapdelCachePlan {
+    let Some(c) = effective else {
+        return SnapdelCachePlan::Volume(CacheVolume::EmptyDir);
+    };
+    let Some(capacity) = c.capacity.clone() else {
+        return SnapdelCachePlan::Volume(CacheVolume::EmptyDir);
+    };
+    let ephemeral = |capacity: String| {
+        SnapdelCachePlan::Volume(CacheVolume::Ephemeral {
+            capacity,
+            storage_class: c.storage_class_name.clone(),
+        })
+    };
+    match c.effective_mode() {
+        CacheVolumeMode::Persistent if max_concurrent_delete_jobs.get() == 1 => {
+            SnapdelCachePlan::Persistent {
+                claim_name: claim_name.to_string(),
+                capacity,
+                storage_class: c.storage_class_name.clone(),
+            }
+        }
+        CacheVolumeMode::Persistent => ephemeral(capacity),
+        CacheVolumeMode::Ephemeral => ephemeral(capacity),
+    }
+}
+
+/// Resolve (and, for a persistent plan, provision) the batch-delete Job's cache
+/// volume. The dedicated PVC is owned by the repository CR (`owner`): a `Repository`
+/// in its own namespace, or a `ClusterRepository` (a cluster-scoped owner of a
+/// namespaced dependent, which Kubernetes garbage collection supports), so it is
+/// deleted with the repository. Like the backup's policy-owned cache PVC, it is
+/// left in place if the repository later stops using `mode: Persistent`, and is
+/// garbage-collected with the repository.
+pub async fn resolve_snapdel_cache_volume(
+    client: &kube::Client,
+    ns: &str,
+    owner: OwnerReference,
+    plan: &SnapdelCachePlan,
+) -> Result<CacheVolume> {
+    match plan {
+        SnapdelCachePlan::Volume(v) => Ok(v.clone()),
+        SnapdelCachePlan::Persistent {
+            claim_name,
+            capacity,
+            storage_class,
+        } => {
+            let claim = crate::io::ensure_cache_pvc(
+                client,
+                ns,
+                claim_name,
+                owner,
+                capacity,
+                storage_class.as_deref(),
+            )
+            .await?;
+            Ok(CacheVolume::Pvc { claim_name: claim })
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -295,5 +412,111 @@ mod tests {
                 storage_class: Some("block".into()),
             }
         );
+    }
+
+    // --- #582: SnapshotDeleteBatch Jobs honor the repository's cache ---------
+
+    const CLAIM: &str = "kopiur-cache-snapdel-garage-1a2b3c4d";
+
+    fn conc(n: usize) -> std::num::NonZeroUsize {
+        std::num::NonZeroUsize::new(n).unwrap()
+    }
+
+    fn cache(mode: Option<CacheVolumeMode>, capacity: Option<&str>) -> CacheDefaults {
+        CacheDefaults {
+            capacity: capacity.map(str::to_string),
+            storage_class_name: Some("local-hostpath".into()),
+            mode,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn snapdel_cache_is_emptydir_without_config_or_capacity() {
+        for n in [1, 4] {
+            assert_eq!(
+                snapdel_cache_plan(None, conc(n), CLAIM),
+                SnapdelCachePlan::Volume(CacheVolume::EmptyDir)
+            );
+            for mode in [
+                None,
+                Some(CacheVolumeMode::Ephemeral),
+                Some(CacheVolumeMode::Persistent),
+            ] {
+                assert_eq!(
+                    snapdel_cache_plan(Some(&cache(mode, None)), conc(n), CLAIM),
+                    SnapdelCachePlan::Volume(CacheVolume::EmptyDir),
+                    "mode {mode:?} without capacity, concurrency {n}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn snapdel_cache_ephemeral_is_sized_ephemeral_at_any_concurrency() {
+        for n in [1, 2, 8] {
+            for mode in [None, Some(CacheVolumeMode::Ephemeral)] {
+                assert_eq!(
+                    snapdel_cache_plan(Some(&cache(mode, Some("10Gi"))), conc(n), CLAIM),
+                    SnapdelCachePlan::Volume(CacheVolume::Ephemeral {
+                        capacity: "10Gi".into(),
+                        storage_class: Some("local-hostpath".into()),
+                    })
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn snapdel_cache_persistent_single_flight_gets_the_dedicated_pvc() {
+        // The #582 reporter's shape: Persistent, 10Gi, local-hostpath, default
+        // maxConcurrentDeleteJobs (1).
+        let plan = snapdel_cache_plan(
+            Some(&cache(Some(CacheVolumeMode::Persistent), Some("10Gi"))),
+            kopiur_api::consts::DEFAULT_MAX_CONCURRENT_DELETE_JOBS,
+            CLAIM,
+        );
+        assert_eq!(
+            plan,
+            SnapdelCachePlan::Persistent {
+                claim_name: CLAIM.into(),
+                capacity: "10Gi".into(),
+                storage_class: Some("local-hostpath".into()),
+            }
+        );
+        assert_eq!(
+            plan.volume(),
+            CacheVolume::Pvc {
+                claim_name: CLAIM.into()
+            }
+        );
+    }
+
+    #[test]
+    fn snapdel_cache_persistent_with_parallel_deletes_is_coerced_to_ephemeral() {
+        // Two delete Jobs may run at once; they must never share a RWO claim.
+        for n in [2, 3, 16] {
+            assert_eq!(
+                snapdel_cache_plan(
+                    Some(&cache(Some(CacheVolumeMode::Persistent), Some("10Gi"))),
+                    conc(n),
+                    CLAIM,
+                ),
+                SnapdelCachePlan::Volume(CacheVolume::Ephemeral {
+                    capacity: "10Gi".into(),
+                    storage_class: Some("local-hostpath".into()),
+                }),
+                "concurrency {n}"
+            );
+        }
+    }
+
+    #[test]
+    fn snapdel_cache_plan_volume_passes_per_run_volumes_through() {
+        let v = CacheVolume::Ephemeral {
+            capacity: "1Gi".into(),
+            storage_class: None,
+        };
+        assert_eq!(SnapdelCachePlan::Volume(v.clone()).volume(), v);
     }
 }

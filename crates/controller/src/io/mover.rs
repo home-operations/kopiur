@@ -1392,7 +1392,26 @@ pub async fn ensure_cache_pvc(
     if api.get_opt(name).await?.is_some() {
         return Ok(name.to_string());
     }
-    let pvc = PersistentVolumeClaim {
+    let pvc = cache_pvc(ns, name, owner, capacity, storage_class);
+    match api.create(&PostParams::default(), &pvc).await {
+        Ok(_) => Ok(name.to_string()),
+        // A concurrent reconcile won the create race: the PVC is there, reuse it.
+        Err(kube::Error::Api(e)) if e.code == 409 => Ok(name.to_string()),
+        Err(e) => Err(Error::Kube(e)),
+    }
+}
+
+/// The controller-owned persistent kopia cache PVC [`ensure_cache_pvc`] creates:
+/// `ReadWriteOnce` at `capacity`, optional `storage_class`, owner-referenced to
+/// `owner` (so it is GC'd with it), labeled as a mover cache. Pure, for tests.
+pub(crate) fn cache_pvc(
+    ns: &str,
+    name: &str,
+    owner: OwnerReference,
+    capacity: &str,
+    storage_class: Option<&str>,
+) -> PersistentVolumeClaim {
+    PersistentVolumeClaim {
         metadata: ObjectMeta {
             name: Some(name.to_string()),
             namespace: Some(ns.to_string()),
@@ -1416,12 +1435,6 @@ pub async fn ensure_cache_pvc(
             ..Default::default()
         }),
         ..Default::default()
-    };
-    match api.create(&PostParams::default(), &pvc).await {
-        Ok(_) => Ok(name.to_string()),
-        // A concurrent reconcile won the create race: the PVC is there, reuse it.
-        Err(kube::Error::Api(e)) if e.code == 409 => Ok(name.to_string()),
-        Err(e) => Err(Error::Kube(e)),
     }
 }
 
@@ -2153,6 +2166,54 @@ pub async fn wedged_pod_verdict(
         grace_seconds,
         chrono::Utc::now().timestamp(),
     ))
+}
+
+#[cfg(test)]
+mod cache_pvc_tests {
+    use super::*;
+
+    #[test]
+    fn cache_pvc_is_rwo_sized_classed_and_owned() {
+        let owner = OwnerReference {
+            api_version: crate::consts::API_VERSION.into(),
+            kind: "ClusterRepository".into(),
+            name: "garage".into(),
+            uid: "uid-garage".into(),
+            controller: Some(true),
+            block_owner_deletion: Some(false),
+        };
+        let pvc = cache_pvc(
+            "kopiur-system",
+            "kopiur-cache-snapdel-garage-1a2b3c4d",
+            owner.clone(),
+            "10Gi",
+            Some("local-hostpath"),
+        );
+        assert_eq!(
+            pvc.metadata.name.as_deref(),
+            Some("kopiur-cache-snapdel-garage-1a2b3c4d")
+        );
+        assert_eq!(pvc.metadata.namespace.as_deref(), Some("kopiur-system"));
+        assert_eq!(pvc.metadata.owner_references, Some(vec![owner]));
+        assert_eq!(
+            pvc.metadata
+                .labels
+                .as_ref()
+                .and_then(|l| l.get("kopiur.home-operations.com/component"))
+                .map(String::as_str),
+            Some("mover-cache")
+        );
+        let spec = pvc.spec.unwrap();
+        assert_eq!(spec.access_modes, Some(vec!["ReadWriteOnce".to_string()]));
+        assert_eq!(spec.storage_class_name.as_deref(), Some("local-hostpath"));
+        assert_eq!(
+            spec.resources.unwrap().requests.unwrap()["storage"],
+            Quantity("10Gi".into())
+        );
+        // No storageClassName → the cluster default.
+        let pvc = cache_pvc("ns", "c", Default::default(), "1Gi", None);
+        assert_eq!(pvc.spec.unwrap().storage_class_name, None);
+    }
 }
 
 #[cfg(test)]

@@ -493,6 +493,21 @@ The `quick` and `deep` verification movers a `SnapshotPolicy` spawns inherit the
 
 ///
 
+/// note | Snapshot-delete Jobs (`snapdel-*`) use `moverDefaults.cache` too
+
+A batch delete Job opens the repository and loads its index just like a backup, so on a large repository a cold cache means gigabytes of index download per Job. Delete Jobs therefore take the repository's `moverDefaults.cache`: its `contentCacheSizeMb`/`metadataCacheSizeMb` budgets, and a volume chosen like this.
+
+| `moverDefaults.cache`                            | Delete Job cache volume                                                                                        |
+| ------------------------------------------------ | -------------------------------------------------------------------------------------------------------------- |
+| unset, or no `capacity`                          | `emptyDir`                                                                                                     |
+| `mode: Ephemeral` + `capacity`                   | a fresh sized ephemeral volume per Job                                                                         |
+| `mode: Persistent` + `capacity`, `maxConcurrentDeleteJobs: 1` (the default) | a warm PVC dedicated to this repository's delete Jobs, `kopiur-cache-snapdel-<repository>-<hash>`, reused by every batch |
+| `mode: Persistent` + `capacity`, `maxConcurrentDeleteJobs` > 1 | a fresh sized ephemeral volume per Job (parallel Jobs cannot share one `ReadWriteOnce` PVC)                    |
+
+The dedicated PVC is separate from the backup's and the `Maintenance` cache PVCs, because those run at the same time as deletes and two pods must never share one kopia cache. It lives where the delete Jobs run (the `Repository`'s namespace, or the operator namespace for a `ClusterRepository`), uses the cache's `capacity` and `storageClassName`, and is owned by the repository, so it is deleted with it. Like the backup's cache PVC, it is not deleted if you later switch away from `mode: Persistent`; delete it by hand if you no longer want it.
+
+///
+
 ### `sourceColocation`: avoid the RWO Multi-Attach error
 
 A `ReadWriteOnce` (RWO) PVC can only be **attached to one node at a time**, though several pods **on that same node** can mount it. When your app pod already holds an RWO PVC on node A and Kopiur's mover lands on node B, the kubelet on B can't attach the volume and the mover pod is stuck with a `Multi-Attach error`. It never starts.
