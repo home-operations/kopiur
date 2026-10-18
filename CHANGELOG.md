@@ -1,5 +1,30 @@
 # Changelog
 
+## [0.10.16](https://github.com/home-operations/kopiur/compare/0.10.15...0.10.16) (2026-10-18)
+
+
+### Features
+
+* **npm:** update web ui dependencies ([#595](https://github.com/home-operations/kopiur/issues/595)) ([c5dd711](https://github.com/home-operations/kopiur/commit/c5dd7116b16767e1a9d6267f0cc46d86baaf182e))
+* **npm:** update web ui dependencies ([#599](https://github.com/home-operations/kopiur/issues/599)) ([b9bfd5a](https://github.com/home-operations/kopiur/commit/b9bfd5affe33f642925580e051b49bd403ebd512))
+
+
+### Bug Fixes
+
+* **npm:** update web ui dependencies ([#590](https://github.com/home-operations/kopiur/issues/590)) ([dd40d67](https://github.com/home-operations/kopiur/commit/dd40d67a0722c0487a73cb55f04d19442956231c))
+* resolve open issues ([#584](https://github.com/home-operations/kopiur/issues/584) [#583](https://github.com/home-operations/kopiur/issues/583) [#582](https://github.com/home-operations/kopiur/issues/582) [#579](https://github.com/home-operations/kopiur/issues/579) [#571](https://github.com/home-operations/kopiur/issues/571) [#552](https://github.com/home-operations/kopiur/issues/552) [#547](https://github.com/home-operations/kopiur/issues/547) [#546](https://github.com/home-operations/kopiur/issues/546) [#545](https://github.com/home-operations/kopiur/issues/545) [#194](https://github.com/home-operations/kopiur/issues/194)) ([#598](https://github.com/home-operations/kopiur/issues/598)) ([1953404](https://github.com/home-operations/kopiur/commit/1953404e2764e5f59c8c1b1f092b2af765912c96))
+* **rust:** update crate schemars (1.2.2 → 1.2.3) ([#592](https://github.com/home-operations/kopiur/issues/592)) ([c5e5982](https://github.com/home-operations/kopiur/commit/c5e5982553bd188bb69b653088bce2c09b461c0c))
+* **rust:** update crate serde_json (1.0.152 → 1.0.154) ([#593](https://github.com/home-operations/kopiur/issues/593)) ([b3d9e66](https://github.com/home-operations/kopiur/commit/b3d9e66b7b580b11603469212f0941f4d8d435be))
+* **rust:** update crate tokio (1.53.2 → 1.53.3) ([#596](https://github.com/home-operations/kopiur/issues/596)) ([4ce5b43](https://github.com/home-operations/kopiur/commit/4ce5b431c2c4b56302f785f15a8e953425b851e8))
+* **rust:** update opentelemetry (0.33.0 → 0.33.1) ([#597](https://github.com/home-operations/kopiur/issues/597)) ([a200a6b](https://github.com/home-operations/kopiur/commit/a200a6b451191249a1482358a2a118ef7b820e41))
+
+
+### Miscellaneous Chores
+
+* **github-action:** update github-actions ([#600](https://github.com/home-operations/kopiur/issues/600)) ([3cfd2a3](https://github.com/home-operations/kopiur/commit/3cfd2a35e622fd591d46932d1f75d47f5783b9df))
+* **mise:** update mise tools ([#594](https://github.com/home-operations/kopiur/issues/594)) ([333677e](https://github.com/home-operations/kopiur/commit/333677e1d94bc8073ec470ccfaa2c8e0811d0fd7))
+* **mise:** update tool helm (4.3.0 → 4.3.1) ([#601](https://github.com/home-operations/kopiur/issues/601)) ([383b99d](https://github.com/home-operations/kopiur/commit/383b99d0ed6a894f12673e50670eaf0b9adbfa24))
+
 ## [0.10.15](https://github.com/home-operations/kopiur/compare/0.10.14...0.10.15) (2026-10-15)
 
 
