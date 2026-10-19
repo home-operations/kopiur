@@ -16,7 +16,7 @@
     "check": "pnpm typecheck && pnpm lint && pnpm format:check && pnpm test"
   },
   "dependencies": {
-    "@tanstack/react-query": "5.104.2",
+    "@tanstack/react-query": "5.104.3",
     "@tanstack/react-router": "1.170.44",
     "elkjs": "0.12.0",
     "lucide-react": "1.57.0",
@@ -38,12 +38,12 @@
     "eslint-plugin-react-hooks": "7.1.1",
     "eslint-plugin-react-refresh": "0.5.7",
     "globals": "17.13.0",
-    "jsdom": "30.1.2",
+    "jsdom": "30.1.3",
     "typescript": "6.0.3",
     "typescript-eslint": "8.71.2",
     "vite": "8.3.4",
-    "vitest": "5.0.4",
+    "vitest": "5.0.5",
     "vitest-fetch-mock": "0.4.5"
   },
-  "packageManager": "pnpm@12.13.0"
+  "packageManager": "pnpm@12.14.0"
 }
