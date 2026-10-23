@@ -448,7 +448,7 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
                 .is_some()
             {
                 let job_api: Api<Job> = Api::namespaced(ctx.client.clone(), &namespace);
-                let job = job_api.get_opt(&name).await?;
+                let job = capture_job(&job_api, &name).await?;
                 if !staged_teardown_ready(job.as_ref()) {
                     // The owned-Job watch re-triggers us when the Job reaches
                     // Complete; the requeue is a backstop for a missed event.
@@ -569,7 +569,7 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
                 .is_some()
             {
                 let job_api: Api<Job> = Api::namespaced(ctx.client.clone(), &namespace);
-                let job = job_api.get_opt(&name).await?;
+                let job = capture_job(&job_api, &name).await?;
                 if !staged_teardown_ready(job.as_ref()) {
                     return Ok(Action::requeue(Duration::from_secs(15)));
                 }
@@ -624,7 +624,7 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
     // If the owned mover Job already reached a terminal state, copy phase/stats
     // into status (controller-as-source-of-truth for phase) and stop running.
     let job_api: Api<Job> = Api::namespaced(ctx.client.clone(), &namespace);
-    if let Some(job) = job_api.get_opt(&name).await? {
+    if let Some(job) = capture_job(&job_api, &name).await? {
         match job_terminal_state(&job) {
             Some(true) => {
                 // ADR §4.8: afterSnapshot hooks (resume/notify) complete — once —
@@ -816,7 +816,9 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
                         );
                         // Stop the kubelet's retry loop, then reap the staged objects
                         // (PVC before VS — the delete order that is safe mid-restore).
-                        let _ = job_api.delete(&name, &DeleteParams::background()).await;
+                        let _ = job_api
+                            .delete(&job.name_any(), &DeleteParams::background())
+                            .await;
                         io::cleanup_staged_source(
                             &ctx.client,
                             &namespace,
@@ -837,7 +839,7 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
                     backup.spec.failure_policy.as_ref(),
                 );
                 if let io::WedgedVerdict::Wedged { reason, message } =
-                    io::wedged_pod_verdict(&ctx.client, &namespace, &name, grace).await?
+                    io::wedged_pod_verdict(&ctx.client, &namespace, &job.name_any(), grace).await?
                 {
                     io::patch_status(
                         &api,
@@ -859,7 +861,9 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
                     // GC. BEST-EFFORT: a delete error must not abort this pass — the
                     // staged-source cleanup below would be skipped and never retried
                     // (the follow-up reconciles route to TerminalFailed).
-                    let _ = job_api.delete(&name, &DeleteParams::background()).await;
+                    let _ = job_api
+                        .delete(&job.name_any(), &DeleteParams::background())
+                        .await;
                     if backup
                         .status
                         .as_ref()
@@ -2014,8 +2018,9 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
             resolved_mover.tolerations.clone(),
         ),
     };
+    let job_name = crate::naming::capped_job_name(&name);
     let inputs = MoverJobInputs {
-        name: &name,
+        name: &job_name,
         namespace: &namespace,
         owner,
         work_spec: &work_spec,
@@ -2049,7 +2054,7 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
         readiness_exec: None,
     };
     let job = jobs::build_job(&inputs)?;
-    io::apply_mover_objects(&ctx.client, &namespace, &name, None, &job).await?;
+    io::apply_mover_objects(&ctx.client, &namespace, &job_name, None, &job).await?;
 
     let mut status = serde_json::json!({
         "phase": "Running",
@@ -2083,6 +2088,20 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
     tracing::info!(backup = %name, "created mover Job for backup");
 
     Ok(Action::requeue(Duration::from_secs(30)))
+}
+
+/// Find the capture Job using the same bounded name as creation. Prefer an
+/// existing legacy Job for 58..=63-byte names so an upgrade never duplicates an
+/// in-flight capture or reaps its staging/credentials while it is still active.
+/// Longer raw names could not pass the API server's generated job-name labels.
+async fn capture_job(jobs: &Api<Job>, snapshot: &str) -> Result<Option<Job>> {
+    let current = crate::naming::capped_job_name(snapshot);
+    if let Some(legacy) = crate::naming::legacy_job_name(snapshot, &current)
+        && let Some(job) = jobs.get_opt(&legacy).await?
+    {
+        return Ok(Some(job));
+    }
+    Ok(jobs.get_opt(&current).await?)
 }
 
 // --- Repository mover-Job pool gate -----------------------------------------
@@ -2155,7 +2174,7 @@ async fn pool_gate(
     // A backup's mover Job is named after its `Snapshot` and lives in the
     // Snapshot's namespace — the same identity `apply_mover_objects` creates it
     // under below, which is what lets the ledger sweep recognize it.
-    let job = crate::pool::job_key(namespace, name);
+    let job = crate::pool::job_key(namespace, &crate::naming::capped_job_name(name));
     match crate::pool::admit_or_park(
         ctx,
         &crate::naming::repo_label(&pinned),
@@ -5508,7 +5527,7 @@ async fn reap_backup_creds_once(
         return Ok(true);
     }
     let job_api: Api<Job> = Api::namespaced(ctx.client.clone(), namespace);
-    if !staged_teardown_ready(job_api.get_opt(name).await?.as_ref()) {
+    if !staged_teardown_ready(capture_job(&job_api, name).await?.as_ref()) {
         return Ok(false);
     }
     let owner_uid = backup.uid().unwrap_or_default();

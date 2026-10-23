@@ -1,4 +1,8 @@
 use super::*;
+
+#[path = "capture_tests.rs"]
+mod capture_tests;
+
 use crate::consts::SKIP_SNAPSHOT_CLEANUP_ANNOTATION;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use kopiur_api::common::NamespaceDeletePolicy;
@@ -4154,12 +4158,22 @@ fn render_mover_job(
     labels: BTreeMap<String, String>,
     resolved_mover: &kopiur_api::common::ResolvedMover,
 ) -> k8s_openapi::api::batch::v1::Job {
+    render_mover_job_for_snapshot(labels, resolved_mover, "db-1", "job-1")
+}
+
+fn render_mover_job_for_snapshot(
+    labels: BTreeMap<String, String>,
+    resolved_mover: &kopiur_api::common::ResolvedMover,
+    snapshot: &str,
+    job_name: &str,
+) -> k8s_openapi::api::batch::v1::Job {
     use kopiur_mover::jobs::{JobLimits, MoverJobInputs, build_job};
-    let ws = sample_backup_work_spec();
+    let mut ws = sample_backup_work_spec();
+    ws.target_ref.name = snapshot.to_string();
     build_job(&MoverJobInputs {
-        name: "job-1",
+        name: job_name,
         namespace: "prod",
-        owner: kopiur_mover::jobs::owner_ref("Snapshot", "db-1", "uid-1"),
+        owner: kopiur_mover::jobs::owner_ref("Snapshot", snapshot, "uid-1"),
         work_spec: &ws,
         image: "ghcr.io/kopiur/mover:test",
         image_pull_policy: None,
