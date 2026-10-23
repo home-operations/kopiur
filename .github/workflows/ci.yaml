@@ -63,7 +63,7 @@ jobs:
           install_args: --locked
 
       - name: Setup Rust cache
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: audit
 
@@ -124,7 +124,7 @@ jobs:
         run: mise run rust-components
 
       - name: Setup Rust cache
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: coverage
 
@@ -564,7 +564,7 @@ jobs:
         run: docker pull "rust:$(mise config get tools.rust.version)-slim-trixie"
 
       - name: Setup Rust cache
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: e2e-release
           workspaces: ". -> target/trixie"
@@ -973,7 +973,7 @@ jobs:
         run: mise run rust-components
 
       - name: Setup Rust cache
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           # -v2: the job now also builds the workspace for doctests and the
           # xtask checks; an exact-key hit never re-saves, so the old entry
@@ -1051,7 +1051,7 @@ jobs:
           install_args: rust aqua:nextest-rs/nextest/cargo-nextest lefthook
 
       - name: Setup Rust cache
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           # Supersedes `tests-v2` and `integration-v2`: one all-features debug
           # build now serves the unit, integration and e2e test jobs.
@@ -1140,7 +1140,7 @@ jobs:
       # xtask binary and kopiur-ui-model. Its own cache key: the Rust jobs build
       # a far larger dependency set and sharing one would evict theirs.
       - name: Setup Rust cache
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           shared-key: ui
 
