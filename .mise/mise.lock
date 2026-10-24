@@ -318,24 +318,24 @@ url_api = "https://api.github.com/repos/pnpm/pnpm/releases/assets/662173343"
 provenance = "github-attestations"
 
 [[tools.promtool]]
-version = "3.15.0"
+version = "3.15.1"
 backend = "aqua:prometheus/prometheus"
-specifiers = ["3.15.0"]
+specifiers = ["3.15.1"]
 
 [tools.promtool."platforms.linux-arm64"]
-checksum = "sha256:f1f90ec08e849d494ca66c611470afc50192f0355f1a61c33f2cbde02d067823"
-url = "https://github.com/prometheus/prometheus/releases/download/v3.15.0/prometheus-3.15.0.linux-arm64.tar.gz"
-url_api = "https://api.github.com/repos/prometheus/prometheus/releases/assets/587862303"
+checksum = "sha256:ceb6d21493c37ca0b4513b147642797c68cf39a0f50a444d50e1e80c74f21b26"
+url = "https://github.com/prometheus/prometheus/releases/download/v3.15.1/prometheus-3.15.1.linux-arm64.tar.gz"
+url_api = "https://api.github.com/repos/prometheus/prometheus/releases/assets/662697891"
 
 [tools.promtool."platforms.linux-x64"]
-checksum = "sha256:2a542df32eac02ee17b9d844fb2aa1de00dafa5476579ba8a3ba862e9d572ea0"
-url = "https://github.com/prometheus/prometheus/releases/download/v3.15.0/prometheus-3.15.0.linux-amd64.tar.gz"
-url_api = "https://api.github.com/repos/prometheus/prometheus/releases/assets/587862123"
+checksum = "sha256:6a726885328ad9efebbf36e876ce2fb6225468a71fd1e7ce3ba666d5f4d97a84"
+url = "https://github.com/prometheus/prometheus/releases/download/v3.15.1/prometheus-3.15.1.linux-amd64.tar.gz"
+url_api = "https://api.github.com/repos/prometheus/prometheus/releases/assets/662697731"
 
 [tools.promtool."platforms.macos-arm64"]
-checksum = "sha256:920df4d17e78b3b0175af144eb318b0c74d1cf7b1d1251b326966f0e81977260"
-url = "https://github.com/prometheus/prometheus/releases/download/v3.15.0/prometheus-3.15.0.darwin-arm64.tar.gz"
-url_api = "https://api.github.com/repos/prometheus/prometheus/releases/assets/587860828"
+checksum = "sha256:0d4d3d9837d27e4fcd0bd16d115b1b8d6732a4bf3e69107f1190d9ef653ae471"
+url = "https://github.com/prometheus/prometheus/releases/download/v3.15.1/prometheus-3.15.1.darwin-arm64.tar.gz"
+url_api = "https://api.github.com/repos/prometheus/prometheus/releases/assets/662695921"
 
 [[tools.rust]]
 version = "1.98.1"
