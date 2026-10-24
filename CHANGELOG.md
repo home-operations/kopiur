@@ -1,5 +1,41 @@
 # Changelog
 
+## [0.10.17](https://github.com/home-operations/kopiur/compare/0.10.16...0.10.17) (2026-10-24)
+
+
+### Features
+
+* **npm:** update dependency lucide-react (1.60.0 → 1.61.0) ([#625](https://github.com/home-operations/kopiur/issues/625)) ([dac1afb](https://github.com/home-operations/kopiur/commit/dac1afba1b8f37f703b558c8bb338405b4831933))
+* **npm:** update dependency pnpm (12.14.0 → 12.15.0) ([#629](https://github.com/home-operations/kopiur/issues/629)) ([2333af8](https://github.com/home-operations/kopiur/commit/2333af81ee7c8d08f14750be8e05089b051f8697))
+* **npm:** update web ui dependencies ([#604](https://github.com/home-operations/kopiur/issues/604)) ([2de0eef](https://github.com/home-operations/kopiur/commit/2de0eef3a6489ec859bb3da2253ae7ea412eec81))
+* **npm:** update web ui dependencies ([#606](https://github.com/home-operations/kopiur/issues/606)) ([c7056e1](https://github.com/home-operations/kopiur/commit/c7056e12c3bb782b3b8bf605dd83fad3ab1a3bc3))
+* **npm:** update web ui dependencies ([#621](https://github.com/home-operations/kopiur/issues/621)) ([107f22f](https://github.com/home-operations/kopiur/commit/107f22f0aba4bf102bdcbd12771b22cf654a3c8c))
+* **rust:** update crate rust-embed (8.12.0 → 8.13.0) ([#610](https://github.com/home-operations/kopiur/issues/610)) ([77e4cd4](https://github.com/home-operations/kopiur/commit/77e4cd4318bb2999ecd2b2a00587ee823bf714a8))
+
+
+### Bug Fixes
+
+* **npm:** update dependency @tanstack/react-query (5.104.4 → 5.104.5) ([#615](https://github.com/home-operations/kopiur/issues/615)) ([52ba37c](https://github.com/home-operations/kopiur/commit/52ba37c3f9e06e775bb78b3f7d9cc72e39d67007))
+* **npm:** update dependency vite (8.3.4 → 8.3.5) ([#626](https://github.com/home-operations/kopiur/issues/626)) ([f7e4799](https://github.com/home-operations/kopiur/commit/f7e4799d6c9b83d0ae22268591578444242457fe))
+* **rust:** update crate libc (0.2.190 → 0.2.191) ([#607](https://github.com/home-operations/kopiur/issues/607)) ([5f9b6c7](https://github.com/home-operations/kopiur/commit/5f9b6c7b895848e27c1b9977c3d3b3f5c6aafa74))
+
+
+### Miscellaneous Chores
+
+* **github-action:** update action jdx/mise-action (v5.1.2 → v5.2.0) ([#608](https://github.com/home-operations/kopiur/issues/608)) ([d20af54](https://github.com/home-operations/kopiur/commit/d20af5403d65e2a5eb4cbc438dc6104850254cb3))
+* **github-action:** update action jdx/mise-action (v5.2.1 → v5.2.2) ([#627](https://github.com/home-operations/kopiur/issues/627)) ([80540c1](https://github.com/home-operations/kopiur/commit/80540c153293511f454c9fff7e55e8515c1e6fda))
+* **github-action:** update action swatinem/rust-cache (v2.9.2 → v2.9.3) ([#622](https://github.com/home-operations/kopiur/issues/622)) ([9774b68](https://github.com/home-operations/kopiur/commit/9774b6868320d2640e261ca878c0cd23ffa8f496))
+* **github-action:** update github-actions ([#619](https://github.com/home-operations/kopiur/issues/619)) ([87fb0e5](https://github.com/home-operations/kopiur/commit/87fb0e52b83a671f19ed7f42733e93c1d28b1f5b))
+* **mise:** update mise tools ([#602](https://github.com/home-operations/kopiur/issues/602)) ([d30b286](https://github.com/home-operations/kopiur/commit/d30b286ac46f7a4492aa649b1a9a8c451ad801a5))
+* **mise:** update mise tools ([#605](https://github.com/home-operations/kopiur/issues/605)) ([8e54a46](https://github.com/home-operations/kopiur/commit/8e54a466e7a3157045dfd5b86c80de05461726c6))
+* **mise:** update mise tools ([#624](https://github.com/home-operations/kopiur/issues/624)) ([a1b0214](https://github.com/home-operations/kopiur/commit/a1b021481e7c7ff179410d9b0b1e7190725d0b60))
+* **mise:** update tool aqua:astral-sh/uv (0.13.1 → 0.13.2) ([#616](https://github.com/home-operations/kopiur/issues/616)) ([16e9d19](https://github.com/home-operations/kopiur/commit/16e9d1932550287c5059bdd97b6ef960db1664be))
+* **mise:** update tool aqua:astral-sh/uv (0.13.2 → 0.13.3) ([#618](https://github.com/home-operations/kopiur/issues/618)) ([7b9cb4b](https://github.com/home-operations/kopiur/commit/7b9cb4b976c5d293a582c5f6ed1905fecd71772e))
+* **mise:** update tool aqua:dadav/helm-schema (0.23.5 → 0.24.0) ([#614](https://github.com/home-operations/kopiur/issues/614)) ([38cbfd6](https://github.com/home-operations/kopiur/commit/38cbfd69af4eb94b6bb476418b73571e5519ecda))
+* **mise:** update tool node (24.21.0 → v24.22.0) ([#609](https://github.com/home-operations/kopiur/issues/609)) ([54dd5d2](https://github.com/home-operations/kopiur/commit/54dd5d256d6a78ac5c36d8de053db434df23ba60))
+* **mise:** update tool oxfmt (0.73.0 → 0.74.0) ([#620](https://github.com/home-operations/kopiur/issues/620)) ([bdba9e5](https://github.com/home-operations/kopiur/commit/bdba9e5253b406a7a8ff9e558cfa84054b32a78a))
+* **mise:** update tool pnpm (12.14.0 → 12.15.0) ([#628](https://github.com/home-operations/kopiur/issues/628)) ([f057c9d](https://github.com/home-operations/kopiur/commit/f057c9d091b1d699cfc13e1993d1be650ec07a1a))
+
 ## [0.10.16](https://github.com/home-operations/kopiur/compare/0.10.15...0.10.16) (2026-10-18)
 
 
