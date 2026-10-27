@@ -61,7 +61,7 @@ spec:
     # label, <=32 chars, no dots): flips the no-hostnameExpr default hostname to
     # <namespace>.<cluster>, feeds the `cluster` CEL variable above, and
     # cluster-qualifies the managed Maintenance lease so clusters never fight
-    # over it. See docs/scenarios/shared-repository-multi-cluster.md.
+    # over it. See docs/src/content/docs/scenarios/shared-repository-multi-cluster.mdx.
     # cluster: east
   # Maintenance is default-managed here too. Because Maintenance is namespaced
   # but a ClusterRepository is not, `namespace` selects where the managed
@@ -76,7 +76,7 @@ spec:
   # column) and emits a Warning event + a non-blocking `IndexBlobHealth=False`
   # condition when it crosses this threshold. Optional — omit to use the default
   # of 1000; set to 0 to disable the warning. The repository stays Ready either
-  # way (this is a degradation signal, not an outage). See docs/maintenance.md.
+  # way (this is a degradation signal, not an outage). See docs/src/content/docs/maintenance.mdx.
   health:
     indexBlobWarnThreshold: 1000
   # Repo-wide mover defaults inherited by every mover this repo spawns. Here we set

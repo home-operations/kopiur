@@ -280,8 +280,8 @@ pub fn build_mover_rolebinding(
 /// For the STREAM mover it is not inert — the residue IS the `pods/exec` privilege,
 /// and it outlives both the policy and the namespace opt-in annotation. Withdrawing
 /// that opt-in stops new stream Jobs; it does not take the grant back. That is a
-/// documented, explicit two-command revoke (`docs/stream-sources.md`
-/// "Revoking the opt-in", `docs/rbac.md`), NOT something this function undoes.
+/// documented, explicit two-command revoke (`docs/src/content/docs/stream-sources.mdx`
+/// "Revoking the opt-in", `docs/src/content/docs/rbac.md`), NOT something this function undoes.
 pub async fn ensure_mover_rbac(
     client: &kube::Client,
     ns: &str,

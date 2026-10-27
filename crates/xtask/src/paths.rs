@@ -36,8 +36,7 @@ pub fn deploy_dir() -> PathBuf {
     workspace_root().join("deploy")
 }
 
-/// The `docs/` directory under the workspace root (MkDocs source tree; home of
-/// the generated `field-reference.md`).
+/// The docs site's content directory (home of the generated `field-reference.md`).
 pub fn docs_dir() -> PathBuf {
-    workspace_root().join("docs")
+    workspace_root().join("docs/src/content/docs")
 }

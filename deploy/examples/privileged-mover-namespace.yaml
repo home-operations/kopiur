@@ -1,4 +1,4 @@
-# Privileged-mover namespace opt-in (docs/permissions.md, docs/security-context.md)
+# Privileged-mover namespace opt-in (docs/src/content/docs/permissions.mdx, docs/src/content/docs/security-context.mdx)
 #
 # A privileged (or root) mover — `runAsUser: 0`, `privileged: true`,
 # `allowPrivilegeEscalation: true`, added Linux capabilities, `runAsNonRoot:

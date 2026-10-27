@@ -1,4 +1,4 @@
-# Try it end-to-end — a privileged (root) mover (docs/movers.md)
+# Try it end-to-end — a privileged (root) mover (docs/src/content/docs/movers.mdx)
 #
 # A complete, self-contained arc that proves a ROOT mover runs only after the
 # namespace opts in. It creates:
@@ -15,13 +15,13 @@
 #   kubectl apply -f deploy/examples/tryit/movers-privileged.yaml
 # (the manual Snapshot uses `generateName`, so create it with `kubectl create`).
 #
-# The `# --8<-- [start:NAME]` / `[end:NAME]` lines are MkDocs snippet markers for
-# docs/movers.md. They are plain YAML comments — the file stays apply-ready.
+# The `# region NAME` / `# endregion NAME` lines are region markers for
+# docs/src/content/docs/movers.mdx. They are plain YAML comments — the file stays apply-ready.
 #
 # Field shapes verified against crates/api (externally-tagged backend: the bucket
 # lives under `backend.s3`).
 ---
-# --8<-- [start:namespace]
+# region namespace
 # The privileged-mover opt-in. Without this annotation, the root Snapshot below
 # is REFUSED with a `MoverPermitted=False` condition until the namespace opts in.
 apiVersion: v1
@@ -30,9 +30,9 @@ metadata:
   name: media
   annotations:
     kopiur.home-operations.com/privileged-movers: "true"
-# --8<-- [end:namespace]
+# endregion namespace
 ---
-# --8<-- [start:pvc]
+# region pvc
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -44,9 +44,9 @@ spec:
   resources:
     requests:
       storage: 1Gi
-# --8<-- [end:pvc]
+# endregion pvc
 ---
-# --8<-- [start:seed]
+# region seed
 # Seed the PVC with ROOT-owned, owner-only (0600) files — exactly the data an
 # unprivileged mover (UID 65532) gets "permission denied" on, so success here
 # proves the ROOT mover read it.
@@ -84,9 +84,9 @@ spec:
         - name: d
           persistentVolumeClaim:
             claimName: app-data
-# --8<-- [end:seed]
+# endregion seed
 ---
-# --8<-- [start:secret]
+# region secret
 apiVersion: v1
 kind: Secret
 metadata:
@@ -99,9 +99,9 @@ stringData:
   # Generate (e.g. `openssl rand -base64 24`) and store it OUTSIDE the cluster —
   # lose it and the backups are unrecoverable.
   KOPIA_PASSWORD: "REPLACE_ME"
-# --8<-- [end:secret]
+# endregion secret
 ---
-# --8<-- [start:repository]
+# region repository
 apiVersion: kopiur.home-operations.com/v1alpha1
 kind: Repository
 metadata:
@@ -123,9 +123,9 @@ spec:
       key: KOPIA_PASSWORD
   create:
     enabled: true
-# --8<-- [end:repository]
+# endregion repository
 ---
-# --8<-- [start:policy]
+# region policy
 apiVersion: kopiur.home-operations.com/v1alpha1
 kind: SnapshotPolicy
 metadata:
@@ -152,9 +152,9 @@ spec:
     # UID itself: without runAsUser: 0 it grants nothing. On a Restore it adds CHOWN,
     # DAC_OVERRIDE, FOWNER and FSETID so original ownership is reproduced.
     privilegedMode: true
-# --8<-- [end:policy]
+# endregion policy
 ---
-# --8<-- [start:snapshot]
+# region snapshot
 apiVersion: kopiur.home-operations.com/v1alpha1
 kind: Snapshot
 metadata:
@@ -163,4 +163,4 @@ metadata:
 spec:
   policyRef:
     name: app-data
-# --8<-- [end:snapshot]
+# endregion snapshot

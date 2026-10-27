@@ -216,16 +216,16 @@ fn default_cell_shows_default_required_or_dash_with_constraints() {
 fn anchors_are_stable_and_drop_array_markers() {
     assert_eq!(
         anchor("Repository", "spec.backend"),
-        "repository-spec-backend"
+        "repository-specbackend"
     );
     assert_eq!(
         anchor("SnapshotPolicy", "spec.sources[]"),
-        "snapshotpolicy-spec-sources"
+        "snapshotpolicy-specsources"
     );
     // camelCase path segments are lowercased for the anchor id.
     assert_eq!(
         anchor("Repository", "spec.moverDefaults"),
-        "repository-spec-moverdefaults"
+        "repository-specmoverdefaults"
     );
 }
 
@@ -266,5 +266,22 @@ fn generated_page_is_deterministic() {
     let b = artifacts().unwrap();
     assert_eq!(a.len(), 1);
     assert_eq!(a[0].content, b[0].content);
-    assert!(a[0].content.contains("# Field reference"));
+    assert!(a[0].content.starts_with("---\ntitle: Field reference\n"));
+}
+
+#[test]
+fn section_anchors_are_unique() {
+    // The site suffixes a repeated heading id with `-1`, which would leave the
+    // links this page writes pointing at the first section with that id.
+    let page = &artifacts().unwrap()[0].content;
+    let mut seen = std::collections::HashSet::new();
+    for line in page
+        .lines()
+        .filter(|l| l.starts_with("###") && l.ends_with('`'))
+    {
+        let (kind, path) = line.trim_start_matches('#').trim().split_once(' ').unwrap();
+        let id = anchor(kind, path.trim_matches('`'));
+        assert!(seen.insert(id.clone()), "duplicate section id {id}");
+    }
+    assert!(!seen.is_empty());
 }

@@ -87,6 +87,6 @@ assert!(concurrency_allows(ConcurrencyPolicy::Replace, true));
 
 ## See also
 
-- [ADR-0003](https://github.com/perfectra1n/kopiur/blob/main/docs/adr/0003-kopiur-rust-operator.md)
+- [ADR-0003](https://kopiur.home-operations.com/adr/0003-kopiur-rust-operator/)
   §5.2 (controller runtime) and §5.4 (kopia interaction) — the canonical design.
 - [`kopiur-api`](kopiur_api) — the CRD types and validators the controller reconciles.

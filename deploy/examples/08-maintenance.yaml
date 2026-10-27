@@ -23,11 +23,11 @@
 # The operator routes it through the same mover/lease/single-flight path as a
 # scheduled slot. The imperative equivalent is `kubectl annotate maintenance …`.
 #
-# The `# --8<-- [start:…]` / `# --8<-- [end:…]` lines are snippet-section markers
-# (docs/maintenance.md pulls this Maintenance on its own). Plain YAML comments —
+# The `# region …` / `# endregion …` lines are region markers
+# (docs/src/content/docs/maintenance.mdx pulls this Maintenance on its own). Plain YAML comments —
 # the file stays `kubectl apply -f`-able as-is.
 ---
-# --8<-- [start:standalone]
+# region standalone
 apiVersion: kopiur.home-operations.com/v1alpha1
 kind: Maintenance
 metadata:
@@ -66,4 +66,4 @@ spec:
     backoffLimit: 1
     activeDeadlineSeconds: 14400 # cap a RUNNING maintenance Job (4h)
     podStartupDeadlineSeconds: 300 # fail fast if the maintenance mover can't START in 5m (default 300)
-# --8<-- [end:standalone]
+# endregion standalone

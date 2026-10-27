@@ -24,14 +24,14 @@
 #   recipe's worth of Snapshots at once is exactly the bulk-deletion pattern
 #   the breaker exists to catch, so a large policy will likely trip it and
 #   need the kopiur.home-operations.com/allow-mass-deletion ack before the
-#   held deletions proceed (see example 34 / docs/repositories.md
+#   held deletions proceed (see example 34 / docs/src/content/docs/repositories.mdx
 #   "deletionProtection").
 #
 # Field shapes verified against crates/api (externally-tagged backend:
 # `backend.s3`, not `backend: { kind: S3 }`).
 #
-# See docs/backups.md ("What happens when the policy is deleted") and
-# docs/scenarios/adopt-existing-repo.md ("Delete a policy, then recreate it").
+# See docs/src/content/docs/backups.mdx ("What happens when the policy is deleted") and
+# docs/src/content/docs/scenarios/adopt-existing-repo.mdx ("Delete a policy, then recreate it").
 ---
 apiVersion: v1
 kind: Secret

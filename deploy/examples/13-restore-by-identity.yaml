@@ -10,7 +10,7 @@
 #   kopia snapshot list --all
 #
 # Default identity is `<snapshotPolicyName>@<namespace>:/pvc/<pvcName>` — see
-# docs/concepts/how-kopia-works.md.
+# docs/src/content/docs/concepts/how-kopia-works.md.
 #
 # Field shapes verified against crates/api: source.identity is
 # { username, hostname, sourcePath?, snapshotID?, asOf?, offset? }; `snapshotID`

@@ -1,4 +1,4 @@
-# Maintenance — tuned inline on the Repository (docs/maintenance.md)
+# Maintenance — tuned inline on the Repository (docs/src/content/docs/maintenance.mdx)
 #
 # The simplest way to control maintenance: set `spec.maintenance` on the
 # Repository/ClusterRepository itself. Maintenance stays operator-managed (the

@@ -1,4 +1,4 @@
-# Web UI on a cluster-scoped ClusterRepository (docs/server.md)
+# Web UI on a cluster-scoped ClusterRepository (docs/src/content/docs/server.mdx)
 #
 # A ClusterRepository has no implicit namespace, so its `spec.server` block
 # REQUIRES `namespace` — which namespace the server Deployment/Service/ConfigMap

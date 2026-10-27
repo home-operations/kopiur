@@ -281,7 +281,7 @@ pub fn select_restore_repository(
 }
 
 /// Deletion semantics for the `Snapshot`s carrying a `SnapshotPolicy`'s config
-/// label (sub-object per docs/dev/api-conventions.md §4 so future deletion
+/// label (sub-object per docs/src/content/docs/dev/api-conventions.md §4 so future deletion
 /// knobs slot in without API breakage). Mirrors `SnapshotSchedule`'s
 /// [`ScheduleDeletionSpec`](crate::snapshot_schedule::ScheduleDeletionSpec).
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default, JsonSchema)]
@@ -1622,7 +1622,7 @@ mod tests {
     fn ignore_rules_explicit_custom_list_replaces_default_wholesale() {
         // An explicit non-empty list REPLACES the default outright — it is not
         // merged/appended. Re-adding a default entry you still want is on the
-        // user (documented in docs/backups.md).
+        // user (documented in docs/src/content/docs/backups.mdx).
         let spec: SnapshotPolicySpec = from_yaml(
             "repository: { kind: Repository, name: r }\nsources: [ { pvc: { name: d } } ]\nfiles: { ignoreRules: [\"*.tmp\", \"lost+found\"] }\n",
         );
@@ -2690,7 +2690,7 @@ preflight:
     fn snapshot_policy_repository_print_column_is_unchanged() {
         // The `Repository` column stays `.spec.repository.name` (renders
         // empty for a multi-repo policy — the `Repositories` summary column
-        // covers that shape; documented in docs/backups.md).
+        // covers that shape; documented in docs/src/content/docs/backups.mdx).
         let crd = SnapshotPolicy::crd();
         let json = serde_json::to_value(&crd).expect("serialize CRD");
         let cols = json["spec"]["versions"][0]["additionalPrinterColumns"]

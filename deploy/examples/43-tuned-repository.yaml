@@ -76,7 +76,7 @@ spec:
       # Hand every mover Job to a Kueue LocalQueue. Kueue admits work by
       # flipping `spec.suspend`, and a SUSPENDED Job has no pod and so does not
       # occupy one of the three slots above — the two queues cannot deadlock
-      # each other. See docs/movers.md for the manageJobsWithoutQueueName hazard.
+      # each other. See docs/src/content/docs/movers.mdx for the manageJobsWithoutQueueName hazard.
       kueue.x-k8s.io/queue-name: backups
       # A selector your NetworkPolicy / monitoring can key off.
       egress-to-object-store: "true"

@@ -72,5 +72,5 @@ notice and each scenario returns early.
 
 ## See also
 
-- [ADR-0003](../../docs/adr/0003-kopiur-rust-operator.md) — the operator design
+- [ADR-0003](https://kopiur.home-operations.com/adr/0003-kopiur-rust-operator/) — the operator design
   and CRD lifecycle these scenarios validate.

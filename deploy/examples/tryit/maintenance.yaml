@@ -1,4 +1,4 @@
-# Try it end-to-end — the managed Maintenance auto-appears (docs/maintenance.md)
+# Try it end-to-end — the managed Maintenance auto-appears (docs/src/content/docs/maintenance.mdx)
 #
 # Deliberately MINIMAL: just a namespace, a repo PVC, a Secret, and a filesystem
 # Repository. There is NO standalone Maintenance in this file — the point is to
@@ -17,17 +17,17 @@
 # `kopiur.home-operations.com/run-requested` (RFC3339) + RUN_MODE_ANNOTATION
 # `kopiur.home-operations.com/run-mode` values quick|full — consts.rs).
 #
-# The `# --8<-- [start:NAME]` / `# --8<-- [end:NAME]` lines are MkDocs snippet
-# section markers for docs/maintenance.md. Plain YAML comments — applies as-is.
+# The `# region NAME` / `# endregion NAME` lines are region
+# markers for docs/src/content/docs/maintenance.mdx. Plain YAML comments — applies as-is.
 ---
-# --8<-- [start:namespace]
+# region namespace
 apiVersion: v1
 kind: Namespace
 metadata:
   name: kopiur-tryit
-# --8<-- [end:namespace]
+# endregion namespace
 ---
-# --8<-- [start:repo-pvc]
+# region repo-pvc
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -38,9 +38,9 @@ spec:
   resources:
     requests:
       storage: 2Gi
-# --8<-- [end:repo-pvc]
+# endregion repo-pvc
 ---
-# --8<-- [start:secret]
+# region secret
 apiVersion: v1
 kind: Secret
 metadata:
@@ -49,9 +49,9 @@ metadata:
 type: Opaque
 stringData:
   KOPIA_PASSWORD: "REPLACE_ME"
-# --8<-- [end:secret]
+# endregion secret
 ---
-# --8<-- [start:repository]
+# region repository
 # A bare Repository. NOTE there is no `spec.maintenance` block and no standalone
 # Maintenance CR: maintenance is default-on, so the operator projects an owned
 # `Maintenance` named `primary` the moment this repository is Ready.
@@ -73,4 +73,4 @@ spec:
       key: KOPIA_PASSWORD
   create:
     enabled: true
-# --8<-- [end:repository]
+# endregion repository

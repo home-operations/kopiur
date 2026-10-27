@@ -1,4 +1,4 @@
-//! Generated CRD field reference (`docs/field-reference.md`).
+//! Generated CRD field reference (`docs/src/content/docs/field-reference.md`).
 //!
 //! Walks each CRD's structural schema — the exact `T::crd()` output that ships
 //! in `deploy/crds/` — and renders one Markdown page: every spec/status field
@@ -27,7 +27,7 @@ use kube::core::CustomResourceExt;
 
 use crate::artifact::{Artifact, DOCS_GEN_HEADER};
 
-/// Generate the single `docs/field-reference.md` artifact for all 9 CRDs.
+/// Generate the single `field-reference.md` artifact for all 9 CRDs.
 pub fn artifacts() -> Result<Vec<Artifact>> {
     // Same order as `crds::artifacts()` so the page reads spec-first, simple to
     // complex, and stays stable.
@@ -44,6 +44,7 @@ pub fn artifacts() -> Result<Vec<Artifact>> {
     ];
 
     let mut page = String::new();
+    page.push_str(FRONTMATTER);
     page.push_str(DOCS_GEN_HEADER);
     page.push_str(INTRO);
     for crd in &crds {
@@ -53,10 +54,12 @@ pub fn artifacts() -> Result<Vec<Artifact>> {
     Ok(vec![Artifact::docs("field-reference.md".to_string(), page)])
 }
 
-/// The hand-authored page preamble (title + how it is generated + conventions).
-const INTRO: &str = "# Field reference\n\
-\n\
-Every spec and status field of all nine CRDs in \
+/// The page's front matter: its title and sidebar label.
+const FRONTMATTER: &str =
+    "---\ntitle: Field reference\nsidebar:\n  label: Field reference (all CRDs)\n---\n";
+
+/// The hand-authored page preamble (how it is generated + conventions).
+const INTRO: &str = "\nEvery spec and status field of all nine CRDs in \
 `kopiur.home-operations.com/v1alpha1`, with its type, schema default, and a \
 one-line meaning taken straight from the Rust doc comments.\n\
 \n\
@@ -65,9 +68,9 @@ gen-docs` (run `mise run gen`); it is drift-checked in CI, so it can never go \
 stale against the shipped CRDs. To change an entry, edit the doc comment on the \
 field in `crates/api` — not this file. For the task-oriented explanations \
 (mental model, which knobs you actually change), see the per-CRD pages under \
-[CRD reference](reference/crds/index.md).\n\
+[CRD reference](/reference/crds/).\n\
 \n\
-/// info | Conventions\n\
+:::note[Conventions]\n\
 \n\
 - **Type** uses the CRD/YAML shape. `enum: A \\| B` lists the allowed values; \
 `[]T` is an array, `map[string]T` a map, `object (free-form)` an \
@@ -84,7 +87,7 @@ fails.\n\
 - Validation rules enforced by the API server (`x-kubernetes-validations`, \
 including immutability) are listed under the table they apply to.\n\
 \n\
-///\n";
+:::\n";
 
 /// Render one CRD: a `##` heading + metadata line, then spec and status sections.
 fn render_crd(crd: &CustomResourceDefinition) -> String {
@@ -93,7 +96,7 @@ fn render_crd(crd: &CustomResourceDefinition) -> String {
     let mut out = String::new();
 
     out.push_str("\n---\n\n");
-    out.push_str(&format!("## {kind} {{ #{} }}\n\n", slug(kind)));
+    out.push_str(&format!("## {kind}\n\n"));
 
     // Metadata line: scope, short names, print columns.
     let mut meta: Vec<String> = vec![format!("**Scope:** {}", crd.spec.scope)];
@@ -170,11 +173,7 @@ impl Section {
     fn render(&self, kind: &str) -> String {
         let depth = self.path.matches('.').count(); // spec=0 → ###, deeper → more #
         let hashes = "#".repeat((depth + 3).min(6));
-        let mut out = format!(
-            "\n{hashes} `{}` {{ #{} }}\n\n",
-            self.path,
-            anchor(kind, &self.path)
-        );
+        let mut out = format!("\n{hashes} {kind} `{}`\n\n", self.path);
         if let Some(intro) = &self.intro {
             out.push_str(intro);
             out.push_str("\n\n");
@@ -516,7 +515,7 @@ fn escape_prose(s: &str) -> String {
 
 /// Rewrite rustdoc intra-doc links to plain Markdown. Doc comments are written
 /// for rustdoc, so descriptions carry `[`Type`]`, `[`field`](Self::field)`, and
-/// `[`crate::consts::X`]` — which render as broken links in MkDocs. Keep the
+/// `[`crate::consts::X`]` — which render as broken links on the site. Keep the
 /// label text (a code span), drop the brackets and any `(target)`.
 fn strip_rustdoc_links(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
@@ -558,22 +557,10 @@ fn strip_rustdoc_links(s: &str) -> String {
     out
 }
 
-/// A stable, collision-free anchor id for a CRD path, e.g.
-/// `repository-spec-backend`. Array markers `[]` are dropped and the whole id is
-/// lowercased to match MkDocs slug conventions (all kopiur field paths are
-/// unique case-insensitively, so no collisions).
+/// The id the site gives the section heading `{kind} `{path}``, e.g.
+/// `repository-specbackend`: lowercased, `.` and `[]` dropped, the space a hyphen.
 fn anchor(kind: &str, path: &str) -> String {
-    format!(
-        "{}-{}",
-        slug(kind),
-        path.replace("[]", "").replace('.', "-")
-    )
-    .to_lowercase()
-}
-
-/// Lowercase kebab slug of a CRD kind for anchors.
-fn slug(kind: &str) -> String {
-    kind.to_lowercase()
+    format!("{kind}-{}", path.replace(['.', '[', ']'], "")).to_lowercase()
 }
 
 #[cfg(test)]

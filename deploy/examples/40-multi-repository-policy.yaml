@@ -12,8 +12,8 @@
 # `spec.hooks` cannot be combined with `spec.repositories` (webhook-refused —
 # use a single-repo policy + a SnapshotReplication instead, see example 39).
 #
-# The `# --8<-- [start:…]` / `# --8<-- [end:…]` lines are snippet-section
-# markers (docs/backups.md pulls the policy stage on its own). Plain YAML
+# The `# region …` / `# endregion …` lines are region
+# markers (docs/src/content/docs/backups.mdx pulls the policy stage on its own). Plain YAML
 # comments — the file stays `kubectl apply -f`-able as-is.
 ---
 apiVersion: v1
@@ -87,7 +87,7 @@ spec:
   create:
     enabled: true
 ---
-# --8<-- [start:policy]
+# region policy
 apiVersion: kopiur.home-operations.com/v1alpha1
 kind: SnapshotPolicy
 metadata:
@@ -116,7 +116,7 @@ spec:
   # cannot honor a freeze/thaw quiesce contract. For hooked backups plus a
   # second repository, keep the policy single-repo and add a
   # SnapshotReplication (example 39).
-# --8<-- [end:policy]
+# endregion policy
 ---
 apiVersion: kopiur.home-operations.com/v1alpha1
 kind: SnapshotSchedule

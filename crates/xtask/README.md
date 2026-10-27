@@ -11,7 +11,7 @@ the checked-in deploy artifacts:
 
 - `gen-crds` → structural-schema CRD YAML under `deploy/crds/`
 - `gen-rbac` → the controller/webhook RBAC manifests under `deploy/`
-- `gen-docs` → `docs/field-reference.md`, rendered from the CRD schemas
+- `gen-docs` → `docs/src/content/docs/field-reference.md`, rendered from the CRD schemas
 - `gen-ui-types` → one `.ts` per `kopiur-ui-model` wire type under
   `crates/ui/web/src/api/types/`, exported with `ts-rs`
 - `gen-all` → all of the above + the Grafana dashboard copy under
@@ -124,5 +124,5 @@ mise run phase-check
 
 ## See also
 
-- [ADR-0003](../../docs/adr/0003-kopiur-rust-operator.md) — the canonical CRD
+- [ADR-0003](https://kopiur.home-operations.com/adr/0003-kopiur-rust-operator/) — the canonical CRD
   surface these artifacts are generated from.

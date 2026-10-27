@@ -1473,7 +1473,7 @@ pub fn fanout_status(
 /// The overwhelmingly common populator is a ONE-PVC app, and for it the
 /// `Restore` simply IS that claim: `status.resolved`, `status.target` and the
 /// `Ready`/`Resolved` conditions are the claim's, verbatim. That is not a
-/// convenience — it is the published contract. `docs/restores.md` promises the
+/// convenience — it is the published contract. `docs/src/content/docs/restores.mdx` promises the
 /// deploy-or-restore decision is pinned to `status.resolved`, and
 /// `kubectl kopiur restore` / `kubectl kopiur status` read exactly that field.
 /// #443 moved the pin under `status.claims.<pvc>.resolved` and broke both.
@@ -1850,7 +1850,7 @@ impl ClaimReason {
 /// lean on: on main a `Failed` populator never reached any reaper at all (it
 /// was terminal at the reconcile guard), so "reap unless told otherwise" was
 /// never the historical behavior. Such a prime is a human's to delete by hand
-/// (documented in `docs/troubleshooting.md`).
+/// (documented in `docs/src/content/docs/troubleshooting.mdx`).
 pub fn claim_artifacts_reapable(reason: Option<&str>) -> bool {
     match reason.and_then(ClaimReason::parse) {
         Some(r) => r.artifacts_reapable(),

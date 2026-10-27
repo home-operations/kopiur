@@ -111,5 +111,5 @@ real repository and cluster, so they are not runnable doctests.
 
 ## See also
 
-- [ADR-0003](../../docs/adr/0003-kopiur-rust-operator.md) — §4.10 (mover pods &
+- [ADR-0003](https://kopiur.home-operations.com/adr/0003-kopiur-rust-operator/) — §4.10 (mover pods &
   failure handling, the work-spec contract) and §5.4 (kopia interaction).

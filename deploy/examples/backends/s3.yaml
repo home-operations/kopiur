@@ -7,14 +7,14 @@
 # Field shapes verified against crates/api: externally-tagged backend
 # (`backend.s3`, NOT `backend: { kind: S3 }`).
 #
-# This file ALSO carries a smoke-test (the `smoketest` snippet section): a tiny
+# This file ALSO carries a smoke-test (the `smoketest` region): a tiny
 # PVC + SnapshotPolicy + Snapshot that backs up against `s3-primary`, so the S3
 # page can show a full "Try it end-to-end" arc from one bundle.
 #
-# The `# --8<-- [start:…]` / `# --8<-- [end:…]` lines are snippet-section markers
-# for docs/backends/s3.md. They are plain YAML comments — the file stays
+# The `# region …` / `# endregion …` lines are region markers
+# for docs/src/content/docs/backends/s3.mdx. They are plain YAML comments — the file stays
 # `kubectl apply -f`-able as-is.
-# --8<-- [start:repository]
+# region repository
 ---
 apiVersion: v1
 kind: Secret
@@ -59,9 +59,9 @@ spec:
       key: KOPIA_PASSWORD
   create:
     enabled: true # initialize the repo if it does not exist yet (default: false)
-# --8<-- [end:repository]
+# endregion repository
 ---
-# --8<-- [start:smoketest]
+# region smoketest
 # A self-contained smoke-test: prove the repository above actually takes a
 # backup. Apply the whole file, wait for `s3-primary` to go Ready, then
 # `kubectl create -f` this file to mint the Snapshot below and watch it succeed.
@@ -101,4 +101,4 @@ metadata:
 spec:
   policyRef:
     name: smoke # invoke the recipe above, once, right now
-# --8<-- [end:smoketest]
+# endregion smoketest

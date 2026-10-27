@@ -13,7 +13,7 @@
 #   kubectl annotate namespace bundlecop \
 #     kopiur.home-operations.com/stream-exec-movers=true
 ---
-# --8<-- [start:restore]
+# region restore
 apiVersion: kopiur.home-operations.com/v1alpha1
 kind: Restore
 metadata:
@@ -38,4 +38,4 @@ spec:
           - -ec
           - exec psql -U postgres -d postgres
         timeout: 2h
-# --8<-- [end:restore]
+# endregion restore

@@ -16,7 +16,7 @@
 # sees its OWN copy of the object, in its OWN etcd, so there is no naming
 # collision to avoid.
 #
-# Maintenance ownership (see docs/maintenance.md "pick ONE owner" — kopia has
+# Maintenance ownership (see docs/src/content/docs/maintenance.mdx "pick ONE owner" — kopia has
 # no cross-cluster lock of its own beyond kopiur's lease): "east" is the ONE
 # cluster that runs maintenance here (maintenance.enabled defaults to true).
 # "west" explicitly disables its own managed Maintenance (enabled: false)
@@ -24,7 +24,7 @@
 #
 # REQUIRES the operator (and mover image) upgraded to a version that supports
 # identityDefaults.cluster on BOTH clusters BEFORE this is applied to either —
-# see docs/scenarios/shared-repository-multi-cluster.md step 0. Also requires
+# see docs/src/content/docs/scenarios/shared-repository-multi-cluster.mdx step 0. Also requires
 # installScope=cluster on both (ClusterRepository is cluster-scoped).
 #
 # Field shapes verified against crates/api: identityDefaults.cluster is an
@@ -125,5 +125,5 @@ spec:
     # "west" is NOT the maintenance owner: disable it here rather than leaving
     # the default takeoverPolicy: Never to yield on every cron slot forever
     # (safe, but a noisy MaintenanceYielding warning + a wasted mover Job each
-    # time). See docs/maintenance.md "pick ONE owner".
+    # time). See docs/src/content/docs/maintenance.mdx "pick ONE owner".
     enabled: false
