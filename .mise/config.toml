@@ -39,7 +39,7 @@ lefthook = "2.2.2"
 # npm backend uses mise's own node+npm and never falls through to a system
 # `npm` on PATH (e.g. a stale/removed `/usr/bin/npm`), which silently breaks
 # `mise install` with `Cannot find module '/usr/bin/npm'`.
-node = "24.22.1"
+node = "24.22.2"
 # Package manager for the web UI SPA (`crates/ui/web`). Resolved from the `aqua`
 # backend (`mise registry pnpm` → `aqua:pnpm/pnpm npm:pnpm`), i.e. a standalone
 # signed binary rather than an npm install into the node above — so `ui-install`
