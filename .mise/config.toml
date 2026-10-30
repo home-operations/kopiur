@@ -44,7 +44,7 @@ node = "24.22.1"
 # backend (`mise registry pnpm` → `aqua:pnpm/pnpm npm:pnpm`), i.e. a standalone
 # signed binary rather than an npm install into the node above — so `ui-install`
 # needs no global npm state and the lock entry carries a per-platform checksum.
-pnpm = "12.15.0"
+pnpm = "12.16.0"
 oxfmt = "0.74.0"
 zizmor = "1.31.1"
 helm = "4.3.1"
