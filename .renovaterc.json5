@@ -22,5 +22,17 @@
       matchPackageNames: ["typescript"],
       allowedVersions: "<6.1.0",
     },
+    {
+      description: "croner 4 rejects shortcut step syntax (`0/15 * * * *`) by default, so a SnapshotSchedule admitted under croner 3 would stop firing after an upgrade; needs `.sloppy_ranges(true)` in `cron_parser()` plus a regression test first, see #433",
+      matchManagers: ["cargo"],
+      matchPackageNames: ["croner"],
+      allowedVersions: "<4.0.0",
+    },
+    {
+      description: "cel 0.15 changes `Context` to take two lifetimes; `identity_context`, and the `context` helpers in `preflight.rs` and `success_expr.rs` must be updated with the bump or the API crate does not compile, see #645",
+      matchManagers: ["cargo"],
+      matchPackageNames: ["cel"],
+      allowedVersions: "<0.15.0",
+    },
   ],
 }
