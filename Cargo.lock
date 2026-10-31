@@ -1036,7 +1036,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1788,6 +1788,18 @@ checksum = "d9c6922f6afe80418dd6019818af5d0d34584c371780ff09b9752370c25b4abb"
 dependencies = [
  "base64 0.22.1",
  "jiff",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "k8s-openapi"
+version = "0.29.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ab0d13801242174b1f3966907c3f32039f2d6b36c7ce82c61225d66ed5d1eb70"
+dependencies = [
+ "base64 0.22.1",
+ "jiff",
  "schemars",
  "serde",
  "serde_json",
@@ -1802,7 +1814,7 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "croner",
- "k8s-openapi",
+ "k8s-openapi 0.29.0",
  "kube",
  "kube_quantity",
  "schemars",
@@ -1819,7 +1831,7 @@ dependencies = [
  "chrono",
  "clap",
  "futures",
- "k8s-openapi",
+ "k8s-openapi 0.29.0",
  "kopiur-api",
  "kopiur-kopia",
  "kopiur-migrate",
@@ -1850,7 +1862,7 @@ dependencies = [
  "http",
  "http-body-util",
  "json-patch",
- "k8s-openapi",
+ "k8s-openapi 0.29.0",
  "kopiur-api",
  "kopiur-kopia",
  "kopiur-mover",
@@ -1884,7 +1896,7 @@ dependencies = [
  "chrono",
  "http",
  "http-body-util",
- "k8s-openapi",
+ "k8s-openapi 0.29.0",
  "kopiur-api",
  "kopiur-ui-model",
  "kube",
@@ -1927,7 +1939,7 @@ dependencies = [
  "clap",
  "http",
  "http-body-util",
- "k8s-openapi",
+ "k8s-openapi 0.29.0",
  "kopiur-api",
  "kopiur-kopia",
  "kopiur-telemetry",
@@ -1950,7 +1962,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "futures",
- "k8s-openapi",
+ "k8s-openapi 0.29.0",
  "kopiur-api",
  "kopiur-kopia",
  "kopiur-mover",
@@ -1996,7 +2008,7 @@ dependencies = [
  "futures",
  "http",
  "http-body-util",
- "k8s-openapi",
+ "k8s-openapi 0.29.0",
  "kopiur-api",
  "kopiur-kopia",
  "kopiur-ops",
@@ -2041,7 +2053,7 @@ dependencies = [
  "http",
  "http-body-util",
  "json-patch",
- "k8s-openapi",
+ "k8s-openapi 0.29.0",
  "kopiur-api",
  "kopiur-telemetry",
  "kube",
@@ -2063,7 +2075,7 @@ version = "4.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "208d7fe1380066abb194812a8a8e303cb896a33bb3d7b3177b71bd03ff39bf18"
 dependencies = [
- "k8s-openapi",
+ "k8s-openapi 0.28.0",
  "kube-client",
  "kube-core",
  "kube-derive",
@@ -2089,7 +2101,7 @@ dependencies = [
  "hyper-util",
  "jiff",
  "jsonpath-rust",
- "k8s-openapi",
+ "k8s-openapi 0.28.0",
  "kube-core",
  "pem 3.0.6",
  "rustls",
@@ -2118,7 +2130,7 @@ dependencies = [
  "http",
  "jiff",
  "json-patch",
- "k8s-openapi",
+ "k8s-openapi 0.28.0",
  "schemars",
  "serde",
  "serde-value",
@@ -2155,7 +2167,7 @@ dependencies = [
  "hashbrown 0.16.1",
  "hostname",
  "json-patch",
- "k8s-openapi",
+ "k8s-openapi 0.28.0",
  "kube-client",
  "parking_lot",
  "pin-project",
@@ -2173,7 +2185,7 @@ version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a5006102fbd11aa86b196a0c76bda5e2ae0cd71d4c9126c9b8bdfe7c7b7a7158"
 dependencies = [
- "k8s-openapi",
+ "k8s-openapi 0.28.0",
  "nom 8.0.0",
  "rust_decimal",
  "thiserror 2.0.21",
@@ -3100,7 +3112,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3157,7 +3169,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3638,7 +3650,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4334,7 +4346,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4523,7 +4535,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "insta",
- "k8s-openapi",
+ "k8s-openapi 0.29.0",
  "kopiur-api",
  "kopiur-ui-model",
  "kube",
