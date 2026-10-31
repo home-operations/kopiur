@@ -49,7 +49,7 @@ oxfmt = "0.75.0"
 zizmor = "1.31.1"
 helm = "4.3.1"
 cosign = "3.1.4"
-kubectl = "1.37.1"
+kubectl = "1.37.2"
 # The shared pre-commit hooks (home-operations/.github lefthook config) run
 # `shellcheck` on staged *.sh files; pin it so the hook resolves a binary.
 shellcheck = "0.11.0"
