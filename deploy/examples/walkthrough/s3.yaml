@@ -1,18 +1,18 @@
-# Complete walkthrough — S3 track (docs/walkthrough.md)
+# Complete walkthrough — S3 track (docs/src/content/docs/walkthrough.mdx)
 #
 # The full journey from the Complete walkthrough, as one apply-ready bundle:
 # credentials → Repository → SnapshotPolicy → SnapshotSchedule → verification
 # Restore. Stage by stage it is identical to the NAS track (nas.yaml) except for
 # the Repository backend and how the Restore names its source — that's the point.
 #
-# The `# --8<-- [start:…]` / `# --8<-- [end:…]` lines are snippet-section markers
-# for docs/walkthrough.md (MkDocs pulls one stage per tab at build time). They are
+# The `# region …` / `# endregion …` lines are region markers
+# for docs/src/content/docs/walkthrough.mdx (the docs show one stage per tab). They are
 # plain YAML comments — the file stays `kubectl apply -f`-able as-is.
 #
 # Field shapes verified against crates/api (externally-tagged backend: the bucket
 # lives under `backend.s3`, NOT `backend: { kind: S3 }`).
 ---
-# --8<-- [start:secret]
+# region secret
 apiVersion: v1
 kind: Secret
 metadata:
@@ -27,9 +27,9 @@ stringData:
   # and store it OUTSIDE the cluster too — lose it and the backups are
   # unrecoverable; kopia cannot decrypt without it.
   KOPIA_PASSWORD: "choose-something-long-and-random"
-# --8<-- [end:secret]
+# endregion secret
 ---
-# --8<-- [start:repository]
+# region repository
 apiVersion: kopiur.home-operations.com/v1alpha1
 kind: Repository
 metadata:
@@ -68,9 +68,9 @@ spec:
     schedule:
       quick: { cron: "0 */6 * * *", jitter: 30m }
       full: { cron: "0 3 * * *", jitter: 1h }
-# --8<-- [end:repository]
+# endregion repository
 ---
-# --8<-- [start:policy]
+# region policy
 apiVersion: kopiur.home-operations.com/v1alpha1
 kind: SnapshotPolicy
 metadata:
@@ -103,9 +103,9 @@ spec:
   # lock-step. Retain/Orphan keep the data when the CR goes — see the backups
   # guide before changing this.
   defaultDeletionPolicy: Delete
-# --8<-- [end:policy]
+# endregion policy
 ---
-# --8<-- [start:schedule]
+# region schedule
 apiVersion: kopiur.home-operations.com/v1alpha1
 kind: SnapshotSchedule
 metadata:
@@ -129,9 +129,9 @@ spec:
     # than stack a second one (the default, explicit here). `Replace` cancels
     # the old run; `Allow` runs both.
     concurrencyPolicy: Forbid
-# --8<-- [end:schedule]
+# endregion schedule
 ---
-# --8<-- [start:restore]
+# region restore
 apiVersion: kopiur.home-operations.com/v1alpha1
 kind: Restore
 metadata:
@@ -153,4 +153,4 @@ spec:
       capacity: 1Gi
       accessModes:
         - ReadWriteOnce
-# --8<-- [end:restore]
+# endregion restore

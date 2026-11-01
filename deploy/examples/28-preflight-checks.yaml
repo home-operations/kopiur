@@ -74,7 +74,7 @@ spec:
   retention:
     keepDaily: 14
     keepWeekly: 4
-  # --8<-- [start:preflight]
+  # region preflight
   preflight:
     # How long to hold a backup in Pending while a check is unsatisfied before it
     # transitions to Failed (Go-style duration; default 10m; `0` = hold forever).
@@ -97,7 +97,7 @@ spec:
       - name: repo-populated
         expr: "repository.snapshotCountKnown && repository.snapshotCount > 0"
         message: "repository snapshot count not yet observed, or repository is empty"
-  # --8<-- [end:preflight]
+  # endregion preflight
 ---
 apiVersion: kopiur.home-operations.com/v1alpha1
 kind: SnapshotSchedule

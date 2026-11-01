@@ -89,7 +89,7 @@ fn a_comment_semicolon_does_not_make_a_braced_module_look_body_less() {
     // production code — a field "wired" only by a test, a phase construct
     // charged to a file that does not contain it.
     let src = "#[cfg(test)]\n\
-               // fixtures; see docs/dev/api-conventions.md\n\
+               // fixtures; see docs/src/content/docs/dev/api-conventions.md\n\
                mod tests {\n\
                \x20   fn f() { inert_fixture(); }\n\
                }\n\

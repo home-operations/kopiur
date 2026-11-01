@@ -70,7 +70,7 @@ fn all_examples_match_crd_field_shapes() {
     );
     assert!(
         scenarios.len() >= 10,
-        "expected >=10 scenario bundles (one per docs/scenarios page), found {scenarios:?}"
+        "expected >=10 scenario bundles (one per docs scenarios page), found {scenarios:?}"
     );
     let files: Vec<PathBuf> = ladder
         .into_iter()

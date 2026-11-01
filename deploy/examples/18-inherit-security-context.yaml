@@ -56,7 +56,7 @@ spec:
   create:
     enabled: true
 ---
-# --8<-- [start:policy]
+# region policy
 apiVersion: kopiur.home-operations.com/v1alpha1
 kind: SnapshotPolicy
 metadata:
@@ -93,9 +93,9 @@ spec:
           matchLabels:
             app.kubernetes.io/name: app # the workload that owns `app-data`
         container: app # optional; defaults to the pod's first container
-# --8<-- [end:policy]
+# endregion policy
 ---
-# --8<-- [start:merged]
+# region merged
 # ── Inherit AND override: the two are merge layers ────────────────────────────
 # Order: hardened ⊂ moverDefaults ⊂ inherited ⊂ mover.securityContext.
 # What you write always wins; inherit fills in what you leave blank; and what you
@@ -128,7 +128,7 @@ spec:
       # supplementalGroups is additive, so this composes with inherit rather than
       # fighting it (see the NFS shared-group recipe in the docs).
       supplementalGroups: [3001]
-# --8<-- [end:merged]
+# endregion merged
 ---
 # ── The SAME knob works on a Restore ──────────────────────────────────────────
 # A Restore writes INTO a PVC, so it has the identical mover surface. Inheriting

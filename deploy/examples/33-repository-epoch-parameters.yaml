@@ -38,7 +38,7 @@
 # cluster that owns the repository — they are a property of the repository, not of
 # each consumer.
 #
-# See docs/repository-health.md
+# See docs/src/content/docs/repository-health.mdx
 ---
 apiVersion: kopiur.home-operations.com/v1alpha1
 kind: Repository

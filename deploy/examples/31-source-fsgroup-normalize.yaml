@@ -29,7 +29,7 @@
 # admission. (The NFS below is the REPOSITORY, not the source.) Nor with
 # staging.accessModes: [ReadOnlyMany] — a read-only stage cannot be mounted rw.
 #
-# See docs/copy-methods.md#making-fsgroup-apply-to-the-source
+# See docs/src/content/docs/copy-methods.mdx#making-fsgroup-apply-to-the-source
 ---
 apiVersion: kopiur.home-operations.com/v1alpha1
 kind: Repository

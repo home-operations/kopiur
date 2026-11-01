@@ -1237,7 +1237,7 @@ fn empty_policy_spec() -> kopiur_api::SnapshotPolicySpec {
 }
 
 /// #351: the field was declared, schema-generated, documented at
-/// `docs/reference/crds/snapshot-policy.md` — and `from_policy` never read it,
+/// `docs/src/content/docs/reference/crds/snapshot-policy.md` — and `from_policy` never read it,
 /// so the knob did nothing at all.
 ///
 /// Only `true` is emitted. `false`/unset must leave the PATH-scoped policy

@@ -1,4 +1,4 @@
-# Try it end-to-end — manual backup with real data (docs/backups.md)
+# Try it end-to-end — manual backup with real data (docs/src/content/docs/backups.mdx)
 #
 # A fully self-contained backup arc: namespace -> a PVC to hold the kopia
 # repository -> credentials (KOPIA_PASSWORD only — filesystem backend needs no
@@ -10,25 +10,25 @@
 #
 # Fill in the one REPLACE_ME (KOPIA_PASSWORD) and apply once:
 #   kubectl apply -f deploy/examples/tryit/backups.yaml
-# then create the generateName Snapshot (see docs/backups.md "Try it end-to-end").
+# then create the generateName Snapshot (see docs/src/content/docs/backups.mdx "Try it end-to-end").
 #
 # Field shapes verified against crates/api (snapshot.rs SnapshotStats:
 # filesNew/bytesNew/sizeBytes; SnapshotInfo.kopiaSnapshotID, capital ID;
 # snapshot_policy.rs spec.{repository,sources,retention}; externally-tagged
 # backend.filesystem with a PVC-backed volume).
 #
-# The `# --8<-- [start:NAME]` / `# --8<-- [end:NAME]` lines are MkDocs snippet
-# section markers for docs/backups.md. They are plain YAML comments — the file
+# The `# region NAME` / `# endregion NAME` lines are region
+# markers for docs/src/content/docs/backups.mdx. They are plain YAML comments — the file
 # stays `kubectl apply -f`-able as-is.
 ---
-# --8<-- [start:namespace]
+# region namespace
 apiVersion: v1
 kind: Namespace
 metadata:
   name: kopiur-tryit
-# --8<-- [end:namespace]
+# endregion namespace
 ---
-# --8<-- [start:repo-pvc]
+# region repo-pvc
 # Backing store for the kopia repository itself. ReadWriteOnce is fine for a
 # single-node try-out; a real shared filesystem repo would be ReadWriteMany.
 apiVersion: v1
@@ -41,9 +41,9 @@ spec:
   resources:
     requests:
       storage: 2Gi
-# --8<-- [end:repo-pvc]
+# endregion repo-pvc
 ---
-# --8<-- [start:secret]
+# region secret
 apiVersion: v1
 kind: Secret
 metadata:
@@ -57,9 +57,9 @@ stringData:
   # keys). Generate one (`openssl rand -base64 24`) and store it OUTSIDE the
   # cluster too — lose it and the backups are unrecoverable.
   KOPIA_PASSWORD: "REPLACE_ME"
-# --8<-- [end:secret]
+# endregion secret
 ---
-# --8<-- [start:app-data]
+# region app-data
 # The volume you actually back up.
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -71,9 +71,9 @@ spec:
   resources:
     requests:
       storage: 1Gi
-# --8<-- [end:app-data]
+# endregion app-data
 ---
-# --8<-- [start:seed]
+# region seed
 # Write real files into app-data so the backup has something to upload. The arc
 # waits for this Job to complete before taking the Snapshot, so
 # status.stats.filesNew / bytesNew come back non-zero.
@@ -106,9 +106,9 @@ spec:
         - name: app-data
           persistentVolumeClaim:
             claimName: app-data
-# --8<-- [end:seed]
+# endregion seed
 ---
-# --8<-- [start:repository]
+# region repository
 apiVersion: kopiur.home-operations.com/v1alpha1
 kind: Repository
 metadata:
@@ -130,9 +130,9 @@ spec:
   # Initialize a brand-new kopia repository on the empty PVC.
   create:
     enabled: true
-# --8<-- [end:repository]
+# endregion repository
 ---
-# --8<-- [start:policy]
+# region policy
 apiVersion: kopiur.home-operations.com/v1alpha1
 kind: SnapshotPolicy
 metadata:
@@ -147,9 +147,9 @@ spec:
   retention:
     keepDaily: 7
     keepWeekly: 4
-# --8<-- [end:policy]
+# endregion policy
 ---
-# --8<-- [start:snapshot]
+# region snapshot
 # The invocation. generateName means every `kubectl create` mints a fresh unique
 # name (app-data-manual-xxxxx), so use `create`, not `apply`, for this one.
 apiVersion: kopiur.home-operations.com/v1alpha1
@@ -160,4 +160,4 @@ metadata:
 spec:
   policyRef:
     name: app-data
-# --8<-- [end:snapshot]
+# endregion snapshot

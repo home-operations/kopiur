@@ -106,7 +106,7 @@ spec:
               value: {{ include "kopiur.moverName" . | quote }}
             - name: KOPIUR_MOVER_ROLE_KIND
               value: {{ eq .Values.installScope "cluster" | ternary "ClusterRole" "Role" | quote }}
-            # Runtime footprint controls (see docs/dev/watch-and-reconcile.md): the
+            # Runtime footprint controls (see https://kopiur.home-operations.com/dev/watch-and-reconcile/): the
             # tokio worker-thread cap (the runtime default sizes to host cores,
             # ignoring the cgroup CPU quota) and the WatchList streaming list.
             - name: KOPIUR_WORKER_THREADS

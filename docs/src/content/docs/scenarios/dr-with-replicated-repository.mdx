@@ -1,0 +1,348 @@
+---
+title: Scenario 10 — Disaster recovery from a replicated repository
+sidebar:
+  label: DR from a replicated repository
+---
+
+import { Code } from "@astrojs/starlight/components";
+import { region } from "@utils/region";
+import examplesScenarios10DrSeedFromReplica from "@repo/deploy/examples/scenarios/10-dr-seed-from-replica.yaml?raw";
+
+**The primary repository is gone, but the off-site mirror survived.** You have been running a [`RepositoryReplication`](/replication/), or keeping a second repository in sync, precisely for this day. You want the rebuilt cluster to get its **own** repository back, pre-loaded with the mirror's history, rather than adopting the mirror as its live store.
+
+`spec.seed` on a `Repository` or `ClusterRepository` does that during the repository's **very first bootstrap**. The seeding mover copies the replica in _before_ the repository is ever reported `Ready`.
+
+:::note[`spec.seed` vs. the "seed job" in other examples]
+
+Several example bundles contain a one-shot Kubernetes `Job` named `seed-…` that writes test data into a volume so there is something to back up. That is unrelated.
+
+**`spec.seed` seeds a _repository_, from another repository.**
+
+:::
+
+## Why not just point at the mirror?
+
+Both are valid. They answer different questions.
+
+|                                      | Connect to the mirror ([scenario 03](/scenarios/disaster-recovery/))    | Seed a new repository (this page)                                                                        |
+| ------------------------------------ | ----------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------- |
+| What the rebuilt cluster writes into | the mirror itself; it becomes the live repository                       | a **new** repository of its own                                                                          |
+| Time to first restore                | immediate (no copy)                                                     | after the copy finishes (minutes to hours)                                                               |
+| The mirror afterwards                | is now production; you need a _new_ off-site copy                       | stays a pristine, untouched replica                                                                      |
+| Blast radius of a mistake on day one | writes land in your last surviving copy                                 | the surviving copy is read-only throughout                                                               |
+| Reach for it when                    | you need data back _now_, or the mirror was always meant to be promoted | the mirror must stay a mirror, or the primary's storage, region, or credentials are being rebuilt anyway |
+
+Seeding never writes to its source in either mode, because the source is connected read-only. A seed that fails leaves the replica exactly as it found it.
+
+:::danger[The failure this exists to prevent]
+
+Without `spec.seed`, the obvious DR sequence is "apply the manifests, let the new repository be created empty, then copy the history in afterwards".
+
+That fails silently. A repository created empty reaches `Ready` **immediately**, and everything downstream believes it. A populator `Restore` with the default `onMissingSnapshot: Continue` resolves _nothing_, provisions a **blank PVC**, the app starts on it, and the first scheduled backup writes that blank state as the newest snapshot. The recovery looks green the whole way through.
+
+Seeding inside the first bootstrap removes that window. The repository does not go `Ready` until the copy has landed. If the copy cannot complete, the repository stays `Initializing` or `Degraded` with an actionable reason instead. A seed that copies **nothing** is refused outright, and `allowEmptySource` is the one explicit override.
+
+:::
+
+## Topology
+
+```mermaid
+flowchart LR
+  subgraph OLD["original cluster (gone)"]
+    P[Repository nas-primary<br/>primary-backups]
+    RR[RepositoryReplication<br/>nightly sync-to]
+    P --> RR
+  end
+  RR --> M[(offsite-mirror<br/>blob copy of the repository)]
+  subgraph NEW["rebuilt cluster"]
+    S[Repository nas-primary<br/>spec.seed] --> R2[(rebuilt-primary)]
+    R2 --> POL[SnapshotPolicy<br/>identity pinned]
+    POL --> PVC[PVC restored by a<br/>populator Restore]
+  end
+  M -.->|seed: kopia repository sync-to| S
+```
+
+Every manifest below is pulled from one apply-ready bundle, [`deploy/examples/scenarios/10-dr-seed-from-replica.yaml`](https://github.com/home-operations/kopiur/blob/main/deploy/examples/scenarios/10-dr-seed-from-replica.yaml). Copy it whole, fill in the `REPLACE_ME` values, and apply the half that belongs on the cluster you are standing in front of.
+
+:::caution[Two clusters, one file]
+
+The `primary` and `mirror` documents belong on the **original** cluster. The seed variants and the app's recovery belong on the **rebuilt** one.
+
+Pick exactly **one** seed variant. They are two spellings of the same recovery.
+
+The rebuilt `Repository` deliberately reuses the original's name and namespace. That is what lets the recovered policies resolve their own old snapshots.
+
+:::
+
+### What the original cluster had
+
+The prerequisite, and the whole reason this scenario is possible: an ordinary `Repository` with nothing special about it:
+
+<Code code={region(examplesScenarios10DrSeedFromReplica, "primary")} lang="yaml" />
+
+## The two modes
+
+### Blob mode — `seed.from.backend`
+
+Runs `kopia repository sync-to` from a **bare storage backend** that holds an exact copy of a kopia repository's files. That is exactly what a `RepositoryReplication` writes.
+
+<Code code={region(examplesScenarios10DrSeedFromReplica, "seed-blob")} lang="yaml" />
+
+- The copy happens at the storage layer, so the seeded repository **gets exactly the mirror's repository format and password**. `encryption.passwordSecretRef` must already hold the _mirror's_ password.
+- `create.splitter`, `create.hash`, `create.encryption`, and `create.ecc` are **rejected at admission** next to a blob seed. The format comes from the mirror, so declaring one would be a field that does nothing.
+- The seed source's credential Secret must live in the namespace the bootstrap Job runs in. See [Where the seed source's Secret must live](#where-the-seed-sources-secret-must-live).
+- A mis-pointed source is caught for you: `sync-to` refuses a destination whose format blob differs from the source's, so two unrelated repositories can never be mixed.
+
+### Migrate mode — `seed.from.repository`
+
+Runs `kopia snapshot migrate` from another `Repository` or `ClusterRepository` CR. Source and destination are two **independent** repositories with their own formats and passwords.
+
+<Code code={region(examplesScenarios10DrSeedFromReplica, "seed-migrate")} lang="yaml" />
+
+- Kopiur creates the local repository itself, honoring `create.splitter`, `create.hash`, `create.encryption`, and `create.ecc`. You get a genuinely new repository with a password of your choosing.
+- The source is resolved as a CR and gated on it being `Ready`. Until then the repository parks visibly with `Seeded=False`, reason `WaitingForSeedSource`, and phase `Pending`, and re-checks every 15 s.
+- Seeding from a **`ClusterRepository`** makes this repository a _consumer_ of it, so the source's `allowedNamespaces` must admit this namespace. That is the same fail-closed gate every other consumer reference goes through, and the webhook rejects the apply naming `spec.seed.from.repository` if it does not. The bundle's `ClusterRepository/offsite-archive` is assumed to exist already, because it is the surviving replica.
+- **Needs `features.credentialProjection.enabled`** whenever the source repository's Secrets are not readable from the seeding Job's namespace. See [the prerequisite below](#prerequisite-credential-projection-for-migrate-mode).
+
+Either way, `kopia snapshot migrate` **preserves each snapshot's `username@hostname:path` identity and its times**, so seeded history stays restorable by `Restore.source.identity` and by `fromPolicy`. That is what lets a rebuilt cluster's policies find their own old snapshots.
+
+## The rest of the recovery bundle
+
+The seeded repository is only half of it. The other half is what the rebuilt cluster runs on top: the policy that reclaims the recovered history, the passive populator `Restore`, and the PVC that consumes it.
+
+<Code code={region(examplesScenarios10DrSeedFromReplica, "app-recovery")} lang="yaml" />
+
+## Before you start: kick a final mirror sync
+
+The mirror is only as current as its last replication run. This is the `RepositoryReplication` that has been writing it:
+
+<Code code={region(examplesScenarios10DrSeedFromReplica, "mirror")} lang="yaml" />
+
+If the primary is still reachable at all, force one more sync before you seed:
+
+```console
+$ kubectl kopiur replication run nas-primary-offsite -n billing --wait
+```
+
+That is the on-demand [run-requested](/replication/#run-it-now) path. It stamps `kopiur.home-operations.com/run-requested` with an RFC3339 timestamp and drives a Job through the normal gates, so `kubectl annotate` does the same thing if you would rather not install the plugin. A manual run stamps `lastReplicated` and re-anchors the next cron slot, which is what you want mid-incident.
+
+## The drill
+
+1. **Install the operator** on the rebuilt cluster, at a version that supports `spec.seed`. Enable `features.credentialProjection.enabled` if you are seeding in migrate mode from a source whose Secrets live elsewhere.
+2. **Restore the Secrets first.** The repository password must be the _original_ one for a blob seed, because it is the mirror's format. The seed source's storage credentials must be in the bootstrap Job's namespace.
+3. **Apply the manifests**: repository, policies, schedules, populator restores, all in the same commit. Nothing needs a "recovery mode" branch.
+4. **Watch the seed.** The repository stays out of `Ready` for the whole copy:
+
+   ```console
+   $ kubectl get repository nas-primary -n billing
+   NAME          PHASE          BACKEND   AGE
+   nas-primary   Initializing   S3        4m
+
+   $ kubectl describe repository nas-primary -n billing | grep -A3 Seeded
+     Type:     Seeded
+     Status:   False
+     Reason:   Seeding
+     Message:  copying initial contents from S3; phase stays Initializing (Degraded
+               while retrying) until done...
+   ```
+
+   A first seed transfers the whole repository, so hours is normal. The phase is `Initializing` while the copy runs. It flips to `Degraded` if an attempt fails and is being retried. `Pending` means the run is parked because a migrate seed's source is not usable yet. The seeding Job's own logs are the progress view:
+
+   ```console
+   $ kubectl logs -n billing job/nas-primary-discovery -f
+   ```
+
+5. **Confirm the seed landed**, then let the rest of the recovery proceed:
+
+   ```console
+   $ kubectl get repository nas-primary -n billing -o jsonpath='{.status.seed}' | jq
+   {
+     "startedAt": "2026-08-17T09:12:04Z",
+     "seededAt":  "2026-08-17T10:41:58Z",
+     "mode":      "blob",
+     "source":    "S3",
+     "snapshotCount": 1284
+   }
+
+   $ kubectl get snapshots -n billing -l kopiur.home-operations.com/origin=discovered | head
+   ```
+
+6. **The app comes back on its own.** The populator `Restore` was parked the whole time waiting for the repository, and its `waitTimeout` window opens at that moment, not at creation, so a long seed does not spend it. See [Restores → `waitTimeout`](/restores/#waittimeout--wait-before-giving-up) and `status.waitStartedAt`. That holds from the very first second of the bring-up: while the `Repository`, or the `SnapshotPolicy` a `fromPolicy` restore names, has not been applied yet, the `Restore` parks with `RestoreReferentMissing` and the window is not open either.
+
+## Observability
+
+| Surface                                      | What it says                                                                                                                              |
+| -------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| `status.seed.startedAt`                      | when a seed attempt was **launched**. This is the durable attempt marker: set before the Job exists, never cleared                        |
+| `status.seed.seededAt`                       | when the seed **finished**. Set once, because a repository is seeded exactly once                                                         |
+| `status.seed.mode` / `.source`               | `blob` or `migrate`, and the rendered source (`S3`, `ClusterRepository/offsite-archive`). Never a credential or a bucket path             |
+| `status.seed.snapshotCount`                  | snapshots observed at the source when the seed ran                                                                                        |
+| `status.seed.snapshotsCopied`                | migrate mode only, and **cumulative**: what is present after the run, including anything an interrupted earlier attempt had already moved |
+| `Seeded` condition                           | the state machine below                                                                                                                   |
+| `RepositorySeeded` Event                     | Normal, published once on the transition, naming the source and the snapshot count                                                        |
+| `kopiur_repository_seed_total{mode,outcome}` | counter; `outcome` is `seeded` / `already_initialized` / `failed`                                                                         |
+| `kubectl kopiur doctor`                      | explains every `Seeded=False` reason with the writer's full remediation text                                                              |
+
+`Seeded` reasons, all of them:
+
+| Status / reason                     | Meaning                                                                                                                                                                                                 |
+| ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `True` / `Seeded`                   | data was copied in                                                                                                                                                                                      |
+| `True` / `AlreadyInitialized`       | the standing no-op: the repository was already initialized, so nothing was copied                                                                                                                       |
+| `False` / `Seeding`                 | the copy is running                                                                                                                                                                                     |
+| `False` / `WaitingForSeedSource`    | migrate mode: the source repository is missing, not `Ready`, or is a bare-path filesystem repository the mover cannot mount                                                                             |
+| `False` / `SeedSourceAuthConflict`  | migrate mode: this repository's backend and the resolved source's disagree on workload identity, and one pod runs as one ServiceAccount. See [One pod, one ServiceAccount](#one-pod-one-serviceaccount) |
+| `False` / `SeedSourceNotFound`      | the source answered but holds no kopia repository. Usually a wrong bucket **or prefix**                                                                                                                 |
+| `False` / `SeedSourceEmpty`         | the source is a kopia repository with zero snapshots and `allowEmptySource` is `false`                                                                                                                  |
+| `False` / `SeedIncomplete`          | migrate post-verify found snapshots missing. kopia exits 0 even when a per-source migration fails, so the destination listing is the real success gate                                                  |
+| `False` / `SeedLeftEmpty`           | a seed was requested and the repository ended up holding zero snapshots. An earlier attempt initialized the backend and then died                                                                       |
+| `False` / `MoverImageTooOldForSeed` | the mover image predates `spec.seed` and silently dropped it. **Terminal**                                                                                                                              |
+
+## Retries, resume, and what is terminal
+
+The four source and copy failures above are **retryable, and retried promptly**. The failed Job is recycled and a fresh one, with a fresh 24 h deadline, is launched roughly **every two minutes**. A mirror that is briefly unreachable, or a replication that has not run yet, therefore heals by itself with no operator action. That promptness is deliberate, because this is the flow you are in on the worst day of the year.
+
+An **interrupted seed resumes**. Kopiur stamps `status.seed.startedAt` _before_ creating the seeding Job, so a copy killed mid-flight by a deadline, an OOM, or a node loss is recognizable as its own on the next pass, and the relaunch continues rather than restarting. `sync-to` copies only the blobs the destination lacks, and `snapshot migrate` is idempotent by `(identity, startTime)`.
+
+:::caution[Do not delete the half-seeded repository at the backend]
+
+`SeedLeftEmpty`'s remedy is to let kopiur retry. It resumes the copy itself, so nothing at the backend should be deleted. Clearing the backend by hand throws away the partial copy the next attempt would have finished.
+
+If attempts keep being cut short, read the seeding Job's pod logs and raise `spec.seed.failurePolicy.activeDeadlineSeconds`, which defaults to **86400**, or 24 h.
+
+:::
+
+Two failures are **terminal**. The same inputs reproduce them forever, so retrying would only hide them:
+
+- **`MoverImageTooOldForSeed`**: the running mover image does not understand `spec.seed` and dropped it. Upgrade the mover image, _and_ delete the finished bootstrap Job with `kubectl -n <ns> delete job <repository>-discovery`. Nothing recycles a terminal Job before its TTL, so an upgrade alone looks like it changed nothing for up to an hour.
+- **`BootstrapInternalInconsistency`**: a kopiur defect, not a repository problem. The message says so. Please file it.
+
+An `AuthFailure` against the seed source is terminal too, by the same rule that governs every bootstrap: kopiur never creates or seeds over a backend it could not authenticate to.
+
+### Changing `spec.seed` while a seed is running
+
+`spec.seed` is mutable. The in-flight Job is **not** killed. It runs to completion and its result is discarded as stale, because the edit bumped `metadata.generation`. Then the next pass launches a fresh seed for the live spec.
+
+The attempt marker survives, so that relaunch **resumes, but against the new source**:
+
+- **Blob mode fails safe.** `sync-to` refuses a destination whose format blob differs from the source's, so repointing at an unrelated mirror errors out instead of mixing two repositories.
+- **Migrate mode has no such backstop.** It will merge the new source's history into whatever the first attempt left behind, and `snapshotsCopied` then reports a mixed total across both sources.
+
+So to _deliberately_ repoint a migrate seed before it finishes, you have two options. Delete the half-seeded repository at the backend first; this is the one case where that is right. Or let the seed finish and move the extra history with a [`SnapshotReplication`](/snapshot-replication/) instead.
+
+`spec.suspend` mid-seed behaves the same way: the Job keeps running, and its result is consumed when you resume.
+
+## Hazards to review before you apply
+
+:::danger[Identity must match the pre-disaster configuration exactly]
+
+Seeding preserves snapshot identities, but nothing makes your _new_ policies compute the same ones. Kopiur's identity-fork guards only fire on an update, so they cannot fire on a freshly-created `SnapshotPolicy`. A rebuilt policy whose identity differs silently starts a **new** backup chain beside the history you just recovered.
+
+**Nothing warns you when this happens.** A rebuilt policy that matches none of the recovered history looks, from the operator's side, exactly like a brand-new policy that simply has nothing to adopt yet. So it stays quiet and starts backing up. Verify **positively** that adoption happened, using [checklist step 5](#verification-checklist) below. Don't wait for a signal that it didn't.
+
+Compare `spec.identity` **and** the repository's `identityDefaults` against the pre-disaster manifests before re-applying. That includes `identityDefaults.cluster`, which adds a suffix to the default hostname. Pin `identity` explicitly in DR manifests so a rebuild into a differently-named namespace still resolves.
+
+:::
+
+:::danger[Re-applying policies can prune the history you just recovered]
+
+Adoption re-attaches matching `discovered` snapshots to a live `SnapshotPolicy`, and an adopted snapshot is then governed by GFS retention like any produced backup.
+
+Under the default `deletionPolicy: Delete`, everything **outside** `spec.retention` is pruned from the repository immediately, and retention prunes deliberately bypass the [mass-deletion breaker](/repositories/#deletionprotection--the-mass-deletion-circuit-breaker). A five-year mirror re-adopted under `keepDaily: 7` loses the rest.
+
+Before re-applying policies over seeded history, do one of:
+
+- widen `spec.retention` to the window you actually intend to keep;
+- set the policy's `defaultDeletionPolicy: Retain` or `Orphan`, so pruning a row deletes only the `Snapshot` CR and never the kopia data. Adoption then only takes candidates the window would keep anyway;
+- `spec.pin` the snapshots you must not lose;
+- or set `adoption: Ignore` and restore from the discovered rows directly.
+
+:::
+
+:::caution[Bound the catalog on a large mirror]
+
+Every snapshot in a seeded repository becomes a `discovered` `Snapshot` CR the moment the repository goes `Ready`. A multi-year mirror is thousands of CRs in one burst.
+
+Set `catalog.retain`, meaning `perIdentity` and `maxAgeDays`. It bounds the **CR rows only**; every snapshot stays restorable [by identity](/restores/#restoring-a-snapshot-kopiur-didnt-create).
+
+:::
+
+### Prerequisite: credential projection for migrate mode
+
+A migrate seed opens **two** repositories from one pod, and the source's Secrets usually live in another namespace. `seed.credentialProjection.enabled: true` lets the operator copy them into the seeding Job's namespace for the run.
+
+That needs the operator's `features.credentialProjection.enabled` Helm flag. See [Feature permissions](/feature-permissions/). Without it the bootstrap fails closed with a message naming both the CR field and the install flag, rather than launching a Job that cannot authenticate. The copies are reclaimed when the seed finishes.
+
+### Where the seed source's Secret must live
+
+The seed source's credentials are loaded with `envFrom`, which is namespace-local, so the Secret must be in **the namespace the bootstrap Job runs in**:
+
+- a namespaced **`Repository`** uses its own namespace. Admission rejects a `seed.from.backend` `secretRef` that pins any other namespace.
+- a **`ClusterRepository`** uses the operator's namespace, _unless_ `encryption.passwordSecretRef.namespace` pins one, in which case the Job runs there and the seed Secret must be there too. Admission rejects a seed `secretRef` that pins a namespace at all, because a cluster-scoped spec cannot name the right one. Put the Secret alongside the repository's other credentials.
+
+### One pod, one ServiceAccount
+
+A seeding bootstrap resolves its run identity against **both** backends, but a pod runs as exactly one ServiceAccount. **The first backend that names a workload identity wins**, and here that is this repository's own backend, not the seed source's.
+
+In **blob mode** admission catches the pairings that would authenticate as the wrong identity, because the seed backend is written inline where the validator can see it. Two rules apply. A pair where both sides use workload identity must name the **same** ServiceAccount. And a _same-kind_ pair, such as S3 with S3 or Azure with Azure, may not mix `workloadIdentity` on one side with a static credential Secret on the other, because the static side's keys sit on the pod's environment and the workload-identity side would silently pick them up. A GCS static key travels as a `--credentials-file` path rather than as ambient environment, so that mixed pair is safe. This is the same rule, and the same validator, that [`SnapshotReplication`](/snapshot-replication/) uses.
+
+:::note[Migrate mode is checked at reconcile, not at apply]
+
+A migrate seed's source backend arrives through a **repository reference**, which admission cannot follow, so the _apply_ is accepted.
+
+The operator applies the same rule itself once it has resolved the source repository. If the two backends disagree on workload identity, it **refuses to launch the seed** and parks the repository on `Seeded=False` with reason `SeedSourceAuthConflict`, naming both ServiceAccounts. It re-checks, so correcting either side clears it with no other action. Give both repositories the same workload-identity ServiceAccount, or give both sides static credentials in the namespace the bootstrap Job runs in. See [Where the seed source's Secret must live](#where-the-seed-sources-secret-must-live).
+
+The operator applies two more rules it cannot see at admission either. It refuses a `seed.from.repository` that resolves to **this repository's own storage**, because admission's self-reference check is by CR _name_, so a second CR over one bucket or PVC passes it. It also refuses one whose filesystem backend shares this repository's in-pod `backend.filesystem.path`, because one seeding pod mounts both and two volumes cannot share a `mountPath`. Both park on `Seeded=False` with `WaitingForSeedSource` and a message naming the storage or the path.
+
+:::
+
+The rejection message is the shared replication one, so it says _"the replication mover's environment carries the static side's keys"_. It means the seeding mover. The substance and the fix are the same: use `workloadIdentity` on both sides, or static Secrets on both.
+
+### Maintenance ownership after a blob seed
+
+A blob copy carries the **source cluster's** `kopia.maintenance` blob, including its owner. Kopiur restamps the maintenance owner unconditionally on a seeded repository, precisely because the old cluster is by definition gone.
+
+Without that restamp, a repository whose `identityDefaults.cluster` forces owner-scoped maintenance would see the recovered repository as permanently foreign and yield forever. There is nothing to configure here. It is worth knowing when you see the owner change on a freshly-seeded repository.
+
+## Verification checklist
+
+```console
+# 1. The seed actually copied something (and says what, from where):
+$ kubectl get repository nas-primary -n billing -o jsonpath='{.status.seed}'
+
+# 2. The repository is Ready and the Seeded condition is True:
+$ kubectl get repository nas-primary -n billing \
+    -o jsonpath='{range .status.conditions[?(@.type=="Seeded")]}{.status}{" "}{.reason}{"\n"}{end}'
+
+# 3. doctor explains anything still blocked, in the operator's own words:
+$ kubectl kopiur doctor -n billing
+
+# 4. The recovered history is visible as discovered snapshots:
+$ kubectl get snapshots -n billing -l kopiur.home-operations.com/origin=discovered
+
+# 5. Your policies MATCHED that history. Nothing warns you if they didn't, so
+#    check it positively — what did the last adoption pass actually see?
+$ kubectl get snapshotpolicy postgres-data -n billing \
+    -o jsonpath='{.status.adoption.lastScanMatched}{" matched / "}{.status.adoption.lastScanUnmatched}{" unmatched\n"}'
+#    lastScanMatched should cover the history this policy is meant to own; once
+#    every pre-disaster policy is back, lastScanUnmatched should be 0. Empty
+#    output for both means no adoption pass has run yet — not "nothing matched".
+$ kubectl get snapshotpolicy postgres-data -n billing -o jsonpath='{.status.adoption.totalAdopted}'
+#    Expect at least the number of snapshots this policy had before the disaster.
+#    The field is omitted when unset, so empty output means adoption never ran.
+$ kubectl kopiur snapshots list -n billing --origin discovered --repository nas-primary
+#    Expect NOTHING left here after a complete DR: every recovered snapshot has
+#    been claimed by a live policy. Rows that remain are history no policy matches.
+
+# 6. The app's PVC came back with data, not blank:
+$ kubectl get pvc,restore -n billing
+```
+
+## See also
+
+- [Repositories → `seed`](/repositories/#seed--initialize-a-new-repository-from-a-replica): the field-level reference.
+- [Scenario 03, disaster recovery on a fresh cluster](/scenarios/disaster-recovery/): the same rebuild, connecting to the surviving repository instead of seeding a new one.
+- [Repository replication](/replication/): the mirror this scenario seeds from, and `kubectl kopiur replication run`.
+- [Snapshot replication](/snapshot-replication/): the ongoing counterpart of migrate mode, for history you want copied on a schedule rather than once.
+- [Troubleshooting → a seeding repository never reaches `Ready`](/troubleshooting/#a-seeding-repository-never-reaches-ready).
+- [Feature permissions](/feature-permissions/): the `credentialProjection` install flag.

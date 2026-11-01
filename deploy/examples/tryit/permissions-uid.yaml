@@ -1,4 +1,4 @@
-# Try it end-to-end — match the mover UID to the data owner (docs/permissions.md)
+# Try it end-to-end — match the mover UID to the data owner (docs/src/content/docs/permissions.mdx)
 #
 # A complete, self-contained arc that proves the #1 permissions fix: the mover
 # must run as a UID that can READ the source. It creates:
@@ -19,20 +19,20 @@
 #   kubectl apply -f deploy/examples/tryit/permissions-uid.yaml
 # (the manual Snapshot uses `generateName`, so create it with `kubectl create`).
 #
-# The `# --8<-- [start:NAME]` / `[end:NAME]` lines are MkDocs snippet markers for
-# docs/permissions.md. They are plain YAML comments — the file stays apply-ready.
+# The `# region NAME` / `# endregion NAME` lines are region markers for
+# docs/src/content/docs/permissions.mdx. They are plain YAML comments — the file stays apply-ready.
 #
 # Field shapes verified against crates/api (externally-tagged backend: the bucket
 # lives under `backend.s3`).
 ---
-# --8<-- [start:namespace]
+# region namespace
 apiVersion: v1
 kind: Namespace
 metadata:
   name: app
-# --8<-- [end:namespace]
+# endregion namespace
 ---
-# --8<-- [start:pvc]
+# region pvc
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -44,9 +44,9 @@ spec:
   resources:
     requests:
       storage: 1Gi
-# --8<-- [end:pvc]
+# endregion pvc
 ---
-# --8<-- [start:seed]
+# region seed
 # Seed the PVC with files owned 1000:1000, mode 0600 (owner-only). Only a mover
 # running as UID 1000 can read them — UID 65532 (the default) gets nothing.
 apiVersion: batch/v1
@@ -82,9 +82,9 @@ spec:
         - name: d
           persistentVolumeClaim:
             claimName: app-data
-# --8<-- [end:seed]
+# endregion seed
 ---
-# --8<-- [start:secret]
+# region secret
 apiVersion: v1
 kind: Secret
 metadata:
@@ -95,9 +95,9 @@ stringData:
   AWS_ACCESS_KEY_ID: "REPLACE_ME"
   AWS_SECRET_ACCESS_KEY: "REPLACE_ME"
   KOPIA_PASSWORD: "REPLACE_ME"
-# --8<-- [end:secret]
+# endregion secret
 ---
-# --8<-- [start:repository]
+# region repository
 apiVersion: kopiur.home-operations.com/v1alpha1
 kind: Repository
 metadata:
@@ -119,9 +119,9 @@ spec:
       key: KOPIA_PASSWORD
   create:
     enabled: true
-# --8<-- [end:repository]
+# endregion repository
 ---
-# --8<-- [start:policy]
+# region policy
 apiVersion: kopiur.home-operations.com/v1alpha1
 kind: SnapshotPolicy
 metadata:
@@ -150,9 +150,9 @@ spec:
         drop: ["ALL"]
       seccompProfile:
         type: RuntimeDefault
-# --8<-- [end:policy]
+# endregion policy
 ---
-# --8<-- [start:snapshot]
+# region snapshot
 apiVersion: kopiur.home-operations.com/v1alpha1
 kind: Snapshot
 metadata:
@@ -161,4 +161,4 @@ metadata:
 spec:
   policyRef:
     name: app-data
-# --8<-- [end:snapshot]
+# endregion snapshot

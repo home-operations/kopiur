@@ -1,4 +1,4 @@
-# Try it end-to-end — the kubectl-kopiur playground (docs/cli/*)
+# Try it end-to-end — the kubectl-kopiur playground (docs/src/content/docs/cli/)
 #
 # The shared base every CLI "Try it end-to-end" arc builds on. It is everything
 # the plugin needs EXCEPT a Snapshot — the CLI arcs create those themselves
@@ -16,20 +16,20 @@
 #   kubectl apply -f deploy/examples/tryit/cli-playground.yaml
 #   kubectl -n media wait --for=condition=Ready repository/nas --timeout=2m
 #
-# The `# --8<-- [start:NAME]` / `[end:NAME]` lines are MkDocs snippet markers for
-# docs/cli/*. They are plain YAML comments — the file stays apply-ready.
+# The `# region NAME` / `# endregion NAME` lines are region markers for
+# docs/src/content/docs/cli/. They are plain YAML comments — the file stays apply-ready.
 #
 # Field shapes verified against crates/api (externally-tagged backend: the bucket
 # lives under `backend.s3`).
 ---
-# --8<-- [start:namespace]
+# region namespace
 apiVersion: v1
 kind: Namespace
 metadata:
   name: media
-# --8<-- [end:namespace]
+# endregion namespace
 ---
-# --8<-- [start:pvc]
+# region pvc
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -41,9 +41,9 @@ spec:
   resources:
     requests:
       storage: 10Gi
-# --8<-- [end:pvc]
+# endregion pvc
 ---
-# --8<-- [start:seed]
+# region seed
 # Seed real content so the browse/list arcs have something to show: a small text
 # file the docs `cat`, and a multi-MB blob the docs `download`. Owned by the
 # default mover UID (65532) so the default mover can read it without extra config.
@@ -83,9 +83,9 @@ spec:
         - name: d
           persistentVolumeClaim:
             claimName: app-data
-# --8<-- [end:seed]
+# endregion seed
 ---
-# --8<-- [start:secret]
+# region secret
 apiVersion: v1
 kind: Secret
 metadata:
@@ -96,9 +96,9 @@ stringData:
   AWS_ACCESS_KEY_ID: "REPLACE_ME"
   AWS_SECRET_ACCESS_KEY: "REPLACE_ME"
   KOPIA_PASSWORD: "REPLACE_ME"
-# --8<-- [end:secret]
+# endregion secret
 ---
-# --8<-- [start:repository]
+# region repository
 apiVersion: kopiur.home-operations.com/v1alpha1
 kind: Repository
 metadata:
@@ -120,9 +120,9 @@ spec:
       key: KOPIA_PASSWORD
   create:
     enabled: true
-# --8<-- [end:repository]
+# endregion repository
 ---
-# --8<-- [start:policy]
+# region policy
 apiVersion: kopiur.home-operations.com/v1alpha1
 kind: SnapshotPolicy
 metadata:
@@ -137,9 +137,9 @@ spec:
   retention:
     keepDaily: 7
     keepWeekly: 4
-# --8<-- [end:policy]
+# endregion policy
 ---
-# --8<-- [start:schedule]
+# region schedule
 apiVersion: kopiur.home-operations.com/v1alpha1
 kind: SnapshotSchedule
 metadata:
@@ -152,4 +152,4 @@ spec:
     cron: "H 2 * * *" # deterministic per-schedule minute, hashed from the UID
     jitter: 30m
     runOnCreate: false # applying does NOT take an immediate backup
-# --8<-- [end:schedule]
+# endregion schedule

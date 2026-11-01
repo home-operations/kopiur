@@ -22,7 +22,7 @@
 # acknowledgeLiveMutation is IGNORED anywhere it is not needed, so it is safe to
 # leave in place if you later switch to copyMethod: Snapshot — no two-step edit.
 #
-# See docs/copy-methods.md#making-fsgroup-apply-to-the-source
+# See docs/src/content/docs/copy-methods.mdx#making-fsgroup-apply-to-the-source
 ---
 apiVersion: kopiur.home-operations.com/v1alpha1
 kind: SnapshotPolicy

@@ -25,7 +25,7 @@
 # `seed.credentialProjection.enabled: true` lets the operator copy them in for
 # the duration of the run — which needs the operator's
 # `features.credentialProjection.enabled` Helm flag (see
-# docs/feature-permissions.md). Without the flag the bootstrap fails closed with
+# docs/src/content/docs/feature-permissions.mdx). Without the flag the bootstrap fails closed with
 # an actionable message rather than launching a Job that cannot authenticate.
 #
 # Field shapes verified against crates/api (crates/api/src/seed.rs):
@@ -36,8 +36,8 @@
 # (an explicit `--no-policies`); `seed.migrate.throttle` is the same per-side
 # {source, destination} shape SnapshotReplication's `spec.migrate.throttle` uses.
 #
-# The `# --8<-- [start:…]` / `# --8<-- [end:…]` lines are snippet-section markers
-# (docs/repositories.md pulls the Repository on its own). Plain YAML comments —
+# The `# region …` / `# endregion …` lines are region markers
+# (docs/src/content/docs/repositories.mdx pulls the Repository on its own). Plain YAML comments —
 # the file stays `kubectl apply -f`-able as-is.
 ---
 apiVersion: v1
@@ -54,7 +54,7 @@ stringData:
   # repository, so this is independent of the source's password.
   KOPIA_PASSWORD: "REPLACE_ME"
 ---
-# --8<-- [start:repository]
+# region repository
 apiVersion: kopiur.home-operations.com/v1alpha1
 kind: Repository
 metadata:
@@ -144,4 +144,4 @@ spec:
     retain:
       perIdentity: 100
       maxAgeDays: 365
-# --8<-- [end:repository]
+# endregion repository

@@ -106,7 +106,7 @@ spec:
   # THIS app's data is owned by a different UID, set just that field here — the
   # rest (fsGroup, cache, the hardened base) still comes from moverDefaults. A
   # partial override can only tighten; it never drops drop:[ALL]/seccomp.
-  # --8<-- [start:mover]
+  # region mover
   mover:
     securityContext:
       runAsUser: 1000 # match the UID that owns THIS app's data (else inherit)
@@ -120,7 +120,7 @@ spec:
     #   runAsUser: 0           # root (privilegedMode never sets this for you)
     #   runAsNonRoot: false
     # privilegedMode: true     # root only: reads any file; preserves UID/GID on RESTORE
-# --8<-- [end:mover]
+# endregion mover
 ---
 # ── Per-RUN override on a one-shot Snapshot (MERGES over the policy) ───────────
 # An ad-hoc snapshot before a risky change, which needs more memory and a bigger
@@ -140,7 +140,7 @@ spec:
 #
 # It also does not escape the privileged-mover gate: an elevated context assembled
 # here still needs the namespace opt-in, because the gate runs on the MERGED result.
-# --8<-- [start:snapshot-mover]
+# region snapshot-mover
 apiVersion: kopiur.home-operations.com/v1alpha1
 kind: Snapshot
 metadata:
@@ -173,4 +173,4 @@ spec:
       contentCacheSizeMb: 20000
     # Keep this Job around longer than the 1h default so you can read its logs.
     ttlSecondsAfterFinished: 21600
-# --8<-- [end:snapshot-mover]
+# endregion snapshot-mover

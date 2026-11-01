@@ -852,8 +852,8 @@ mod tests {
         // uses to reach `deploy/examples`.
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         for page in [
-            "docs/troubleshooting.md",
-            "docs/scenarios/dr-with-replicated-repository.md",
+            "docs/src/content/docs/troubleshooting.mdx",
+            "docs/src/content/docs/scenarios/dr-with-replicated-repository.mdx",
         ] {
             let path = root.join(page);
             let text = std::fs::read_to_string(&path)

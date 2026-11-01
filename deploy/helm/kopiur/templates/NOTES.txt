@@ -5,7 +5,7 @@ CRDs: shipped in the chart's crds/ directory — installed on `helm install`, bu
       Helm never upgrades them on `helm upgrade`. For a helm-CLI upgrade, apply
       the new schema yourself: kubectl apply --server-side -f deploy/crds/ (GitOps CreateReplace
       handles this automatically). Upgrading FROM 0.5.x is a one-time special case
-      (the CRDs moved into crds/) — see docs/upgrade.md before upgrading.
+      (the CRDs moved into crds/) — see https://kopiur.home-operations.com/upgrade/ before upgrading.
 Webhook: {{ if .Values.webhook.enabled }}enabled (failurePolicy={{ .Values.webhook.failurePolicy }}){{ else }}disabled{{ end }}
 
 1. Verify the controller is running:
@@ -76,4 +76,4 @@ Webhook: {{ if .Values.webhook.enabled }}enabled (failurePolicy={{ .Values.webho
    kubectl get repositories,snapshotpolicies,snapshotschedules,snapshots,restores -A
    kubectl get maintenances,repositoryreplications,snapshotreplications -A
 
-Docs: docs/install.md
+Docs: https://kopiur.home-operations.com/install/

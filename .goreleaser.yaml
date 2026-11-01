@@ -71,8 +71,10 @@ homebrew_casks:
     # block the first run with "developer cannot be verified".
     hooks:
       post:
-        install: |
-          system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/kopiur"] if OS.mac?
+        install_steps: |
+          on_macos do
+            run "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "{{ .StagedPath }}/kopiur"]
+          end
 
 # No `krews:` block: krew-index needs a PR per release, which krew-release-bot
 # opens from the repo-root `.krew.yaml` template (release.yaml, after this run

@@ -65,7 +65,7 @@ pub struct SnapshotScheduleSpec {
 }
 
 /// Deletion semantics for a schedule's produced `Snapshot`s (sub-object per
-/// docs/dev/api-conventions.md §4 so future deletion knobs slot in without
+/// docs/src/content/docs/dev/api-conventions.md §4 so future deletion knobs slot in without
 /// API breakage).
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]

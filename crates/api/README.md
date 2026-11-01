@@ -59,7 +59,7 @@ Shared pure logic (no controller deps):
 
 ## Conventions
 
-Before editing this crate, read [`docs/dev/api-conventions.md`]. The load-bearing
+Before editing this crate, read [API conventions]. The load-bearing
 rules:
 
 - **Discriminated unions are externally-tagged enums** (`backend: { s3: {...} }`),
@@ -109,7 +109,7 @@ assert_eq!(backend.kind_str(), "S3");
 ## See also
 
 - [ADR-0003] — the canonical source of truth for the CRD surface, UX, and design.
-- [`docs/dev/api-conventions.md`] — how to encode the ADR's fields in Rust.
+- [API conventions] — how to encode the ADR's fields in Rust.
 
-[ADR-0003]: ../../docs/adr/0003-kopiur-rust-operator.md
-[`docs/dev/api-conventions.md`]: ../../docs/dev/api-conventions.md
+[ADR-0003]: https://kopiur.home-operations.com/adr/0003-kopiur-rust-operator/
+[API conventions]: https://kopiur.home-operations.com/dev/api-conventions/

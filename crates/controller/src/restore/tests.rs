@@ -702,7 +702,7 @@ fn the_zero_claimant_park_nulls_the_records_of_gone_claimants() {
 // --- the single-claim TOP-LEVEL mirror (#443 CI regression) -------------
 //
 // The overwhelmingly common populator is a one-PVC app, and for it the `Restore`
-// simply IS that claim. `docs/restores.md` promises the deploy-or-restore
+// simply IS that claim. `docs/src/content/docs/restores.mdx` promises the deploy-or-restore
 // decision is pinned to `status.resolved`, and `kubectl kopiur restore`/`status`
 // read exactly that field — moving the pin under `status.claims.<pvc>.resolved`
 // broke both, plus four e2e regressions.

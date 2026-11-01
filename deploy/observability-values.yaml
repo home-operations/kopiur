@@ -5,7 +5,7 @@
 #   helm upgrade --install kopiur deploy/helm/kopiur -n kopiur-system \
 #     -f deploy/observability-values.yaml
 #
-# See docs/dev/observability.md for the full metric list and details.
+# See https://kopiur.home-operations.com/dev/observability/ for the full metric list and details.
 
 # The controller's metrics Service is always created; the monitoring umbrella
 # wires up the Prometheus-Operator objects and the Grafana dashboard.

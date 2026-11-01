@@ -25,7 +25,7 @@ operator depend on it:
 
 - the **controller** uses it for short, idempotent operations it runs in-process
   or as tiny Jobs — `repository connect` to validate a `Repository`, `snapshot
-list` to materialize the catalog (ADR §5.4);
+  list` to materialize the catalog (ADR §5.4);
 - the **mover** ([`kopiur-mover`](../mover)) uses it for the long-running
   snapshot/restore/maintenance subprocesses that must not be stranded by a
   controller restart.
@@ -96,6 +96,6 @@ println!("repo unique id: {}", status.unique_id_hex);
 
 ## See also
 
-- [ADR-0003](../../docs/adr/0003-kopiur-rust-operator.md) — §5.4 (kopia
+- [ADR-0003](https://kopiur.home-operations.com/adr/0003-kopiur-rust-operator/) — §5.4 (kopia
   interaction) is the canonical description of the subprocess contract; §5.1
   explains the `api`/`controller`/`kopia` dependency split.

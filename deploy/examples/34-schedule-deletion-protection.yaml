@@ -27,8 +27,8 @@
 # Field shapes verified against crates/api (externally-tagged backend:
 # `backend.s3`, not `backend: { kind: S3 }`).
 #
-# See docs/backups.md ("What happens when the schedule is deleted") and
-# docs/repositories.md ("deletionProtection").
+# See docs/src/content/docs/backups.mdx ("What happens when the schedule is deleted") and
+# docs/src/content/docs/repositories.mdx ("deletionProtection").
 ---
 apiVersion: v1
 kind: Secret
@@ -93,7 +93,7 @@ spec:
     keepDaily: 14
     keepWeekly: 4
 ---
-# --8<-- [start:schedule-deletion]
+# region schedule-deletion
 apiVersion: kopiur.home-operations.com/v1alpha1
 kind: SnapshotSchedule
 metadata:
@@ -116,4 +116,4 @@ spec:
     # vanished is downgraded to retain — no kopia data lost, rediscovered
     # later as `origin: discovered`.
     onScheduleDelete: Delete
-# --8<-- [end:schedule-deletion]
+# endregion schedule-deletion

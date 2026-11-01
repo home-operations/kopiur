@@ -1,22 +1,24 @@
 ---
 name: documentation
-description: How Kopiur writes and maintains user-facing docs — the MkDocs Material site under docs/ and the example manifests under deploy/examples/. Use when adding or editing any doc page, writing or changing an example manifest, or whenever you change operator behavior that affects how someone deploys, uses, or configures Kopiur (CRD fields, defaults, Helm values, RBAC, reconciler UX, kopia/mover invocation). Encodes the painfully-clear-for-three-audiences rule, the examples-live-in-deploy/examples-and-are-snippet-included convention, the simple→complex example ladder, and the docs-change-with-the-code discipline.
+description: How Kopiur writes and maintains user-facing docs — the Astro Starlight site under docs/ and the example manifests under deploy/examples/. Use when adding or editing any doc page, writing or changing an example manifest, or whenever you change operator behavior that affects how someone deploys, uses, or configures Kopiur (CRD fields, defaults, Helm values, RBAC, reconciler UX, kopia/mover invocation). Encodes the painfully-clear-for-three-audiences rule, the examples-live-in-deploy/examples-and-are-included convention, the simple→complex example ladder, and the docs-change-with-the-code discipline.
 ---
 
 # Kopiur documentation norms
 
-Kopiur's docs are an **MkDocs Material** site whose source IS the `docs/` tree
-(`mkdocs.yml` sets `docs_dir: docs`). Page order and grouping live in the `nav:`
-block of `mkdocs.yml` — there is no SUMMARY.md; a `docs/*.md` left out of `nav:`
-still builds but is unlinked (and `--strict` warns). Example manifests live in
-`deploy/examples/` and are pulled into the prose at build time (pymdownx
-snippets); they are never copy-pasted into `.md` files. `mise run docs` builds
-the site with `mkdocs build --strict` — a broken cross-link or a missing nav file
-fails the build, so it doubles as our doc lint.
+Kopiur's docs are an **Astro Starlight** site in `docs/`. Pages live under
+`docs/src/content/docs/`, and a page's path is its URL (`backends/s3.mdx` →
+`/backends/s3/`). Page order and grouping live in the `sidebar` of
+`docs/astro.config.mjs`; a page left out of it still builds but is unlinked, and
+nothing catches that. A sidebar label that differs from the page title goes in
+the page's front matter (`sidebar: { label: … }`), not in the config. Example
+manifests live in `deploy/examples/` and are pulled into the prose at build time
+(see below); they are never copy-pasted into pages. `mise run docs` builds the
+site, and starlight-links-validator fails the build on a broken cross-link or
+heading anchor, so it doubles as our doc lint.
 
-The MkDocs + Material + pymdown-extensions toolchain is pinned in `pyproject.toml`
-/ `uv.lock` and run via uv (mise installs uv). Material bundles mermaid.js and the
-admonition styling, so there are no preprocessor binaries or committed assets.
+The Astro + Starlight toolchain is pinned in `docs/package.json` /
+`docs/pnpm-lock.yaml` and installed with the node and pnpm mise pins. Mermaid
+fences render through the `astro-mermaid` integration.
 
 ## The bar: painfully clear for three audiences
 
@@ -34,28 +36,23 @@ Every user-facing page must let a reader who has never seen Kopiur succeed at
    reverse-engineer the CRD to find the knobs.
 
 When in doubt, over-explain the "why", and prefer a worked example over a prose
-description. Use Material **admonitions** for the gotchas — alpha API,
-webhook-enforced constraints, version prerequisites. This repo uses the pymdownx
-**blocks** form (`/// note | Title` … `///`), NOT the classic `!!! note` form:
-the classic `admonition` extension is not even registered (`mkdocs.yml` wires up
-`pymdownx.blocks.admonition`), because the pre-commit `oxfmt` pass strips the
-4-space body indentation `!!!` requires and silently breaks every such block. The
-blocks body stays at **column 0** and the block is closed with a `///` line:
+description. Use Starlight **asides** for the gotchas — alpha API,
+webhook-enforced constraints, version prerequisites. The title goes in brackets
+and the block closes with `:::`:
 
 ```markdown
-/// warning | Lose the password, lose the backups
+:::caution[Lose the password, lose the backups]
 
 The `KOPIA_PASSWORD` encrypts the repository. If you lose it, the backups are
 unrecoverable — kopia cannot decrypt without it.
 
-///
+:::
 ```
 
-Keep a blank line before the closing `///` (so oxfmt doesn't fold it into a
-preceding list item). The title is bare text after `| ` — not quoted. Registered
-types are the canonical Material set: `note`, `abstract`, `info`, `tip`,
-`success`, `question`, `warning`, `failure`, `danger`, `bug`, `example`, `quote`
-— `important` is **not** one; use `warning` for a webhook-enforced constraint.
+The types are `note`, `tip`, `caution` and `danger`; use `caution` for a
+webhook-enforced constraint. For a collapsible block use plain HTML
+`<details>`/`<summary>`, and for tabs the `<Tabs>`/`<TabItem>` components in an
+`.mdx` page.
 
 ## Examples are the backbone (simple → complex)
 
@@ -67,23 +64,26 @@ examples at the complexity tier they belong to, not just at the end.
 
 ### The hard rule: example YAML lives in `deploy/examples/`, never inline
 
-Docs include manifests with a pymdownx **snippet** marker so prose and apply-ready
-files cannot drift. The snippet path is repo-root-relative (snippets `base_path`
-is the repo root):
+Pages include manifests with a `?raw` import and Starlight's `<Code>` component,
+so prose and apply-ready files cannot drift. The page must be `.mdx`, and the
+`@repo/` import alias is the repo root:
 
-````markdown
+```mdx
+import { Code } from "@astrojs/starlight/components";
+import examples09KebabName from "@repo/deploy/examples/09-<kebab-name>.yaml?raw";
+
 ## Example 09 — <what it demonstrates>
 
 <1–3 sentences: what this shows and when you'd reach for it.>
 
-```yaml
---8<-- "deploy/examples/09-<kebab-name>.yaml"
+<Code code={examples09KebabName} lang="yaml" title="deploy/examples/09-<kebab-name>.yaml" />
 ```
-````
 
-````
+To show one part of a file, wrap it in `# region <name>` / `# endregion <name>`
+comments in the manifest and pass `region(file, "<name>")` from `@utils/region`
+as the `code`. A region that no longer exists fails the build.
 
-**Never** paste a literal multi-line manifest into a `.md` file. If you're about
+**Never** paste a literal multi-line manifest into a page. If you're about
 to, stop and make it a file under `deploy/examples/` instead. (Short inline
 `console`/`kubectl` snippets that aren't manifests are fine.)
 
@@ -104,39 +104,39 @@ to, stop and make it a file under `deploy/examples/` instead. (Short inline
 
 There are **two** conventions, and the number tells you which:
 
-**01–20 — the `docs/examples.md` ladder.** A three-touch change:
+**01–20 — the `docs/src/content/docs/examples.mdx` ladder.** A three-touch change:
 
 1. Create `deploy/examples/NN-name.yaml`.
-2. Add a `## Example NN — …` section in `docs/examples.md` with the
-   `--8<-- "deploy/examples/NN-name.yaml"` snippet inside a `yaml` fence.
-3. Add a row to the table at the top of `docs/examples.md`.
+2. Add a `## Example NN — …` section in `docs/src/content/docs/examples.mdx` with
+   the `<Code>` include of `deploy/examples/NN-name.yaml`.
+3. Add a row to the table at the top of `docs/src/content/docs/examples.mdx`.
 
-**21+ — capability-page inclusion.** The ladder is a *tutorial* sequence and
+**21+ — capability-page inclusion.** The ladder is a _tutorial_ sequence and
 stops at 20 deliberately; everything after it is a per-capability example that
 belongs beside the prose explaining that capability, not at the end of a
 tutorial. So a two-touch change:
 
 1. Create `deploy/examples/NN-name.yaml`, usually with
-   `# --8<-- [start:…]` / `[end:…]` section markers so the page can pull just
-   the CR that teaches the point.
-2. Snippet-include it from the capability page that documents the field
-   (`docs/replication.md` for 19's replication CR, `docs/repositories.md` for
-   the `spec.seed` examples, `docs/backends/s3.md` for 38, …).
+   `# region …` / `# endregion …` markers so the page can pull just the CR that
+   teaches the point.
+2. Include it from the capability page that documents the field
+   (`docs/src/content/docs/replication.mdx` for 19's replication CR, `docs/src/content/docs/repositories.mdx` for
+   the `spec.seed` examples, `docs/src/content/docs/backends/s3.mdx` for 38, …).
 
-   **Do not** add a `docs/examples.md` row/section for a 21+ example — that is
+   **Do not** add a `docs/src/content/docs/examples.mdx` row/section for a 21+ example — that is
    how the same manifest ends up documented twice and the two copies drift.
 
-Either way the file must be reachable from *some* page: an example nothing
+Either way the file must be reachable from _some_ page: an example nothing
 includes is an orphan, and nothing in the build catches it.
 
 **Scenario bundles** are a third home: `deploy/examples/scenarios/NN-name.yaml`,
-one per `docs/scenarios/*.md` page, pulled by that page (whole-file or by
+one per page under `docs/src/content/docs/scenarios/`, pulled by that page (whole-file or by
 section) and listed in the scenarios index table. They are typed-checked by
 `crates/api/tests/examples_match_crd_shapes.rs` like everything else.
 
-A new top-level **page** (not an example) also needs an entry in the `nav:` of
-`mkdocs.yml`, or it builds unlinked (and `--strict` warns). A new **scenario**
-page additionally needs its row in `docs/scenarios/index.md`.
+A new **page** (not an example) also needs an entry in the `sidebar` of
+`docs/astro.config.mjs`, or it builds unlinked. A new **scenario**
+page additionally needs its row in `docs/src/content/docs/scenarios/index.md`.
 
 ## Docs change in the same PR as the behavior
 
@@ -145,14 +145,14 @@ Kopiur, update the docs in the same change.** This is not a follow-up task.
 
 Triggers that REQUIRE a docs/examples update:
 
-| You changed… | Update… |
-|---|---|
-| A CRD field / shape / default in `crates/api` | the relevant `docs/*.md` prose **and** any example manifest that uses it |
-| A Helm value or install scope (`deploy/helm`) | `docs/install.md` |
-| RBAC / SA / mover behavior | `docs/movers.md` |
-| Maintenance defaults or projection | `docs/maintenance.md` |
-| A webhook-enforced constraint | the affected page (state it as a `/// warning` admonition) + the example that would otherwise violate it |
-| A reconciler UX change (status, print columns, phases) | wherever that surface is described |
+| You changed…                                           | Update…                                                                                            |
+| ------------------------------------------------------ | -------------------------------------------------------------------------------------------------- |
+| A CRD field / shape / default in `crates/api`          | the relevant page under `docs/src/content/docs/` **and** any example manifest that uses it         |
+| A Helm value or install scope (`deploy/helm`)          | `docs/src/content/docs/install.mdx`                                                                |
+| RBAC / SA / mover behavior                             | `docs/src/content/docs/movers.mdx`                                                                 |
+| Maintenance defaults or projection                     | `docs/src/content/docs/maintenance.mdx`                                                            |
+| A webhook-enforced constraint                          | the affected page (state it as a `:::caution` aside) + the example that would otherwise violate it |
+| A reconciler UX change (status, print columns, phases) | wherever that surface is described                                                                 |
 
 Field shapes shown in docs/examples must be the real ones — the manifests are
 apply-ready, so a wrong field is a user-facing bug, not a typo.
@@ -160,30 +160,30 @@ apply-ready, so a wrong field is a user-facing bug, not a typo.
 ## Verify before claiming done
 
 ```bash
-mise run docs   # mkdocs build --strict (broken link / missing nav file = build fail)
-````
+mise run docs   # rustdoc + astro build (broken link or anchor = build fail)
+```
 
-The build also expands every snippet — a renamed/missing example file fails here
-(snippets `check_paths` is on). `--strict` additionally validates heading anchors,
-so a deep-link to a `#section` that no longer exists fails too. Don't claim a docs
-change is done without a green `mise run docs`. For a fast inner loop without the
-rustdoc nesting, use `mise run docs-serve` (live-reload `mkdocs serve`). If you
+The build also resolves every include — a renamed or missing example file or
+region fails here. The link validator checks heading anchors too, so a
+deep-link to a `#section` that no longer exists fails. Don't claim a docs change
+is done without a green `mise run docs`. For a fast inner loop, use
+`mise run docs-serve` (live-reload `astro dev`). If you
 added/changed a manifest, the field shapes should be the same ones the tests in
 `crates/api` accept (see [[kopiur-design]] for the `from_yaml` parse path); a
 manifest that wouldn't survive admission is wrong even if the site builds.
 
 ## Common mistakes
 
-- Pasting YAML inline in a `.md` instead of snippet-including a file → drift.
-- Adding a **01–20** ladder example but forgetting the `docs/examples.md` table
+- Pasting YAML inline in a page instead of including a file → drift.
+- Adding a **01–20** ladder example but forgetting the `docs/src/content/docs/examples.mdx` table
   row or the section (or vice-versa) → orphaned file or dead reference.
-- Adding a **21+** example to the `docs/examples.md` ladder as well as its
+- Adding a **21+** example to the `docs/src/content/docs/examples.mdx` ladder as well as its
   capability page → the same manifest documented twice, and the copies drift.
-- New page not added to the `nav:` in `mkdocs.yml` → builds unlinked.
-- Writing an admonition in the classic `!!! note` form (4-space-indented body)
-  instead of the `/// note | Title` … `///` blocks form → the title renders as
-  literal text and the indented body becomes a code block (it does not error —
-  eyeball the rendered page or grep the built HTML for `class="admonition`).
+- New page not added to the `sidebar` in `docs/astro.config.mjs` → builds unlinked.
+- Writing an MkDocs admonition (`/// note | Title` or `!!! note`) instead of a
+  `:::note[Title]` aside → it renders as literal text and does not error.
+- A bare `{` or `<` in the prose of an `.mdx` page → MDX parses it as an
+  expression or a tag and the build fails; put it in a code span.
 - Documenting the field list without the mental model or the "which values do I
   actually change" guidance → technically complete, practically useless.
 - Shipping a behavior change with "docs later" → the docs now lie. Same PR.

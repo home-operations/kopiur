@@ -1688,7 +1688,10 @@ mod tests {
         // The one target the CLI genuinely cannot build is named, so a user after
         // it is sent to the manifest instead of concluding it does not exist.
         assert!(msg.contains("streamExec"), "{msg}");
-        assert!(msg.contains("docs/stream-sources.md"), "{msg}");
+        assert!(
+            msg.contains("https://kopiur.home-operations.com/stream-sources/"),
+            "{msg}"
+        );
 
         // More than one target is the same refusal, and lists both.
         let mut two = restore_args(&["--from-snapshot", "snap1", "--to-pvc", "existing"]);

@@ -1,6 +1,6 @@
 //! Backup preflight: user-declared CEL preconditions a `Snapshot` must satisfy
 //! before its mover Job is launched (the "stronger preflight" of
-//! `docs/repository-health.md`).
+//! `docs/src/content/docs/repository-health.mdx`).
 //!
 //! This reuses the `cel`/`*Expr` foundation from [`crate::success_expr`] and
 //! [`crate::identity`]: compile → execute → require a typed result, length-capped

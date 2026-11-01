@@ -2023,7 +2023,7 @@ async fn maintenance_claims_lease() {
     // §2). That heal is a SEPARATE status write from the lease/run bookkeeping, so
     // gate on the healed condition rather than asserting it right after the lease
     // claim — same two-pass heal discipline as the restore/snapshot/replication
-    // guards (docs/dev/watch-and-reconcile.md, "Two-pass terminal heal").
+    // guards (docs/src/content/docs/dev/watch-and-reconcile.md, "Two-pass terminal heal").
     wait_condition(&maints, "e2e-maint", "Ready", "True")
         .await
         .expect("a Maintenance whose repository is Ready must heal kstatus Ready=True");

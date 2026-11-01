@@ -64,7 +64,7 @@ spec:
     # never recreates a repository that has already been `Ready` — the probe alerts,
     # it does not act (the data-safety invariant).
     enabled: true
-  # --8<-- [start:health]
+  # region health
   # The probe runs by default — `spec.health.probe` is only needed to tune it
   # or opt out. Everything below shows the defaults plus the two opt-outs.
   health:
@@ -85,4 +85,4 @@ spec:
       # `Alert` to keep the pre-breaker alert-only behavior: the Repository
       # stays `Ready` and backups keep running against the failing backend.
       onFailure: Degrade
-  # --8<-- [end:health]
+  # endregion health

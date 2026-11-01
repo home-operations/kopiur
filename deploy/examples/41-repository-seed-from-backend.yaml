@@ -35,8 +35,8 @@
 # is the shared FailurePolicy shape (24h activeDeadlineSeconds by default while
 # seeding, versus the 120s a routine connect gets).
 #
-# The `# --8<-- [start:…]` / `# --8<-- [end:…]` lines are snippet-section markers
-# (docs/repositories.md pulls the Repository on its own). Plain YAML comments —
+# The `# region …` / `# endregion …` lines are region markers
+# (docs/src/content/docs/repositories.mdx pulls the Repository on its own). Plain YAML comments —
 # the file stays `kubectl apply -f`-able as-is.
 ---
 apiVersion: v1
@@ -68,7 +68,7 @@ stringData:
   AWS_ACCESS_KEY_ID: "REPLACE_ME"
   AWS_SECRET_ACCESS_KEY: "REPLACE_ME"
 ---
-# --8<-- [start:repository]
+# region repository
 apiVersion: kopiur.home-operations.com/v1alpha1
 kind: Repository
 metadata:
@@ -129,4 +129,4 @@ spec:
     retain:
       perIdentity: 100
       maxAgeDays: 365
-# --8<-- [end:repository]
+# endregion repository

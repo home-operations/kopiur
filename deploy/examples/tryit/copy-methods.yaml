@@ -1,4 +1,4 @@
-# Try it end-to-end — copyMethod: Snapshot (staged CSI copy) (docs/copy-methods.md)
+# Try it end-to-end — copyMethod: Snapshot (staged CSI copy) (docs/src/content/docs/copy-methods.mdx)
 #
 # Proves a point-in-time `copyMethod: Snapshot` backup: Kopiur takes a CSI
 # VolumeSnapshot of the source PVC, stages a temporary PVC from it
@@ -21,17 +21,17 @@
 # {copyMethod,volumeSnapshotName,pvcName,ready}; the staged PVC is <snapshot>-src;
 # externally-tagged backend.filesystem).
 #
-# The `# --8<-- [start:NAME]` / `# --8<-- [end:NAME]` lines are MkDocs snippet
-# section markers for docs/copy-methods.md. Plain YAML comments — applies as-is.
+# The `# region NAME` / `# endregion NAME` lines are region
+# markers for docs/src/content/docs/copy-methods.mdx. Plain YAML comments — applies as-is.
 ---
-# --8<-- [start:namespace]
+# region namespace
 apiVersion: v1
 kind: Namespace
 metadata:
   name: kopiur-tryit
-# --8<-- [end:namespace]
+# endregion namespace
 ---
-# --8<-- [start:repo-pvc]
+# region repo-pvc
 # Backing store for the kopia repository (filesystem backend — no cloud creds).
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -43,9 +43,9 @@ spec:
   resources:
     requests:
       storage: 2Gi
-# --8<-- [end:repo-pvc]
+# endregion repo-pvc
 ---
-# --8<-- [start:secret]
+# region secret
 apiVersion: v1
 kind: Secret
 metadata:
@@ -54,9 +54,9 @@ metadata:
 type: Opaque
 stringData:
   KOPIA_PASSWORD: "REPLACE_ME"
-# --8<-- [end:secret]
+# endregion secret
 ---
-# --8<-- [start:app-data]
+# region app-data
 # The source volume — MUST be CSI-provisioned so it can be VolumeSnapshotted.
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -69,9 +69,9 @@ spec:
   resources:
     requests:
       storage: 1Gi
-# --8<-- [end:app-data]
+# endregion app-data
 ---
-# --8<-- [start:seed]
+# region seed
 # Seed real data so the backup uploads non-zero bytes/files.
 apiVersion: batch/v1
 kind: Job
@@ -102,9 +102,9 @@ spec:
         - name: app-data
           persistentVolumeClaim:
             claimName: app-data
-# --8<-- [end:seed]
+# endregion seed
 ---
-# --8<-- [start:repository]
+# region repository
 apiVersion: kopiur.home-operations.com/v1alpha1
 kind: Repository
 metadata:
@@ -123,9 +123,9 @@ spec:
       key: KOPIA_PASSWORD
   create:
     enabled: true
-# --8<-- [end:repository]
+# endregion repository
 ---
-# --8<-- [start:policy]
+# region policy
 apiVersion: kopiur.home-operations.com/v1alpha1
 kind: SnapshotPolicy
 metadata:
@@ -143,9 +143,9 @@ spec:
   retention:
     keepDaily: 7
     keepWeekly: 4
-# --8<-- [end:policy]
+# endregion policy
 ---
-# --8<-- [start:snapshot]
+# region snapshot
 # A FIXED-name Snapshot (not generateName) so the staged PVC is deterministically
 # `app-data-snapshot-src` — apply this with `apply`, not `create`.
 apiVersion: kopiur.home-operations.com/v1alpha1
@@ -156,4 +156,4 @@ metadata:
 spec:
   policyRef:
     name: app-data
-# --8<-- [end:snapshot]
+# endregion snapshot

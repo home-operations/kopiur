@@ -34,9 +34,9 @@
 #
 # THIS FILE IS NOT ONE `kubectl apply`. The first document is Helm values
 # (`helm upgrade -f`); everything after it is cluster objects. The docs page
-# pulls each section separately — see docs/ui.md.
+# pulls each section separately — see docs/src/content/docs/ui.mdx.
 
-# --8<-- [start:values]
+# region values
 # ---------------------------------------------------------------------------
 # Helm values — `helm upgrade --install kopiur ... -f this-excerpt.yaml`
 # ---------------------------------------------------------------------------
@@ -89,9 +89,9 @@ ui:
       namespaceSelector:
         matchLabels:
           kubernetes.io/metadata.name: monitoring
-# --8<-- [end:values]
+# endregion values
 
-# --8<-- [start:proxy-secret]
+# region proxy-secret
 ---
 # The shared token. YOU create it; the chart only mounts it. Generate something
 # long and random, e.g. `openssl rand -hex 32`.
@@ -115,9 +115,9 @@ metadata:
 type: Opaque
 stringData:
   token: REPLACE_ME
-# --8<-- [end:proxy-secret]
+# endregion proxy-secret
 
-# --8<-- [start:oauth2-proxy]
+# region oauth2-proxy
 ---
 # oauth2-proxy's alpha config: it authenticates the user with your IdP, then
 # proxies to the console with the two identity headers and the shared token set.
@@ -226,9 +226,9 @@ spec:
     - name: http
       port: 80
       targetPort: http
-# --8<-- [end:oauth2-proxy]
+# endregion oauth2-proxy
 
-# --8<-- [start:ingress]
+# region ingress
 ---
 # Your edge, pointed at the PROXY — never at the console Service. An Ingress
 # that targets `kopiur-ui` directly publishes a console that believes whatever
@@ -254,9 +254,9 @@ spec:
                 name: oauth2-proxy
                 port:
                   name: http
-# --8<-- [end:ingress]
+# endregion ingress
 
-# --8<-- [start:httproute]
+# region httproute
 ---
 # The Gateway API variant of the same thing. Same rule: the backend is the
 # proxy, not the console.
@@ -276,9 +276,9 @@ spec:
     - backendRefs:
         - name: oauth2-proxy
           port: 80
-# --8<-- [end:httproute]
+# endregion httproute
 
-# --8<-- [start:bindings]
+# region bindings
 ---
 # WHO MAY USE THE CONSOLE. Until one of these exists, everyone who signs in gets
 # "Forbidden" on every screen — the console grants nothing by itself, and that
@@ -327,7 +327,7 @@ subjects:
   - apiGroup: rbac.authorization.k8s.io
     kind: Group
     name: media-admins
-# --8<-- [end:bindings]
+# endregion bindings
 
 # ===========================================================================
 # VARIANT B — Envoy Gateway SecurityPolicy (OIDC) in front of the console.
@@ -346,7 +346,7 @@ subjects:
 # ONE group named "WyJEb21h…" that matches no binding.
 # ===========================================================================
 
-# --8<-- [start:envoy-values]
+# region envoy-values
 ui:
   enabled: true
 
@@ -400,12 +400,12 @@ ui:
       podSelector:
         matchLabels:
           app.kubernetes.io/component: proxy
-# --8<-- [end:envoy-values]
+# endregion envoy-values
 
-# --8<-- [start:envoy-proxy-secret]
+# region envoy-proxy-secret
 ---
 # The OIDC client credentials Envoy uses to log users in — the client you
-# register in your IdP (see the Authelia note in docs/ui.md). Envoy Gateway
+# register in your IdP (see the Authelia note in docs/src/content/docs/ui.mdx). Envoy Gateway
 # reads `client-id` and `client-secret` from this Secret.
 apiVersion: v1
 kind: Secret
@@ -431,9 +431,9 @@ metadata:
 type: Opaque
 stringData:
   credential: REPLACE_ME
-# --8<-- [end:envoy-proxy-secret]
+# endregion envoy-proxy-secret
 
-# --8<-- [start:envoy-gateway]
+# region envoy-gateway
 ---
 # The route: your Gateway → the console Service directly (Envoy is the proxy).
 # Its one filter hands every request to the HTTPRouteFilter below, which sets
@@ -493,7 +493,7 @@ spec:
 # Envoy writes a header only for a claim the token actually contains — and if
 # a claim is missing, a header of that name sent by the BROWSER is not
 # replaced. So make sure the ID token always carries `preferred_username`,
-# `groups` and `email` (for Authelia: a claims_policy, see docs/ui.md).
+# `groups` and `email` (for Authelia: a claims_policy, see docs/src/content/docs/ui.mdx).
 apiVersion: gateway.envoyproxy.io/v1alpha1
 kind: SecurityPolicy
 metadata:
@@ -531,9 +531,9 @@ spec:
             header: x-user-groups
           - claim: email # → ui.auth.emailHeader (display only)
             header: x-user-email
-# --8<-- [end:envoy-gateway]
+# endregion envoy-gateway
 
-# --8<-- [start:envoy-route-header-modifier]
+# region envoy-route-header-modifier
 ---
 # FALLBACK for Envoy Gateway older than v1.4, which has no credential
 # injection. Use this route INSTEAD OF the HTTPRoute and HTTPRouteFilter above
@@ -563,4 +563,4 @@ spec:
             set:
               - name: X-Kopiur-Proxy-Token
                 value: REPLACE_ME # the same value as `credential` in the Secret above
-# --8<-- [end:envoy-route-header-modifier]
+# endregion envoy-route-header-modifier

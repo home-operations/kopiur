@@ -21,8 +21,8 @@
 # (kind defaults to Repository); destination is an externally-tagged Backend;
 # schedule is { cron, jitter }.
 #
-# The `# --8<-- [start:…]` / `# --8<-- [end:…]` lines are snippet-section markers
-# (docs/replication.md pulls the RepositoryReplication CR on its own). Plain YAML
+# The `# region …` / `# endregion …` lines are region markers
+# (docs/src/content/docs/replication.mdx pulls the RepositoryReplication CR on its own). Plain YAML
 # comments — the file stays `kubectl apply -f`-able as-is.
 ---
 apiVersion: v1
@@ -36,7 +36,7 @@ stringData:
   AWS_ACCESS_KEY_ID: "REPLACE_ME"
   AWS_SECRET_ACCESS_KEY: "REPLACE_ME"
 ---
-# --8<-- [start:replication]
+# region replication
 apiVersion: kopiur.home-operations.com/v1alpha1
 kind: RepositoryReplication
 metadata:
@@ -68,9 +68,9 @@ spec:
   # so a large initial seed to a slow/high-latency destination can otherwise
   # take days. `deleteExtra` (kopia's `--delete`) prunes destination-only blobs
   # for a true mirror — left `false` (additive) here since it deletes
-  # destination content; see docs/replication.md#tuning-the-sync.
+  # destination content; see docs/src/content/docs/replication.mdx#tuning-the-sync.
   sync:
     parallel: 8
   # Pause replication without deleting the CR.
   suspend: false
-# --8<-- [end:replication]
+# endregion replication

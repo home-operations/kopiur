@@ -1,6 +1,6 @@
 {
   $schema: "https://docs.renovatebot.com/renovate-schema.json",
-  extends: ["local>home-operations/renovate-config"],
+  extends: ["local>home-operations/.github:renovate-config"],
   postUpdateOptions: ["pnpmDedupe"],
   packageRules: [
     {
@@ -21,6 +21,24 @@
       description: "typescript-eslint's supported TypeScript range (peer typescript >=4.8.4 <6.1.0); raise with it, see typescript-eslint/typescript-eslint#10940",
       matchPackageNames: ["typescript"],
       allowedVersions: "<6.1.0",
+    },
+    {
+      description: "croner 4 rejects shortcut step syntax (`0/15 * * * *`) by default, so a SnapshotSchedule admitted under croner 3 would stop firing after an upgrade; needs `.sloppy_ranges(true)` in `cron_parser()` plus a regression test first, see #433",
+      matchManagers: ["cargo"],
+      matchPackageNames: ["croner"],
+      allowedVersions: "<4.0.0",
+    },
+    {
+      description: "cel 0.15 changes `Context` to take two lifetimes; `identity_context`, and the `context` helpers in `preflight.rs` and `success_expr.rs` must be updated with the bump or the API crate does not compile, see #645",
+      matchManagers: ["cargo"],
+      matchPackageNames: ["cel"],
+      allowedVersions: "<0.15.0",
+    },
+    {
+      description: "kube 4.2 depends on k8s-openapi ^0.28, so bumping the workspace to 0.29 splits the graph into two k8s-openapi versions and the 0.28 copy fails to build with no `v1_*` feature; raise once a kube release ships kube-rs/kube#2120",
+      matchManagers: ["cargo"],
+      matchPackageNames: ["k8s-openapi"],
+      allowedVersions: "<0.29.0",
     },
   ],
 }

@@ -2654,7 +2654,7 @@ async fn finalize_bootstrap_failure(
         }
         // A seed failure retries PROMPTLY — flat ~120s cadence, no failure
         // streak, no backoff: the documented DR contract
-        // (docs/scenarios/dr-with-replicated-repository.md) keeps seed retries
+        // (docs/src/content/docs/scenarios/dr-with-replicated-repository.mdx) keeps seed retries
         // fast because this is the flow you are in on the worst day of the
         // year, and a seeding repository has no probe-health state to pollute.
         io::FailureRoute::SeedRetry => {

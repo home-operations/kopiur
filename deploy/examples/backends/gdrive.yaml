@@ -12,10 +12,10 @@
 # Field shapes verified against crates/api: externally-tagged backend
 # (`backend.gdrive`).
 #
-# The `# --8<-- [start:…]` / `# --8<-- [end:…]` lines are snippet-section markers
-# for docs/backends/gdrive.md. They are plain YAML comments — the file stays
+# The `# region …` / `# endregion …` lines are region markers
+# for docs/src/content/docs/backends/gdrive.mdx. They are plain YAML comments — the file stays
 # `kubectl apply -f`-able as-is.
-# --8<-- [start:repository]
+# region repository
 ---
 apiVersion: v1
 kind: Secret
@@ -59,4 +59,4 @@ spec:
       key: KOPIA_PASSWORD
   # `create` now defaults to enabled (connect-or-create is idempotent); set
   # `create.enabled: false` only for a strictly read-only / externally-managed repo.
-# --8<-- [end:repository]
+# endregion repository

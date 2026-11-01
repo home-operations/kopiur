@@ -1,0 +1,5 @@
+dist
+node_modules
+.astro
+# Copied from target/doc by `mise run rustdoc`.
+public/rustdoc

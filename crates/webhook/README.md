@@ -72,6 +72,6 @@ assert!(matches!(
 
 ## See also
 
-- [ADR-0003](https://github.com/perfectra1n/kopiur/blob/main/docs/adr/0003-kopiur-rust-operator.md)
+- [ADR-0003](https://kopiur.home-operations.com/adr/0003-kopiur-rust-operator/)
   §5.1 ("one validator, two callers") and §5.3 (webhook) — the canonical design.
 - [`kopiur-api`](kopiur_api) — the validators this webhook shares with the controller.

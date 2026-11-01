@@ -16,11 +16,11 @@
 # without the gate, anyone who can write a SnapshotPolicy there would effectively
 # gain `pods/exec` without holding it.
 #
-# The `# --8<-- [start:…]` / `# --8<-- [end:…]` lines are snippet-section markers
-# (docs/stream-sources.md pulls the policy and schedule individually). They are
+# The `# region …` / `# endregion …` lines are region markers
+# (docs/src/content/docs/stream-sources.mdx pulls the policy and schedule individually). They are
 # plain YAML comments — the file stays `kubectl apply -f`-able as-is.
 ---
-# --8<-- [start:policy]
+# region policy
 apiVersion: kopiur.home-operations.com/v1alpha1
 kind: SnapshotPolicy
 metadata:
@@ -65,9 +65,9 @@ spec:
     keepDaily: 14
     keepWeekly: 8
     keepMonthly: 12
-# --8<-- [end:policy]
+# endregion policy
 ---
-# --8<-- [start:schedule]
+# region schedule
 apiVersion: kopiur.home-operations.com/v1alpha1
 kind: SnapshotSchedule
 metadata:
@@ -79,4 +79,4 @@ spec:
   schedule:
     cron: "H 2 * * *"
     jitter: 30m
-# --8<-- [end:schedule]
+# endregion schedule

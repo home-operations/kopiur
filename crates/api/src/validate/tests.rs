@@ -5268,7 +5268,10 @@ fn hourly_or_slower_schedules_get_no_growth_warning() {
 fn sub_hourly_schedules_warn_with_the_fires_per_hour_count() {
     let ten = schedule_cr_growth_warning("*/10 * * * *").expect("*/10 warns");
     assert!(ten.contains("6×/hour"), "{ten}");
-    assert!(ten.contains("docs/backups.md"), "{ten}");
+    assert!(
+        ten.contains("https://kopiur.home-operations.com/backups/"),
+        "{ten}"
+    );
     let five = schedule_cr_growth_warning("*/5 * * * *").expect("*/5 warns");
     assert!(five.contains("12×/hour"), "{five}");
     let twice = schedule_cr_growth_warning("0,30 * * * *").expect("0,30 warns");
