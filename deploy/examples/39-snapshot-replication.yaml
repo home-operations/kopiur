@@ -21,7 +21,7 @@
 # identity component (`*`/`?`, anchored); pruning is exactly one of
 # none / mirrorSource / retention.
 #
-# The `# --8<-- [start:…]` / `# --8<-- [end:…]` lines are snippet-section
+# The `# region …` / `# endregion …` lines are region
 # markers (the docs pull the SnapshotReplication CR on its own). Plain YAML
 # comments — the file stays `kubectl apply -f`-able as-is.
 ---
@@ -64,7 +64,7 @@ spec:
   create:
     enabled: true
 ---
-# --8<-- [start:snapshot-replication]
+# region snapshot-replication
 apiVersion: kopiur.home-operations.com/v1alpha1
 kind: SnapshotReplication
 metadata:
@@ -142,4 +142,4 @@ spec:
       keepMonthly: 6
   # Pause replication without deleting the CR.
   suspend: false
-# --8<-- [end:snapshot-replication]
+# endregion snapshot-replication

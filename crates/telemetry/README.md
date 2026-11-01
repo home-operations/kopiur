@@ -95,10 +95,10 @@ reconciles.add(1, &[opentelemetry::KeyValue::new("kind", "Snapshot")]);
 
 ## See also
 
-- [`docs/dev/observability.md`](../../docs/dev/observability.md) — the full
+- [Observability](https://kopiur.home-operations.com/dev/observability/) — the full
   architecture, the `kopiur_*` metric catalog, Helm knobs, and the OTLP collector
   recipe.
-- [ADR-0003](../../docs/adr/0003-kopiur-rust-operator.md) — the canonical design
+- [ADR-0003](https://kopiur.home-operations.com/adr/0003-kopiur-rust-operator/) — the canonical design
   for the operator this crate instruments.
 
 [`opentelemetry-prometheus`]: https://docs.rs/opentelemetry-prometheus

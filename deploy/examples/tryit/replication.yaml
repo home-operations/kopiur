@@ -1,4 +1,4 @@
-# Try it end-to-end — mirror a repository to a second backend (docs/replication.md)
+# Try it end-to-end — mirror a repository to a second backend (docs/src/content/docs/replication.mdx)
 #
 # A self-contained 3-2-1 mirror, all on filesystem PVCs (no cloud creds):
 #   - a SOURCE filesystem Repository (`primary`) on PVC `kopia-repo-src`
@@ -25,17 +25,17 @@
 # Backend; schedule={cron,jitter}; status.phase +
 # status.lastReplicated. externally-tagged backend.filesystem on every Repository).
 #
-# The `# --8<-- [start:NAME]` / `# --8<-- [end:NAME]` lines are MkDocs snippet
-# section markers for docs/replication.md. Plain YAML comments — applies as-is.
+# The `# region NAME` / `# endregion NAME` lines are region
+# markers for docs/src/content/docs/replication.mdx. Plain YAML comments — applies as-is.
 ---
-# --8<-- [start:namespace]
+# region namespace
 apiVersion: v1
 kind: Namespace
 metadata:
   name: kopiur-tryit
-# --8<-- [end:namespace]
+# endregion namespace
 ---
-# --8<-- [start:secret]
+# region secret
 apiVersion: v1
 kind: Secret
 metadata:
@@ -45,9 +45,9 @@ type: Opaque
 stringData:
   # One password for source + mirror + verifier (a true mirror shares it).
   KOPIA_PASSWORD: "REPLACE_ME"
-# --8<-- [end:secret]
+# endregion secret
 ---
-# --8<-- [start:source-repo]
+# region source-repo
 # The SOURCE repository: a filesystem Repository on its own PVC.
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -78,9 +78,9 @@ spec:
       key: KOPIA_PASSWORD
   create:
     enabled: true
-# --8<-- [end:source-repo]
+# endregion source-repo
 ---
-# --8<-- [start:source-data]
+# region source-data
 # Seed real data and take ONE source Snapshot, so the source repository has blobs
 # for replication to mirror.
 apiVersion: v1
@@ -146,9 +146,9 @@ metadata:
 spec:
   policyRef:
     name: app-data
-# --8<-- [end:source-data]
+# endregion source-data
 ---
-# --8<-- [start:replication]
+# region replication
 # A second PVC to receive the mirror.
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -185,9 +185,9 @@ spec:
   schedule:
     cron: "* * * * *"
   suspend: false
-# --8<-- [end:replication]
+# endregion replication
 ---
-# --8<-- [start:verify-mirror]
+# region verify-mirror
 # Connect to the DESTINATION to confirm the snapshot is mirrored there. This is a
 # read-only sanity check: it points at the same on-disk path the mirror wrote.
 apiVersion: kopiur.home-operations.com/v1alpha1
@@ -208,4 +208,4 @@ spec:
       key: KOPIA_PASSWORD
   # NO create block: the mirror already initialized this repository, so the
   # verifier only CONNECTS to it (creating would error on a non-empty repo).
-# --8<-- [end:verify-mirror]
+# endregion verify-mirror

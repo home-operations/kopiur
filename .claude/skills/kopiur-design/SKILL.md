@@ -8,8 +8,8 @@ description: Design norms and locked decisions for the Kopiur Kopia-native Kuber
 Kopiur is a Kopia-native Kubernetes backup operator in Rust on `kube-rs`. The
 **source of truth for current behavior is the code**: the CRD types live in
 `crates/api/src/`, their generated schemas in `deploy/crds/`. Read
-`docs/dev/api-conventions.md` for the encoding rulebook and `CLAUDE.md` for the
-quick map. The ADRs (`docs/adr/`) are historical rationale — reach for one only
+`docs/src/content/docs/dev/api-conventions.md` for the encoding rulebook and `CLAUDE.md` for the
+quick map. The ADRs (`docs/src/content/docs/adr/`) are historical rationale — reach for one only
 to recover the _why_ behind a decision, not for current field names or behavior,
 which they may pre-date.
 
@@ -135,7 +135,7 @@ Pick the cheapest tier that actually exercises the broken path:
    tested pure fn" idiom. Example: the "ClusterRepository refs are
    ignored" bug (controller resolved every `repository` ref as a namespaced
    `Repository` regardless of `kind`) became `io::repo_lookup(&RepositoryRef, …) ->
-RepoLookup` with unit tests asserting `kind: ClusterRepository` maps to a
+   RepoLookup` with unit tests asserting `kind: ClusterRepository` maps to a
    cluster-scoped lookup, never a namespaced get. Runs in `cargo test`, no cluster.
 2. **e2e test for whole-pipeline bugs.** If the failure only shows up against a live
    operator (a reconcile that never reaches `Succeeded`, a missing dependency, an

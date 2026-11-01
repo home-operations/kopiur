@@ -10,7 +10,7 @@
 //! client-side `kubectl apply` would store the entire object in the
 //! `last-applied-configuration` annotation, blowing past the 256KB annotation
 //! limit. This was caught running against a real kind cluster. Operators must
-//! install these CRDs server-side (documented in docs/install.md).
+//! install these CRDs server-side (documented in docs/src/content/docs/install.mdx).
 //!
 //! We do NOT create a cluster here: `scripts/with-kind.sh` provides
 //! an ephemeral kind cluster and exports `KUBECONFIG`. If `kubectl` or

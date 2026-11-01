@@ -3,7 +3,7 @@
 //! Subcommands (dispatched on `std::env::args`, no clap):
 //!   * `gen-crds [--check]`  — write `deploy/crds/*.yaml` (one per CRD + bundle)
 //!   * `gen-rbac [--check]`  — write `deploy/rbac/*.yaml` (cluster + namespaced)
-//!   * `gen-docs [--check]`  — write `docs/field-reference.md` from the schemas
+//!   * `gen-docs [--check]`  — write `docs/src/content/docs/field-reference.md` from the schemas
 //!   * `gen-ui-types [--check]` — write `crates/ui/web/src/api/types/*.ts`
 //!   * `gen-all  [--check]`  — all of the above (+ dashboards)
 //!   * `check-wiring`        — fail if a CRD field is read by no consumer crate
@@ -24,7 +24,7 @@ fn usage() {
          \n\
          gen-crds   generate deploy/crds/*.yaml from the kopiur-api CRD types\n\
          gen-rbac   generate deploy/rbac/*.yaml (ClusterRole + Role install modes)\n\
-         gen-docs   generate docs/field-reference.md from the CRD schemas\n\
+         gen-docs   generate docs/src/content/docs/field-reference.md from the CRD schemas\n\
          gen-ui-types\n\
          \x20          generate crates/ui/web/src/api/types/*.ts from the\n\
          \x20          kopiur-ui-model wire types (ts-rs). Deletes types the\n\

@@ -37,7 +37,7 @@
 # REPOSITORY, from another repository.
 #
 # Field shapes verified against crates/api (crates/api/src/seed.rs). See
-# docs/scenarios/dr-with-replicated-repository.md for the full walkthrough,
+# docs/src/content/docs/scenarios/dr-with-replicated-repository.mdx for the full walkthrough,
 # including the identity-must-match and adoption/retention hazards.
 
 # ============================================================================
@@ -58,7 +58,7 @@ stringData:
   # copies the format blob verbatim, and kopia cannot decrypt without it.
   KOPIA_PASSWORD: "REPLACE_ME"
 ---
-# --8<-- [start:primary]
+# region primary
 apiVersion: kopiur.home-operations.com/v1alpha1
 kind: Repository
 metadata:
@@ -77,7 +77,7 @@ spec:
     passwordSecretRef:
       name: repo-creds
       key: KOPIA_PASSWORD
-# --8<-- [end:primary]
+# endregion primary
 ---
 apiVersion: v1
 kind: Secret
@@ -91,7 +91,7 @@ stringData:
   AWS_ACCESS_KEY_ID: "REPLACE_ME"
   AWS_SECRET_ACCESS_KEY: "REPLACE_ME"
 ---
-# --8<-- [start:mirror]
+# region mirror
 apiVersion: kopiur.home-operations.com/v1alpha1
 kind: RepositoryReplication
 metadata:
@@ -114,7 +114,7 @@ spec:
   schedule:
     cron: "H 5 * * *" # nightly, after the backup window
     jitter: 30m
-# --8<-- [end:mirror]
+# endregion mirror
 
 # ============================================================================
 # REBUILT CLUSTER — variant A: seed from the mirror BACKEND (blob mode)
@@ -123,7 +123,7 @@ spec:
 # too — `repo-creds` must carry the ORIGINAL KOPIA_PASSWORD, because a blob seed
 # inherits the mirror's format and password.
 ---
-# --8<-- [start:seed-blob]
+# region seed-blob
 apiVersion: kopiur.home-operations.com/v1alpha1
 kind: Repository
 metadata:
@@ -173,7 +173,7 @@ spec:
     retain:
       perIdentity: 100
       maxAgeDays: 365
-# --8<-- [end:seed-blob]
+# endregion seed-blob
 
 # ============================================================================
 # REBUILT CLUSTER — variant B: seed from another REPOSITORY CR (migrate mode)
@@ -186,7 +186,7 @@ spec:
 # Requires the operator's `features.credentialProjection.enabled` Helm flag when
 # the source repository's Secrets are not readable from this namespace.
 ---
-# --8<-- [start:seed-migrate]
+# region seed-migrate
 apiVersion: kopiur.home-operations.com/v1alpha1
 kind: Repository
 metadata:
@@ -231,13 +231,13 @@ spec:
     retain:
       perIdentity: 100
       maxAgeDays: 365
-# --8<-- [end:seed-migrate]
+# endregion seed-migrate
 
 # ============================================================================
 # REBUILT CLUSTER — the app comes back on top of the seeded repository
 # ============================================================================
 ---
-# --8<-- [start:app-recovery]
+# region app-recovery
 apiVersion: kopiur.home-operations.com/v1alpha1
 kind: SnapshotPolicy
 metadata:
@@ -303,4 +303,4 @@ spec:
     apiGroup: kopiur.home-operations.com
     kind: Restore
     name: postgres-data-restore
-# --8<-- [end:app-recovery]
+# endregion app-recovery

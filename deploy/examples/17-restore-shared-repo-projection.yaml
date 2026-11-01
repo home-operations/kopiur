@@ -8,7 +8,7 @@
 # — so you don't hand-place credentials in every recovery namespace.
 #
 # Requires the operator's Secret-projection RBAC: Helm `features.credentialProjection.enabled`
-# (off by default). See docs/movers.md.
+# (off by default). See docs/src/content/docs/movers.mdx.
 #
 # Field shapes verified against crates/api: credentialProjection = { enabled }.
 ---

@@ -8,7 +8,7 @@
 # exclusivity does not restrict), stages a temporary PVC from the snapshot, and the
 # mover reads that stage — never the live volume. The staged PVC inherits RWOP, but
 # the mover is its only pod, so the exclusivity is satisfied. Your app keeps
-# running, untouched. See docs/access-modes.md.
+# running, untouched. See docs/src/content/docs/access-modes.mdx.
 #
 # REQUIRES the CSI snapshot stack (external-snapshotter + CRDs) and a
 # VolumeSnapshotClass for your driver — and since RWOP itself is CSI-only, a driver

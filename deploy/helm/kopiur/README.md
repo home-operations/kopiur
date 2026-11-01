@@ -29,7 +29,7 @@ helm install kopiur oci://ghcr.io/home-operations/charts/kopiur \
 Working from a checkout instead? Swap the OCI ref for the local chart path
 `deploy/helm/kopiur` — the dev copy floats image tags (empty digests).
 
-See [`docs/install.md`](../../../docs/install.md) for the full quickstart and prerequisites.
+See [the installation guide](https://kopiur.home-operations.com/install/) for the full quickstart and prerequisites.
 
 ## Install modes
 
@@ -62,7 +62,7 @@ Disable the webhook entirely with `webhook.enabled=false` (validation then falls
 
 ### CRDs
 
-The 9 CRDs ship in the chart's special `crds/` directory. Helm installs them on `helm install`, and — because Helm never touches `crds/` on `helm upgrade` — an accidental `helm uninstall` leaves them (and every `kopiur.home-operations.com` object) untouched, exactly what you want for a backup operator. The flip side: a plain helm-CLI **upgrade** does not update the CRD schema as the `v1alpha1` API evolves. For a helm-CLI upgrade, apply the new schema yourself with `kubectl apply --server-side -f deploy/crds/`; GitOps tooling with a `CreateReplace` CRD policy (e.g. Flux) upgrades the `crds/`-shipped CRDs automatically. **Upgrading from 0.5.x to 0.6.0 is a one-time special case** — the CRDs moved out of Helm-templated resources into this `crds/` directory, so the crossing removes and re-installs them (cascade-deleting your CRs) unless you pin them first; see [`docs/upgrade.md`](../../../docs/upgrade.md) before upgrading.
+The 9 CRDs ship in the chart's special `crds/` directory. Helm installs them on `helm install`, and — because Helm never touches `crds/` on `helm upgrade` — an accidental `helm uninstall` leaves them (and every `kopiur.home-operations.com` object) untouched, exactly what you want for a backup operator. The flip side: a plain helm-CLI **upgrade** does not update the CRD schema as the `v1alpha1` API evolves. For a helm-CLI upgrade, apply the new schema yourself with `kubectl apply --server-side -f deploy/crds/`; GitOps tooling with a `CreateReplace` CRD policy (e.g. Flux) upgrades the `crds/`-shipped CRDs automatically. **Upgrading from 0.5.x to 0.6.0 is a one-time special case** — the CRDs moved out of Helm-templated resources into this `crds/` directory, so the crossing removes and re-installs them (cascade-deleting your CRs) unless you pin them first; see [the upgrade guide](https://kopiur.home-operations.com/upgrade/) before upgrading.
 
 ### Web console (`ui.enabled`)
 
@@ -78,7 +78,7 @@ The chart renders **no Ingress**, in any mode, and binds **nobody** unless you l
 
 `ui.rbac.browseRole` is separate and off by default for a reason: **granting the in-snapshot file browser in a namespace grants that namespace's repository credentials**, because the browse session pod loads them from its environment and `pods/exec` cannot be narrowed to one pod by RBAC. Bind it with a namespaced `RoleBinding`, never cluster-wide.
 
-Full documentation — trust model, the four roles, browse sessions, caps, and troubleshooting by problem type — is in [`docs/ui.md`](../../../docs/ui.md), with a worked oauth2-proxy deployment in [`deploy/examples/45-web-ui.yaml`](../../examples/45-web-ui.yaml).
+Full documentation — trust model, the four roles, browse sessions, caps, and troubleshooting by problem type — is in [the web console guide](https://kopiur.home-operations.com/ui/), with a worked oauth2-proxy deployment in [`deploy/examples/45-web-ui.yaml`](../../examples/45-web-ui.yaml).
 
 ## Values
 
@@ -284,7 +284,7 @@ Full documentation — trust model, the four roles, browse sessions, caps, and t
 
 ### Observability
 
-Metrics are always available on the controller's `/metrics` (also `/healthz`, `/readyz`); enable `metrics.serviceMonitor` to scrape them. Turning on `observability.otlp` additionally exports **traces, logs, and a metrics push** over OTLP from the controller, webhook, and mover Jobs (the controller passes the `OTEL_*` env through to the Jobs it creates) — set `observability.otlp.endpoint` to your collector's gRPC port. All metrics are under the `kopiur_` namespace; see [`docs/dev/observability.md`](../../../docs/dev/observability.md) for the full metric list, env vars, and a sample collector config. A ready-made values overlay that turns everything on is at `deploy/observability-values.yaml`. The dashboard JSON also lives at `deploy/dashboards/kopiur.json` for manual Grafana import.
+Metrics are always available on the controller's `/metrics` (also `/healthz`, `/readyz`); enable `metrics.serviceMonitor` to scrape them. Turning on `observability.otlp` additionally exports **traces, logs, and a metrics push** over OTLP from the controller, webhook, and mover Jobs (the controller passes the `OTEL_*` env through to the Jobs it creates) — set `observability.otlp.endpoint` to your collector's gRPC port. All metrics are under the `kopiur_` namespace; see [the observability guide](https://kopiur.home-operations.com/dev/observability/) for the full metric list, env vars, and a sample collector config. A ready-made values overlay that turns everything on is at `deploy/observability-values.yaml`. The dashboard JSON also lives at `deploy/dashboards/kopiur.json` for manual Grafana import.
 
 ## Verify a render locally
 

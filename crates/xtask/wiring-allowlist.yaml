@@ -2,7 +2,7 @@
 #
 # The ratchet asserts that every CRD spec/status field is READ by a consumer
 # crate (controller, mover, kopia, webhook, cli). A field that nothing reads is
-# INERT: users can set it, the apiserver accepts it, `docs/field-reference.md`
+# INERT: users can set it, the apiserver accepts it, `docs/src/content/docs/field-reference.md`
 # documents it, and nothing happens. Two shipped bugs came from exactly that —
 # #346 (`pvcSelector` had no implementation anywhere, so a policy using it died
 # with "invariant violated ... likely a bug in kopiur") and #351

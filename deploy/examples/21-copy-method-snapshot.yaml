@@ -11,7 +11,7 @@
 # REQUIRES the cluster CSI snapshot stack (external-snapshotter + CRDs) and a
 # VolumeSnapshotClass whose driver matches the source PVC's StorageClass provisioner.
 # Without it the backup fails with a clear, actionable condition (it never silently
-# falls back). See docs/copy-methods.md.
+# falls back). See docs/src/content/docs/copy-methods.mdx.
 #
 # Leave volumeSnapshotClassName UNSET to auto-select your driver's default class;
 # set it (as below) to pin a specific one.

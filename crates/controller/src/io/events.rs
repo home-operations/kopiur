@@ -1259,7 +1259,7 @@ impl BootstrapFailure {
     /// so a variant that both recycles and feeds the sensor can never be
     /// silently shadowed into the sensor-less recycle arm; the seed carve-out
     /// keeps its documented flat, prompt DR retry cadence
-    /// (`docs/scenarios/dr-with-replicated-repository.md`) out of the
+    /// (`docs/src/content/docs/scenarios/dr-with-replicated-repository.mdx`) out of the
     /// exponential backoff.
     pub fn route(&self, bootstrapped: bool) -> FailureRoute {
         if self.retryable_outage_for_bootstrapped(bootstrapped) {
@@ -1424,7 +1424,7 @@ pub enum FailureRoute {
     /// A `spec.seed` failure: recycle and retry PROMPTLY (flat cadence, no
     /// streak) — the documented DR contract keeps seed retries at roughly two
     /// minutes because this is the flow you are in on the worst day of the
-    /// year (`docs/scenarios/dr-with-replicated-repository.md`).
+    /// year (`docs/src/content/docs/scenarios/dr-with-replicated-repository.mdx`).
     SeedRetry,
     /// A non-retryable verdict: park terminal `Failed` (kstatus-Stalled).
     Terminal,

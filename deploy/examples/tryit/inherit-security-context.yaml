@@ -1,5 +1,5 @@
 # Try it end-to-end — inherit the mover UID/GID from a live workload
-# (docs/security-context.md)
+# (docs/src/content/docs/security-context.mdx)
 #
 # A complete, self-contained arc that proves `inheritSecurityContextFrom`: the
 # mover runs as whatever the app pod runs as, with no hard-coded UID to track.
@@ -22,22 +22,22 @@
 # Wait for the Deployment to be Running FIRST (inherit reads a live pod), then
 # create the manual Snapshot with `kubectl create`.
 #
-# The `# --8<-- [start:NAME]` / `[end:NAME]` lines are MkDocs snippet markers for
-# docs/security-context.md. They are plain YAML comments — the file stays
+# The `# region NAME` / `# endregion NAME` lines are region markers for
+# docs/src/content/docs/security-context.mdx. They are plain YAML comments — the file stays
 # apply-ready.
 #
 # Field shapes verified against crates/api:
 #   spec.mover.inheritSecurityContextFrom : { podSelector: LabelSelector, container? }
 #   (externally-tagged backend: the bucket lives under `backend.s3`)
 ---
-# --8<-- [start:namespace]
+# region namespace
 apiVersion: v1
 kind: Namespace
 metadata:
   name: app
-# --8<-- [end:namespace]
+# endregion namespace
 ---
-# --8<-- [start:pvc]
+# region pvc
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -49,9 +49,9 @@ spec:
   resources:
     requests:
       storage: 1Gi
-# --8<-- [end:pvc]
+# endregion pvc
 ---
-# --8<-- [start:workload]
+# region workload
 # A live workload that runs as UID 1000 and mounts `app-data`. The mover will
 # COPY this pod's securityContext, so it must be Running before the Snapshot.
 apiVersion: apps/v1
@@ -102,9 +102,9 @@ spec:
         - name: d
           persistentVolumeClaim:
             claimName: app-data
-# --8<-- [end:workload]
+# endregion workload
 ---
-# --8<-- [start:secret]
+# region secret
 apiVersion: v1
 kind: Secret
 metadata:
@@ -115,9 +115,9 @@ stringData:
   AWS_ACCESS_KEY_ID: "REPLACE_ME"
   AWS_SECRET_ACCESS_KEY: "REPLACE_ME"
   KOPIA_PASSWORD: "REPLACE_ME"
-# --8<-- [end:secret]
+# endregion secret
 ---
-# --8<-- [start:repository]
+# region repository
 apiVersion: kopiur.home-operations.com/v1alpha1
 kind: Repository
 metadata:
@@ -139,9 +139,9 @@ spec:
       key: KOPIA_PASSWORD
   create:
     enabled: true
-# --8<-- [end:repository]
+# endregion repository
 ---
-# --8<-- [start:policy]
+# region policy
 apiVersion: kopiur.home-operations.com/v1alpha1
 kind: SnapshotPolicy
 metadata:
@@ -165,9 +165,9 @@ spec:
   mover:
     inheritSecurityContextFrom:
       pvcConsumer: {}
-# --8<-- [end:policy]
+# endregion policy
 ---
-# --8<-- [start:snapshot]
+# region snapshot
 apiVersion: kopiur.home-operations.com/v1alpha1
 kind: Snapshot
 metadata:
@@ -176,4 +176,4 @@ metadata:
 spec:
   policyRef:
     name: app-data
-# --8<-- [end:snapshot]
+# endregion snapshot

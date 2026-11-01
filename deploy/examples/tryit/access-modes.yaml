@@ -1,5 +1,5 @@
 # Try it end-to-end — back up a held ReadWriteOncePod volume with no downtime
-# (docs/access-modes.md)
+# (docs/src/content/docs/access-modes.mdx)
 #
 # Proves the RWOP story: a ReadWriteOncePod PVC can be mounted by exactly ONE pod
 # cluster-wide. A long-running `holder` Deployment keeps it mounted the whole time.
@@ -18,17 +18,17 @@
 # snapshot_policy.rs spec.copyMethod=Snapshot; snapshot.rs status.staged.pvcName;
 # externally-tagged backend.filesystem).
 #
-# The `# --8<-- [start:NAME]` / `# --8<-- [end:NAME]` lines are MkDocs snippet
-# section markers for docs/access-modes.md. Plain YAML comments — applies as-is.
+# The `# region NAME` / `# endregion NAME` lines are region
+# markers for docs/src/content/docs/access-modes.mdx. Plain YAML comments — applies as-is.
 ---
-# --8<-- [start:namespace]
+# region namespace
 apiVersion: v1
 kind: Namespace
 metadata:
   name: kopiur-tryit
-# --8<-- [end:namespace]
+# endregion namespace
 ---
-# --8<-- [start:repo-pvc]
+# region repo-pvc
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -39,9 +39,9 @@ spec:
   resources:
     requests:
       storage: 2Gi
-# --8<-- [end:repo-pvc]
+# endregion repo-pvc
 ---
-# --8<-- [start:secret]
+# region secret
 apiVersion: v1
 kind: Secret
 metadata:
@@ -50,9 +50,9 @@ metadata:
 type: Opaque
 stringData:
   KOPIA_PASSWORD: "REPLACE_ME"
-# --8<-- [end:secret]
+# endregion secret
 ---
-# --8<-- [start:app-data]
+# region app-data
 # A ReadWriteOncePod source — exclusive to a single pod cluster-wide. CSI-only.
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -65,9 +65,9 @@ spec:
   resources:
     requests:
       storage: 1Gi
-# --8<-- [end:app-data]
+# endregion app-data
 ---
-# --8<-- [start:holder]
+# region holder
 # The "application": holds the RWOP volume mounted for the whole demo. It writes a
 # marker file once, then sleeps — so there is real data to back up AND a running
 # pod proving the live volume is occupied while the backup runs.
@@ -105,9 +105,9 @@ spec:
         - name: app-data
           persistentVolumeClaim:
             claimName: app-data
-# --8<-- [end:holder]
+# endregion holder
 ---
-# --8<-- [start:repository]
+# region repository
 apiVersion: kopiur.home-operations.com/v1alpha1
 kind: Repository
 metadata:
@@ -126,9 +126,9 @@ spec:
       key: KOPIA_PASSWORD
   create:
     enabled: true
-# --8<-- [end:repository]
+# endregion repository
 ---
-# --8<-- [start:policy]
+# region policy
 apiVersion: kopiur.home-operations.com/v1alpha1
 kind: SnapshotPolicy
 metadata:
@@ -146,9 +146,9 @@ spec:
   retention:
     keepDaily: 7
     keepWeekly: 4
-# --8<-- [end:policy]
+# endregion policy
 ---
-# --8<-- [start:snapshot]
+# region snapshot
 # Fixed name so the staged PVC is `app-data-snapshot-src`. Apply (not create).
 apiVersion: kopiur.home-operations.com/v1alpha1
 kind: Snapshot
@@ -158,4 +158,4 @@ metadata:
 spec:
   policyRef:
     name: app-data
-# --8<-- [end:snapshot]
+# endregion snapshot

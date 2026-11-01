@@ -7,7 +7,7 @@
 #
 # If the driver can't clone the volume, the staged PVC stays Pending and the backup
 # never starts — check `kubectl describe pvc <snapshot-name>-src` and switch to
-# Snapshot or Direct. See docs/copy-methods.md.
+# Snapshot or Direct. See docs/src/content/docs/copy-methods.mdx.
 ---
 apiVersion: kopiur.home-operations.com/v1alpha1
 kind: SnapshotPolicy

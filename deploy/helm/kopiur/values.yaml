@@ -11,10 +11,14 @@
 # the webhook has its own under `webhook:`, and the mover, a controller-stamped
 # Job, takes no workload/scheduling keys (only `mover.image`).
 
+# region naming
+
 # -- Override the chart name used in resource names (defaults to .Chart.Name = "kopiur").
 nameOverride: ""
 # -- Override the full release-qualified name (defaults to "<release>-kopiur").
 fullnameOverride: ""
+
+# endregion naming
 
 # =============================================================================
 # Global (chart-wide fallbacks + umbrella-injectable subset)
@@ -44,6 +48,8 @@ global:
   topologySpreadConstraints: []
   # -- Labels stamped on every rendered object (fleet-wide labelling).
   commonLabels: {}
+
+# region install-scope
 
 # =============================================================================
 # Install scope
@@ -83,6 +89,10 @@ installScope: cluster
 # Ignored under `installScope: cluster`.
 rbacNamespaceReadForStreamSources: false
 
+# endregion install-scope
+
+# region controller-image
+
 # =============================================================================
 # Controller image
 # =============================================================================
@@ -114,7 +124,12 @@ image:
 # (bootstrap, delete, pin, replication, kopia server), the Maintenance CR's
 # namespace, and the operator namespace (ClusterRepository bootstrap/delete).
 imagePullSecrets: []
+
+# endregion controller-image
+
 #  - name: my-registry-creds
+
+# region controller-runtime
 
 # =============================================================================
 # Controller runtime behavior
@@ -268,6 +283,10 @@ podDisruptionBudget:
   enabled: false
   minAvailable: 1
 
+# endregion controller-runtime
+
+# region controller-security
+
 # =============================================================================
 # Controller pod security (controller only)
 # =============================================================================
@@ -289,6 +308,10 @@ securityContext:
   capabilities:
     drop:
       - ALL
+
+# endregion controller-security
+
+# region controller-probes
 
 # =============================================================================
 # Controller port & probes
@@ -317,6 +340,10 @@ readinessProbe:
   initialDelaySeconds: 5
   periodSeconds: 10
 
+# endregion controller-probes
+
+# region service-account
+
 # =============================================================================
 # ServiceAccount
 # =============================================================================
@@ -330,6 +357,10 @@ serviceAccount:
   # -- Extra annotations (e.g. IRSA / Workload Identity role bindings).
   annotations: {}
 
+# endregion service-account
+
+# region feature-permissions
+
 # =============================================================================
 # Feature permissions
 # =============================================================================
@@ -342,7 +373,7 @@ serviceAccount:
 # resource's `.status` shows an actionable condition like
 #   "... (HTTP 403). ... Fix: set features.<name>.enabled: true ..."
 # Set the matching flag below and the operator heals on the next reconcile.
-# See docs/feature-permissions.md for the full mapping and security trade-offs.
+# See https://kopiur.home-operations.com/feature-permissions/ for the full mapping and security trade-offs.
 features:
   credentialProjection:
     # -- Enable `spec.credentialProjection` (copy a repository's credential
@@ -362,6 +393,8 @@ features:
     # the operator manages.
     enabled: false
 
+# endregion feature-permissions
+
 # =============================================================================
 # Extra RBAC
 # =============================================================================
@@ -375,6 +408,8 @@ rbac:
   # secrets`, granted separately). The chart only renders the ClusterRole; bind
   # it to your users/groups with your own (Cluster)RoleBinding.
   browseRole: false
+
+# region logging
 
 # =============================================================================
 # Logging (stdout / `kubectl logs`, always on)
@@ -394,6 +429,10 @@ logging:
   # -- Console format: "text" (human-readable, default) or "json" (one structured
   # object per line for Loki/ELK/Datadog). Unknown values degrade to text.
   format: text
+
+# endregion logging
+
+# region opentelemetry
 
 # =============================================================================
 # OpenTelemetry (OTLP) — optional push of traces + logs (and a metrics push)
@@ -418,6 +457,10 @@ observability:
     strict: false
     # -- Extra raw env (e.g. OTEL_TRACES_SAMPLER) added to every component.
     extraEnv: []
+
+# endregion opentelemetry
+
+# region monitoring
 
 # =============================================================================
 # Monitoring (Prometheus + Grafana)
@@ -482,6 +525,10 @@ monitoring:
       # -- spec.instanceSelector.matchLabels — selects which Grafana instance(s) load this dashboard.
       matchLabels: {}
 
+# endregion monitoring
+
+# region webhook
+
 # =============================================================================
 # Admission webhook  (its own Deployment + Service + configs)
 # =============================================================================
@@ -538,6 +585,11 @@ webhook:
   podDisruptionBudget:
     enabled: false
     minAvailable: 1
+
+  # endregion webhook
+
+  # region webhook-security
+
   # -- Pod security context for the webhook pod. Kept at the most locked-down
   # posture (the webhook is pure admission and never touches a repository), so
   # relaxing the controller's context never loosens the webhook.
@@ -555,6 +607,9 @@ webhook:
     capabilities:
       drop:
         - ALL
+
+  # endregion webhook-security
+
   # -- Extra environment variables for the webhook container (list of
   # `{name, value}` / `{name, valueFrom}` entries), appended after the
   # operator-managed env. Mirrors the root `extraEnv`.
@@ -590,6 +645,9 @@ webhook:
     labels: {}
     # -- The webhook serves a self-signed cert, so skip verification by default.
     insecureSkipVerify: true
+
+  # region webhook-tls
+
   # TLS for the webhook server. The webhook ALWAYS serves TLS (k8s requires
   # HTTPS for admission). How the serving cert is provisioned is chosen by
   # tls.mode below.
@@ -621,6 +679,8 @@ webhook:
   # the serving cert. Ignored in self and cert-manager modes (caBundle is
   # populated by the operator or cert-manager's ca-injector respectively).
   caBundle: ""
+
+  # endregion webhook-tls
 
 # =============================================================================
 # Mover (per-Job image)

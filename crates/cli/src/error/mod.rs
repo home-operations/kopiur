@@ -45,7 +45,7 @@ pub enum CliError {
         "no single restore target in the flags ({given}). \
          Fix: pass exactly one of --to-pvc, --create-pvc or --populator. \
          For a `target.streamExec` restore, apply a `Restore` manifest \
-         (see docs/stream-sources.md)"
+         (see https://kopiur.home-operations.com/stream-sources/)"
     )]
     UnresolvedRestoreTarget {
         /// Which target flags were seen, for the message.

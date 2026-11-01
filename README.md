@@ -1,6 +1,6 @@
 # kopiur
 
-**Kopiur** (Kopia + Rust) is a Kopia-native Kubernetes backup operator written in Rust on [`kube-rs`](https://github.com/kube-rs/kube). It makes a kopia repository a first-class Kubernetes resource and separates the backup **recipe** from its **invocation** from its **schedule**, so backups can be triggered by cron, `kubectl create`, Argo Events, or a Helm hook — and a kopia snapshot's lifecycle is tied to its `Snapshot` CR by a finalizer + `deletionPolicy`. The whole CRD surface is modeled as Rust enums so invalid states are unrepresentable and reconcilers handle every variant at compile time. See [ADR-0003](docs/adr/0003-kopiur-rust-operator.md) for the full design.
+**Kopiur** (Kopia + Rust) is a Kopia-native Kubernetes backup operator written in Rust on [`kube-rs`](https://github.com/kube-rs/kube). It makes a kopia repository a first-class Kubernetes resource and separates the backup **recipe** from its **invocation** from its **schedule**, so backups can be triggered by cron, `kubectl create`, Argo Events, or a Helm hook — and a kopia snapshot's lifecycle is tied to its `Snapshot` CR by a finalizer + `deletionPolicy`. The whole CRD surface is modeled as Rust enums so invalid states are unrepresentable and reconcilers handle every variant at compile time. See [ADR-0003](https://kopiur.home-operations.com/adr/0003-kopiur-rust-operator/) for the full design.
 
 > Status: **alpha** — API group `kopiur.home-operations.com`, version `v1alpha1`. The CRD surface may still change between releases.
 
@@ -35,7 +35,7 @@ Then apply a worked example:
 kubectl apply -f deploy/examples/01-single-pvc-scheduled.yaml
 ```
 
-Full install guide, prerequisites (k8s >= 1.24, optional cert-manager), install modes, and the CRD-lifecycle caveat: **[docs/install.md](docs/install.md)**.
+Full install guide, prerequisites (k8s >= 1.24, optional cert-manager), install modes, and the CRD-lifecycle caveat: **[Installation](https://kopiur.home-operations.com/install/)**.
 
 ### kubectl plugin
 
@@ -49,7 +49,7 @@ kubectl kopiur status
 Or via Homebrew: `brew install home-operations/tap/kopiur` (installs the
 standalone `kopiur` command, so it coexists with a krew install).
 
-Full reference: **[docs/cli/index.md](docs/cli/index.md)**.
+Full reference: **[kubectl plugin](https://kopiur.home-operations.com/cli/)**.
 
 ## Layout
 
@@ -59,16 +59,16 @@ deploy/crds/     Generated CRDs (cargo xtask gen-crds) — checked in
 deploy/rbac/     Generated RBAC (cargo xtask gen-rbac) — checked in
 deploy/helm/     Helm chart (deploy/helm/kopiur)
 deploy/examples/ 40 runnable usage walkthroughs (numbered ladder + backends + scenarios)
-docs/adr/        Architecture Decision Records (0003 is canonical)
+docs/            Docs site (Astro Starlight); ADRs in docs/src/content/docs/adr/ (0003 is canonical)
 ```
 
 ## Documentation
 
 📖 **Docs site: <https://kopiur.home-operations.com/>** — user guide, ADRs, and the generated [Rust API reference](https://kopiur.home-operations.com/rustdoc/).
 
-- [Install guide](docs/install.md)
+- [Install guide](https://kopiur.home-operations.com/install/)
 - [Helm chart values & modes](deploy/helm/kopiur/README.md)
-- [ADR-0003 — Kopiur, a Kopia-native backup operator in Rust](docs/adr/0003-kopiur-rust-operator.md)
+- [ADR-0003 — Kopiur, a Kopia-native backup operator in Rust](https://kopiur.home-operations.com/adr/0003-kopiur-rust-operator/)
 - [Example manifests](deploy/examples/)
 
 ## Releases

@@ -1,4 +1,4 @@
-# Try it end-to-end — the kopia web UI on a Repository (docs/server.md)
+# Try it end-to-end — the kopia web UI on a Repository (docs/src/content/docs/server.mdx)
 #
 # A complete, self-contained arc that turns on the kopia web UI and proves it
 # answers with HTTP basic-auth. It creates:
@@ -14,20 +14,20 @@
 # Fill in the two `REPLACE_ME` backend keys and a `KOPIA_PASSWORD`, then:
 #   kubectl apply -f deploy/examples/tryit/server-ui.yaml
 #
-# The `# --8<-- [start:NAME]` / `[end:NAME]` lines are MkDocs snippet markers for
-# docs/server.md. They are plain YAML comments — the file stays apply-ready.
+# The `# region NAME` / `# endregion NAME` lines are region markers for
+# docs/src/content/docs/server.mdx. They are plain YAML comments — the file stays apply-ready.
 #
 # Field shapes verified against crates/api: externally-tagged backend
 # (`backend.s3`), and `server.auth.generate` (externally-tagged auth enum).
 ---
-# --8<-- [start:namespace]
+# region namespace
 apiVersion: v1
 kind: Namespace
 metadata:
   name: apps
-# --8<-- [end:namespace]
+# endregion namespace
 ---
-# --8<-- [start:secret]
+# region secret
 apiVersion: v1
 kind: Secret
 metadata:
@@ -39,9 +39,9 @@ stringData:
   AWS_SECRET_ACCESS_KEY: "REPLACE_ME"
   # Generate (e.g. `openssl rand -base64 24`) and store it OUTSIDE the cluster.
   KOPIA_PASSWORD: "REPLACE_ME"
-# --8<-- [end:secret]
+# endregion secret
 ---
-# --8<-- [start:repository]
+# region repository
 apiVersion: kopiur.home-operations.com/v1alpha1
 kind: Repository
 metadata:
@@ -68,4 +68,4 @@ spec:
   # Secret, a ClusterIP Service, port 51515.
   server:
     auth: { generate: {} }
-# --8<-- [end:repository]
+# endregion repository

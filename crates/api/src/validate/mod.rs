@@ -622,7 +622,7 @@ pub fn schedule_cr_growth_warning(cron: &str) -> Option<String> {
         "schedule fires ~{fires}×/hour and each fire creates a Snapshot CR per source, kept \
          for the SnapshotPolicy retention window — this can add up to thousands of CRs. If \
          unintended, use a coarser schedule or bound SnapshotPolicy.spec.retention. See \
-         docs/backups.md ('How many Snapshot CRs will I have?')."
+         https://kopiur.home-operations.com/backups/#how-many-snapshot-crs-will-i-have"
     ))
 }
 

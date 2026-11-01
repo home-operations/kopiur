@@ -8,7 +8,7 @@
 #
 # 1. `kubectl delete snapshotschedule postgres-data-nightly` then
 #    `kubectl delete snapshotpolicy postgres-data` (or a GitOps prune removing
-#    both at once — see docs/backups.md "Retain-wins-ties"). The policy's
+#    both at once — see docs/src/content/docs/backups.mdx "Retain-wins-ties"). The policy's
 #    Snapshot CRs are cleaned up; every kopia snapshot survives, un-cataloged.
 # 2. `kubectl apply -f` this file again (a genuinely fresh SnapshotPolicy has
 #    no Snapshot CRs carrying its config label — no history yet). Its first
@@ -30,7 +30,7 @@
 #    just re-runs next pass).
 # 5. Adopted rows are now GFS-governed exactly like produced ones — the SAME
 #    spec.retention below prunes them once they age out of the window. This
-#    is by design, not a bug: see docs/backups.md "Retention" and
+#    is by design, not a bug: see docs/src/content/docs/backups.mdx "Retention" and
 #    "troubleshooting.md" if backups you didn't expect to lose disappear
 #    right after a recreate. (That destructive prune applies under the
 #    default `defaultDeletionPolicy: Delete`. Under Retain/Orphan, out-of-
@@ -47,9 +47,9 @@
 # Field shapes verified against crates/api (externally-tagged backend:
 # `backend.s3`, not `backend: { kind: S3 }`).
 #
-# See docs/repositories.md ("The catalog — discovered snapshots"),
-# docs/backups.md ("What happens when the policy is deleted"), and
-# docs/scenarios/adopt-existing-repo.md ("Delete a policy, then recreate it").
+# See docs/src/content/docs/repositories.mdx ("The catalog — discovered snapshots"),
+# docs/src/content/docs/backups.mdx ("What happens when the policy is deleted"), and
+# docs/src/content/docs/scenarios/adopt-existing-repo.mdx ("Delete a policy, then recreate it").
 ---
 apiVersion: v1
 kind: Secret

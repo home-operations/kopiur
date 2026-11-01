@@ -10,7 +10,7 @@
 #
 # For ReadWriteOnce volumes Kopiur automatically co-locates the mover on the node
 # already holding the PVC, avoiding the Kubernetes "Multi-Attach error" — no extra
-# config needed (see docs/repositories.md#sourcecolocation-avoid-the-rwo-multi-attach-error).
+# config needed (see docs/src/content/docs/repositories.mdx#sourcecolocation-avoid-the-rwo-multi-attach-error).
 ---
 apiVersion: kopiur.home-operations.com/v1alpha1
 kind: SnapshotPolicy

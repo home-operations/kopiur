@@ -10,6 +10,7 @@ deploy/helm/kopiur/values.schema.json
 deploy/crds/
 deploy/helm/kopiur/crds/
 deploy/rbac/
+docs/src/content/docs/field-reference.md
 
 # Helm chart templates are Go-templated YAML (a `{{- if -}}` guard isn't valid
 # standalone YAML), so oxfmt can't parse them — exclude the whole templates/ dir.
@@ -17,9 +18,6 @@ deploy/helm/kopiur/templates/
 
 # krew-release-bot's krew-index manifest template — Go-templated, same reason.
 .krew.yaml
-
-# Docs site (MkDocs); leave authored Markdown untouched by oxfmt.
-docs/
 
 # The SPA's generated TypeScript (`cargo xtask gen-ui-types`), gated
 # byte-for-byte by `gen-check` and the xtask drift test. Same reasoning as the

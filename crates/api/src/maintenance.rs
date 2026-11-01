@@ -657,7 +657,7 @@ pub struct ManualRunStatus {
     // null does NOT clear the field, and this contract silently breaks.
     //
     // Kept a plain comment rather than rustdoc on purpose: doc comments become
-    // the CRD `description` (`kubectl explain`, docs/field-reference.md).
+    // the CRD `description` (`kubectl explain`, docs/src/content/docs/field-reference.md).
     #[serde(default)]
     pub completed_at: Option<String>,
 }

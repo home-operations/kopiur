@@ -199,7 +199,7 @@ impl SeedSource {
 /// (`kopiur_repository_seed_total{mode}`) and docs share one vocabulary.
 // The wire strings are pinned by `tests::seed_mode_labels_are_stable` rather
 // than a doctest: schemars lifts a referenced enum's doc comment into the field
-// description, so a code block here would land in `docs/field-reference.md`.
+// description, so a code block here would land in `docs/src/content/docs/field-reference.md`.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub enum SeedMode {

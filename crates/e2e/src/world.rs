@@ -212,7 +212,7 @@ impl World {
     /// The `src-eh` source PV/PVC (operator namespace) over the node-seeded dir
     /// holding the deliberately unreadable file.
     /// Bind the console's human roles to the permitted test subject, exactly as
-    /// `docs/ui.md` tells an administrator to.
+    /// `docs/src/content/docs/ui.mdx` tells an administrator to.
     ///
     /// Two bindings, two shapes, on purpose:
     ///

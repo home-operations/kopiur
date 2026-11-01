@@ -381,7 +381,7 @@ where
 /// — the exact bug behind `restore_completed_reports_kstatus_ready`,
 /// `http_request_post_hook_hits_in_cluster_receiver`, and
 /// `metrics_reflect_backup_lifecycle`. Gating on `Ready=True` waits for the heal.
-/// See `docs/dev/watch-and-reconcile.md` ("Two-pass terminal heal").
+/// See `docs/src/content/docs/dev/watch-and-reconcile.md` ("Two-pass terminal heal").
 pub async fn wait_ready<K>(api: &Api<K>, name: &str) -> anyhow::Result<serde_json::Value>
 where
     K: kube::Resource + Clone + DeserializeOwned + Serialize + std::fmt::Debug,

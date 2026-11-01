@@ -32,7 +32,7 @@
 # populator-aware CSI provisioner (its external-provisioner must defer to
 # `dataSourceRef` rather than binding the claim to an empty volume).
 #
-# --8<-- [start:policy]
+# region policy
 ---
 apiVersion: kopiur.home-operations.com/v1alpha1
 kind: SnapshotPolicy
@@ -57,7 +57,7 @@ spec:
   # with `copyMethod: Direct`. Use `VolumeGroupSnapshot` (the default) when the
   # volumes must agree with each other — the restore side is identical.
   groupBy: None
-# --8<-- [end:policy]
+# endregion policy
 ---
 apiVersion: kopiur.home-operations.com/v1alpha1
 kind: SnapshotSchedule
@@ -71,7 +71,7 @@ spec:
     cron: "H 2 * * *"
     jitter: 30m
     runOnCreate: false
-# --8<-- [start:restore]
+# region restore
 ---
 apiVersion: kopiur.home-operations.com/v1alpha1
 kind: Restore
@@ -95,8 +95,8 @@ spec:
   policy:
     onMissingSnapshot: Continue # fresh repository ⇒ empty volumes, not a failure
     waitTimeout: 5m # per claim: a PVC applied later gets its own full window
-# --8<-- [end:restore]
-# --8<-- [start:claims]
+# endregion restore
+# region claims
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -140,4 +140,4 @@ spec:
     apiGroup: kopiur.home-operations.com
     kind: Restore
     name: billing-app-restore
-# --8<-- [end:claims]
+# endregion claims

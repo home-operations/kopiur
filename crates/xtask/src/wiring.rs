@@ -6,7 +6,7 @@
 //! nothing about whether anything ever *reads* a field. Because every
 //! `crates/api` type is `pub`, `dead_code` can never fire on one either. So a
 //! field could be defined, schema-generated, documented in
-//! `docs/field-reference.md`, accepted by admission — and do absolutely
+//! `docs/src/content/docs/field-reference.md`, accepted by admission — and do absolutely
 //! nothing. Two shipped bugs came from exactly that:
 //!
 //! * **#346** — `SnapshotPolicy.spec.sources[].pvcSelector` had no
