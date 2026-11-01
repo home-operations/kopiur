@@ -4251,7 +4251,7 @@ fn select_recorded_source(
             let Some(status) = snap.status.as_ref() else {
                 return false;
             };
-            status.recorded.is_some() && status.snapshot.as_ref().is_some_and(&identity_matches)
+            status.recorded.is_some() && status.snapshot.as_ref().is_some_and(identity_matches)
         })
         .map(|snap| (snap, row_time(snap)))
         .collect();

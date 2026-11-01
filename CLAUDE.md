@@ -115,7 +115,7 @@ add controller-runtime dependencies to `crates/api`.
 
 Pinned deps: `kube` 4.0, `k8s-openapi` 0.28 (feature `v1_33`, `schemars` on),
 `schemars` 1, `axum` 0.8, `croner` 3, `cel` 0.14, `ts-rs` 12. The toolchain mise
-installs is **Rust 1.98.0** (`.mise/config.toml`); the workspace's published MSRV
+installs is **Rust 1.99.1** (`.mise/config.toml`); the workspace's published MSRV
 (`rust-version`) is **1.95** — the two are different numbers and both are real,
 so quote whichever one the question is about.
 
