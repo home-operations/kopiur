@@ -36,7 +36,7 @@ kopiur-ui = { path = "crates/ui" }
 kopiur-ui-model = { path = "crates/ui-model" }
 
 # Kubernetes / controller-runtime
-kube = { version = "4.0", default-features = false }
+kube = { version = "5.0", default-features = false }
 k8s-openapi = { version = "0.28", default-features = false, features = ["schemars"] }
 schemars = "1"
 
