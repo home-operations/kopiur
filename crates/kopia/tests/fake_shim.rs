@@ -7,7 +7,6 @@
 #![cfg(unix)]
 
 use std::collections::BTreeMap;
-use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 
 use kopiur_kopia::{
@@ -17,7 +16,8 @@ use kopiur_kopia::{
 
 /// Write an executable shell script to a tempdir and return its path. The
 /// tempdir is leaked into the returned guard so the file outlives the test
-/// body.
+/// body. Written via [`kopiur_kopia::testutil::write_executable`] so a sibling
+/// test's fork can never hold a writer to it (the ETXTBSY flake).
 struct Shim {
     _dir: tempfile::TempDir,
     path: PathBuf,
@@ -26,10 +26,7 @@ struct Shim {
 fn shim(script: &str) -> Shim {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("kopia-shim.sh");
-    std::fs::write(&path, script).unwrap();
-    let mut perms = std::fs::metadata(&path).unwrap().permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(&path, perms).unwrap();
+    kopiur_kopia::testutil::write_executable(&path, script);
     Shim { _dir: dir, path }
 }
 

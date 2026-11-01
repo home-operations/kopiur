@@ -20,6 +20,12 @@ tracing = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 tempfile = "3"
+# Self dev-dependency: turns on `testutil` for this crate's own integration
+# tests (tests/fake_shim.rs), which link the crate like any downstream user.
+kopiur-kopia = { path = ".", features = ["testutil"] }
 
 [features]
 integration = []
+# Exposes `kopiur_kopia::testutil` (race-free fake-kopia shim writing) to
+# downstream crates' tests. Test-support only — never enable it in a shipped binary.
+testutil = []

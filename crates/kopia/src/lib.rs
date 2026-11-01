@@ -8,6 +8,8 @@ pub mod humanize;
 pub mod model;
 pub mod selection;
 pub mod session;
+#[cfg(all(unix, any(test, feature = "testutil")))]
+pub mod testutil;
 
 pub use client::{
     CacheTuning, ConnectOptions, ConnectSpec, CreateOptions, DEFAULT_STDIN_FINALIZE_TIMEOUT,

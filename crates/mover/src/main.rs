@@ -4864,13 +4864,9 @@ mod tests {
 
     #[cfg(unix)]
     fn shim(script: &str) -> Shim {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("kopia-shim.sh");
-        std::fs::write(&path, script).unwrap();
-        let mut perms = std::fs::metadata(&path).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&path, perms).unwrap();
+        kopiur_kopia::testutil::write_executable(&path, script);
         Shim { _dir: dir, path }
     }
 
