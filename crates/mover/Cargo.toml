@@ -29,6 +29,8 @@ clap = { workspace = true }
 
 [dev-dependencies]
 serial_test = { workspace = true }
+# Race-free fake-kopia shim writing for the KopiaClient-backed tests.
+kopiur-kopia = { workspace = true, features = ["testutil"] }
 tempfile = "3"
 # Mock kube client for the KubeStatusReporter tests (`tower::service_fn` needs
 # the `util` feature — the workspace `tower` is default-features, and relying on

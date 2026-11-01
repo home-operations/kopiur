@@ -900,24 +900,16 @@ fn sync_to_args_builds_parallel_and_tristates_and_speeds() {
 #[cfg(unix)]
 #[tokio::test]
 async fn sync_to_env_overlay_sets_destination_and_unsets_source_only_vars() {
-    use std::io::Write;
-    use std::os::unix::fs::PermissionsExt;
-
     // A shim standing in for `kopia`: it records the two credential env vars it was
     // spawned with, then exits 0 (a successful sync-to).
     let dir = std::env::temp_dir().join(format!("kopiur-syncenv-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let shim = dir.join("kopia");
     let out = dir.join("env.out");
-    {
-        let mut f = std::fs::File::create(&shim).unwrap();
-        write!(
-            f,
-            "#!/bin/sh\necho \"KEY=${{AWS_ACCESS_KEY_ID:-<unset>}} TOKEN=${{AWS_SESSION_TOKEN:-<unset>}}\" > \"$KOPIUR_SYNCENV_OUT\"\nexit 0\n"
-        )
-        .unwrap();
-        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
+    crate::testutil::write_executable(
+        &shim,
+        "#!/bin/sh\necho \"KEY=${AWS_ACCESS_KEY_ID:-<unset>} TOKEN=${AWS_SESSION_TOKEN:-<unset>}\" > \"$KOPIUR_SYNCENV_OUT\"\nexit 0\n",
+    );
 
     // Source credentials arrive as common_env (as they do in the mover pod).
     let client = KopiaClient::builder()
@@ -1180,24 +1172,16 @@ fn builder_records_env_remove_keys() {
 #[cfg(unix)]
 #[tokio::test]
 async fn env_remove_unsets_the_variable_at_spawn_even_when_env_set_it() {
-    use std::io::Write;
-    use std::os::unix::fs::PermissionsExt;
-
     // A shim standing in for `kopia`: records the two env vars it was spawned
     // with, then exits 0. Same pattern as the sync-to overlay test above.
     let dir = std::env::temp_dir().join(format!("kopiur-envremove-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let shim = dir.join("kopia");
     let out = dir.join("env.out");
-    {
-        let mut f = std::fs::File::create(&shim).unwrap();
-        write!(
-            f,
-            "#!/bin/sh\necho \"PW=${{KOPIA_PASSWORD:-<unset>}} KEEP=${{KOPIUR_KEEP_VAR:-<unset>}}\" > \"$KOPIUR_ENVREMOVE_OUT\"\nexit 0\n"
-        )
-        .unwrap();
-        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
+    crate::testutil::write_executable(
+        &shim,
+        "#!/bin/sh\necho \"PW=${KOPIA_PASSWORD:-<unset>} KEEP=${KOPIUR_KEEP_VAR:-<unset>}\" > \"$KOPIUR_ENVREMOVE_OUT\"\nexit 0\n",
+    );
 
     // The removal must win over the builder's own env for the same key
     // (mirroring the overlay's `None` semantics), while other builder env
@@ -1486,9 +1470,6 @@ fn throttle_args_builds_per_second_flags_and_empties() {
 #[cfg(unix)]
 #[tokio::test]
 async fn set_client_read_only_emits_the_matching_polarity_flag() {
-    use std::io::Write;
-    use std::os::unix::fs::PermissionsExt;
-
     // `repository_set_client_read_only` builds argv only — no parsing — so the
     // assertion has to be on what the process is actually SPAWNED with. A shim
     // standing in for `kopia` appends its argv to a file (issue #374).
@@ -1499,15 +1480,10 @@ async fn set_client_read_only_emits_the_matching_polarity_flag() {
     std::fs::create_dir_all(&dir).unwrap();
     let shim = dir.join("kopia");
     let out = dir.join("argv.out");
-    {
-        let mut f = std::fs::File::create(&shim).unwrap();
-        write!(
-            f,
-            "#!/bin/sh\necho \"$@\" >> \"$KOPIUR_SETCLIENT_OUT\"\nexit 0\n"
-        )
-        .unwrap();
-        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
+    crate::testutil::write_executable(
+        &shim,
+        "#!/bin/sh\necho \"$@\" >> \"$KOPIUR_SETCLIENT_OUT\"\nexit 0\n",
+    );
 
     let client = KopiaClient::builder()
         .binary(&shim)
@@ -1747,8 +1723,6 @@ fn set_parameters_disable_emits_the_mode_alone_and_is_not_empty() {
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn timed_out_child_is_killed_and_reaped_not_left_a_zombie() {
-    use std::io::Write;
-    use std::os::unix::fs::PermissionsExt;
     use std::time::Duration;
 
     // A shim standing in for `kopia`: records its PID, then hangs far past the
@@ -1758,11 +1732,10 @@ async fn timed_out_child_is_killed_and_reaped_not_left_a_zombie() {
     let shim = dir.join("kopia");
     let pid_file = dir.join("pid");
     let _ = std::fs::remove_file(&pid_file);
-    {
-        let mut f = std::fs::File::create(&shim).unwrap();
-        write!(f, "#!/bin/sh\necho $$ > \"$KOPIUR_REAP_PID\"\nsleep 300\n").unwrap();
-        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
+    crate::testutil::write_executable(
+        &shim,
+        "#!/bin/sh\necho $$ > \"$KOPIUR_REAP_PID\"\nsleep 300\n",
+    );
 
     let client = KopiaClient::builder()
         .binary(&shim)
