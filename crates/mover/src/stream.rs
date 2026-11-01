@@ -287,7 +287,7 @@ pub fn consumer_failure_detail(
 /// restore would then fail with a transport error and the message would blame the
 /// user's command for a timeout kopiur imposed on itself.
 ///
-/// `read_timeout` is already `None` in kube 4.x precisely so exec/attach sessions
+/// `read_timeout` is already `None` in kube (4.x and 5.x) precisely so exec/attach sessions
 /// survive; `write_timeout` was left at its default. Both are cleared here, and
 /// `connect_timeout` is deliberately KEPT — a connection that cannot be
 /// established should fail fast.

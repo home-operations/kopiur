@@ -113,7 +113,7 @@ add controller-runtime dependencies to `crates/api`.
 | Deletion            | `Snapshot` CR owns its kopia snapshot via finalizer; `deletionPolicy: Delete`(default produced) / `Retain`(forced for discovered) / `Orphan`. Schedule-deletion cascade guarded by `SnapshotSchedule.spec.deletion.onScheduleDelete` (default `Retain`, opt-in `Delete`). Per-repo mass-deletion breaker `deletionProtection.threshold` (default 10, `0` disables, timestamp-ack release) holds bulk EXTERNAL deletes; operator prunes always bypass it. Execution is batched per repository (`snapdel-*` mover Jobs), never one Job per Snapshot — see ADR-0006. |
 | Maintenance         | Default-managed: `Repository`/`ClusterRepository` `spec.maintenance` (default-on) is projected into an _owned_ `Maintenance` CR; an externally-authored `Maintenance` is always honored (never duplicated), even with `enabled: false`. ClusterRepo placement: `spec.maintenance.namespace` else `KOPIUR_NAMESPACE`.                                                                                                                                                                                                                                              |
 
-Pinned deps: `kube` 4.0, `k8s-openapi` 0.28 (feature `v1_33`, `schemars` on),
+Pinned deps: `kube` 5.0, `k8s-openapi` 0.29 (feature `v1_33`, `schemars` on),
 `schemars` 1, `axum` 0.8, `croner` 3, `cel` 0.14, `ts-rs` 12. The toolchain mise
 installs is **Rust 1.99.1** (`.mise/config.toml`); the workspace's published MSRV
 (`rust-version`) is **1.95** — the two are different numbers and both are real,

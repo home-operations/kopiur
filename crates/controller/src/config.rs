@@ -273,7 +273,7 @@ pub const DEFAULT_RECONCILE_CONCURRENCY: u16 = 8;
 /// Reachable via the chart's `controller.extraEnv`.
 pub const SOURCE_PVC_DEADLINE_ENV: &str = "KOPIUR_SOURCE_PVC_DEADLINE_SECONDS";
 
-/// Read timeout for the shared kube client. kube 4.0 defaults `read_timeout`
+/// Read timeout for the shared kube client. kube (4.0+, still in 5.0) defaults `read_timeout`
 /// to `None`, so a connection that stalls after establishing (the OOM-flapping
 /// apiserver's signature) held its fd until TCP gave up. MUST exceed the watch
 /// long-poll window — kube-runtime requests 290s server-side watch timeouts
@@ -306,7 +306,7 @@ pub const KUBE_CLIENT_READ_TIMEOUT: std::time::Duration = std::time::Duration::f
 pub const KUBE_CLIENT_ELECTION_READ_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(5);
 
-/// Connect timeout for the shared kube client (kube 4.0 default: 30s). During
+/// Connect timeout for the shared kube client (kube 5.0 default: 30s). During
 /// the apiserver outage each blackholed connect pinned an fd for the full 30s
 /// — the dominant per-fd hold time. In-cluster the apiserver is one ClusterIP
 /// hop and a healthy accept is milliseconds; 5s tolerates real blips while
