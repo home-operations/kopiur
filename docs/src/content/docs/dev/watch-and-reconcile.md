@@ -150,7 +150,7 @@ and runtime are sized. The levers, all in `spawn_all`/`main.rs`/`config.rs`:
   [kube.rs optimization guide](https://kube.rs/controllers/optimization/), this is the
   highest-leverage watch change (metadata-only watching alone ≈ 60% for Pods; field
   pruning adds ≈ 30%). Requires the kube `unstable-runtime` feature (`watches_stream`
-  is still unstable in kube 4.0).
+  is still unstable in kube 5.0).
 - **Worker-thread cap.** `main.rs` builds the tokio runtime with
   `config::worker_threads()` (`KOPIUR_WORKER_THREADS`, default 2) instead of
   `Runtime::new()`'s default — `available_parallelism()` sizes to the _host_ core count,

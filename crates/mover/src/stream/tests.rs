@@ -368,7 +368,7 @@ fn other_object_read_failures_pass_the_kopia_error_through() {
 
 /// The `>295 s consumer is not killed` guarantee, pinned without a cluster.
 ///
-/// kube 4.x infers a 295 s `write_timeout`, which `hyper_timeout::TimeoutConnector`
+/// kube (4.x and 5.x) infers a 295 s `write_timeout`, which `hyper_timeout::TimeoutConnector`
 /// applies PER WRITE and enforces by tearing the connection down. On a `streamExec`
 /// restore kopiur is the writer (`kopia show` piped into the consumer's stdin), so a
 /// `psql` legitimately backpressuring on one enormous statement for five minutes

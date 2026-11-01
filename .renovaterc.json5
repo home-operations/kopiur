@@ -34,11 +34,5 @@
       matchPackageNames: ["cel"],
       allowedVersions: "<0.15.0",
     },
-    {
-      description: "kube 4.2 depends on k8s-openapi ^0.28, so bumping the workspace to 0.29 splits the graph into two k8s-openapi versions and the 0.28 copy fails to build with no `v1_*` feature; raise once a kube release ships kube-rs/kube#2120",
-      matchManagers: ["cargo"],
-      matchPackageNames: ["k8s-openapi"],
-      allowedVersions: "<0.29.0",
-    },
   ],
 }
