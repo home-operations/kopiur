@@ -16,7 +16,7 @@
     "check": "pnpm typecheck && pnpm lint && pnpm format:check && pnpm test"
   },
   "dependencies": {
-    "@tanstack/react-query": "5.105.3",
+    "@tanstack/react-query": "5.106.0",
     "@tanstack/react-router": "1.170.46",
     "elkjs": "0.12.1",
     "lucide-react": "1.68.0",
@@ -45,5 +45,5 @@
     "vitest": "5.1.0",
     "vitest-fetch-mock": "0.4.5"
   },
-  "packageManager": "pnpm@12.16.1"
+  "packageManager": "pnpm@12.18.0"
 }
