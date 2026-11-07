@@ -1,5 +1,33 @@
 # Changelog
 
+## [0.10.18](https://github.com/home-operations/kopiur/compare/0.10.17...0.10.18) (2026-11-07)
+
+
+### Continuous Integration
+
+* replace the shared workflow-lint action with zizmor-action ([a303eb9](https://github.com/home-operations/kopiur/commit/a303eb9ebf0690a87fc6b78c89a80eed93c0ddfb))
+
+
+### Miscellaneous Chores
+
+* **github-action:** update action jdx/mise-action (v5.2.4 → v5.2.5) ([#666](https://github.com/home-operations/kopiur/issues/666)) ([64cef55](https://github.com/home-operations/kopiur/commit/64cef55b465d0c75c3b191a5447d7c0bf6900370))
+* **github-action:** update github-actions ([#678](https://github.com/home-operations/kopiur/issues/678)) ([4b9a76b](https://github.com/home-operations/kopiur/commit/4b9a76b794a384150fb862500eb04ce2d1f63aa3))
+* **mise:** update mise tools ([#680](https://github.com/home-operations/kopiur/issues/680)) ([6924541](https://github.com/home-operations/kopiur/commit/6924541533a43c260884bfbcb43a671d425759c9))
+* **npm:** update dependency @tanstack/react-query (5.105.1 → 5.105.2) ([#669](https://github.com/home-operations/kopiur/issues/669)) ([4292ea6](https://github.com/home-operations/kopiur/commit/4292ea6a353091e130b94bbd0662f0f3e1c344a9))
+* **npm:** update dependency @tanstack/react-query (5.105.2 → 5.105.3) ([#672](https://github.com/home-operations/kopiur/issues/672)) ([61ab391](https://github.com/home-operations/kopiur/commit/61ab391cf6f1c08d2aea7122f0abc9749a0911ab))
+* **npm:** update dependency @vitejs/plugin-react (6.1.2 → 6.2.1) ([#667](https://github.com/home-operations/kopiur/issues/667)) ([b16017e](https://github.com/home-operations/kopiur/commit/b16017e3fac8806a677499a89f0f1ebb39b73af1))
+* **npm:** update dependency astro (7.4.4 → 7.4.5) ([#670](https://github.com/home-operations/kopiur/issues/670)) ([c5fef60](https://github.com/home-operations/kopiur/commit/c5fef60ddd5ea9238757be0f2732e9c283406f7b))
+* **npm:** update dependency astro (7.4.5 → 7.4.6) ([#683](https://github.com/home-operations/kopiur/issues/683)) ([ef43627](https://github.com/home-operations/kopiur/commit/ef4362768455543cd7ba86944c7b0d7b5079f785))
+* **npm:** update dependency astro (7.4.6 → 7.4.7) ([#687](https://github.com/home-operations/kopiur/issues/687)) ([6513e91](https://github.com/home-operations/kopiur/commit/6513e91d65699370bb7a88505fe43addf2179c74))
+* **npm:** update dependency lucide-react (1.66.0 → 1.67.0) ([#673](https://github.com/home-operations/kopiur/issues/673)) ([93b40f7](https://github.com/home-operations/kopiur/commit/93b40f7a6667621c12430e87ca3d619c0ab170fb))
+* **npm:** update dependency lucide-react (1.67.0 → 1.68.0) ([#676](https://github.com/home-operations/kopiur/issues/676)) ([f0567c9](https://github.com/home-operations/kopiur/commit/f0567c95409315f4af0f433f2702236f48168b92))
+* **npm:** update dependency lucide-react (1.69.0 → 1.70.0) ([#688](https://github.com/home-operations/kopiur/issues/688)) ([4cc7180](https://github.com/home-operations/kopiur/commit/4cc71800d7a85aeef946dcc4ed0e14ed5dd6e47e))
+* **npm:** update dependency mermaid (12.2.0 → 12.3.0) ([#674](https://github.com/home-operations/kopiur/issues/674)) ([b50d0a9](https://github.com/home-operations/kopiur/commit/b50d0a94220cab4657991d81ea28972afc3370db))
+* **npm:** update dependency vitest (5.0.5 → 5.1.0) ([#671](https://github.com/home-operations/kopiur/issues/671)) ([13ce82a](https://github.com/home-operations/kopiur/commit/13ce82a8f63a17b0ab2574ade8807cdbcc810c5d))
+* **npm:** update web ui dependencies ([#664](https://github.com/home-operations/kopiur/issues/664)) ([23e4d58](https://github.com/home-operations/kopiur/commit/23e4d58c9161ca951bd1261d06787540cbeec5b0))
+* **npm:** update web ui dependencies ([#679](https://github.com/home-operations/kopiur/issues/679)) ([b947213](https://github.com/home-operations/kopiur/commit/b947213d04f1c9fe8a73786f3f1fc279f2ec04a3))
+* **npm:** update web ui dependencies ([#682](https://github.com/home-operations/kopiur/issues/682)) ([8bc4fd3](https://github.com/home-operations/kopiur/commit/8bc4fd390c4d853b3de2322d40d392c21832d6c5))
+
 ## [0.10.17](https://github.com/home-operations/kopiur/compare/0.10.16...0.10.17) (2026-11-01)
 
 
