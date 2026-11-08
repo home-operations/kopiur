@@ -703,6 +703,13 @@ pub(crate) fn infer_staged_class(
     }
 }
 
+/// The class an already-created staged PVC was written with, if any — the pin that
+/// keeps class inference from re-running (and diverging) across a stage's reconciles.
+/// Empty counts as none.
+fn existing_staged_class(staged: &PersistentVolumeClaim) -> Option<String> {
+    staged_class_of(staged).filter(|c| !c.is_empty())
+}
+
 /// `staging` with `storageClassName` set to `class` — the inferred class then flows
 /// through [`build_staged_pvc`] exactly like a user override (other fields kept).
 fn with_staged_class(staging: Option<&StagingSpec>, class: String) -> StagingSpec {
@@ -1321,6 +1328,12 @@ pub async fn resolve_staging(
     // A statically-provisioned CSI source has no StorageClass to copy (#686). Pick one
     // of its driver for the staged PVC up front — before any VolumeSnapshot exists —
     // or fail now with the fix, instead of a staged PVC that can never bind.
+    //
+    // Inference happens ONCE per run: this function re-runs on every reconcile while
+    // the stage waits, and a staged PVC's `storageClassName` is immutable. So once the
+    // staged PVC exists its class is pinned and reused — re-inferring could fail a
+    // stage that is already provisioning (a new, non-default class of the driver made
+    // the choice ambiguous) or pick a different class the apply would be rejected for.
     let inferred_staging;
     let staging = match (
         staging.and_then(|s| s.storage_class_name.as_deref()),
@@ -1328,16 +1341,25 @@ pub async fn resolve_staging(
         provisioner.as_deref(),
     ) {
         (None, None, Some(driver)) => {
-            let classes = list_storage_classes(client).await?;
-            match infer_staged_class(&classes, driver, ns, source_name) {
-                Ok(class) => {
-                    inferred_staging = with_staged_class(staging, class);
-                    Some(&inferred_staging)
+            let pinned = pvc_api
+                .get_opt(&staged_pvc)
+                .await?
+                .as_ref()
+                .and_then(existing_staged_class);
+            let class = match pinned {
+                Some(class) => class,
+                None => {
+                    let classes = list_storage_classes(client).await?;
+                    match infer_staged_class(&classes, driver, ns, source_name) {
+                        Ok(class) => class,
+                        Err((reason, message)) => {
+                            return Ok(StagingOutcome::Failed { reason, message });
+                        }
+                    }
                 }
-                Err((reason, message)) => {
-                    return Ok(StagingOutcome::Failed { reason, message });
-                }
-            }
+            };
+            inferred_staging = with_staged_class(staging, class);
+            Some(&inferred_staging)
         }
         // An override is set, the source has its own class, or the source isn't CSI
         // at all (handled below with `SourceNotCSIProvisioned`).
@@ -2209,6 +2231,17 @@ mod tests {
         assert_eq!(reason, REASON_NO_STAGED_CLASS);
         assert!(msg.contains("zfs-a, zfs-b"));
         assert!(msg.contains("spec.staging.storageClassName"));
+    }
+
+    #[test]
+    fn an_existing_staged_pvc_pins_its_class() {
+        let mut staged = override_test_source();
+        assert_eq!(existing_staged_class(&staged).as_deref(), Some("fast"));
+        // Not yet written with a class (or blank) ⇒ no pin; inference runs.
+        staged.spec.as_mut().unwrap().storage_class_name = Some(String::new());
+        assert_eq!(existing_staged_class(&staged), None);
+        staged.spec.as_mut().unwrap().storage_class_name = None;
+        assert_eq!(existing_staged_class(&staged), None);
     }
 
     #[test]
