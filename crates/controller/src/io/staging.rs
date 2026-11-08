@@ -45,6 +45,11 @@ use crate::error::{Error, Result};
 pub const SNAPSHOT_GROUP: &str = "snapshot.storage.k8s.io";
 /// The well-known annotation marking the default `VolumeSnapshotClass` for a driver.
 pub const DEFAULT_CLASS_ANNOTATION: &str = "snapshot.storage.kubernetes.io/is-default-class";
+/// Records, on a run's `VolumeSnapshot`, the StorageClass Kopiur inferred for the
+/// staged PVC (statically-provisioned sources, #686), so every later reconcile of the
+/// run reuses that choice instead of re-inferring from a StorageClass set that may
+/// have changed mid-stage.
+pub const STAGED_CLASS_ANNOTATION: &str = "kopiur.home-operations.com/staged-storage-class";
 /// The annotation marking the cluster's default `StorageClass`.
 const DEFAULT_STORAGE_CLASS_ANNOTATION: &str = "storageclass.kubernetes.io/is-default-class";
 /// The legacy beta spelling of [`DEFAULT_STORAGE_CLASS_ANNOTATION`], still honored by
@@ -261,13 +266,34 @@ fn source_not_csi_message(ns: &str, source_name: &str) -> String {
     )
 }
 
+/// Message for [`REASON_SOURCE_NOT_CSI`] when the source PVC is not bound yet, so its
+/// PV (and with it the CSI driver of a statically-provisioned volume) is unknown.
+fn source_unbound_message(ns: &str, source_name: &str) -> String {
+    format!(
+        "source PVC `{ns}/{source_name}` is not bound to a PersistentVolume yet, so its CSI \
+         driver is unknown. Fix: wait for the PVC to bind; the next scheduled run (or a new \
+         Snapshot) retries"
+    )
+}
+
+/// Message for [`REASON_NO_STAGED_CLASS`] under `copyMethod: Clone`: CSI volume cloning
+/// requires the clone in the source's own StorageClass, and that class can't provision
+/// the driver (absent, missing, or a placeholder).
+fn clone_needs_source_class_message(ns: &str, source_name: &str, driver: &str) -> String {
+    format!(
+        "copyMethod Clone needs the staged PVC in the source's own StorageClass, but source \
+         PVC `{ns}/{source_name}` has no StorageClass that provisions its CSI driver \
+         `{driver}` (it is statically provisioned). Fix: set spec.copyMethod: Snapshot"
+    )
+}
+
 /// Message for [`REASON_NO_STAGED_CLASS`] when no StorageClass uses the driver.
 fn no_staged_class_for_driver_message(ns: &str, source_name: &str, driver: &str) -> String {
     format!(
-        "source PVC `{ns}/{source_name}` has no StorageClass, and no StorageClass uses its \
-         CSI driver `{driver}`, so the staged PVC has nothing to provision it. Fix: create a \
-         StorageClass with provisioner `{driver}`, or set spec.staging.storageClassName \
-         to one"
+        "source PVC `{ns}/{source_name}` has no StorageClass that provisions its CSI driver \
+         `{driver}`, and no StorageClass uses that driver, so the staged PVC has nothing to \
+         provision it. Fix: create a StorageClass with provisioner `{driver}`, or set \
+         spec.staging.storageClassName to one"
     )
 }
 
@@ -279,9 +305,9 @@ fn ambiguous_staged_class_message(
     candidates: &[String],
 ) -> String {
     format!(
-        "source PVC `{ns}/{source_name}` has no StorageClass, and several StorageClasses use \
-         its CSI driver `{driver}` ({}) with none the cluster default. Fix: set \
-         spec.staging.storageClassName to one of them",
+        "source PVC `{ns}/{source_name}` has no StorageClass that provisions its CSI driver \
+         `{driver}`, and several StorageClasses use that driver ({}) with none the cluster \
+         default. Fix: set spec.staging.storageClassName to one of them",
         candidates.join(", ")
     )
 }
@@ -434,6 +460,7 @@ pub fn build_volume_snapshot(
     ns: &str,
     source_claim: &str,
     class: Option<&str>,
+    staged_class: Option<&str>,
     owner: k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference,
 ) -> DynamicObject {
     let mut spec = serde_json::json!({
@@ -450,6 +477,12 @@ pub fn build_volume_snapshot(
         "kopiur.home-operations.com/component",
         "staged-source-snapshot",
     )]));
+    if let Some(staged_class) = staged_class {
+        obj.metadata.annotations = Some(BTreeMap::from([(
+            STAGED_CLASS_ANNOTATION.to_string(),
+            staged_class.to_string(),
+        )]));
+    }
     obj
 }
 
@@ -652,30 +685,85 @@ fn source_class_name(source_pvc: &PersistentVolumeClaim) -> Option<&str> {
         .filter(|c| !c.is_empty())
 }
 
-/// The CSI driver behind a source PVC. **Pure** over what the caller read: the
-/// StorageClass `provisioner` wins when known (unchanged behavior for every
-/// dynamically-provisioned volume); otherwise the bound PV's `spec.csi.driver`, which
-/// is the only place a statically-provisioned CSI volume names its driver (#686).
-/// `None` = not a CSI volume (hostPath, local, NFS, …) or unbound.
-pub(crate) fn source_driver(
-    class_provisioner: Option<String>,
-    bound_pv: Option<&PersistentVolume>,
-) -> Option<String> {
-    class_provisioner.filter(|p| !p.is_empty()).or_else(|| {
-        bound_pv
-            .and_then(|pv| pv.spec.as_ref())
-            .and_then(|s| s.csi.as_ref())
-            .map(|csi| csi.driver.clone())
-            .filter(|d| !d.is_empty())
-    })
+/// What staging knows about the source PVC's storage — see [`source_storage`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SourceStorage {
+    /// The CSI driver backing the source; `None` = not a CSI volume, or unbound.
+    pub driver: Option<String>,
+    /// Whether the source's own StorageClass exists AND provisions `driver` — i.e.
+    /// whether the staged PVC can simply copy the source's class.
+    pub class_provisions_driver: bool,
+    /// Whether the source PVC is bound to a PV (`spec.volumeName` set).
+    pub bound: bool,
 }
 
-/// Pick the staged PVC's StorageClass for a source that has none (a statically
-/// provisioned CSI volume) and no `spec.staging.storageClassName` override. **Pure**
-/// over the listed StorageClasses (as [`ClassInfo`], `driver` = `provisioner`).
+/// Resolve the source's CSI driver. **Pure** over what the caller read. The bound PV's
+/// `spec.csi.driver` is authoritative — it is the driver that actually owns the volume,
+/// and the only place a statically-provisioned CSI volume names it (#686), whether its
+/// PVC has no class, a class with no `StorageClass` object (e.g. `manual`), or a
+/// placeholder class (`kubernetes.io/no-provisioner`). The StorageClass `provisioner`
+/// is the fallback for non-CSI PVs (in-tree volumes keep their old behavior).
+pub(crate) fn source_storage(
+    class_provisioner: Option<&str>,
+    bound_pv: Option<&PersistentVolume>,
+    bound: bool,
+) -> SourceStorage {
+    let class_provisioner = class_provisioner.filter(|p| !p.is_empty());
+    let driver = bound_pv
+        .and_then(|pv| pv.spec.as_ref())
+        .and_then(|s| s.csi.as_ref())
+        .map(|csi| csi.driver.as_str())
+        .filter(|d| !d.is_empty())
+        .or(class_provisioner)
+        .map(str::to_string);
+    SourceStorage {
+        class_provisions_driver: class_provisioner.is_some()
+            && class_provisioner == driver.as_deref(),
+        driver,
+        bound,
+    }
+}
+
+/// How the staged PVC gets its StorageClass — see [`staged_class_plan`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StagedClassPlan<'a> {
+    /// Build from `spec.staging` as configured: the override when set, else the
+    /// source's class (which provisions the driver). Also used when the source has no
+    /// CSI driver at all — that is reported separately (`SourceNotCSIProvisioned`).
+    AsConfigured,
+    /// The source's class can't provision this driver (none, missing, or a
+    /// placeholder) — pick a StorageClass of the driver for the staged PVC.
+    Infer(&'a str),
+    /// As `Infer`, but under `copyMethod: Clone`, where CSI requires the clone to be in
+    /// the source's own StorageClass — so no class can work.
+    CloneNeedsSourceClass(&'a str),
+}
+
+/// Decide how the staged PVC gets its StorageClass. **Pure.**
+pub(crate) fn staged_class_plan(
+    copy_method: CopyMethod,
+    override_set: bool,
+    storage: &SourceStorage,
+) -> StagedClassPlan<'_> {
+    match storage.driver.as_deref() {
+        _ if override_set => StagedClassPlan::AsConfigured,
+        None => StagedClassPlan::AsConfigured,
+        Some(_) if storage.class_provisions_driver => StagedClassPlan::AsConfigured,
+        Some(driver) if copy_method == CopyMethod::Clone => {
+            StagedClassPlan::CloneNeedsSourceClass(driver)
+        }
+        Some(driver) => StagedClassPlan::Infer(driver),
+    }
+}
+
+/// Pick the staged PVC's StorageClass for a source whose own class can't provision its
+/// driver ([`StagedClassPlan::Infer`]: no class, a missing class, or a placeholder) and
+/// no `spec.staging.storageClassName` override. **Pure** over the listed StorageClasses
+/// (as [`ClassInfo`], `driver` = `provisioner`).
 ///
-/// Without this the staged PVC would copy the source's empty class and could only bind
-/// to a pre-existing PV — it would sit `Pending` until the bind deadline. Same precedence
+/// Without this the staged PVC would copy a class nothing provisions and could only
+/// bind to a pre-existing PV — sit `Pending` until the bind deadline, or worse, bind
+/// to an unrelated spare static PV of that class. Same precedence
 /// as [`decide_class`]: the single class of `driver`, else the unique cluster-default one
 /// among several, else a [`REASON_NO_STAGED_CLASS`] failure naming the fix.
 pub(crate) fn infer_staged_class(
@@ -703,11 +791,20 @@ pub(crate) fn infer_staged_class(
     }
 }
 
-/// The class an already-created staged PVC was written with, if any — the pin that
-/// keeps class inference from re-running (and diverging) across a stage's reconciles.
-/// Empty counts as none.
+/// The class an already-created staged PVC was written with, if any — one of the pins
+/// that keep class inference from re-running (and diverging) across a stage's
+/// reconciles. Empty counts as none.
 fn existing_staged_class(staged: &PersistentVolumeClaim) -> Option<String> {
     staged_class_of(staged).filter(|c| !c.is_empty())
+}
+
+/// The inferred staged class recorded on this run's VolumeSnapshot, if any — the pin
+/// for the window before the staged PVC exists (the whole readyToUse wait).
+fn annotated_staged_class(vs: &DynamicObject) -> Option<String> {
+    vs.annotations()
+        .get(STAGED_CLASS_ANNOTATION)
+        .filter(|c| !c.is_empty())
+        .cloned()
 }
 
 /// `staging` with `storageClassName` set to `class` — the inferred class then flows
@@ -755,15 +852,13 @@ pub async fn list_snapshot_classes(client: &kube::Client) -> Result<Option<Vec<C
     }
 }
 
-/// The CSI driver backing a PVC (see [`source_driver`]): its `StorageClass.provisioner`,
-/// else — for a statically-provisioned volume with no class, or a deleted class — the
-/// bound PV's `spec.csi.driver`. `None` when neither names a driver (hostPath / local /
-/// NFS volumes can't be CSI-snapshotted). The PV is only read when the class can't
-/// answer, so dynamically-provisioned sources cost no extra call.
-pub async fn source_provisioner(
+/// Read what [`source_storage`] needs: the source's StorageClass provisioner (when it
+/// names a class) and its bound PV (when bound). The PV is read for every bound source
+/// because its `spec.csi.driver` is authoritative.
+pub(crate) async fn read_source_storage(
     client: &kube::Client,
     source_pvc: &PersistentVolumeClaim,
-) -> Result<Option<String>> {
+) -> Result<SourceStorage> {
     let class_provisioner = match source_class_name(source_pvc) {
         Some(class) => {
             let api: Api<StorageClass> = Api::all(client.clone());
@@ -771,22 +866,80 @@ pub async fn source_provisioner(
         }
         None => None,
     };
-    if class_provisioner.as_deref().is_some_and(|p| !p.is_empty()) {
-        return Ok(class_provisioner);
-    }
-    let bound_pv = match source_pvc
+    let pv_name = source_pvc
         .spec
         .as_ref()
         .and_then(|s| s.volume_name.as_deref())
-        .filter(|v| !v.is_empty())
-    {
+        .filter(|v| !v.is_empty());
+    let bound_pv = match pv_name {
         Some(pv_name) => {
             let pv_api: Api<PersistentVolume> = Api::all(client.clone());
             pv_api.get_opt(pv_name).await?
         }
         None => None,
     };
-    Ok(source_driver(class_provisioner, bound_pv.as_ref()))
+    Ok(source_storage(
+        class_provisioner.as_deref(),
+        bound_pv.as_ref(),
+        pv_name.is_some(),
+    ))
+}
+
+/// Resolve the staged PVC's StorageClass per `plan`. `Ok(Ok(Some(spec)))` = build with
+/// this `spec.staging` (inferred class filled in); `Ok(Ok(None))` = build with
+/// `spec.staging` as configured; `Ok(Err(..))` = fail staging with this reason/message.
+///
+/// Inference happens ONCE per run: `resolve_staging` re-runs on every reconcile while
+/// the stage waits, and a staged PVC's `storageClassName` is immutable. So the choice is
+/// pinned — on the run's VolumeSnapshot (annotation, written with it) for the readyToUse
+/// wait, and on the staged PVC itself once it exists — and reused. Re-inferring could
+/// fail a stage already in flight (a new non-default class of the driver made the
+/// choice ambiguous) or pick a class the apply onto the existing PVC would be rejected
+/// for.
+#[allow(clippy::too_many_arguments)]
+async fn resolve_staged_class(
+    client: &kube::Client,
+    pvc_api: &Api<PersistentVolumeClaim>,
+    plan: StagedClassPlan<'_>,
+    staging: Option<&StagingSpec>,
+    ns: &str,
+    source_name: &str,
+    staged_pvc: &str,
+    vs_name: &str,
+) -> Result<std::result::Result<Option<StagingSpec>, (&'static str, String)>> {
+    let driver = match plan {
+        StagedClassPlan::AsConfigured => return Ok(Ok(None)),
+        StagedClassPlan::CloneNeedsSourceClass(driver) => {
+            return Ok(Err((
+                REASON_NO_STAGED_CLASS,
+                clone_needs_source_class_message(ns, source_name, driver),
+            )));
+        }
+        StagedClassPlan::Infer(driver) => driver,
+    };
+    let pinned = match pvc_api.get_opt(staged_pvc).await? {
+        Some(pvc) => existing_staged_class(&pvc),
+        None => None,
+    };
+    let pinned = match pinned {
+        Some(class) => Some(class),
+        None => volume_snapshot_api(client, ns)
+            .get_opt(vs_name)
+            .await?
+            .as_ref()
+            .and_then(annotated_staged_class),
+    };
+    let class = match pinned {
+        Some(class) => class,
+        None => {
+            let classes = list_storage_classes(client).await?;
+            match infer_staged_class(&classes, driver, ns, source_name) {
+                Ok(class) => class,
+                Err(failure) => return Ok(Err(failure)),
+            }
+        }
+    };
+    Ok(Ok(Some(with_staged_class(staging, class))))
 }
 
 /// List the cluster's `StorageClass`es as [`ClassInfo`] (`driver` = `provisioner`,
@@ -1109,19 +1262,11 @@ async fn effective_staged_class(
     if let Some(c) = staged_class_of(staged) {
         return Ok(Some(c));
     }
-    let sc_api: Api<StorageClass> = Api::all(client.clone());
-    let classes = sc_api.list(&ListParams::default()).await?;
-    Ok(classes
-        .items
+    Ok(list_storage_classes(client)
+        .await?
         .into_iter()
-        .find(|sc| {
-            sc.metadata
-                .annotations
-                .as_ref()
-                .and_then(|a| a.get("storageclass.kubernetes.io/is-default-class"))
-                .is_some_and(|v| v == "true")
-        })
-        .and_then(|sc| sc.metadata.name))
+        .find(|c| c.is_default)
+        .map(|c| c.name))
 }
 
 /// Gate `Ready` on the staged PVC actually binding when its StorageClass binds
@@ -1303,9 +1448,10 @@ pub async fn resolve_staging(
     );
     let staging_timeout_seconds = timeout.map(|d| d.as_secs() as i64).unwrap_or(0);
 
-    // Source provisioner (CSI driver): required for `Snapshot` class selection, and
-    // the reference for the staged-class preflight (both methods).
-    let provisioner = source_provisioner(client, &source_pvc).await?;
+    // Source CSI driver: required for `Snapshot` class selection, and the reference
+    // for the staged-class preflight (both methods).
+    let storage = read_source_storage(client, &source_pvc).await?;
+    let provisioner = storage.driver.clone();
 
     // Fail fast on a bad `spec.staging.storageClassName` — missing, or on a
     // different driver than the source — instead of letting the staged PVC sit
@@ -1325,46 +1471,36 @@ pub async fn resolve_staging(
         }
     }
 
-    // A statically-provisioned CSI source has no StorageClass to copy (#686). Pick one
-    // of its driver for the staged PVC up front — before any VolumeSnapshot exists —
+    // A statically-provisioned CSI source has no StorageClass that provisions its driver
+    // (#686). Pick one for the staged PVC up front — before any VolumeSnapshot exists —
     // or fail now with the fix, instead of a staged PVC that can never bind.
-    //
-    // Inference happens ONCE per run: this function re-runs on every reconcile while
-    // the stage waits, and a staged PVC's `storageClassName` is immutable. So once the
-    // staged PVC exists its class is pinned and reused — re-inferring could fail a
-    // stage that is already provisioning (a new, non-default class of the driver made
-    // the choice ambiguous) or pick a different class the apply would be rejected for.
-    let inferred_staging;
-    let staging = match (
-        staging.and_then(|s| s.storage_class_name.as_deref()),
-        source_class_name(&source_pvc),
-        provisioner.as_deref(),
-    ) {
-        (None, None, Some(driver)) => {
-            let pinned = pvc_api
-                .get_opt(&staged_pvc)
-                .await?
-                .as_ref()
-                .and_then(existing_staged_class);
-            let class = match pinned {
-                Some(class) => class,
-                None => {
-                    let classes = list_storage_classes(client).await?;
-                    match infer_staged_class(&classes, driver, ns, source_name) {
-                        Ok(class) => class,
-                        Err((reason, message)) => {
-                            return Ok(StagingOutcome::Failed { reason, message });
-                        }
-                    }
-                }
-            };
-            inferred_staging = with_staged_class(staging, class);
-            Some(&inferred_staging)
-        }
-        // An override is set, the source has its own class, or the source isn't CSI
-        // at all (handled below with `SourceNotCSIProvisioned`).
-        _ => staging,
+    let plan = staged_class_plan(
+        copy_method,
+        staging
+            .and_then(|s| s.storage_class_name.as_deref())
+            .is_some(),
+        &storage,
+    );
+    let inferred_staging = match resolve_staged_class(
+        client,
+        &pvc_api,
+        plan,
+        staging,
+        ns,
+        source_name,
+        &staged_pvc,
+        &vs_name,
+    )
+    .await?
+    {
+        Ok(inferred) => inferred,
+        Err((reason, message)) => return Ok(StagingOutcome::Failed { reason, message }),
     };
+    // Recorded on the VolumeSnapshot only when inferred (the pin for its readyToUse wait).
+    let inferred_class = inferred_staging
+        .as_ref()
+        .and_then(|s| s.storage_class_name.clone());
+    let staging = inferred_staging.as_ref().or(staging);
 
     // `groupBy: VolumeGroupSnapshot`: the capture is ONE shared object across
     // every member of the expansion, so the create/wait/pick-my-member half is
@@ -1431,9 +1567,14 @@ pub async fn resolve_staging(
     if copy_method != CopyMethod::Clone {
         // Provisioner (CSI driver) of the source — required to match a class.
         let Some(provisioner) = provisioner else {
+            let message = if storage.bound {
+                source_not_csi_message(ns, source_name)
+            } else {
+                source_unbound_message(ns, source_name)
+            };
             return Ok(StagingOutcome::Failed {
                 reason: REASON_SOURCE_NOT_CSI,
-                message: source_not_csi_message(ns, source_name),
+                message,
             });
         };
         // Preflight the snapshot stack + pick the class.
@@ -1474,7 +1615,14 @@ pub async fn resolve_staging(
         };
 
         // Create (SSA, idempotent) the VolumeSnapshot and wait for readyToUse.
-        let vs = build_volume_snapshot(&vs_name, ns, source_name, Some(&class), owner.clone());
+        let vs = build_volume_snapshot(
+            &vs_name,
+            ns,
+            source_name,
+            Some(&class),
+            inferred_class.as_deref(),
+            owner.clone(),
+        );
         apply(&volume_snapshot_api(client, ns), &vs_name, &vs).await?;
 
         // Wait for readyToUse, bounded by the staging deadline (issue #198): a
@@ -2152,30 +2300,113 @@ mod tests {
     }
 
     #[test]
-    fn source_driver_falls_back_to_the_bound_pv_csi_driver() {
+    fn source_storage_reads_the_driver_from_the_bound_pv() {
         // The reported case: no StorageClass, but a CSI-backed static PV.
         let pv = pv_with_csi(Some("zfs.csi.openebs.io"));
-        assert_eq!(
-            source_driver(None, Some(&pv)).as_deref(),
-            Some("zfs.csi.openebs.io")
+        let st = source_storage(None, Some(&pv), true);
+        assert_eq!(st.driver.as_deref(), Some("zfs.csi.openebs.io"));
+        assert!(!st.class_provisions_driver);
+        // A placeholder class (`no-provisioner`) must not shadow the PV's real driver.
+        let st = source_storage(Some("kubernetes.io/no-provisioner"), Some(&pv), true);
+        assert_eq!(st.driver.as_deref(), Some("zfs.csi.openebs.io"));
+        assert!(!st.class_provisions_driver);
+        // A dynamically-provisioned volume: class and PV agree, so the class is copied.
+        let st = source_storage(Some("zfs.csi.openebs.io"), Some(&pv), true);
+        assert_eq!(st.driver.as_deref(), Some("zfs.csi.openebs.io"));
+        assert!(st.class_provisions_driver);
+    }
+
+    #[test]
+    fn source_storage_falls_back_to_the_class_for_non_csi_pvs() {
+        // In-tree (non-CSI) PV keeps the old class-provisioner behavior.
+        let st = source_storage(
+            Some("kubernetes.io/aws-ebs"),
+            Some(&pv_with_csi(None)),
+            true,
         );
-        // A known class provisioner still wins (dynamic volumes unchanged).
+        assert_eq!(st.driver.as_deref(), Some("kubernetes.io/aws-ebs"));
+        assert!(st.class_provisions_driver);
+        // Neither names a driver.
+        let st = source_storage(None, Some(&pv_with_csi(None)), true);
+        assert_eq!(st.driver, None);
+        assert!(st.bound);
         assert_eq!(
-            source_driver(Some("rbd.csi.ceph.com".into()), Some(&pv)).as_deref(),
-            Some("rbd.csi.ceph.com")
+            source_storage(None, Some(&pv_with_csi(Some(""))), true).driver,
+            None
         );
-        // An empty provisioner is not an answer.
+        assert_eq!(source_storage(Some(""), None, true).driver, None);
+        // Unbound.
+        let st = source_storage(None, None, false);
+        assert_eq!(st.driver, None);
+        assert!(!st.bound);
+    }
+
+    fn storage(driver: Option<&str>, class_provisions_driver: bool) -> SourceStorage {
+        SourceStorage {
+            driver: driver.map(str::to_string),
+            class_provisions_driver,
+            bound: true,
+        }
+    }
+
+    #[test]
+    fn staged_class_plan_infers_only_when_the_source_class_cannot_serve() {
+        let zfs = "zfs.csi.openebs.io";
+        let static_src = storage(Some(zfs), false);
         assert_eq!(
-            source_driver(Some(String::new()), Some(&pv)).as_deref(),
-            Some("zfs.csi.openebs.io")
+            staged_class_plan(CopyMethod::Snapshot, false, &static_src),
+            StagedClassPlan::Infer(zfs)
+        );
+        // Clone can't change class, so it fails fast instead of inferring.
+        assert_eq!(
+            staged_class_plan(CopyMethod::Clone, false, &static_src),
+            StagedClassPlan::CloneNeedsSourceClass(zfs)
+        );
+        // An explicit override always wins (its own preflight already ran).
+        for m in [CopyMethod::Snapshot, CopyMethod::Clone] {
+            assert_eq!(
+                staged_class_plan(m, true, &static_src),
+                StagedClassPlan::AsConfigured
+            );
+        }
+        // The source's class provisions the driver ⇒ copy it, unchanged behavior.
+        assert_eq!(
+            staged_class_plan(CopyMethod::Snapshot, false, &storage(Some(zfs), true)),
+            StagedClassPlan::AsConfigured
+        );
+        // No CSI driver ⇒ reported separately as SourceNotCSIProvisioned.
+        assert_eq!(
+            staged_class_plan(CopyMethod::Snapshot, false, &storage(None, false)),
+            StagedClassPlan::AsConfigured
         );
     }
 
     #[test]
-    fn source_driver_is_none_for_non_csi_or_unbound_sources() {
-        assert_eq!(source_driver(None, Some(&pv_with_csi(None))), None);
-        assert_eq!(source_driver(None, Some(&pv_with_csi(Some("")))), None);
-        assert_eq!(source_driver(None, None), None);
+    fn the_inferred_class_is_pinned_on_the_volume_snapshot() {
+        let owner = k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference::default();
+        let vs = build_volume_snapshot(
+            "p-snap",
+            "media",
+            "photos",
+            Some("zfs-snap"),
+            Some("zfs"),
+            owner.clone(),
+        );
+        assert_eq!(annotated_staged_class(&vs).as_deref(), Some("zfs"));
+        let vs = build_volume_snapshot("p-snap", "media", "photos", Some("zfs-snap"), None, owner);
+        assert_eq!(vs.metadata.annotations, None);
+        assert_eq!(annotated_staged_class(&vs), None);
+    }
+
+    #[test]
+    fn unbound_and_clone_messages_name_the_fix() {
+        let msg = source_unbound_message("media", "photos");
+        assert!(msg.contains("media/photos"));
+        assert!(msg.contains("not bound"));
+        assert!(!msg.contains("copyMethod: Direct"));
+        let msg = clone_needs_source_class_message("media", "photos", "zfs.csi.openebs.io");
+        assert!(msg.contains("zfs.csi.openebs.io"));
+        assert!(msg.contains("spec.copyMethod: Snapshot"));
     }
 
     #[test]
@@ -2457,12 +2688,12 @@ mod tests {
     #[test]
     fn volume_snapshot_has_source_and_class() {
         let owner = k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference::default();
-        let vs = build_volume_snapshot("db-snap", "ns", "db", Some("csi-class"), owner);
+        let vs = build_volume_snapshot("db-snap", "ns", "db", Some("csi-class"), None, owner);
         assert_eq!(vs.data["spec"]["source"]["persistentVolumeClaimName"], "db");
         assert_eq!(vs.data["spec"]["volumeSnapshotClassName"], "csi-class");
         // Omitting the class leaves it unset (controller auto-selects the default).
         let owner = k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference::default();
-        let vs2 = build_volume_snapshot("db-snap", "ns", "db", None, owner);
+        let vs2 = build_volume_snapshot("db-snap", "ns", "db", None, None, owner);
         assert!(vs2.data["spec"].get("volumeSnapshotClassName").is_none());
     }
 

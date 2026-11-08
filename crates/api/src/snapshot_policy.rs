@@ -699,10 +699,13 @@ pub struct StagingSpec {
     /// StorageClass for the **staged PVC** — the temporary PVC restored from the
     /// CSI `VolumeSnapshot` (`copyMethod: Snapshot`) or cloned from the source
     /// (`copyMethod: Clone`). Absent ⇒ the staged PVC copies the source PVC's
-    /// class; a statically-provisioned source with no class gets the StorageClass
-    /// of its CSI driver (read from the bound PV) — the only one, else the cluster
-    /// default among several (set this field when neither exists). Must belong to
-    /// the **same CSI driver** as the source (staging fails fast on a mismatch). Flagship use: a rook-ceph CephFS class with
+    /// class. A statically-provisioned source whose class can't provision its CSI
+    /// driver (no class, a class with no StorageClass object, or a
+    /// `kubernetes.io/no-provisioner` placeholder) instead gets a StorageClass of
+    /// the driver named in its bound PV — the only one, else the cluster default
+    /// among several (set this field when neither exists; `copyMethod: Clone`
+    /// can't stage such a source). Must belong to the **same CSI driver** as the
+    /// source (staging fails fast on a mismatch). Flagship use: a rook-ceph CephFS class with
     /// `backingSnapshot: "true"`, which mounts the snapshot shallowly
     /// (metadata-only, near-instant, read-only) instead of running a full
     /// subvolume clone that can take many minutes on small-file-heavy volumes.
