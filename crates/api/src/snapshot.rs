@@ -657,7 +657,8 @@ pub struct StagedSources {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ready: Option<bool>,
     /// StorageClass of the staged PVC — `spec.staging.storageClassName` when set,
-    /// else the source PVC's class. Pinned for observability (e.g. confirming a
+    /// else the source PVC's class, else (a statically-provisioned source) the class
+    /// Kopiur picked for the source's CSI driver. Pinned for observability (e.g. confirming a
     /// CephFS shallow-clone class actually took effect).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_class_name: Option<String>,
