@@ -45,11 +45,19 @@ use crate::error::{Error, Result};
 pub const SNAPSHOT_GROUP: &str = "snapshot.storage.k8s.io";
 /// The well-known annotation marking the default `VolumeSnapshotClass` for a driver.
 pub const DEFAULT_CLASS_ANNOTATION: &str = "snapshot.storage.kubernetes.io/is-default-class";
-/// Records, on a run's `VolumeSnapshot`, the StorageClass Kopiur inferred for the
+/// Records, on the run's own `Snapshot` CR, the StorageClass Kopiur inferred for the
 /// staged PVC (statically-provisioned sources, #686), so every later reconcile of the
 /// run reuses that choice instead of re-inferring from a StorageClass set that may
-/// have changed mid-stage.
+/// have changed mid-stage. On the CR because it is the only per-run object that
+/// exists before the capture on EVERY path — a `groupBy: VolumeGroupSnapshot` member
+/// owns nothing else until its staged PVC.
 pub const STAGED_CLASS_ANNOTATION: &str = "kopiur.home-operations.com/staged-storage-class";
+/// Marks a staged PVC whose StorageClass Kopiur inferred (rather than the user or the
+/// source choosing it), so a bind timeout can say so and point at the override —
+/// a class of the right driver can still be unable to restore the volume (e.g. a
+/// different storage pool), and only the user can pick the right one.
+pub const STAGED_CLASS_INFERRED_ANNOTATION: &str =
+    "kopiur.home-operations.com/staged-storage-class-inferred";
 /// The annotation marking the cluster's default `StorageClass`.
 const DEFAULT_STORAGE_CLASS_ANNOTATION: &str = "storageclass.kubernetes.io/is-default-class";
 /// The legacy beta spelling of [`DEFAULT_STORAGE_CLASS_ANNOTATION`], still honored by
@@ -460,7 +468,6 @@ pub fn build_volume_snapshot(
     ns: &str,
     source_claim: &str,
     class: Option<&str>,
-    staged_class: Option<&str>,
     owner: k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference,
 ) -> DynamicObject {
     let mut spec = serde_json::json!({
@@ -477,12 +484,6 @@ pub fn build_volume_snapshot(
         "kopiur.home-operations.com/component",
         "staged-source-snapshot",
     )]));
-    if let Some(staged_class) = staged_class {
-        obj.metadata.annotations = Some(BTreeMap::from([(
-            STAGED_CLASS_ANNOTATION.to_string(),
-            staged_class.to_string(),
-        )]));
-    }
     obj
 }
 
@@ -791,20 +792,82 @@ pub(crate) fn infer_staged_class(
     }
 }
 
-/// The class an already-created staged PVC was written with, if any — one of the pins
-/// that keep class inference from re-running (and diverging) across a stage's
-/// reconciles. Empty counts as none.
-fn existing_staged_class(staged: &PersistentVolumeClaim) -> Option<String> {
-    staged_class_of(staged).filter(|c| !c.is_empty())
+/// A staged class this run already committed to: the class an existing staged PVC was
+/// written with (immutable from then on), or the one recorded on the Snapshot CR when
+/// it was inferred. `inferred` carries whether Kopiur picked it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StagedClassPin {
+    pub class: String,
+    pub inferred: bool,
 }
 
-/// The inferred staged class recorded on this run's VolumeSnapshot, if any — the pin
-/// for the window before the staged PVC exists (the whole readyToUse wait).
-fn annotated_staged_class(vs: &DynamicObject) -> Option<String> {
-    vs.annotations()
-        .get(STAGED_CLASS_ANNOTATION)
+/// The pin an existing staged PVC holds, if it was written with a class. Empty counts
+/// as none.
+fn staged_pvc_pin(staged: &PersistentVolumeClaim) -> Option<StagedClassPin> {
+    staged_class_of(staged)
         .filter(|c| !c.is_empty())
-        .cloned()
+        .map(|class| StagedClassPin {
+            class,
+            inferred: is_marked_inferred(&staged.metadata),
+        })
+}
+
+/// The inferred class recorded on the run's Snapshot CR, if any.
+fn snapshot_cr_pin(meta: &ObjectMeta) -> Option<StagedClassPin> {
+    meta.annotations
+        .as_ref()
+        .and_then(|a| a.get(STAGED_CLASS_ANNOTATION))
+        .filter(|c| !c.is_empty())
+        .map(|class| StagedClassPin {
+            class: class.clone(),
+            inferred: true,
+        })
+}
+
+fn is_marked_inferred(meta: &ObjectMeta) -> bool {
+    meta.annotations
+        .as_ref()
+        .and_then(|a| a.get(STAGED_CLASS_INFERRED_ANNOTATION))
+        .is_some_and(|v| v == "true")
+}
+
+/// What to do about the staged PVC's class this reconcile. **Pure.** A pin always wins
+/// over the plan: `resolve_staging` re-runs on every reconcile while the stage waits,
+/// and the StorageClass set (or the source's class) may change in between. Re-planning
+/// could fail a stage already in flight, or pick a class the apply onto the existing,
+/// immutable staged PVC would be rejected for (stranding the run). The staged PVC is
+/// the truth once it exists; the Snapshot CR covers the capture wait before it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StagedClassChoice<'a> {
+    Pinned(StagedClassPin),
+    Plan(StagedClassPlan<'a>),
+}
+
+pub(crate) fn choose_staged_class<'a>(
+    staged_pvc_pin: Option<StagedClassPin>,
+    snapshot_cr_pin: Option<StagedClassPin>,
+    plan: StagedClassPlan<'a>,
+) -> StagedClassChoice<'a> {
+    match staged_pvc_pin.or(snapshot_cr_pin) {
+        Some(pin) => StagedClassChoice::Pinned(pin),
+        None => StagedClassChoice::Plan(plan),
+    }
+}
+
+/// Mark a built staged PVC as carrying an inferred class (see
+/// [`STAGED_CLASS_INFERRED_ANNOTATION`]). Applied on every build of the run so the
+/// server-side apply never drops it.
+fn mark_staged_class_inferred(staged: &mut PersistentVolumeClaim, inferred: bool) {
+    if inferred {
+        staged
+            .metadata
+            .annotations
+            .get_or_insert_with(BTreeMap::new)
+            .insert(
+                STAGED_CLASS_INFERRED_ANNOTATION.to_string(),
+                "true".to_string(),
+            );
+    }
 }
 
 /// `staging` with `storageClassName` set to `class` — the inferred class then flows
@@ -885,17 +948,19 @@ pub(crate) async fn read_source_storage(
     ))
 }
 
-/// Resolve the staged PVC's StorageClass per `plan`. `Ok(Ok(Some(spec)))` = build with
-/// this `spec.staging` (inferred class filled in); `Ok(Ok(None))` = build with
-/// `spec.staging` as configured; `Ok(Err(..))` = fail staging with this reason/message.
-///
-/// Inference happens ONCE per run: `resolve_staging` re-runs on every reconcile while
-/// the stage waits, and a staged PVC's `storageClassName` is immutable. So the choice is
-/// pinned — on the run's VolumeSnapshot (annotation, written with it) for the readyToUse
-/// wait, and on the staged PVC itself once it exists — and reused. Re-inferring could
-/// fail a stage already in flight (a new non-default class of the driver made the
-/// choice ambiguous) or pick a class the apply onto the existing PVC would be rejected
-/// for.
+/// The staged class this run resolved: `staging` = the `spec.staging` to build with
+/// (`None` = as configured), `inferred` = Kopiur picked the class.
+#[derive(Debug, Clone, Default)]
+struct ResolvedStagedClass {
+    staging: Option<StagingSpec>,
+    inferred: bool,
+}
+
+/// Resolve the staged PVC's StorageClass: a pin from earlier in the run wins (see
+/// [`choose_staged_class`]), else `plan`. A freshly inferred class is recorded on the
+/// Snapshot CR BEFORE anything is captured, so it pins the whole run. Pins are read
+/// with direct GETs, never the informer cache — a stale cache would re-infer and could
+/// overwrite the pin. `Ok(Err(..))` = fail staging with this reason/message.
 #[allow(clippy::too_many_arguments)]
 async fn resolve_staged_class(
     client: &kube::Client,
@@ -905,41 +970,56 @@ async fn resolve_staged_class(
     ns: &str,
     source_name: &str,
     staged_pvc: &str,
-    vs_name: &str,
-) -> Result<std::result::Result<Option<StagingSpec>, (&'static str, String)>> {
-    let driver = match plan {
-        StagedClassPlan::AsConfigured => return Ok(Ok(None)),
-        StagedClassPlan::CloneNeedsSourceClass(driver) => {
+    snapshot_cr: &str,
+) -> Result<std::result::Result<ResolvedStagedClass, (&'static str, String)>> {
+    let snap_api: Api<kopiur_api::Snapshot> = Api::namespaced(client.clone(), ns);
+    let staged_pin = match pvc_api.get_opt(staged_pvc).await? {
+        Some(pvc) => staged_pvc_pin(&pvc),
+        None => None,
+    };
+    let cr_pin = match staged_pin {
+        Some(_) => None,
+        None => snap_api
+            .get_opt(snapshot_cr)
+            .await?
+            .and_then(|cr| snapshot_cr_pin(&cr.metadata)),
+    };
+    let driver = match choose_staged_class(staged_pin, cr_pin, plan) {
+        StagedClassChoice::Pinned(pin) => {
+            return Ok(Ok(ResolvedStagedClass {
+                staging: Some(with_staged_class(staging, pin.class)),
+                inferred: pin.inferred,
+            }));
+        }
+        StagedClassChoice::Plan(StagedClassPlan::AsConfigured) => {
+            return Ok(Ok(ResolvedStagedClass::default()));
+        }
+        StagedClassChoice::Plan(StagedClassPlan::CloneNeedsSourceClass(driver)) => {
             return Ok(Err((
                 REASON_NO_STAGED_CLASS,
                 clone_needs_source_class_message(ns, source_name, driver),
             )));
         }
-        StagedClassPlan::Infer(driver) => driver,
+        StagedClassChoice::Plan(StagedClassPlan::Infer(driver)) => driver,
     };
-    let pinned = match pvc_api.get_opt(staged_pvc).await? {
-        Some(pvc) => existing_staged_class(&pvc),
-        None => None,
+    let classes = list_storage_classes(client).await?;
+    let class = match infer_staged_class(&classes, driver, ns, source_name) {
+        Ok(class) => class,
+        Err(failure) => return Ok(Err(failure)),
     };
-    let pinned = match pinned {
-        Some(class) => Some(class),
-        None => volume_snapshot_api(client, ns)
-            .get_opt(vs_name)
-            .await?
-            .as_ref()
-            .and_then(annotated_staged_class),
-    };
-    let class = match pinned {
-        Some(class) => class,
-        None => {
-            let classes = list_storage_classes(client).await?;
-            match infer_staged_class(&classes, driver, ns, source_name) {
-                Ok(class) => class,
-                Err(failure) => return Ok(Err(failure)),
-            }
-        }
-    };
-    Ok(Ok(Some(with_staged_class(staging, class))))
+    snap_api
+        .patch(
+            snapshot_cr,
+            &PatchParams::default(),
+            &Patch::Merge(serde_json::json!({
+                "metadata": { "annotations": { STAGED_CLASS_ANNOTATION: class } }
+            })),
+        )
+        .await?;
+    Ok(Ok(ResolvedStagedClass {
+        staging: Some(with_staged_class(staging, class)),
+        inferred: true,
+    }))
 }
 
 /// List the cluster's `StorageClass`es as [`ClassInfo`] (`driver` = `provisioner`,
@@ -1149,6 +1229,9 @@ pub(crate) struct StagedPvcObservation {
     /// `metadata.creationTimestamp` — the bind-deadline anchor. Stable across the
     /// idempotent SSA re-applies each reconcile performs.
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Whether Kopiur inferred the PVC's StorageClass
+    /// ([`STAGED_CLASS_INFERRED_ANNOTATION`]) — a bind timeout then names the override.
+    pub class_inferred: bool,
 }
 
 /// Extract a [`StagedPvcObservation`] from a read PVC (pure — shared by the
@@ -1161,6 +1244,7 @@ pub(crate) fn staged_pvc_observation(pvc: &PersistentVolumeClaim) -> StagedPvcOb
             .creation_timestamp
             .as_ref()
             .and_then(|t| chrono::DateTime::<chrono::Utc>::from_timestamp(t.0.as_second(), 0)),
+        class_inferred: is_marked_inferred(&pvc.metadata),
     }
 }
 
@@ -1238,14 +1322,23 @@ pub(crate) fn pvc_bind_outcome(
         return PvcBindWait::Waiting(msg);
     }
     let waited = fmt_go_duration(timeout.expect("expired implies a timeout"));
+    // An inferred class matched the driver but may still be wrong for this volume
+    // (e.g. another storage pool) — only the user can name the right one.
+    let inferred_note = if obs.class_inferred {
+        " Kopiur picked this StorageClass because the source has none that provisions its \
+         driver; if it can't restore this volume (e.g. a different storage pool), set \
+         spec.staging.storageClassName to one that can."
+    } else {
+        ""
+    };
     PvcBindWait::Failed {
         reason: REASON_STAGED_PVC_BIND_TIMEOUT,
         message: format!(
             "staged PVC `{ns}/{pvc_name}` did not bind within {waited} (spec.staging.timeout, \
              default 10m); the copy is still provisioning or {} cannot provision it. Fix: check \
              `kubectl describe pvc -n {ns} {pvc_name}`, raise spec.staging.timeout, or on CephFS \
-             set spec.staging.storageClassName to a `backingSnapshot: \"true\"` class. The next \
-             scheduled run (or a new Snapshot) retries",
+             set spec.staging.storageClassName to a `backingSnapshot: \"true\"` class.\
+             {inferred_note} The next scheduled run (or a new Snapshot) retries",
             bind_class_phrase(class)
         ),
     }
@@ -1481,7 +1574,7 @@ pub async fn resolve_staging(
             .is_some(),
         &storage,
     );
-    let inferred_staging = match resolve_staged_class(
+    let resolved = match resolve_staged_class(
         client,
         &pvc_api,
         plan,
@@ -1489,18 +1582,15 @@ pub async fn resolve_staging(
         ns,
         source_name,
         &staged_pvc,
-        &vs_name,
+        snapshot_cr,
     )
     .await?
     {
-        Ok(inferred) => inferred,
+        Ok(resolved) => resolved,
         Err((reason, message)) => return Ok(StagingOutcome::Failed { reason, message }),
     };
-    // Recorded on the VolumeSnapshot only when inferred (the pin for its readyToUse wait).
-    let inferred_class = inferred_staging
-        .as_ref()
-        .and_then(|s| s.storage_class_name.clone());
-    let staging = inferred_staging.as_ref().or(staging);
+    let class_inferred = resolved.inferred;
+    let staging = resolved.staging.as_ref().or(staging);
 
     // `groupBy: VolumeGroupSnapshot`: the capture is ONE shared object across
     // every member of the expansion, so the create/wait/pick-my-member half is
@@ -1528,7 +1618,7 @@ pub async fn resolve_staging(
             super::group_staging::GroupStage::Ready { member } => {
                 let data_source =
                     data_source_for(copy_method, source_name, &member.volume_snapshot_name);
-                let staged = build_staged_pvc(
+                let mut staged = build_staged_pvc(
                     &staged_pvc,
                     ns,
                     &source_pvc,
@@ -1537,6 +1627,7 @@ pub async fn resolve_staging(
                     staging,
                     owner.clone(),
                 );
+                mark_staged_class_inferred(&mut staged, class_inferred);
                 apply(&pvc_api, &staged_pvc, &staged).await?;
                 if let Some(outcome) =
                     staged_pvc_bind_gate(client, &pvc_api, ns, &staged, &staged_pvc, timeout)
@@ -1615,14 +1706,7 @@ pub async fn resolve_staging(
         };
 
         // Create (SSA, idempotent) the VolumeSnapshot and wait for readyToUse.
-        let vs = build_volume_snapshot(
-            &vs_name,
-            ns,
-            source_name,
-            Some(&class),
-            inferred_class.as_deref(),
-            owner.clone(),
-        );
+        let vs = build_volume_snapshot(&vs_name, ns, source_name, Some(&class), owner.clone());
         apply(&volume_snapshot_api(client, ns), &vs_name, &vs).await?;
 
         // Wait for readyToUse, bounded by the staging deadline (issue #198): a
@@ -1655,7 +1739,7 @@ pub async fn resolve_staging(
         };
 
         let data_source = data_source_for(copy_method, source_name, &vs_name);
-        let staged = build_staged_pvc(
+        let mut staged = build_staged_pvc(
             &staged_pvc,
             ns,
             &source_pvc,
@@ -1664,6 +1748,7 @@ pub async fn resolve_staging(
             staging,
             owner.clone(),
         );
+        mark_staged_class_inferred(&mut staged, class_inferred);
         apply(&pvc_api, &staged_pvc, &staged).await?;
         // Gate on the bind for Immediate classes: minting the Job while the CSI
         // restore is in flight is exactly the wedge-then-delete-the-VS race.
@@ -1684,7 +1769,7 @@ pub async fn resolve_staging(
 
     // Clone: stage straight from the source PVC (CSI volume clone). No VolumeSnapshot.
     let data_source = data_source_for(CopyMethod::Clone, source_name, &vs_name);
-    let staged = build_staged_pvc(
+    let mut staged = build_staged_pvc(
         &staged_pvc,
         ns,
         &source_pvc,
@@ -1693,6 +1778,7 @@ pub async fn resolve_staging(
         staging,
         owner.clone(),
     );
+    mark_staged_class_inferred(&mut staged, class_inferred);
     apply(&pvc_api, &staged_pvc, &staged).await?;
     // Same bind gate as the Snapshot tail — a CSI full clone is the SLOWEST staging
     // method there is, so skipping the gate here would reproduce the original bug
@@ -2381,21 +2467,66 @@ mod tests {
         );
     }
 
+    fn pin(class: &str, inferred: bool) -> StagedClassPin {
+        StagedClassPin {
+            class: class.into(),
+            inferred,
+        }
+    }
+
     #[test]
-    fn the_inferred_class_is_pinned_on_the_volume_snapshot() {
-        let owner = k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference::default();
-        let vs = build_volume_snapshot(
-            "p-snap",
-            "media",
-            "photos",
-            Some("zfs-snap"),
-            Some("zfs"),
-            owner.clone(),
-        );
-        assert_eq!(annotated_staged_class(&vs).as_deref(), Some("zfs"));
-        let vs = build_volume_snapshot("p-snap", "media", "photos", Some("zfs-snap"), None, owner);
-        assert_eq!(vs.metadata.annotations, None);
-        assert_eq!(annotated_staged_class(&vs), None);
+    fn a_pin_wins_over_every_plan() {
+        let zfs = "zfs.csi.openebs.io";
+        let plans = [
+            StagedClassPlan::AsConfigured,
+            StagedClassPlan::Infer(zfs),
+            StagedClassPlan::CloneNeedsSourceClass(zfs),
+        ];
+        for plan in plans {
+            // The staged PVC (immutable class) beats the Snapshot CR pin — e.g. the
+            // source's missing class was recreated mid-run (AsConfigured now).
+            assert_eq!(
+                choose_staged_class(Some(pin("a", true)), Some(pin("b", true)), plan.clone()),
+                StagedClassChoice::Pinned(pin("a", true))
+            );
+            // Before the staged PVC exists, the Snapshot CR pin covers the capture wait.
+            assert_eq!(
+                choose_staged_class(None, Some(pin("b", true)), plan.clone()),
+                StagedClassChoice::Pinned(pin("b", true))
+            );
+            assert_eq!(
+                choose_staged_class(None, None, plan.clone()),
+                StagedClassChoice::Plan(plan)
+            );
+        }
+    }
+
+    #[test]
+    fn pins_are_read_from_the_staged_pvc_and_the_snapshot_cr() {
+        let mut staged = override_test_source();
+        assert_eq!(staged_pvc_pin(&staged), Some(pin("fast", false)));
+        mark_staged_class_inferred(&mut staged, true);
+        assert_eq!(staged_pvc_pin(&staged), Some(pin("fast", true)));
+        staged.spec.as_mut().unwrap().storage_class_name = Some(String::new());
+        assert_eq!(staged_pvc_pin(&staged), None);
+
+        let mut meta = ObjectMeta::default();
+        assert_eq!(snapshot_cr_pin(&meta), None);
+        meta.annotations = Some(BTreeMap::from([(
+            STAGED_CLASS_ANNOTATION.to_string(),
+            "zfs".to_string(),
+        )]));
+        assert_eq!(snapshot_cr_pin(&meta), Some(pin("zfs", true)));
+    }
+
+    #[test]
+    fn marking_is_a_no_op_for_a_class_kopiur_did_not_pick() {
+        let mut staged = override_test_source();
+        mark_staged_class_inferred(&mut staged, false);
+        assert!(!is_marked_inferred(&staged.metadata));
+        assert!(!staged_pvc_observation(&staged).class_inferred);
+        mark_staged_class_inferred(&mut staged, true);
+        assert!(staged_pvc_observation(&staged).class_inferred);
     }
 
     #[test]
@@ -2462,17 +2593,6 @@ mod tests {
         assert_eq!(reason, REASON_NO_STAGED_CLASS);
         assert!(msg.contains("zfs-a, zfs-b"));
         assert!(msg.contains("spec.staging.storageClassName"));
-    }
-
-    #[test]
-    fn an_existing_staged_pvc_pins_its_class() {
-        let mut staged = override_test_source();
-        assert_eq!(existing_staged_class(&staged).as_deref(), Some("fast"));
-        // Not yet written with a class (or blank) ⇒ no pin; inference runs.
-        staged.spec.as_mut().unwrap().storage_class_name = Some(String::new());
-        assert_eq!(existing_staged_class(&staged), None);
-        staged.spec.as_mut().unwrap().storage_class_name = None;
-        assert_eq!(existing_staged_class(&staged), None);
     }
 
     #[test]
@@ -2688,12 +2808,12 @@ mod tests {
     #[test]
     fn volume_snapshot_has_source_and_class() {
         let owner = k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference::default();
-        let vs = build_volume_snapshot("db-snap", "ns", "db", Some("csi-class"), None, owner);
+        let vs = build_volume_snapshot("db-snap", "ns", "db", Some("csi-class"), owner);
         assert_eq!(vs.data["spec"]["source"]["persistentVolumeClaimName"], "db");
         assert_eq!(vs.data["spec"]["volumeSnapshotClassName"], "csi-class");
         // Omitting the class leaves it unset (controller auto-selects the default).
         let owner = k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference::default();
-        let vs2 = build_volume_snapshot("db-snap", "ns", "db", None, None, owner);
+        let vs2 = build_volume_snapshot("db-snap", "ns", "db", None, owner);
         assert!(vs2.data["spec"].get("volumeSnapshotClassName").is_none());
     }
 
@@ -2718,7 +2838,27 @@ mod tests {
         StagedPvcObservation {
             phase: phase.map(str::to_string),
             created_at: age.map(|a| t0() - chrono::Duration::from_std(a).unwrap()),
+            class_inferred: false,
         }
+    }
+
+    #[test]
+    fn bind_timeout_names_the_override_only_for_an_inferred_class() {
+        let mut o = pvc_obs(Some("Pending"), Some(std::time::Duration::from_secs(600)));
+        let PvcBindWait::Failed { message, .. } = bind_decide(&o, TEN_MIN) else {
+            panic!("expected Failed");
+        };
+        assert!(!message.contains("Kopiur picked"), "{message}");
+        o.class_inferred = true;
+        let PvcBindWait::Failed { message, .. } = bind_decide(&o, TEN_MIN) else {
+            panic!("expected Failed");
+        };
+        assert!(
+            message.contains("Kopiur picked this StorageClass"),
+            "{message}"
+        );
+        assert!(message.contains("different storage pool"), "{message}");
+        assert!(message.ends_with("retries"), "{message}");
     }
 
     fn bind_decide(o: &StagedPvcObservation, timeout: Option<std::time::Duration>) -> PvcBindWait {
