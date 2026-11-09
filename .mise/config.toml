@@ -61,7 +61,7 @@ kopia = "v0.23.1"
 "aqua:nextest-rs/nextest/cargo-nextest" = "0.9.140"
 helm-docs = "1.14.2"
 "aqua:dadav/helm-schema" = "0.24.0"
-yq = "4.54.1"
+yq = "4.54.2"
 # `promtool` (the Prometheus rule/query test runner) ships inside the
 # `prometheus/prometheus` aqua package; mise's `promtool` short-name maps to it
 # (`mise registry promtool` → aqua:prometheus/prometheus) and exposes the
