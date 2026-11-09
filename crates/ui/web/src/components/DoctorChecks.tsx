@@ -125,18 +125,30 @@ function doctorCell(
       return <HealthBadge health={lamp.key} label={lamp.word} />;
     }
     case "check":
+      // One line, id first, the way the check reads in `?checks=` and the
+      // CLI's `-o json`: `recent-failures: no recent failed snapshots/restores`.
+      // Stacked on two lines the id read as a second, unexplained finding
+      // (#695).
       return (
-        <div className="doctor-checks__check">
-          <span className="doctor-checks__title">{check.title}</span>
+        <p className="doctor-checks__check">
           <span className="mono doctor-checks__id">{check.check}</span>
-        </div>
+          <span className="doctor-checks__sep" aria-hidden="true">
+            :{" "}
+          </span>
+          <span className="doctor-checks__title">{check.title}</span>
+        </p>
       );
     case "scope":
       return scopeCell(check.scope, namespace);
     case "finding":
       return (
         <div className="doctor-checks__finding">
-          {check.what !== undefined && check.what !== null && check.what.length > 0 ? (
+          {/* A pass has nothing to say: whatever text rode along, a passing
+              row shows the empty cell, so an ok check never reads as a finding. */}
+          {check.outcome !== "Pass" &&
+          check.what !== undefined &&
+          check.what !== null &&
+          check.what.length > 0 ? (
             <Finding what={check.what} why={check.why} fix={check.fix} />
           ) : (
             EMPTY_CELL
