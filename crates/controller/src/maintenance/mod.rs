@@ -100,6 +100,31 @@ async fn record_maintenance_status_metrics(maint: &Maintenance, ctx: &Context, o
     }
 }
 
+/// **Pure.** What holds a maintenance run behind its repository's
+/// availability (G7, #413, #689): `None` = proceed; `Some((reason, message))`
+/// = write `LeaseOwned=False` with that reason and wait. Exhaustive over
+/// [`io::RepositoryAvailability`], so a suspended repository is never
+/// maintained and never reported as merely unhealthy.
+fn maintenance_hold(
+    availability: io::RepositoryAvailability,
+    repo_ref: &kopiur_api::common::RepositoryRef,
+    namespace: &str,
+) -> Option<(&'static str, String)> {
+    match availability {
+        io::RepositoryAvailability::Available => None,
+        io::RepositoryAvailability::NotReady => Some((
+            crate::consts::WAITING_FOR_REPOSITORY_REASON,
+            "waiting for the repository: it is not bootstrapped, unreachable, gone, or failed; \
+             maintenance runs once it is healthy"
+                .to_string(),
+        )),
+        io::RepositoryAvailability::Suspended => Some((
+            crate::consts::REPOSITORY_SUSPENDED_REASON,
+            io::repository_suspended_message(repo_ref, namespace),
+        )),
+    }
+}
+
 async fn reconcile_inner(maint: &Maintenance, ctx: &Context) -> Result<Action> {
     let errs = validate::validate_maintenance(&maint.spec);
     if let Some(first) = errs.into_iter().next() {
@@ -130,17 +155,14 @@ async fn reconcile_inner(maint: &Maintenance, ctx: &Context) -> Result<Action> {
     // reserved for a never-bootstrapped repo (a maintenance pod would be
     // doomed), a CONFIRMED-unreachable/vanished backend (the #345 breaker
     // semantics), and terminal/unknown phases.
-    if !io::repository_maintainable_cached(ctx, repo_ref, &namespace).await? {
-        patch_condition_if_changed(
-            &api,
-            &name,
-            maint,
-            "False",
-            crate::consts::WAITING_FOR_REPOSITORY_REASON,
-            "waiting for the repository: it is not bootstrapped, unreachable, gone, or failed; \
-             maintenance runs once it is healthy",
-        )
-        .await?;
+    //
+    // #689: a SUSPENDED repository holds maintenance too — including the owned
+    // `Maintenance` CR the repository projected before it was suspended, and
+    // an externally-authored one, neither of which the repository's own
+    // suspend branch can reach.
+    let availability = io::repository_maintainable_cached(ctx, repo_ref, &namespace).await?;
+    if let Some((reason, message)) = maintenance_hold(availability, repo_ref, &namespace) {
+        patch_condition_if_changed(&api, &name, maint, "False", reason, &message).await?;
         return Ok(Action::requeue(REQUEUE_NOT_READY));
     }
 

@@ -39,8 +39,8 @@ use crate::pool::slot_gate_is_false;
 use crate::replication_run::{
     ReplicationPoolGate, RunObservation, RunRequest, RunStall, heal_replication_slot_condition,
     idle_report, manual_replication_job_name, manual_run_request, manual_run_status,
-    observe_and_count_runs, recorded_running, replication_pool_gate, run_job_annotations,
-    suspended_manual_run, suspended_report,
+    observe_and_count_runs, recorded_running, replication_pool_gate, replication_repository_hold,
+    resumed_phase, run_job_annotations, suspended_manual_run, suspended_report,
 };
 use crate::snapshot::{backend_to_repository_connect, job_terminal_state};
 use crate::snapshot_schedule::{next_fire, parse_go_duration};
@@ -121,6 +121,16 @@ async fn reconcile_inner(repl: &RepositoryReplication, ctx: &Context) -> Result<
     if repl.spec.suspend {
         return suspended(&api, repl, &namespace, &name).await;
     }
+    // #689: resumed — replace a stale `phase: Suspended` the suspended arm
+    // left behind (nothing else rewrites it before the next run ENDS).
+    if let Some(fix) = resumed_phase(
+        repl.spec.suspend,
+        repl.status.as_ref().and_then(|s| s.phase.as_ref())
+            == Some(&RepositoryReplicationPhase::Suspended),
+        observed.has_active,
+    ) {
+        io::patch_status(&api, &name, serde_json::json!({ "phase": fix.label() })).await?;
+    }
 
     let source_ref = &repl.spec.source_ref;
     // Launch-side (mirror Job inputs) — store-backed point read (#382 M2).
@@ -131,14 +141,25 @@ async fn reconcile_inner(repl: &RepositoryReplication, ctx: &Context) -> Result<
     // pauses replication (fanning `sync-to` Jobs at a degraded backend is
     // doomed work), whereas maintenance is exempt because it is the cure for
     // a Degraded-because-slow repository.
-    if !io::repository_ready_cached(ctx, source_ref, &namespace).await? {
+    // #689: a SUSPENDED source repository holds the run under its own
+    // `RepositorySuspended` reason.
+    let availability = io::repository_availability_cached(ctx, source_ref, &namespace).await?;
+    if let Some((reason, message)) = replication_repository_hold(
+        availability,
+        (
+            crate::consts::WAITING_FOR_REPOSITORY_REASON,
+            "source repository is not Ready; deferring replication",
+        ),
+        source_ref,
+        &namespace,
+    ) {
         patch_ready_if_changed(
             &api,
             &name,
             repl,
             io::ReadyOutcome::Reconciling,
-            crate::consts::WAITING_FOR_REPOSITORY_REASON,
-            "source repository is not Ready; deferring replication",
+            reason,
+            &message,
             None,
         )
         .await?;

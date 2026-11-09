@@ -5631,3 +5631,51 @@ fn an_uncreatable_legacy_pin_name_is_not_looked_up() {
     assert!(current.len() <= kopiur_api::consts::JOB_NAME_MAX);
     assert_eq!(legacy, None);
 }
+
+/// Both repository kinds, as a backup's repository reference (#689 was
+/// reported against a `ClusterRepository`; the namespaced kind is the same bug).
+fn both_repo_kinds() -> [kopiur_api::common::RepositoryRef; 2] {
+    use kopiur_api::common::{RepositoryKind, RepositoryRef};
+    [
+        RepositoryRef {
+            kind: RepositoryKind::Repository,
+            name: "nas".into(),
+            namespace: None,
+        },
+        RepositoryRef {
+            kind: RepositoryKind::ClusterRepository,
+            name: "shared".into(),
+            namespace: None,
+        },
+    ]
+}
+
+#[test]
+fn a_suspended_repository_of_either_kind_holds_a_backup_launch() {
+    use crate::io::RepositoryAvailability as A;
+    for rref in both_repo_kinds() {
+        // Available: dispatch.
+        assert_eq!(repository_launch_hold(A::Available, &rref, "apps"), None);
+        // Not Ready: the pre-#689 park, unchanged.
+        let (reason, msg) = repository_launch_hold(A::NotReady, &rref, "apps").expect("held");
+        assert_eq!(reason, crate::consts::REPOSITORY_NOT_READY_REASON);
+        assert!(msg.contains(&rref.name), "{msg}");
+        // Suspended: held under its OWN reason, naming the repository + fix.
+        let (reason, msg) = repository_launch_hold(A::Suspended, &rref, "apps").expect("held");
+        assert_eq!(reason, "RepositorySuspended");
+        assert_eq!(reason, crate::consts::REPOSITORY_SUSPENDED_REASON);
+        assert!(msg.contains(&rref.name), "{msg}");
+        assert!(msg.contains("spec.suspend: false"), "{msg}");
+    }
+}
+
+/// End to end through the pure decision: a `ClusterRepository` that is
+/// `suspend: true` while its phase still reads `Ready` (exactly #689) must
+/// hold the backup — the old phase-only gate let it through.
+#[test]
+fn a_ready_but_suspended_cluster_repository_holds_the_backup() {
+    let rref = &both_repo_kinds()[1];
+    let availability = crate::io::RepositoryAvailability::decide(true, true);
+    let (reason, _) = repository_launch_hold(availability, rref, "apps").expect("must hold");
+    assert_eq!(reason, crate::consts::REPOSITORY_SUSPENDED_REASON);
+}

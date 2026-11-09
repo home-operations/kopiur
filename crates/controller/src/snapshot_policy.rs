@@ -201,15 +201,67 @@ fn executable_prunes(
         .collect()
 }
 
+/// The policy's targets that are held out of the ready subset, split by WHY
+/// (#689): not Ready (a fault to repair) vs suspended (a deliberate pause to
+/// lift). Keys are normalized [`kopiur_api::common::repo_key`]s, in spec order.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct HeldRepositories {
+    not_ready: Vec<String>,
+    suspended: Vec<String>,
+}
+
+impl HeldRepositories {
+    /// Record one target's availability; `true` = it joins the ready subset.
+    /// Exhaustive over [`io::RepositoryAvailability`].
+    fn record(&mut self, availability: io::RepositoryAvailability, key: String) -> bool {
+        match availability {
+            io::RepositoryAvailability::Available => true,
+            io::RepositoryAvailability::NotReady => {
+                self.not_ready.push(key);
+                false
+            }
+            io::RepositoryAvailability::Suspended => {
+                self.suspended.push(key);
+                false
+            }
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.not_ready.is_empty() && self.suspended.is_empty()
+    }
+
+    /// The `Ready=False` reason while something is held: `RepositorySuspended`
+    /// only when every held repository is suspended (nothing is broken, it is
+    /// all a pause); any not-Ready repository keeps `RepositoryNotReady`.
+    fn ready_reason(&self) -> &'static str {
+        if self.not_ready.is_empty() && !self.suspended.is_empty() {
+            crate::consts::REPOSITORY_SUSPENDED_REASON
+        } else {
+            crate::consts::REPOSITORY_NOT_READY_REASON
+        }
+    }
+}
+
 /// **Pure.** The actionable message for the `RepositoriesReady=False` gate,
-/// naming every not-ready repository. Deterministic (spec order) so the guarded
-/// status write stays a no-op while the outage persists.
-fn policy_repo_gate_message(not_ready_keys: &[String]) -> String {
-    format!(
-        "repository(ies) not Ready: {}. Work against them waits until they recover; \
-         Ready repositories keep going.",
-        not_ready_keys.join(", ")
-    )
+/// naming every held repository and why. Deterministic (spec order) so the
+/// guarded status write stays a no-op while the hold persists.
+fn policy_repo_gate_message(held: &HeldRepositories) -> String {
+    let mut parts = Vec::new();
+    if !held.not_ready.is_empty() {
+        parts.push(format!(
+            "repository(ies) not Ready: {}. Work against them waits until they recover",
+            held.not_ready.join(", ")
+        ));
+    }
+    if !held.suspended.is_empty() {
+        parts.push(format!(
+            "repository(ies) suspended (spec.suspend: true): {}. Work against them waits \
+             until they are unsuspended (Fix: set spec.suspend: false)",
+            held.suspended.join(", ")
+        ));
+    }
+    format!("{}; available repositories keep going.", parts.join("; "))
 }
 
 /// **Pure.** The `status.repositorySummary` print-column value (#368 B1): the
@@ -868,24 +920,29 @@ async fn reconcile_inner(config: &SnapshotPolicy, ctx: &Context) -> Result<Actio
     // — which is every not-ready single-repo policy — the reconciler parks
     // exactly as before (Reconciling + 15s requeue), now with the gate as the
     // one condition truth for the block.
+    // #689: a SUSPENDED repository is held out of the ready subset too (its
+    // phase can still read `Ready`): suspend pauses retention prunes and
+    // verification against it, and the gate message names it as suspended.
     let mut ready: Vec<&PolicyRepoTarget> = Vec::new();
-    let mut not_ready_keys: Vec<String> = Vec::new();
+    let mut held = HeldRepositories::default();
     for t in &targets {
-        if io::repository_ready_cached(ctx, &t.rref, &namespace).await? {
+        let availability = io::repository_availability_cached(ctx, &t.rref, &namespace).await?;
+        if held.record(
+            availability,
+            kopiur_api::common::repo_key(&t.rref, &namespace),
+        ) {
             ready.push(t);
-        } else {
-            not_ready_keys.push(kopiur_api::common::repo_key(&t.rref, &namespace));
         }
     }
-    let all_ready = not_ready_keys.is_empty();
-    let gate_message = policy_repo_gate_message(&not_ready_keys);
+    let all_ready = held.is_empty();
+    let gate_message = policy_repo_gate_message(&held);
     if ready.is_empty() {
         let conditions = io::set_ready(
             &existing,
             generation,
             io::ReadyOutcome::Reconciling,
-            crate::consts::REPOSITORY_NOT_READY_REASON,
-            "waiting for the referenced Repository to become Ready before reconciling",
+            held.ready_reason(),
+            &gate_message,
         );
         let conditions = io::upsert_gate(
             &conditions,
@@ -1082,7 +1139,13 @@ async fn reconcile_inner(config: &SnapshotPolicy, ctx: &Context) -> Result<Actio
     // registered `RepositoriesReady` gate otherwise), the observedGeneration,
     // the §3 lastSuccessfulSnapshot, the `repositorySummary` print column, and
     // the folded per-repo verification state.
-    let conditions = policy_ready_conditions(&existing, generation, all_ready, &gate_message);
+    let conditions = policy_ready_conditions(
+        &existing,
+        generation,
+        all_ready,
+        held.ready_reason(),
+        &gate_message,
+    );
     // Warn-only: surface a deep-verify scratch `storageClassName` that is a silent
     // no-op (set with no effective `capacity` → an `emptyDir`, which has no
     // StorageClass). Folded into the SAME status patch as set_ready (single writer,
@@ -1348,6 +1411,7 @@ fn policy_ready_conditions(
     existing: &[k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition],
     generation: Option<i64>,
     all_ready: bool,
+    held_reason: &str,
     gate_message: &str,
 ) -> Vec<k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition> {
     if all_ready {
@@ -1378,7 +1442,7 @@ fn policy_ready_conditions(
             existing,
             generation,
             io::ReadyOutcome::Reconciling,
-            crate::consts::REPOSITORY_NOT_READY_REASON,
+            held_reason,
             gate_message,
         );
         io::upsert_gate(
@@ -3487,8 +3551,12 @@ mod tests {
         // Not ready: the gate is written FROM the registry row (blocked
         // polarity False, reason RepositoryNotReady) and Ready=False/
         // Reconciling=True carry the same reason — one truth.
-        let msg = policy_repo_gate_message(&["Repository/apps/repo-b".to_string()]);
-        let blocked = policy_ready_conditions(&[], generation, false, &msg);
+        let held = HeldRepositories {
+            not_ready: vec!["Repository/apps/repo-b".to_string()],
+            suspended: vec![],
+        };
+        let msg = policy_repo_gate_message(&held);
+        let blocked = policy_ready_conditions(&[], generation, false, held.ready_reason(), &msg);
         let gate = blocked
             .iter()
             .find(|c| c.type_ == crate::consts::REPOSITORIES_READY_CONDITION)
@@ -3507,7 +3575,7 @@ mod tests {
 
         // Recovery: the gate self-clears to True (because it exists) and Ready
         // returns.
-        let healed = policy_ready_conditions(&blocked, generation, true, "");
+        let healed = policy_ready_conditions(&blocked, generation, true, "", "");
         let gate = healed
             .iter()
             .find(|c| c.type_ == crate::consts::REPOSITORIES_READY_CONDITION)
@@ -3520,7 +3588,7 @@ mod tests {
 
         // A never-gated policy never grows the condition: the healthy
         // single-repo status wire stays byte-identical.
-        let never_gated = policy_ready_conditions(&[], generation, true, "");
+        let never_gated = policy_ready_conditions(&[], generation, true, "", "");
         assert!(
             !never_gated
                 .iter()
@@ -4220,5 +4288,50 @@ mod tests {
                 .as_deref(),
             Some("2026-09-16T02:00:00+00:00")
         );
+    }
+
+    // --- #689: a suspended repository leaves the policy's ready subset -------
+
+    #[test]
+    fn held_repositories_split_not_ready_from_suspended() {
+        use crate::io::RepositoryAvailability as A;
+        let mut held = HeldRepositories::default();
+        assert!(held.record(A::Available, "Repository/apps/a".into()));
+        assert!(held.is_empty());
+        assert!(!held.record(A::Suspended, "ClusterRepository/shared".into()));
+        assert!(!held.is_empty());
+        // Only suspended repositories held: a pause, not a fault.
+        assert_eq!(
+            held.ready_reason(),
+            crate::consts::REPOSITORY_SUSPENDED_REASON
+        );
+        let msg = policy_repo_gate_message(&held);
+        assert!(msg.contains("suspended"), "{msg}");
+        assert!(msg.contains("ClusterRepository/shared"), "{msg}");
+        assert!(msg.contains("spec.suspend: false"), "{msg}");
+        assert!(!msg.contains("not Ready"), "{msg}");
+        // Any not-Ready repository keeps the fault reason.
+        assert!(!held.record(A::NotReady, "Repository/apps/b".into()));
+        assert_eq!(
+            held.ready_reason(),
+            crate::consts::REPOSITORY_NOT_READY_REASON
+        );
+        let msg = policy_repo_gate_message(&held);
+        assert!(msg.contains("not Ready: Repository/apps/b"), "{msg}");
+        assert!(
+            msg.contains("suspended (spec.suspend: true): ClusterRepository/shared"),
+            "{msg}"
+        );
+        // The registered gate is still the one written, whichever the cause.
+        let conds = policy_ready_conditions(&[], Some(1), false, held.ready_reason(), &msg);
+        let gate = conds
+            .iter()
+            .find(|c| c.type_ == crate::consts::REPOSITORIES_READY_CONDITION)
+            .expect("gate written");
+        assert!(kopiur_api::gates::POLICY_REPOSITORY_NOT_READY_GATE.matches(
+            &gate.type_,
+            &gate.status,
+            &gate.reason
+        ));
     }
 }

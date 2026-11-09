@@ -3982,3 +3982,34 @@ fn the_fanout_status_body_preserves_a_healed_inherit_hold() {
         "pinning the defect: a stale base erases the heal from the fan-out body"
     );
 }
+
+#[test]
+fn a_suspended_repository_of_either_kind_holds_a_restore_launch() {
+    use crate::io::RepositoryAvailability as A;
+    use kopiur_api::common::{RepositoryKind, RepositoryRef};
+    for kind in [
+        RepositoryKind::Repository,
+        RepositoryKind::ClusterRepository,
+    ] {
+        let rref = RepositoryRef {
+            kind,
+            name: "nas".into(),
+            namespace: None,
+        };
+        assert_eq!(repository_restore_hold(A::Available, &rref, "apps"), None);
+        let (reason, _) = repository_restore_hold(A::NotReady, &rref, "apps").expect("held");
+        assert_eq!(reason, crate::consts::RESTORE_REPOSITORY_NOT_READY_REASON);
+        let (reason, msg) = repository_restore_hold(A::Suspended, &rref, "apps").expect("held");
+        assert_eq!(reason, crate::consts::REPOSITORY_SUSPENDED_REASON);
+        assert!(
+            msg.contains("nas") && msg.contains("spec.suspend: false"),
+            "{msg}"
+        );
+        // The parked reason round-trips through the claim vocabulary, so a
+        // populator claim that mirrors it is read back, not dropped.
+        assert_eq!(
+            ClaimReason::parse(reason),
+            Some(ClaimReason::RepositorySuspended)
+        );
+    }
+}

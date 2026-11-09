@@ -620,3 +620,24 @@ fn maintenance_op_threads_owner_and_aliases_from_ownership() {
             .is_empty()
     );
 }
+
+#[test]
+fn a_suspended_repository_of_either_kind_holds_maintenance() {
+    use crate::io::RepositoryAvailability as A;
+    for kind in [
+        RepositoryKind::Repository,
+        RepositoryKind::ClusterRepository,
+    ] {
+        let rref = RepositoryRef {
+            kind,
+            name: "nas".into(),
+            namespace: None,
+        };
+        assert_eq!(maintenance_hold(A::Available, &rref, "apps"), None);
+        let (reason, _) = maintenance_hold(A::NotReady, &rref, "apps").expect("held");
+        assert_eq!(reason, crate::consts::WAITING_FOR_REPOSITORY_REASON);
+        let (reason, msg) = maintenance_hold(A::Suspended, &rref, "apps").expect("held");
+        assert_eq!(reason, crate::consts::REPOSITORY_SUSPENDED_REASON);
+        assert!(msg.contains("spec.suspend: false"), "{msg}");
+    }
+}

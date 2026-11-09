@@ -1007,19 +1007,18 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
     // A store-backed point read (#382 M2) — independent of preflight, so it's
     // evaluated FIRST and the repository-not-ready reason is always surfaced
     // before any preflight machinery. A stale not-Ready hit heals at this
-    // gate's own 15s requeue below (see `io::repository_ready_cached`).
-    if !io::repository_ready_cached(ctx, repo_ref, &namespace).await? {
+    // gate's own 15s requeue below (see `io::repository_availability_cached`).
+    // #689: a SUSPENDED repository holds the launch too (its phase can still
+    // read `Ready`), parked under its own `RepositorySuspended` reason; the
+    // same requeue resumes the backup once the repository is unsuspended.
+    let availability = io::repository_availability_cached(ctx, repo_ref, &namespace).await?;
+    if let Some((reason, message)) = repository_launch_hold(availability, repo_ref, &namespace) {
         let current = serde_json::to_value(&backup.status).ok();
         io::patch_status_if_changed(
             &api,
             &name,
             current.as_ref(),
-            snapshot_ready_status(
-                backup,
-                SnapshotPhase::Pending,
-                crate::consts::REPOSITORY_NOT_READY_REASON,
-                &repository_not_ready_message(&repo_ref.name),
-            ),
+            snapshot_ready_status(backup, SnapshotPhase::Pending, reason, &message),
         )
         .await?;
         return Ok(Action::requeue(Duration::from_secs(15)));
@@ -4469,6 +4468,21 @@ async fn reconcile_pin(
     // The child's effective repository (pin-aware — a pinned child of a
     // multi-repo policy pins/unpins in ITS repository).
     let repo_ref = &effective_repo;
+    // #689: a suspended repository runs no new mover work, pin/unpin included.
+    // Only `Suspended` holds here: a not-Ready repository keeps today's
+    // behavior (the pin Job's own retry covers a transient outage). The pin
+    // converges on its own once the repository is unsuspended.
+    match io::repository_availability_cached(ctx, repo_ref, namespace).await? {
+        io::RepositoryAvailability::Suspended => {
+            tracing::info!(
+                backup = %name,
+                repository = %repo_ref.name,
+                "holding pin/unpin: repository is suspended (spec.suspend)"
+            );
+            return Ok(Action::requeue(Duration::from_secs(60)));
+        }
+        io::RepositoryAvailability::Available | io::RepositoryAvailability::NotReady => {}
+    }
     let identity = resolve_identity_for(
         &config,
         namespace,

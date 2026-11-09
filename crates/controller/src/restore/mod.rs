@@ -4940,8 +4940,10 @@ enum RepositoryGate<'a> {
 
 /// The Restore peer of the Snapshot reconciler's repository-readiness gate: hold a
 /// not-yet-launched restore in `Pending` (`Ready=False`/`RepositoryNotReady`,
-/// non-terminal) while its repository is not `Ready`, and requeue on the same 15s
-/// cadence. Returns a [`RepositoryGate`] the caller matches exhaustively.
+/// non-terminal) while its repository is not `Ready` — or `Ready=False`/
+/// `RepositorySuspended` while it is `spec.suspend: true` (#689) — and requeue on
+/// the same 15s cadence. Returns a [`RepositoryGate`] the caller matches
+/// exhaustively.
 ///
 /// Two semantic notes, both deliberate:
 /// - **`spec.mode: ReadOnly` is a different axis.** The Snapshot reconciler's mode
@@ -5016,9 +5018,10 @@ async fn gate_on_repository_readiness<'a>(
             .await;
         }
     };
-    match io::repository_ready_cached(ctx, &rref, &base_ns).await {
-        Ok(true) => proceed_past_gate(restore, api, name).await,
-        Ok(false) => {
+    let availability = io::repository_availability_cached(ctx, &rref, &base_ns).await;
+    match availability.map(|a| repository_restore_hold(a, &rref, &base_ns)) {
+        Ok(None) => proceed_past_gate(restore, api, name).await,
+        Ok(Some((reason, message))) => {
             // patch-if-changed for byte-stability: the parked status is identical
             // across the 15s requeues, so a re-park is a server-side no-op — no
             // watch event, no self-trigger (the reconcile hot-loop rule).
@@ -5036,8 +5039,8 @@ async fn gate_on_repository_readiness<'a>(
                     restore,
                     &conditions,
                     RestorePhase::Pending,
-                    crate::consts::REPOSITORY_NOT_READY_REASON,
-                    &repository_not_ready_restore_message(&rref.name),
+                    reason,
+                    &message,
                 ),
             )
             .await?;

@@ -124,6 +124,31 @@ pub(super) fn repository_not_ready_restore_message(repo_name: &str) -> String {
     )
 }
 
+/// **Pure.** What holds a not-yet-launched restore behind its repository's
+/// availability (#689): `None` = proceed; `Some((reason, message))` = park the
+/// restore `Pending` under that reason. Exhaustive over
+/// [`crate::io::RepositoryAvailability`] — a suspended repository parks the
+/// restore under its own `RepositorySuspended` reason (never the not-Ready
+/// wording), and, exactly like a not-Ready park, does NOT open the
+/// `waitTimeout` window: time spent suspended never fails a restore.
+pub(super) fn repository_restore_hold(
+    availability: crate::io::RepositoryAvailability,
+    rref: &kopiur_api::common::RepositoryRef,
+    base_ns: &str,
+) -> Option<(&'static str, String)> {
+    match availability {
+        crate::io::RepositoryAvailability::Available => None,
+        crate::io::RepositoryAvailability::NotReady => Some((
+            ClaimReason::RepositoryNotReady.as_str(),
+            repository_not_ready_restore_message(&rref.name),
+        )),
+        crate::io::RepositoryAvailability::Suspended => Some((
+            ClaimReason::RepositorySuspended.as_str(),
+            crate::io::repository_suspended_message(rref, base_ns),
+        )),
+    }
+}
+
 /// Whether `phase` lets the reconcile-entry guard short-circuit — i.e. whether
 /// the whole `Restore` is settled. Pure.
 ///
@@ -1563,6 +1588,9 @@ pub fn mirrored_resolved_condition(mirror: &ClaimsMirror<'_>) -> Option<(bool, &
             Some((false, ClaimReason::SourcePathAmbiguous.as_str()))
         }
         ClaimReason::RepositoryNotReady => Some((false, ClaimReason::RepositoryNotReady.as_str())),
+        ClaimReason::RepositorySuspended => {
+            Some((false, ClaimReason::RepositorySuspended.as_str()))
+        }
         ClaimReason::RestoreReferentMissing => {
             Some((false, ClaimReason::RestoreReferentMissing.as_str()))
         }
@@ -1724,6 +1752,8 @@ pub enum ClaimReason {
     WaitingForSnapshot,
     /// The repository is not `Ready`.
     RepositoryNotReady,
+    /// The repository is suspended (`spec.suspend: true`, #689).
+    RepositorySuspended,
     /// The referent the repository is derived from does not exist.
     RestoreReferentMissing,
     /// The source resolved to a concrete snapshot.
@@ -1760,6 +1790,7 @@ impl ClaimReason {
         Self::AwaitingPodSchedule,
         Self::WaitingForSnapshot,
         Self::RepositoryNotReady,
+        Self::RepositorySuspended,
         Self::RestoreReferentMissing,
         Self::SourceResolved,
         Self::PopulatingPrimePvc,
@@ -1785,6 +1816,7 @@ impl ClaimReason {
             Self::AwaitingPodSchedule => c::AWAITING_POD_SCHEDULE_REASON,
             Self::WaitingForSnapshot => c::WAITING_FOR_SNAPSHOT_REASON,
             Self::RepositoryNotReady => c::RESTORE_REPOSITORY_NOT_READY_REASON,
+            Self::RepositorySuspended => c::REPOSITORY_SUSPENDED_REASON,
             Self::RestoreReferentMissing => c::RESTORE_REFERENT_MISSING_REASON,
             Self::SourceResolved => c::RESTORE_SOURCE_RESOLVED_REASON,
             Self::PopulatingPrimePvc => c::POPULATING_PRIME_PVC_REASON,
@@ -1825,6 +1857,7 @@ impl ClaimReason {
             | Self::AwaitingPodSchedule
             | Self::WaitingForSnapshot
             | Self::RepositoryNotReady
+            | Self::RepositorySuspended
             | Self::RestoreReferentMissing
             | Self::SourceResolved
             | Self::PopulatingPrimePvc
@@ -1953,6 +1986,7 @@ fn legacy_claim_phase(phase: &RestorePhase, reason: Option<&str>) -> RestoreClai
                 | ClaimReason::AwaitingPodSchedule
                 | ClaimReason::WaitingForSnapshot
                 | ClaimReason::RepositoryNotReady
+                | ClaimReason::RepositorySuspended
                 | ClaimReason::RestoreReferentMissing
                 | ClaimReason::SourceResolved
                 | ClaimReason::PopulatingPrimePvc

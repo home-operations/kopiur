@@ -341,6 +341,71 @@ pub fn suspended_report(pending_request: bool) -> (&'static str, &'static str) {
     }
 }
 
+/// The phase a replication that was suspended and is now RESUMED should show
+/// in place of its stale `Suspended` (#689 finding 2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResumedPhase {
+    /// A run Job is in flight.
+    Replicating,
+    /// Waiting for its next slot (or a gate) — no Job yet.
+    Pending,
+}
+
+impl ResumedPhase {
+    /// The wire label — identical for both replication kinds' phase enums.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Replicating => "Replicating",
+            Self::Pending => "Pending",
+        }
+    }
+}
+
+/// **Pure.** The `status.phase` rewrite a resumed replication owes, if any.
+///
+/// The suspended arm stamps `phase: Suspended`, but nothing on the resumed
+/// path wrote a phase until the mover stamped `Succeeded`/`Failed` at the END
+/// of the next run — so after `suspend: false` the CR (and every UI surface
+/// reading it) kept saying `Suspended` through a whole schedule interval and
+/// the run itself (#689). Only a phase that is `Suspended` while the spec is
+/// NOT suspended is rewritten; every other phase is left to its owner.
+pub fn resumed_phase(
+    spec_suspended: bool,
+    phase_is_suspended: bool,
+    has_active_job: bool,
+) -> Option<ResumedPhase> {
+    match (spec_suspended, phase_is_suspended, has_active_job) {
+        // Still suspended, or the phase is not the stale one: nothing to fix.
+        (true, _, _) | (false, false, _) => None,
+        (false, true, true) => Some(ResumedPhase::Replicating),
+        (false, true, false) => Some(ResumedPhase::Pending),
+    }
+}
+
+/// **Pure.** What holds a replication run behind ONE endpoint repository's
+/// availability (#689). Shared by both replication kinds: `None` = that
+/// endpoint is usable; `Some((reason, message))` = report `Ready=Reconciling`
+/// with that reason and wait. `not_ready` is the caller's existing
+/// endpoint-specific `(reason, message)` for a not-Ready repository (so
+/// `kubectl describe` keeps naming which end holds the run); a SUSPENDED
+/// endpoint always reports `RepositorySuspended`. Exhaustive over
+/// [`crate::io::RepositoryAvailability`].
+pub fn replication_repository_hold(
+    availability: crate::io::RepositoryAvailability,
+    not_ready: (&'static str, &'static str),
+    repo_ref: &kopiur_api::common::RepositoryRef,
+    namespace: &str,
+) -> Option<(&'static str, String)> {
+    match availability {
+        crate::io::RepositoryAvailability::Available => None,
+        crate::io::RepositoryAvailability::NotReady => Some((not_ready.0, not_ready.1.to_string())),
+        crate::io::RepositoryAvailability::Suspended => Some((
+            crate::consts::REPOSITORY_SUSPENDED_REASON,
+            crate::io::repository_suspended_message(repo_ref, namespace),
+        )),
+    }
+}
+
 // --- the source repository's mover-Job pool gate ------------------------------
 
 /// The pool gate's verdict for one replication reconcile — the replication peer
@@ -1036,5 +1101,76 @@ mod tests {
         assert!(repo.contains(REPLICATION_COMPONENT), "{repo}");
         assert!(repo.ends_with("=offsite"), "{repo}");
         assert!(snap.contains(SNAPSHOT_REPLICATION_COMPONENT), "{snap}");
+    }
+
+    #[test]
+    fn a_suspended_endpoint_of_either_kind_holds_a_replication_run() {
+        use crate::io::RepositoryAvailability as A;
+        use kopiur_api::common::{RepositoryKind, RepositoryRef};
+        let not_ready = (
+            "WaitingForSourceRepository",
+            "source repository is not Ready",
+        );
+        for kind in [
+            RepositoryKind::Repository,
+            RepositoryKind::ClusterRepository,
+        ] {
+            let rref = RepositoryRef {
+                kind,
+                name: "src".into(),
+                namespace: None,
+            };
+            assert_eq!(
+                replication_repository_hold(A::Available, not_ready, &rref, "apps"),
+                None
+            );
+            // Not Ready keeps the caller's endpoint-specific reason.
+            assert_eq!(
+                replication_repository_hold(A::NotReady, not_ready, &rref, "apps"),
+                Some((not_ready.0, not_ready.1.to_string()))
+            );
+            let (reason, msg) =
+                replication_repository_hold(A::Suspended, not_ready, &rref, "apps").expect("held");
+            assert_eq!(reason, crate::consts::REPOSITORY_SUSPENDED_REASON);
+            assert!(
+                msg.contains("src") && msg.contains("spec.suspend: false"),
+                "{msg}"
+            );
+        }
+    }
+
+    /// #689 finding 2: a replication resumed from `suspend: true` kept
+    /// `phase: Suspended` until its next run ENDED. Every combination of the
+    /// three inputs is pinned.
+    #[test]
+    fn a_resumed_replication_replaces_its_stale_suspended_phase() {
+        // Still suspended: the suspended arm owns the phase.
+        for phase_suspended in [true, false] {
+            for active in [true, false] {
+                assert_eq!(resumed_phase(true, phase_suspended, active), None);
+            }
+        }
+        // Resumed, but the phase is not the stale one: left to its owner.
+        assert_eq!(resumed_phase(false, false, true), None);
+        assert_eq!(resumed_phase(false, false, false), None);
+        // Resumed with the stale phase: Replicating while a Job runs, else Pending.
+        assert_eq!(
+            resumed_phase(false, true, true),
+            Some(ResumedPhase::Replicating)
+        );
+        assert_eq!(
+            resumed_phase(false, true, false),
+            Some(ResumedPhase::Pending)
+        );
+        // The labels are the wire values of BOTH kinds' phase enums.
+        use kopiur_api::common::PhaseLabel;
+        assert_eq!(
+            ResumedPhase::Replicating.label(),
+            kopiur_api::RepositoryReplicationPhase::Replicating.label()
+        );
+        assert_eq!(
+            ResumedPhase::Pending.label(),
+            kopiur_api::SnapshotReplicationPhase::Pending.label()
+        );
     }
 }

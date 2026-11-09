@@ -543,6 +543,15 @@ pub const REPOSITORIES_READY_CONDITION: &str = "RepositoriesReady";
 /// the `Snapshot` reconciler stamps on a child parked behind a not-Ready
 /// repository (one string, both surfaces; the controller re-exports it).
 pub const REPOSITORY_NOT_READY_REASON: &str = "RepositoryNotReady";
+/// `reason` stamped on work held because its `Repository`/`ClusterRepository`
+/// has `spec.suspend: true` (#689): a `Snapshot`/`Restore` parked `Pending`, a
+/// `Maintenance`/`RepositoryReplication`/`SnapshotReplication` waiting, a
+/// `SnapshotPolicy` whose every repository is suspended. Distinct from
+/// [`REPOSITORY_NOT_READY_REASON`] on purpose: a suspended repository is a
+/// deliberate pause (its `status.phase` can still read `Ready`), not a fault,
+/// and the fix is "unsuspend", not "repair the backend". Held work resumes on
+/// its own once the repository is unsuspended.
+pub const REPOSITORY_SUSPENDED_REASON: &str = "RepositorySuspended";
 
 /// `SnapshotSchedule` condition recording whether a fired slot minted its full
 /// members × repositories fan-out. `True` (with [`FANOUT_TOO_LARGE_REASON`])

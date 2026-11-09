@@ -55,8 +55,8 @@ use crate::pool::slot_gate_is_false;
 use crate::replication_run::{
     ReplicationPoolGate, RunObservation, RunRequest, RunStall, heal_replication_slot_condition,
     idle_report, manual_replication_job_name, manual_run_request, manual_run_status,
-    observe_and_count_runs, recorded_running, replication_pool_gate, run_job_annotations,
-    suspended_manual_run, suspended_report,
+    observe_and_count_runs, recorded_running, replication_pool_gate, replication_repository_hold,
+    resumed_phase, run_job_annotations, suspended_manual_run, suspended_report,
 };
 use crate::snapshot::{backend_to_repository_connect, job_terminal_state};
 use crate::snapshot_schedule::{next_fire, parse_go_duration};
@@ -152,6 +152,16 @@ async fn reconcile_inner(repl: &SnapshotReplication, ctx: &Context) -> Result<Ac
     if repl.spec.suspend {
         return suspended(&api, repl, &namespace, &name).await;
     }
+    // #689: resumed — replace a stale `phase: Suspended` the suspended arm
+    // left behind (nothing else rewrites it before the next run ENDS).
+    if let Some(fix) = resumed_phase(
+        repl.spec.suspend,
+        repl.status.as_ref().and_then(|s| s.phase.as_ref())
+            == Some(&SnapshotReplicationPhase::Suspended),
+        observed.has_active,
+    ) {
+        io::patch_status(&api, &name, serde_json::json!({ "phase": fix.label() })).await?;
+    }
 
     // Both endpoints are real repository CRs — resolve them (backend, encryption,
     // moverDefaults, CA bundles), source first for message determinism.
@@ -163,33 +173,42 @@ async fn reconcile_inner(repl: &SnapshotReplication, ctx: &Context) -> Result<Ac
     // Gate on BOTH repositories being Ready — an object-store repo must be
     // bootstrapped before `kopia snapshot migrate` can reach it. DISTINCT
     // reasons so `kubectl describe` names which end is holding the run.
-    if !io::repository_ready_cached(ctx, &repl.spec.source_ref, &namespace).await? {
-        patch_ready_if_changed(
-            &api,
-            &name,
-            repl,
-            io::ReadyOutcome::Reconciling,
-            "WaitingForSourceRepository",
-            "source repository is not Ready; deferring replication",
-            None,
-            None,
-        )
-        .await?;
-        return Ok(Action::requeue(REQUEUE_NOT_READY));
-    }
-    if !io::repository_ready_cached(ctx, &repl.spec.destination_ref, &namespace).await? {
-        patch_ready_if_changed(
-            &api,
-            &name,
-            repl,
-            io::ReadyOutcome::Reconciling,
-            "WaitingForDestinationRepository",
-            "destination repository is not Ready; deferring replication",
-            None,
-            None,
-        )
-        .await?;
-        return Ok(Action::requeue(REQUEUE_NOT_READY));
+    // #689: a SUSPENDED endpoint (either end) holds the run under
+    // `RepositorySuspended`, naming which repository is suspended.
+    let endpoints = [
+        (
+            &repl.spec.source_ref,
+            (
+                "WaitingForSourceRepository",
+                "source repository is not Ready; deferring replication",
+            ),
+        ),
+        (
+            &repl.spec.destination_ref,
+            (
+                "WaitingForDestinationRepository",
+                "destination repository is not Ready; deferring replication",
+            ),
+        ),
+    ];
+    for (rref, not_ready) in endpoints {
+        let availability = io::repository_availability_cached(ctx, rref, &namespace).await?;
+        if let Some((reason, message)) =
+            replication_repository_hold(availability, not_ready, rref, &namespace)
+        {
+            patch_ready_if_changed(
+                &api,
+                &name,
+                repl,
+                io::ReadyOutcome::Reconciling,
+                reason,
+                &message,
+                None,
+                None,
+            )
+            .await?;
+            return Ok(Action::requeue(REQUEUE_NOT_READY));
+        }
     }
 
     // A read-only destination can never take migrated snapshots: stalled until

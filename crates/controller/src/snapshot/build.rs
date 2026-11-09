@@ -419,6 +419,29 @@ pub(super) fn repository_not_ready_message(repo_name: &str) -> String {
     )
 }
 
+/// **Pure.** What holds a backup's FIRST launch behind its repository's
+/// availability (#689): `None` = dispatch; `Some((reason, message))` = park
+/// the Snapshot `Pending` with that reason. Exhaustive over
+/// [`io::RepositoryAvailability`] so a suspended repository can never fall
+/// through to a launch, and never borrows the not-Ready wording.
+pub(super) fn repository_launch_hold(
+    availability: io::RepositoryAvailability,
+    repo_ref: &kopiur_api::common::RepositoryRef,
+    namespace: &str,
+) -> Option<(&'static str, String)> {
+    match availability {
+        io::RepositoryAvailability::Available => None,
+        io::RepositoryAvailability::NotReady => Some((
+            crate::consts::REPOSITORY_NOT_READY_REASON,
+            repository_not_ready_message(&repo_ref.name),
+        )),
+        io::RepositoryAvailability::Suspended => Some((
+            crate::consts::REPOSITORY_SUSPENDED_REASON,
+            io::repository_suspended_message(repo_ref, namespace),
+        )),
+    }
+}
+
 /// Snapshot tags for a run: the user's `Snapshot.spec.tags` (invalid keys
 /// defensively SKIPPED with a warning — a stored pre-validator object must
 /// never fail its backup over a tag), then the reserved operator tags inserted
