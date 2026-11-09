@@ -204,7 +204,8 @@ pub struct SnapshotOp {
     /// ignore-cache-dirs / backup-side error handling / upload parallelism /
     /// extraArgs). The controller resolves these from
     /// `SnapshotPolicy.spec.{compression,files,errorHandling,upload,extraArgs}`
-    /// (ADR-0005 §13(b)/§13(f), ADR-0004 §4b). Empty ⇒ leave kopia's defaults.
+    /// (ADR-0005 §13(b)/§13(f), ADR-0004 §4b). Empty ⇒ the path scope holds no
+    /// policy and inherits the identity/global ones.
     #[serde(default, skip_serializing_if = "PolicyArgsSpec::is_empty")]
     pub policy: PolicyArgsSpec,
     /// `snapshot create --[no-]fail-fast` (M4 flag sweep, issue #216 category
@@ -238,8 +239,9 @@ impl SnapshotOp {
 
 /// Serializable mirror of [`kopiur_kopia::PolicyArgs`] for the work spec (the kopia
 /// client's type isn't serde). The controller fills it from the flattened
-/// `SnapshotPolicy` policy knobs; the mover converts back and runs `kopia policy
-/// set` against the snapshot's source identity before creating the snapshot. This
+/// `SnapshotPolicy` policy knobs; the mover converts back and REPLACES the kopia
+/// policy at the snapshot's source path with it (delete, then `policy set`; see
+/// `KopiaClient::policy_replace`) before creating the snapshot. This
 /// is what makes `compression`/`files`/`errorHandling`/`upload`/`extraArgs`
 /// actually reach kopia (no-inert-fields). ADR-0005 §13(b)/§13(f).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -287,7 +289,10 @@ pub struct PolicyArgsSpec {
 }
 
 impl PolicyArgsSpec {
-    /// Whether every knob is unset (so the mover skips `kopia policy set` entirely).
+    /// Whether every knob is unset. Only decides wire serialization: the mover
+    /// replaces the path-scoped kopia policy on every run whether or not this
+    /// is empty, since an empty spec must still clear what an earlier run
+    /// stored there (#681).
     pub fn is_empty(&self) -> bool {
         self.compression.is_none()
             && self.ignore.is_empty()
@@ -320,7 +325,9 @@ impl PolicyArgsSpec {
             ignore_file_errors: self.ignore_file_errors,
             ignore_dir_errors: self.ignore_dir_errors,
             ignore_unknown_types: self.ignore_unknown_types,
-            max_parallel_snapshots: self.max_parallel_snapshots,
+            max_parallel_snapshots: self
+                .max_parallel_snapshots
+                .map(kopiur_kopia::PolicyInt::Set),
             max_parallel_file_reads: self.max_parallel_file_reads,
             extra_args: self.extra_args.clone(),
             ..Default::default()

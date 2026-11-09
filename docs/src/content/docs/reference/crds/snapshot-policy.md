@@ -102,11 +102,11 @@ Kopiur pins `--ignore-identical-snapshots=false` at the kopia identity scope on 
 
 `ignoreRules` defaults to a set of five OS-artifact excludes: `/lost+found`, `System Volume Information`, `$RECYCLE.BIN`, `@eaDir` and `.snapshot`. They apply even when you leave `files` out of the spec entirely. The apiserver only server-side-defaults a nested field when the parent object is present, so the controller applies this default again when it resolves the mover work spec.
 
-An explicit `ignoreRules` list **replaces** the default outright rather than adding to it, and `ignoreRules: []` turns off ignoring anything at all. See [Backups → `files.ignoreRules` default](/backups/#filesignorerules-default-os-artifact-excludes) for why each entry is there, plus a copy-paste block of recommended extras.
+An explicit `ignoreRules` list **replaces** the default outright rather than adding to it, and `ignoreRules: []` turns off ignoring anything at all. Kopiur rewrites the source's kopia policy from the spec before every snapshot, so a rule you remove stops applying on the next snapshot (see [Backups → Kopiur owns the per-source kopia policy](/backups/#compression-files--extraargs--kopia-tuning-and-ignores)). See [Backups → `files.ignoreRules` default](/backups/#filesignorerules-default-os-artifact-excludes) for why each entry is there, plus a copy-paste block of recommended extras.
 
 ### `extraArgs`
 
-An escape hatch for kopia flags that do not yet have a field of their own.
+An escape hatch for kopia `policy set` flags that do not yet have a field of their own. They are applied to the source's kopia policy on every run, after Kopiur deletes the stored policy, so `extraArgs` is also the way to keep a kopia policy setting Kopiur would otherwise reset.
 
 ### `errorHandling`
 
