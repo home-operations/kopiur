@@ -47,6 +47,7 @@ use kopiur_mover::status::{
     snapshot_replicate_no_match_message, snapshot_replicate_ok_body,
     snapshot_replicate_success_message, split_api_version, verify_failed_body, verify_ok_body,
 };
+use kopiur_mover::verify::quick_coverage;
 use kopiur_mover::workspec::{
     self, BootstrapRepositoryOp, BrowseSessionOp, KOPIA_KEEP_MAX, KOPIUR_PIN_NAME, MaintenanceOp,
     MoverWorkSpec, Operation, ReplicateOp, RestoreOp, RestoreSelection, RestoreSelector,
@@ -3237,33 +3238,6 @@ fn probe_scratch_writable(path: &str) -> std::io::Result<()> {
     std::fs::remove_file(&probe)
 }
 
-/// **Pure.** The quick tier's `successExpr` environment derived from the newest
-/// snapshot manifest for its identity: `(stats, snapshot id)`.
-///
-/// `kopia snapshot verify` reports no machine-readable file/byte counts of its
-/// own, so a healthy quick verify of a non-empty snapshot satisfies the common
-/// `stats.files > 0` predicate from the manifest instead of always failing on a
-/// hardcoded 0. `errors` is 0 — a passing verify found no integrity errors.
-/// Counts saturate rather than wrap, so an absurd manifest cannot make a
-/// predicate read a small number.
-///
-/// Deliberately takes the manifest that WAS found. "No manifest for this
-/// identity" is not an environment to report, it is a terminal verdict
-/// ([`MoverError::VerifyNoSnapshot`]): `kopia snapshot verify --sources` exits 0
-/// when its filter matches ZERO manifests, so reporting success there stamps
-/// `status.lastVerified` for a source path the repository holds no snapshot for
-/// — the #456 false pass.
-fn quick_coverage(entry: kopiur_kopia::SnapshotListEntry) -> (kopiur_api::VerifyStats, String) {
-    (
-        kopiur_api::VerifyStats {
-            files: i64::try_from(entry.stats.file_count).unwrap_or(i64::MAX),
-            bytes: i64::try_from(entry.stats.total_size).unwrap_or(i64::MAX),
-            errors: 0,
-        },
-        entry.id,
-    )
-}
-
 /// Drive a `Verify` run (ADR-0005 §4): connect, run the quick (`kopia snapshot
 /// verify`) or deep (scratch-restore) tier, evaluate the optional CEL `successExpr`
 /// over the result, and PATCH the `SnapshotPolicy` `.status.lastVerified` on
@@ -4428,37 +4402,6 @@ mod tests {
     use super::*;
 
     // --- #456: the quick tier's coverage verdict -----------------------------
-
-    /// A manifest entry with the given counts, for [`quick_coverage`].
-    fn manifest(id: &str, files: u64, bytes: u64) -> kopiur_kopia::SnapshotListEntry {
-        let mut e: kopiur_kopia::SnapshotListEntry = serde_json::from_value(serde_json::json!({
-            "id": id,
-            "source": { "host": "h", "userName": "u", "path": "/pvc/data" },
-            "startTime": "2026-08-01T00:00:00Z",
-            "endTime": "2026-08-01T00:01:00Z",
-        }))
-        .expect("typed manifest entry");
-        e.stats.file_count = files;
-        e.stats.total_size = bytes;
-        e
-    }
-
-    #[test]
-    fn quick_coverage_reports_the_manifest_counts_and_saturates() {
-        let (stats, id) = quick_coverage(manifest("k1", 42, 4096));
-        assert_eq!(id, "k1");
-        assert_eq!(stats.files, 42);
-        assert_eq!(stats.bytes, 4096);
-        assert_eq!(
-            stats.errors, 0,
-            "a passing quick verify found no integrity errors"
-        );
-        // Saturate, never wrap: a wrapped count could make `stats.files > 0`
-        // read false (or a byte budget read small) on an absurd manifest.
-        let (stats, _) = quick_coverage(manifest("k2", u64::MAX, u64::MAX));
-        assert_eq!(stats.files, i64::MAX);
-        assert_eq!(stats.bytes, i64::MAX);
-    }
 
     #[test]
     fn a_quick_verify_that_covered_no_snapshot_is_a_terminal_failure_not_a_pass() {
