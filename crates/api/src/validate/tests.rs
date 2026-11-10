@@ -757,6 +757,7 @@ fn restore_with(source: RestoreSource, repo: Option<RepositoryRef>) -> RestoreSp
             namespace: None,
         }),
         options: None,
+        selection: None,
         policy: None,
         credential_projection: None,
         mover: None,
@@ -8728,4 +8729,167 @@ fn scheduled_job_name_length_warning_accounts_for_the_slot_stamp() {
     let w = scheduled_job_name_length_warning(&"s".repeat(43)).expect("43 + 15 = 58 warns");
     assert!(w.contains("58-character"), "{w}");
     assert!(w.contains("Fix:"), "{w}");
+}
+
+// --- validate_restore: partial restore selection (#689) ---
+
+fn restore_selecting(paths: &[&str]) -> RestoreSpec {
+    use crate::common::ObjectRef;
+    use crate::restore::PathSelection;
+    RestoreSpec {
+        selection: Some(PathSelection {
+            paths: paths.iter().map(|p| p.to_string()).collect(),
+        }),
+        ..restore_with(
+            RestoreSource::SnapshotRef(ObjectRef {
+                name: "snap".into(),
+                namespace: None,
+            }),
+            None,
+        )
+    }
+}
+
+#[test]
+fn restore_selection_accepts_normalized_relative_paths() {
+    for paths in [
+        &["docs/report.odt"][..],
+        &["music/album", "docs/report.odt"],
+        &["a b/c d.txt"],
+        &[".hidden/file"],
+        &["docs/report.odt", "docs/report.odt.bak"],
+        &["dir..name/x"],
+    ] {
+        let spec = restore_selecting(paths);
+        assert_eq!(validate_restore(&spec), Ok(()), "paths {paths:?}");
+    }
+}
+
+#[test]
+fn restore_selection_rejects_unsafe_or_unnormalized_paths() {
+    // Each case is (path, a substring the actionable reason must contain).
+    let cases = [
+        ("", "is empty"),
+        ("/etc/passwd", "is absolute"),
+        ("../etc/passwd", "'..'"),
+        ("docs/../../etc", "'..'"),
+        ("docs/..", "'..'"),
+        ("./docs", "'.' segment"),
+        ("docs/./x", "'.' segment"),
+        ("docs//x", "empty segment"),
+        ("docs/", "trailing slash"),
+        ("..", "'..'"),
+        ("docs/\nx", "control character"),
+    ];
+    for (path, needle) in cases {
+        let err = validate_restore(&restore_selecting(&[path])).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            matches!(
+                err,
+                ValidationError::RestoreSelectionPathInvalid { index: 0, .. }
+            ),
+            "path {path:?} -> {err:?}"
+        );
+        assert!(msg.contains(needle), "path {path:?}: {msg}");
+        assert!(msg.contains("spec.selection.paths[0]"), "{msg}");
+    }
+    let long_name = "x".repeat(256);
+    assert!(validate_restore(&restore_selecting(&[&long_name])).is_err());
+    let too_long = "a/".repeat(2049) + "z";
+    assert!(validate_restore(&restore_selecting(&[&too_long])).is_err());
+}
+
+#[test]
+fn restore_selection_rejects_duplicates_and_nested_paths() {
+    let err = validate_restore(&restore_selecting(&["music", "docs", "music"])).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            ValidationError::RestoreSelectionPathInvalid { index: 2, .. }
+        ),
+        "{err:?}"
+    );
+    assert!(
+        err.to_string()
+            .contains("duplicates spec.selection.paths[0]")
+    );
+
+    let err = validate_restore(&restore_selecting(&["docs/report.odt", "docs"])).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            ValidationError::RestoreSelectionPathInvalid { index: 0, .. }
+        ),
+        "{err:?}"
+    );
+    assert!(err.to_string().contains("already restores it"), "{err}");
+}
+
+#[test]
+fn restore_selection_rejects_empty_and_oversized_lists() {
+    assert!(matches!(
+        validate_restore(&restore_selecting(&[])),
+        Err(ValidationError::MissingRequiredField { .. })
+    ));
+    let many: Vec<String> = (0..=MAX_SELECTION_PATHS).map(|i| format!("f{i}")).collect();
+    let refs: Vec<&str> = many.iter().map(String::as_str).collect();
+    let err = validate_restore(&restore_selecting(&refs)).unwrap_err();
+    assert!(
+        err.to_string().contains("more than the 64 allowed"),
+        "{err}"
+    );
+
+    // 64 distinct paths each under the per-path cap still must not exceed the
+    // total the work spec can carry, or the Restore is admitted but never starts.
+    let long: Vec<String> = (0..MAX_SELECTION_PATHS)
+        .map(|i| format!("{i:02}/{}/{}", "x".repeat(250), "y".repeat(250)))
+        .collect();
+    let refs: Vec<&str> = long.iter().map(String::as_str).collect();
+    assert!(long.iter().map(String::len).sum::<usize>() > MAX_SELECTION_TOTAL_BYTES);
+    let err = validate_restore(&restore_selecting(&refs)).unwrap_err();
+    assert!(err.to_string().contains("a restore Job can carry"), "{err}");
+}
+
+#[test]
+fn restore_selection_with_file_deletion_is_admitted_because_deletion_is_scoped() {
+    // kopia's --delete-extra on a sub-path restore only prunes INSIDE
+    // `<target>/<path>` (proven against real kopia in
+    // crates/kopia/tests/integration_roundtrip.rs), so the combination is
+    // well-defined: it mirrors each selected directory, never anything outside.
+    use crate::restore::RestoreOptions;
+    let spec = RestoreSpec {
+        options: Some(RestoreOptions {
+            enable_file_deletion: true,
+            ..Default::default()
+        }),
+        ..restore_selecting(&["music/album"])
+    };
+    assert_eq!(validate_restore(&spec), Ok(()));
+}
+
+#[test]
+fn restore_selection_is_rejected_with_a_stream_exec_target() {
+    use crate::restore::StreamExecTarget;
+    let spec = RestoreSpec {
+        target: RestoreTarget::StreamExec(StreamExecTarget {
+            file_name: "postgres.sql".into(),
+            workload_exec: crate::snapshot_policy::StreamExec {
+                pod_selector: LabelSelector {
+                    match_labels: Some(BTreeMap::from([("app".to_string(), "pg".to_string())])),
+                    ..Default::default()
+                },
+                container: None,
+                command: vec!["psql".into()],
+                timeout: None,
+            },
+        }),
+        ..restore_selecting(&["postgres.sql"])
+    };
+    let err = validate_restore(&spec).unwrap_err();
+    assert!(
+        matches!(err, ValidationError::MutuallyExclusive { .. }),
+        "{err:?}"
+    );
+    assert!(err.to_string().contains("Fix:"), "{err}");
 }

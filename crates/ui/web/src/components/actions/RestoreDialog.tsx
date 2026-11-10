@@ -43,6 +43,15 @@ import { ActionPanel } from "./ActionPanel";
  * dropping the field — the input is therefore not offered for that source,
  * with the reason, instead of being sent into a 400.
  *
+ * # Paths restore part of a snapshot, in place
+ *
+ * `paths` (one per line) becomes `spec.selection.paths`: only those files or
+ * directories are restored, each to the same relative location in the target,
+ * and every sibling is left alone — bring back one deleted file into a live
+ * claim without touching the rest. Empty restores the whole snapshot. The
+ * shape rules (relative, no `..`) are the shared validator's, so they are not
+ * re-implemented here.
+ *
  * # What is not offered
  *
  * `spec.target.populator` has no wire variant: a populator restore is claimed
@@ -96,6 +105,7 @@ export function RestoreDialog({ namespace, snapshot, open, onOpenChange }: Resto
   const [overwrite, setOverwrite] = useState<OverwriteChoice>("");
   const [restoreName, setRestoreName] = useState("");
   const [sourcePath, setSourcePath] = useState("");
+  const [pathLines, setPathLines] = useState("");
   const [repositoryKind, setRepositoryKind] = useState("");
   const [repositoryName, setRepositoryName] = useState("");
   const [repositoryNamespace, setRepositoryNamespace] = useState("");
@@ -117,6 +127,7 @@ export function RestoreDialog({ namespace, snapshot, open, onOpenChange }: Resto
   // `sourcePath` is meaningless for a snapshotRef and the handler refuses it,
   // so it is never carried into the body from a stale input.
   const selector = sourceKind === "snapshotRef" ? "" : sourcePath.trim();
+  const paths = splitPaths(pathLines);
 
   const body: RestoreBody | undefined =
     source === undefined || target === undefined || overwrite === ""
@@ -128,6 +139,7 @@ export function RestoreDialog({ namespace, snapshot, open, onOpenChange }: Resto
           overwrite: overwrite === "yes",
           ...(restoreName.trim().length > 0 ? { name: restoreName.trim() } : {}),
           ...(selector.length > 0 ? { sourcePath: selector } : {}),
+          ...(paths.length > 0 ? { paths } : {}),
           ...(repository !== undefined ? { repository } : {}),
         };
 
@@ -343,6 +355,24 @@ export function RestoreDialog({ namespace, snapshot, open, onOpenChange }: Resto
         </Radio>
       </fieldset>
 
+      <div className="controls__field">
+        <label htmlFor={`${fieldId}-paths`}>Only these paths (optional, one per line)</label>
+        <textarea
+          id={`${fieldId}-paths`}
+          className="controls__input"
+          rows={3}
+          value={pathLines}
+          placeholder={"docs/report.odt\nmusic/album"}
+          onChange={(event) => {
+            setPathLines(event.target.value);
+          }}
+        />
+        <p className="action__note">
+          Relative to the snapshot root. Each file or directory is restored to the same place in the
+          target and nothing else is touched. Leave empty to restore the whole snapshot.
+        </p>
+      </div>
+
       {sourceKind === "snapshotRef" ? (
         <p className="action__note">
           A source path cannot be chosen for this source: the <span className="mono">Snapshot</span>{" "}
@@ -399,6 +429,14 @@ export function RestoreDialog({ namespace, snapshot, open, onOpenChange }: Resto
       />
     </ActionPanel>
   );
+}
+
+/** The non-blank lines of the paths box, trimmed — `spec.selection.paths`. */
+function splitPaths(lines: string): string[] {
+  return lines
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0);
 }
 
 /** Every free-text field the source and target variants need. */

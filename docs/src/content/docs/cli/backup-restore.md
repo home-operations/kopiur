@@ -57,6 +57,8 @@ restore.kopiur.home-operations.com/restore-nightly-20260611120001 created
 restore restore-nightly-20260611120001 completed: kopia id a1b2c3d4e5f6, 5.0 GiB / 1000 files into pvc/data-restored
 ```
 
+`--path <PATH>` restores only that file or directory out of the snapshot, to the same place in the target, and leaves everything else alone; repeat it for several paths. It sets `spec.selection.paths`, so the same rules apply (relative to the snapshot root, no `..`). See [Restores → selection](/restores/#restore-only-some-files--selection).
+
 Every `spec.options` and `spec.policy` knob has a flag: `--enable-file-deletion` for an exact-mirror restore, since the default is additive, plus `--ignore-permission-errors true|false`, `--write-files-atomically true|false`, `--on-missing-snapshot fail|continue` and `--wait-timeout 5m`. `--backoff-limit` and `--active-deadline-seconds` configure the mover Job.
 
 `--credential-projection` copies the repository's credential Secret into the restore's namespace. It needs the owning `ClusterRepository`'s `credentialProjection.allowed` gate; see [Movers → credential projection](/movers/#let-kopiur-project-the-credentials-secret-recommended-for-shared-repos).

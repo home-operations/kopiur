@@ -1,0 +1,76 @@
+[
+  {
+    "id": "1a971cb3ebdbd5a1c17409de36e240e6",
+    "source": { "host": "e2e", "userName": "kopiur", "path": "/pvc/data" },
+    "description": "",
+    "startTime": "2026-11-09T23:39:05.827161926Z",
+    "endTime": "2026-11-09T23:39:05.827874368Z",
+    "stats": {
+      "totalSize": 6,
+      "excludedTotalSize": 0,
+      "fileCount": 2,
+      "cachedFiles": 0,
+      "nonCachedFiles": 2,
+      "dirCount": 1,
+      "excludedFileCount": 0,
+      "excludedDirCount": 0,
+      "ignoredErrorCount": 0,
+      "errorCount": 0
+    },
+    "rootEntry": {
+      "name": "data",
+      "type": "d",
+      "mode": "0755",
+      "mtime": "2026-11-09T23:39:05.461941589Z",
+      "uid": 1000,
+      "gid": 100,
+      "obj": "k510d47fd3c910deaca2a8727ffd4d1d0",
+      "summ": {
+        "size": 6,
+        "files": 2,
+        "symlinks": 0,
+        "dirs": 1,
+        "maxTime": "2026-11-09T23:39:05.461941589Z",
+        "numFailed": 0
+      }
+    },
+    "retentionReason": ["latest-2"]
+  },
+  {
+    "id": "d901956efaf80d8ba0597651343bf4b0",
+    "source": { "host": "e2e", "userName": "kopiur", "path": "/pvc/data" },
+    "description": "",
+    "startTime": "2026-11-09T23:39:05.925868966Z",
+    "endTime": "2026-11-09T23:39:05.926036367Z",
+    "stats": {
+      "totalSize": 6,
+      "excludedTotalSize": 0,
+      "fileCount": 0,
+      "cachedFiles": 2,
+      "nonCachedFiles": 0,
+      "dirCount": 1,
+      "excludedFileCount": 0,
+      "excludedDirCount": 0,
+      "ignoredErrorCount": 0,
+      "errorCount": 0
+    },
+    "rootEntry": {
+      "name": "data",
+      "type": "d",
+      "mode": "0755",
+      "mtime": "2026-11-09T23:39:05.461941589Z",
+      "uid": 1000,
+      "gid": 100,
+      "obj": "k510d47fd3c910deaca2a8727ffd4d1d0",
+      "summ": {
+        "size": 6,
+        "files": 2,
+        "symlinks": 0,
+        "dirs": 1,
+        "maxTime": "2026-11-09T23:39:05.461941589Z",
+        "numFailed": 0
+      }
+    },
+    "retentionReason": ["latest-1", "hourly-1", "daily-1", "weekly-1", "monthly-1", "annual-1"]
+  }
+]

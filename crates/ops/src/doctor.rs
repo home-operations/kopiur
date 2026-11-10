@@ -114,6 +114,73 @@ impl DoctorCheck {
             Self::RecentWarnings => "recent warning events",
         }
     }
+
+    /// **Pure.** The stable identifier for one check — its variant name in
+    /// kebab-case, so `CrdsInstalled` becomes `crds-installed`.
+    ///
+    /// Derived from the variant name rather than written out per variant: the
+    /// `Debug` name *is* the identifier, so the two cannot drift apart when a
+    /// check is added or renamed. Every surface (the CLI's `-o json`, the web
+    /// console's `?checks=` and its rows) names a check by this one function.
+    pub fn id(self) -> String {
+        let name = format!("{self:?}");
+        let mut out = String::with_capacity(name.len() + 4);
+        for (i, c) in name.char_indices() {
+            if c.is_uppercase() {
+                if i != 0 {
+                    out.push('-');
+                }
+                out.extend(c.to_lowercase());
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+}
+
+/// How loudly one check's outcome counts, without its words. The one severity
+/// every surface renders — the CLI's `ok`/`warn`/`FAIL` column and the web
+/// console's `Pass`/`Warn`/`Fail` lamp are both exhaustive matches over this,
+/// so the two cannot disagree about a check's colour for the same report
+/// (issue #695).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+pub enum Severity {
+    /// The check passed.
+    Pass,
+    /// Reported, never counted as red.
+    Warn,
+    /// The check failed; the run exits 1.
+    Fail,
+}
+
+impl Severity {
+    /// The wire label the console's `DoctorCheckView.outcome` carries.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Pass => "Pass",
+            Self::Warn => "Warn",
+            Self::Fail => "Fail",
+        }
+    }
+}
+
+/// **Pure.** The scope one doctor run reads, from the namespace its caller
+/// explicitly asked for.
+///
+/// Doctor diagnoses the **installation**, so with no explicit namespace it
+/// reads every namespace — on every surface. The CLI used to take its scope
+/// from the kubeconfig context's namespace like the listing commands do, so
+/// `kubectl kopiur doctor` (context namespace `kopiur-system`) examined only
+/// the operator's own namespace and reported `ok` for failures and warnings
+/// the web console — which runs cluster-wide — showed in every other one
+/// (issue #695). Both surfaces now call this with the namespace the user
+/// *typed* (`-n` / `?namespace=`), never a defaulted one.
+pub fn doctor_scope(explicit_namespace: Option<&str>) -> Scope {
+    match explicit_namespace {
+        Some(ns) => Scope::Namespace(ns.to_string()),
+        None => Scope::All,
+    }
 }
 
 /// Outcome of one check.
@@ -133,6 +200,17 @@ pub enum Outcome {
         /// How to fix it.
         fix: String,
     },
+}
+
+impl Outcome {
+    /// **Pure.** This outcome's [`Severity`].
+    pub fn severity(&self) -> Severity {
+        match self {
+            Self::Pass => Severity::Pass,
+            Self::Warn(_) => Severity::Warn,
+            Self::Fail { .. } => Severity::Fail,
+        }
+    }
 }
 
 /// One line of the doctor report.
@@ -278,6 +356,16 @@ impl DoctorReport {
             .iter()
             .any(|c| matches!(c.outcome, Outcome::Fail { .. }));
         u8::from(failed)
+    }
+
+    /// **Pure.** `(id, severity)` per row, in run order — the projection every
+    /// surface must agree on. The CLI/console parity ratchet compares each
+    /// renderer's output against this.
+    pub fn verdicts(&self) -> Vec<(String, Severity)> {
+        self.checks
+            .iter()
+            .map(|c| (c.check.id(), c.outcome.severity()))
+            .collect()
     }
 }
 
@@ -1627,7 +1715,7 @@ fn failures_outcome(
     now: DateTime<Utc>,
     lookback: std::time::Duration,
 ) -> Outcome {
-    let lookback_label = format!("{}s", lookback.as_secs());
+    let lookback_label = kopiur_api::render_go_duration(lookback);
     let window =
         chrono::Duration::from_std(lookback).unwrap_or_else(|_| chrono::Duration::hours(24));
     let cutoff = now - window;
@@ -1686,14 +1774,48 @@ fn failures_outcome(
         ));
     }
     if !older.is_empty() {
-        let lines: Vec<String> = older.iter().map(|e| line(e)).collect();
-        note.push(format!(
-            "{} failed object(s) retained as history, none in the last {lookback_label}: {}",
-            older.len(),
-            join_capped(&lines, 5)
-        ));
+        note.push(retained_history_note(&older, &lookback_label));
     }
     Outcome::Warn(note.join("; "))
+}
+
+/// The sentence for failures older than the window: what is there, why it is
+/// still there, and how it goes away. **Pure.**
+///
+/// Deliberately a SUMMARY, not a list (issue #695): retained history is a
+/// steady state — up to `failedJobsHistoryLimit` rows per schedule and
+/// repository, kept on purpose — so naming every row turned a calm Warn into a
+/// wall of text that read like an outage. The per-object list still travels in
+/// the check's `objects` (`-o json`, the console's findings); this sentence
+/// answers "where do these come from, and when are they purged".
+fn retained_history_note(older: &[&&FailureEntry], lookback_label: &str) -> String {
+    let mut per_ns: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+    for e in older {
+        *per_ns
+            .entry(e.target.namespace.as_deref().unwrap_or("(cluster)"))
+            .or_default() += 1;
+    }
+    let by_ns: Vec<String> = per_ns.iter().map(|(ns, n)| format!("{ns} {n}")).collect();
+    let oldest = older
+        .iter()
+        .filter_map(|e| e.at)
+        .min()
+        .map(|t| format!(", oldest {}", t.to_rfc3339()))
+        .unwrap_or_default();
+    format!(
+        "{count} failed object(s) retained as history, none in the last {lookback_label} \
+         (by namespace: {by_ns}{oldest}). They are kept on purpose so a past failure can \
+         still be diagnosed: each SnapshotSchedule keeps its newest `failedJobsHistoryLimit` \
+         (default {limit}) failed Snapshots per repository and deletes older ones as newer \
+         failures arrive, failed manual Snapshots keep the newest {limit} per SnapshotPolicy, \
+         and Restores are never pruned — so a burst of failures stays until newer failures \
+         displace it. To clear them, delete the ones you have diagnosed \
+         (`kubectl delete snapshot -n <namespace> <name>`) or lower failedJobsHistoryLimit; \
+         `-o json` names every object",
+        count = older.len(),
+        by_ns = join_capped(&by_ns, 8),
+        limit = kopiur_api::consts::DEFAULT_FAILED_JOBS_HISTORY_LIMIT,
+    )
 }
 
 /// Build one [`FailureEntry`], letting a `Warn`-severity registry row explain
@@ -1857,12 +1979,33 @@ async fn check_warnings(ctx: &OpsCtx, now: DateTime<Utc>) -> Outcome {
     } else {
         // Warnings are informational here — the specific checks above turn the
         // actionable ones into Fails; this is the catch-all surface.
-        Outcome::Warn(format!(
-            "{} warning(s) on kopiur objects in the last hour: {}",
-            recent.len(),
-            recent.join(" | ")
-        ))
+        Outcome::Warn(warnings_note(&recent))
     }
+}
+
+/// The recent-warnings sentence, capped: the five newest-sorted entries in
+/// full and a count of the rest, so a noisy hour cannot bury the report.
+/// `kubectl get events --field-selector type=Warning -A` lists them all. **Pure.**
+fn warnings_note(recent: &[String]) -> String {
+    const SHOWN: usize = 5;
+    let shown = recent
+        .iter()
+        .take(SHOWN)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(" | ");
+    let rest = recent.len().saturating_sub(SHOWN);
+    let more = if rest == 0 {
+        String::new()
+    } else {
+        format!(
+            " | (+{rest} more; `kubectl get events -A --field-selector type=Warning` lists them)"
+        )
+    };
+    format!(
+        "{} warning(s) on kopiur objects in the last hour: {shown}{more}",
+        recent.len()
+    )
 }
 
 /// What a doctor run needs from its caller: the two windows the age-based
@@ -2034,8 +2177,19 @@ async fn run_work_checks(
         return;
     }
     let work = list_work(ctx).await;
+    out.extend(work_checks(&work, params, now));
+}
+
+/// **Pure.** The two work-scoped checks over an already-listed [`Work`], in
+/// report order, for the ones `params` asks for.
+///
+/// Split out of the runner so a caller holding fixture objects gets exactly the
+/// rows a live run would produce — the CLI/console parity ratchet feeds both
+/// renderers from this (#695).
+pub fn work_checks(work: &Work, params: &DoctorParams, now: DateTime<Utc>) -> Vec<CheckResult> {
+    let mut out = Vec::new();
     if params.wants(DoctorCheck::NoStuckWork) {
-        let (outcome, objects) = stuck(&work, params.stuck_threshold, now);
+        let (outcome, objects) = stuck(work, params.stuck_threshold, now);
         out.push(CheckResult {
             check: DoctorCheck::NoStuckWork,
             outcome: merge_degradation(outcome, &work.degraded),
@@ -2043,13 +2197,14 @@ async fn run_work_checks(
         });
     }
     if params.wants(DoctorCheck::RecentFailures) {
-        let (outcome, objects) = recent_failures(&work, params.failure_lookback, now);
+        let (outcome, objects) = recent_failures(work, params.failure_lookback, now);
         out.push(CheckResult {
             check: DoctorCheck::RecentFailures,
             outcome: merge_degradation(outcome, &work.degraded),
             objects,
         });
     }
+    out
 }
 
 /// Run the checks this run asked for, in report order, and collect them. Never
@@ -3224,6 +3379,74 @@ mod tests {
         };
         assert!(msg.contains("retained as history"), "{msg}");
         assert_eq!(report(vec![outcome]).exit_code(), 0);
+    }
+
+    /// #695: 131 retained failures produced a Warn that named five of them in
+    /// full and gave no hint where they came from or when they go away. The
+    /// sentence is now a summary that says why they are kept and how to clear
+    /// them; the per-object list stays in `objects`.
+    #[test]
+    fn retained_history_is_summarized_with_why_and_how_it_is_purged() {
+        let mut snaps: Vec<Snapshot> = (0..12)
+            .map(|i| failed_snapshot(&format!("hourly-{i}"), 60 * 24 * 21 - i * 60))
+            .collect();
+        let mut other = failed_snapshot("nightly-0", 60 * 24 * 20);
+        other.metadata.namespace = Some("id".into());
+        snaps.push(other);
+        let w = work(snaps, vec![]);
+        let (outcome, objects) =
+            recent_failures(&w, std::time::Duration::from_secs(24 * 3600), now());
+        let Outcome::Warn(msg) = &outcome else {
+            panic!("history alone must warn: {outcome:?}");
+        };
+        assert!(
+            msg.starts_with("13 failed object(s) retained as history, none in the last 24h"),
+            "the window reads as a duration, not 86400s: {msg}"
+        );
+        assert!(msg.contains("by namespace: id 1; media 12"), "{msg}");
+        assert!(
+            msg.contains("failedJobsHistoryLimit"),
+            "why they are kept: {msg}"
+        );
+        assert!(
+            msg.contains("kubectl delete snapshot"),
+            "how to clear: {msg}"
+        );
+        assert!(
+            !msg.contains("hourly-3") && !msg.contains("kopia could not connect"),
+            "no per-object dump in the sentence: {msg}"
+        );
+        assert_eq!(objects.len(), 13, "every object is still a finding");
+        assert!(objects.iter().all(|o| o.severity == FindingSeverity::Warn));
+    }
+
+    #[test]
+    fn recent_warnings_are_capped_with_a_count_of_the_rest() {
+        let many: Vec<String> = (0..12)
+            .map(|i| format!("Reason ns/obj-{i}: note"))
+            .collect();
+        let note = warnings_note(&many);
+        assert!(note.starts_with("12 warning(s)"), "{note}");
+        assert!(note.contains("obj-4"), "{note}");
+        assert!(!note.contains("obj-5"), "{note}");
+        assert!(note.contains("(+7 more"), "{note}");
+        let few = warnings_note(&many[..2]);
+        assert!(!few.contains("more"), "{few}");
+    }
+
+    #[test]
+    fn check_ids_are_kebab_case_variant_names_and_severity_is_exhaustive() {
+        assert_eq!(DoctorCheck::CrdsInstalled.id(), "crds-installed");
+        assert_eq!(DoctorCheck::RecentFailures.id(), "recent-failures");
+        let ids: BTreeSet<String> = DoctorCheck::ALL.iter().map(|c| c.id()).collect();
+        assert_eq!(ids.len(), DoctorCheck::ALL.len(), "ids are unique");
+        assert_eq!(Outcome::Pass.severity(), Severity::Pass);
+        assert_eq!(Outcome::Warn(String::new()).severity(), Severity::Warn);
+        assert_eq!(doctor_scope(None), Scope::All);
+        assert_eq!(
+            doctor_scope(Some("media")),
+            Scope::Namespace("media".into())
+        );
     }
 
     #[test]

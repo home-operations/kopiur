@@ -33,6 +33,12 @@ row: RestoreRow,
  */
 source?: RestoreSourceView | null,
 /**
+ * `spec.selection.paths` — a partial restore's selected snapshot paths,
+ * each written to the same relative location in the target. Empty means
+ * the whole snapshot is restored.
+ */
+selectedPaths: Array<string>,
+/**
  * `status.target` — where the data is actually being written.
  */
 target?: RestoreTargetView | null,

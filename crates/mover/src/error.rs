@@ -22,8 +22,10 @@ pub enum KopiaOp {
     RepositoryConnect,
     /// `repository throttle set` (moverDefaults.throttle).
     ThrottleSet,
-    /// `policy set` against the snapshot's source identity.
+    /// `policy set` against the snapshot's identity scope (`username@hostname`).
     PolicySet,
+    /// `kopia policy delete` + `policy set` on the source's path scope (#681).
+    PolicyReplace,
     /// `snapshot create`.
     SnapshotCreate,
     /// `snapshot restore`.
@@ -50,6 +52,8 @@ pub enum KopiaOp {
     /// `snapshot list` while resolving an object-store restore source (the in-Job
     /// `fromPolicy`/`identity` listing path).
     RestoreSnapshotList,
+    /// `ls <id>/<path>` probing a partial restore's selected paths (#689).
+    RestorePathProbe,
     /// `snapshot list` while resolving the deep-verify restore candidate.
     DeepVerifySnapshotList,
     /// The deep-verify scratch restore.
@@ -112,6 +116,7 @@ impl KopiaOp {
             KopiaOp::RepositoryConnect => "repository connect",
             KopiaOp::ThrottleSet => "repository throttle set",
             KopiaOp::PolicySet => "policy set",
+            KopiaOp::PolicyReplace => "policy replace",
             KopiaOp::SnapshotCreate => "snapshot create",
             KopiaOp::SnapshotRestore => "snapshot restore",
             KopiaOp::SnapshotDelete => "snapshot delete",
@@ -124,6 +129,7 @@ impl KopiaOp {
             KopiaOp::VerifyConnect => "verify connect",
             KopiaOp::SnapshotVerify => "snapshot verify",
             KopiaOp::RestoreSnapshotList => "restore snapshot list",
+            KopiaOp::RestorePathProbe => "restore path probe",
             KopiaOp::DeepVerifySnapshotList => "deep verify snapshot list",
             KopiaOp::DeepVerifyRestore => "deep verify restore",
             KopiaOp::ReplicateConnect => "replication connect",
@@ -325,6 +331,57 @@ pub enum MoverError {
     RestoreNoSnapshot {
         /// The kopia identity the listing keyed on (`user@host:path`).
         identity: String,
+    },
+
+    /// A partial restore (#689) selected path(s) that do not exist in the
+    /// snapshot. Raised by the pre-restore probe, so NOTHING was written to the
+    /// target. Terminal: the same snapshot will never grow the path.
+    #[error(
+        "partial restore: {} selected path(s) not found in snapshot {snapshot_id}: {}. Nothing \
+         was restored. Fix: correct spec.selection.paths (relative to the snapshot root — \
+         browse the snapshot to check the exact names), or restore from a snapshot taken \
+         while the path existed",
+        missing.len(),
+        missing.iter().map(|p| format!("{p:?}")).collect::<Vec<_>>().join(", ")
+    )]
+    RestorePathsMissing {
+        /// The snapshot that was probed.
+        snapshot_id: String,
+        /// The selected paths absent from it, in selection order.
+        missing: Vec<String>,
+    },
+
+    /// A partial restore could not create the parent directory of a selected
+    /// FILE inside the target (kopia restores a file only into an existing
+    /// directory).
+    #[error(
+        "partial restore: could not create directory {} in the restore target: {source}. Fix: \
+         make the target PVC writable by the mover (mover.securityContext / \
+         inheritSecurityContextFrom), or restore the parent directory instead of the file",
+        path.display()
+    )]
+    RestoreTargetDir {
+        /// The directory that could not be created.
+        path: std::path::PathBuf,
+        /// The underlying IO error.
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// A partial restore (#689) found a symbolic link on the way to a selected
+    /// path in the live target. Writing through it could land outside the
+    /// target volume (into another mount of the mover pod), so the run is
+    /// refused before anything is written.
+    #[error(
+        "partial restore refused: {} in the restore target is a symbolic link, so restoring \
+         the selected path through it could write outside the target volume. Nothing was \
+         restored. Fix: replace the link with a real directory in the PVC, or restore into a \
+         new PVC (target.pvc) and copy the files across",
+        path.display()
+    )]
+    RestoreTargetSymlink {
+        /// The symlinked path inside the target.
+        path: std::path::PathBuf,
     },
 
     /// A restore selector's `asOf` was not a valid RFC3339 timestamp. The webhook
@@ -610,6 +667,9 @@ impl MoverError {
             | MoverError::VerifyNoSnapshot { .. }
             | MoverError::RestoreNoSnapshot { .. }
             | MoverError::RestoreAsOfInvalid { .. }
+            | MoverError::RestorePathsMissing { .. }
+            | MoverError::RestoreTargetDir { .. }
+            | MoverError::RestoreTargetSymlink { .. }
             | MoverError::ScratchNotWritable { .. }
             // A failed dump command / unresolvable pod is the user's config, not a
             // transient fault: re-running the same Job re-runs the same command.
@@ -655,6 +715,7 @@ mod tests {
             KopiaOp::RepositoryConnect,
             KopiaOp::ThrottleSet,
             KopiaOp::PolicySet,
+            KopiaOp::PolicyReplace,
             KopiaOp::SnapshotCreate,
             KopiaOp::SnapshotRestore,
             KopiaOp::SnapshotDelete,
@@ -667,6 +728,7 @@ mod tests {
             KopiaOp::VerifyConnect,
             KopiaOp::SnapshotVerify,
             KopiaOp::RestoreSnapshotList,
+            KopiaOp::RestorePathProbe,
             KopiaOp::DeepVerifySnapshotList,
             KopiaOp::DeepVerifyRestore,
             KopiaOp::ReplicateConnect,

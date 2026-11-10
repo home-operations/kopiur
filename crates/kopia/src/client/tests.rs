@@ -511,6 +511,94 @@ fn restore_args_default_is_bare() {
 }
 
 #[test]
+fn restore_path_args_scope_source_and_target_to_the_selected_path() {
+    // #689 partial restore: `<id>/<rel>` -> `<target>/<rel>`, nothing else.
+    assert_eq!(
+        restore_path_args(
+            "snap1",
+            "docs/report.odt",
+            "/data",
+            &RestoreOptions::default()
+        ),
+        vec![
+            "snapshot",
+            "restore",
+            "snap1/docs/report.odt",
+            "/data/docs/report.odt"
+        ]
+    );
+    // A trailing slash on the mount root never produces `//`.
+    assert_eq!(
+        restore_path_args("snap1", "music/album", "/data/", &RestoreOptions::default()),
+        vec![
+            "snapshot",
+            "restore",
+            "snap1/music/album",
+            "/data/music/album"
+        ]
+    );
+    // Spaces survive verbatim (argv, never a shell).
+    assert_eq!(
+        restore_path_args("s", "a b/c d.txt", "/data", &RestoreOptions::default()),
+        vec!["snapshot", "restore", "s/a b/c d.txt", "/data/a b/c d.txt"]
+    );
+    // Every restore flag applies to a partial restore exactly as to a full one.
+    let opts = RestoreOptions {
+        delete_extra: Some(true),
+        overwrite_files: Some(false),
+        parallel: Some(2),
+        ..Default::default()
+    };
+    assert_eq!(
+        restore_path_args("s", "music", "/data", &opts),
+        vec![
+            "snapshot",
+            "restore",
+            "s/music",
+            "/data/music",
+            "--no-overwrite-files",
+            "--delete-extra",
+            "--parallel",
+            "2"
+        ]
+    );
+    assert_eq!(restore_path_target("/", "a/b"), "/a/b");
+}
+
+#[test]
+fn snapshot_path_probe_classifies_kopia_ls_stderr() {
+    let err = |tail: &str| KopiaError::NonZeroExit {
+        args: "ls x".into(),
+        code: Some(1),
+        class: KopiaErrorClass::NotFound,
+        stderr_tail: tail.into(),
+    };
+    assert_eq!(
+        classify_snapshot_path_probe(err(
+            "unable to get filesystem directory entry: abc/docs/report.odt is not a directory object"
+        ))
+        .unwrap(),
+        SnapshotPathKind::NonDirectory
+    );
+    assert_eq!(
+        classify_snapshot_path_probe(err(
+            "unable to get filesystem directory entry: error reading directory: entry not found"
+        ))
+        .unwrap(),
+        SnapshotPathKind::Missing
+    );
+    // A stale/unknown manifest id is NOT "missing path": it stays an error so the
+    // mover can self-heal the id instead of blaming the user's selection.
+    assert!(
+        classify_snapshot_path_probe(err(
+            "unable to get filesystem directory entry: entry not found \"docs\": parent is not a directory"
+        ))
+        .is_err()
+    );
+    assert!(classify_snapshot_path_probe(err("error connecting to repository")).is_err());
+}
+
+#[test]
 fn restore_args_tristate_and_flags() {
     let opts = RestoreOptions {
         ignore_permission_errors: Some(false),
@@ -1329,6 +1417,91 @@ fn policy_set_args_builds_flags() {
 }
 
 #[test]
+fn policy_replace_plan_deletes_the_stored_policy_before_setting_the_spec() {
+    // #681: `--add-ignore` (and every other `policy set` list flag) is a set
+    // UNION into the policy kopia already stores for the target, and an omitted
+    // scalar flag keeps its stored value. So `policy set` alone can only ever
+    // ADD to a scope: a rule removed from the CRD lived on in kopia forever.
+    // The replace plan drops the stored policy first, so the set that follows
+    // writes the spec onto an empty policy.
+    let policy = PolicyArgs {
+        compression: Some("zstd".into()),
+        ignore: vec!["/lost+found".into(), ".snapshot".into()],
+        ..Default::default()
+    };
+    let plan = policy_replace_plan("u@h:/pvc/immich", &policy);
+    assert_eq!(plan.delete, vec!["policy", "delete", "u@h:/pvc/immich"]);
+    assert_eq!(
+        plan.set,
+        Some(policy_set_args("u@h:/pvc/immich", &policy)),
+        "the set step is exactly the spec's `policy set`, nothing appended"
+    );
+}
+
+#[test]
+fn policy_replace_plan_never_clears_a_list_inside_the_set() {
+    // The tempting one-liner fix is `--clear-ignore --add-ignore …` in one
+    // `policy set`. In kopia 0.23.1 `applyPolicyStringList` RETURNS right after
+    // clearing, so that call stores an EMPTY list: every ignore rule silently
+    // dropped. Verified against the real binary; the real-kopia guard is
+    // `policy_replace_removes_rules_dropped_from_the_spec` in
+    // tests/integration_roundtrip.rs. The plan must never take that shape.
+    let policy = PolicyArgs {
+        ignore: vec!["/a".into()],
+        never_compress: vec!["*.gz".into()],
+        ..Default::default()
+    };
+    let set = policy_replace_plan("u@h:/p", &policy)
+        .set
+        .expect("a non-empty spec has a set step");
+    assert!(
+        !set.iter().any(|a| a.starts_with("--clear-")),
+        "a --clear-* flag swallows the --add-* flags beside it: {set:?}"
+    );
+}
+
+#[test]
+fn policy_replace_plan_skips_the_set_when_the_spec_writes_nothing() {
+    // `files.ignoreRules: []` with no other knob resolves to an empty
+    // PolicyArgs. Deleting the stored policy IS the whole job then, and a bare
+    // `kopia policy set <target>` would fail anyway ("no changes specified").
+    let plan = policy_replace_plan("u@h:/p", &PolicyArgs::default());
+    assert_eq!(plan.delete, vec!["policy", "delete", "u@h:/p"]);
+    assert_eq!(plan.set, None);
+}
+
+#[test]
+fn policy_set_args_writes_max_parallel_snapshots_inherit_to_reset_it() {
+    // `--max-parallel-snapshots` lives at the identity scope, which Kopiur
+    // writes but does not delete (it also holds the KOPIA_KEEP_MAX pin). So an
+    // unset knob has to be written as an explicit `inherit` there, or a value
+    // removed from the spec would stay stored: the #681 class at the identity
+    // scope. Verified: kopia 0.23.1 accepts `--max-parallel-snapshots inherit`.
+    let reset = PolicyArgs {
+        max_parallel_snapshots: Some(PolicyInt::Inherit),
+        ..Default::default()
+    };
+    assert_eq!(
+        policy_set_args("u@h", &reset),
+        vec![
+            "policy",
+            "set",
+            "u@h",
+            "--max-parallel-snapshots",
+            "inherit"
+        ]
+    );
+    let set = PolicyArgs {
+        max_parallel_snapshots: Some(PolicyInt::Set(3)),
+        ..Default::default()
+    };
+    assert_eq!(
+        policy_set_args("u@h", &set),
+        vec!["policy", "set", "u@h", "--max-parallel-snapshots", "3"]
+    );
+}
+
+#[test]
 fn tristate_helpers_match_each_command_grammar() {
     // `snapshot restore` flags are kingpin `--[no-]flag` booleans…
     let mut a = Vec::new();
@@ -1354,7 +1527,7 @@ fn split_policy_scopes_moves_max_parallel_snapshots_to_identity() {
     // regression) — that one knob must be applied at the identity scope.
     let policy = PolicyArgs {
         compression: Some("zstd".into()),
-        max_parallel_snapshots: Some(2),
+        max_parallel_snapshots: Some(PolicyInt::Set(2)),
         max_parallel_file_reads: Some(4),
         ..Default::default()
     };
@@ -1367,7 +1540,7 @@ fn split_policy_scopes_moves_max_parallel_snapshots_to_identity() {
     assert_eq!(
         identity,
         PolicyArgs {
-            max_parallel_snapshots: Some(2),
+            max_parallel_snapshots: Some(PolicyInt::Set(2)),
             ..Default::default()
         }
     );
@@ -1389,7 +1562,7 @@ fn policy_set_args_builds_error_handling_and_upload_flags() {
         ignore_file_errors: Some(true),
         ignore_dir_errors: Some(false),
         ignore_unknown_types: Some(true),
-        max_parallel_snapshots: Some(4),
+        max_parallel_snapshots: Some(PolicyInt::Set(4)),
         max_parallel_file_reads: Some(8),
         ..Default::default()
     };

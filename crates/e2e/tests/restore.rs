@@ -2157,3 +2157,264 @@ async fn restore_parks_when_frompolicy_names_a_missing_policy() {
     let _ = configs.delete(WR_CFG, &DeleteParams::default()).await;
     let _ = repos.delete(WR_CFG_REPO, &DeleteParams::default()).await;
 }
+
+// ---------------------------------------------------------------------------
+// Partial, in-place restore (#689)
+// ---------------------------------------------------------------------------
+
+const PARTIAL_SUBPATH: &str = "partial";
+const PARTIAL_REPO: &str = "e2e-partial-repo";
+const PARTIAL_CFG: &str = "e2e-partial-cfg";
+const PARTIAL_BACKUP: &str = "e2e-partial-snap";
+const PARTIAL_PVC: &str = "e2e-partial-live";
+const PARTIAL_RESTORE: &str = "e2e-partial-restore";
+const PARTIAL_RESTORE_MISSING: &str = "e2e-partial-restore-missing";
+
+/// Run a one-shot busybox pod with `script` against the live PVC (mounted at
+/// `/data`) and wait for it to succeed, then delete it so the next step can
+/// reuse the name. Every write ends world-writable: the mover runs as uid
+/// 65532, and a root-owned 0755 directory would stop it restoring INTO it —
+/// a fixture artifact, not what this scenario tests.
+async fn run_on_live_pvc(client: &Client, pod: &str, script: &str) {
+    use kopiur_e2e::builders;
+    let pods: Api<Pod> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let _ = pods.delete(pod, &DeleteParams::default()).await;
+    wait_until(
+        &format!("helper pod {pod} gone"),
+        default_timeout(),
+        poll_interval(),
+        || async { Ok(pods.get_opt(pod).await?.is_none().then_some(())) },
+    )
+    .await
+    .unwrap_or_else(|e| panic!("previous helper pod {pod} must clear: {e}"));
+    pods.create(
+        &PostParams::default(),
+        &builders::one_shot_pod(
+            E2E_NAMESPACE,
+            pod,
+            &["sh", "-ec", script],
+            &[(PARTIAL_PVC, "/data")],
+        ),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("create helper pod {pod}: {e}"));
+    kopiur_e2e::wait::pod_succeeded(client, E2E_NAMESPACE, pod)
+        .await
+        .unwrap_or_else(|e| panic!("helper pod {pod} must succeed: {e}"));
+    let _ = pods.delete(pod, &DeleteParams::default()).await;
+}
+
+/// The #689 use case end to end: a user deleted one file on a SHARED, live PVC
+/// while others kept working on it. A `Restore` with `spec.selection.paths`
+/// restores just that file (and one directory) back INTO the live PVC — not a
+/// full in-place restore, not a new PVC + rsync — and every sibling file that
+/// changed or appeared after the snapshot is left exactly as it is.
+///
+/// Also asserts the fail-closed path: a selected path that is not in the
+/// snapshot fails the Restore with the mover's actionable message and writes
+/// nothing.
+#[tokio::test]
+#[ignore = "requires the e2e harness (mise run //crates/e2e:test)"]
+async fn partial_in_place_restore_brings_back_only_the_selected_paths() {
+    let Some(world) = World::connect().await else {
+        return;
+    };
+    world
+        .ensure(&[Need::Filesystem])
+        .await
+        .expect("fixtures ready");
+    let client = world.client().clone();
+    common::ensure_repo(&client, PARTIAL_SUBPATH).await;
+    let repos: Api<Repository> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let configs: Api<SnapshotPolicy> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let backups: Api<Snapshot> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let restores: Api<Restore> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+
+    // Rerun hygiene: this scenario mutates its PVC, so it always starts fresh.
+    cleanup_restore(&restores, PARTIAL_RESTORE).await;
+    cleanup_restore(&restores, PARTIAL_RESTORE_MISSING).await;
+    let _ = backups
+        .delete(PARTIAL_BACKUP, &DeleteParams::default())
+        .await;
+    wait_until(
+        "previous partial-restore Snapshot gone",
+        default_timeout(),
+        poll_interval(),
+        || async {
+            Ok(backups
+                .get_opt(PARTIAL_BACKUP)
+                .await?
+                .is_none()
+                .then_some(()))
+        },
+    )
+    .await
+    .expect("a previous run's Snapshot must clear");
+    if pvcs.get_opt(PARTIAL_PVC).await.ok().flatten().is_none() {
+        pvcs.create(
+            &PostParams::default(),
+            &kopiur_e2e::builders::dynamic_pvc(E2E_NAMESPACE, PARTIAL_PVC, "64Mi"),
+        )
+        .await
+        .expect("create the live PVC");
+    }
+
+    // 1. The shared volume as it was at backup time.
+    run_on_live_pvc(
+        &client,
+        "e2e-partial-seed",
+        "rm -rf /data/* && mkdir -p /data/docs /data/music/album && \
+         echo 'report v1' > /data/docs/report.odt && \
+         echo 'other v1' > /data/docs/other.txt && \
+         echo 'track one' > /data/music/album/01.mp3 && \
+         echo 'track two' > /data/music/album/02.mp3 && \
+         echo 'top v1' > /data/top.txt && chmod -R a+rwX /data",
+    )
+    .await;
+
+    // 2. Back it up.
+    if repos.get_opt(PARTIAL_REPO).await.ok().flatten().is_none() {
+        repos
+            .create(
+                &PostParams::default(),
+                &cr(common::repository_json(
+                    PARTIAL_REPO,
+                    PARTIAL_SUBPATH,
+                    serde_json::json!({}),
+                )),
+            )
+            .await
+            .expect("create Repository");
+    }
+    wait_phase(&repos, PARTIAL_REPO, "Ready")
+        .await
+        .expect("partial-restore Repository Ready");
+    if configs.get_opt(PARTIAL_CFG).await.ok().flatten().is_none() {
+        configs
+            .create(
+                &PostParams::default(),
+                &cr(common::snapshot_policy_json(
+                    E2E_NAMESPACE,
+                    PARTIAL_CFG,
+                    "Repository",
+                    PARTIAL_REPO,
+                    serde_json::json!({ "sources": [ { "pvc": { "name": PARTIAL_PVC } } ] }),
+                )),
+            )
+            .await
+            .expect("create SnapshotPolicy");
+    }
+    backups
+        .create(
+            &PostParams::default(),
+            &cr(common::snapshot_json(
+                E2E_NAMESPACE,
+                PARTIAL_BACKUP,
+                PARTIAL_CFG,
+                serde_json::json!({}),
+            )),
+        )
+        .await
+        .expect("create Snapshot");
+    wait_phase(&backups, PARTIAL_BACKUP, "Succeeded")
+        .await
+        .expect("the partial-restore Snapshot should Succeed");
+
+    // 3. Life goes on: one user deletes report.odt and an album track, while
+    //    others edit other.txt and add a new file — all AFTER the snapshot.
+    run_on_live_pvc(
+        &client,
+        "e2e-partial-mutate",
+        "rm /data/docs/report.odt /data/music/album/02.mp3 && \
+         echo 'edited after backup' > /data/docs/other.txt && \
+         echo 'written after backup' > /data/docs/new-since-backup.txt && \
+         echo 'top edited' > /data/top.txt && chmod -R a+rwX /data",
+    )
+    .await;
+
+    let restore_cr = |name: &str, paths: serde_json::Value| -> Restore {
+        cr(serde_json::json!({
+            "apiVersion": "kopiur.home-operations.com/v1alpha1",
+            "kind": "Restore",
+            "metadata": { "name": name, "namespace": E2E_NAMESPACE },
+            "spec": {
+                "repository": { "kind": "Repository", "name": PARTIAL_REPO },
+                "source": { "snapshotRef": { "name": PARTIAL_BACKUP } },
+                "target": { "pvcRef": { "name": PARTIAL_PVC } },
+                "selection": { "paths": paths },
+                // Overwrite is kopia's default; said explicitly because this
+                // writes into a live volume.
+                "options": { "overwriteFiles": true },
+                "failurePolicy": { "backoffLimit": 0 }
+            }
+        }))
+    };
+
+    // 4. Fail closed: a path absent from the snapshot fails the Restore before
+    //    anything is written, with the mover's actionable message.
+    restores
+        .create(
+            &PostParams::default(),
+            &restore_cr(
+                PARTIAL_RESTORE_MISSING,
+                serde_json::json!(["docs/report.odt", "docs/never-existed.odt"]),
+            ),
+        )
+        .await
+        .expect("create missing-path Restore");
+    wait_phase(&restores, PARTIAL_RESTORE_MISSING, "Failed")
+        .await
+        .expect("a selected path absent from the snapshot must fail the Restore");
+    let s = status_json(&restores, PARTIAL_RESTORE_MISSING).await;
+    let msg = s["failure"]["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("not found in snapshot") && msg.contains("docs/never-existed.odt"),
+        "the failure must name the missing path: {s}"
+    );
+    // ...and nothing was written: report.odt (which DOES exist in the snapshot)
+    // is still gone, because the probe runs before any restore.
+    run_on_live_pvc(
+        &client,
+        "e2e-partial-check-none",
+        "test ! -e /data/docs/report.odt",
+    )
+    .await;
+    cleanup_restore(&restores, PARTIAL_RESTORE_MISSING).await;
+
+    // 5. The real thing: bring back the deleted file and the album, in place.
+    restores
+        .create(
+            &PostParams::default(),
+            &restore_cr(
+                PARTIAL_RESTORE,
+                serde_json::json!(["docs/report.odt", "music/album"]),
+            ),
+        )
+        .await
+        .expect("create partial Restore");
+    wait_phase(&restores, PARTIAL_RESTORE, "Completed")
+        .await
+        .expect("the partial in-place Restore should reach Completed");
+
+    // 6. The selected paths are back; every sibling written after the snapshot
+    //    is untouched (not reverted, not deleted).
+    run_on_live_pvc(
+        &client,
+        "e2e-partial-verify",
+        "grep -qx 'report v1' /data/docs/report.odt && \
+         grep -qx 'track two' /data/music/album/02.mp3 && \
+         grep -qx 'track one' /data/music/album/01.mp3 && \
+         grep -qx 'edited after backup' /data/docs/other.txt && \
+         grep -qx 'written after backup' /data/docs/new-since-backup.txt && \
+         grep -qx 'top edited' /data/top.txt",
+    )
+    .await;
+
+    cleanup_restore(&restores, PARTIAL_RESTORE).await;
+    let _ = backups
+        .delete(PARTIAL_BACKUP, &DeleteParams::default())
+        .await;
+    let _ = configs.delete(PARTIAL_CFG, &DeleteParams::default()).await;
+    let _ = repos.delete(PARTIAL_REPO, &DeleteParams::default()).await;
+}
