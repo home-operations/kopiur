@@ -31,6 +31,8 @@ use api::validate::ExistingIdentity;
 use api::{ClusterRepository, IdentityInputs, Repository, SnapshotPolicy, SnapshotPolicySpec};
 use kube::{Api, Client, ResourceExt};
 
+use crate::referent::{self, Referent};
+
 /// The normalized repository key — hoisted into `kopiur_api::common` (the
 /// shared validator's duplicate-repo check normalizes with the SAME function),
 /// re-exported here so the webhook's existing callers keep their import path.
@@ -86,21 +88,78 @@ pub fn policy_identity_string(
         .map(|r| api::identity_string(&r))
 }
 
-/// Look up the `identityDefaults` of the `Repository`/`ClusterRepository` a policy
-/// references, if any (`None` when the lookup fails). Cached by [`repo_key`] (kind +
-/// effective namespace + name) so listing N policies that share a repository does
-/// one get — a plain repo-name key would collide across namespaces for a namespaced
-/// `Repository`. Fetch the `identityDefaults` of the repository a single policy
-/// references (no cache — for callers resolving one policy, e.g. the fork guard).
+/// The `identityDefaults` of the repository a policy references, as read at
+/// admission. Three-way (issue #677) so the fork guard can tell "the repository
+/// has no defaults" from "the repository does not exist yet" — the two need
+/// different decisions (see [`crate::identity_fork`]).
+#[derive(Debug, Clone)]
+pub(crate) enum RepoDefaults {
+    /// The repository exists; its `identityDefaults` (`None` = none set).
+    Known(Option<IdentityDefaults>),
+    /// The repository does not exist (404). It has no defaults to resolve against.
+    Missing,
+    /// The read failed for another reason (RBAC, apiserver). Unknown.
+    Unreadable,
+}
+
+impl RepoDefaults {
+    /// The defaults to resolve an identity under for the best-effort collision
+    /// guard: whatever is known, else none (its historical fail-open posture).
+    pub(crate) fn best_effort(&self) -> Option<IdentityDefaults> {
+        match self {
+            RepoDefaults::Known(d) => d.clone(),
+            RepoDefaults::Missing | RepoDefaults::Unreadable => None,
+        }
+    }
+}
+
+/// Read the `identityDefaults` of the `Repository`/`ClusterRepository` `repo`
+/// names, through the shared [`crate::referent::fetch`] (no cache — for callers
+/// resolving one policy, e.g. the fork guard).
+pub(crate) async fn repo_defaults_lookup(
+    client: &Client,
+    repo: &RepositoryRef,
+    owner_namespace: &str,
+) -> RepoDefaults {
+    let read = match repo.kind {
+        RepositoryKind::ClusterRepository => {
+            let api: Api<ClusterRepository> = Api::all(client.clone());
+            referent::fetch(&api, &repo.name)
+                .await
+                .map(|c| c.spec.identity_defaults)
+        }
+        RepositoryKind::Repository => {
+            let ns = repo.namespace.as_deref().unwrap_or(owner_namespace);
+            let api: Api<Repository> = Api::namespaced(client.clone(), ns);
+            referent::fetch(&api, &repo.name)
+                .await
+                .map(|r| r.spec.identity_defaults)
+        }
+    };
+    match read {
+        Referent::Found(defaults) => RepoDefaults::Known(defaults),
+        Referent::Missing => RepoDefaults::Missing,
+        Referent::Unreadable(_) => RepoDefaults::Unreadable,
+    }
+}
+
+/// [`repo_defaults_lookup`] collapsed to its best-effort value (`None` when the
+/// repository is absent, has no defaults, or is unreadable).
 pub(crate) async fn cluster_repo_defaults_for(
     client: &Client,
     repo: &RepositoryRef,
     owner_namespace: &str,
 ) -> Option<IdentityDefaults> {
-    let mut cache = BTreeMap::new();
-    cluster_repo_defaults(client, repo, owner_namespace, &mut cache).await
+    repo_defaults_lookup(client, repo, owner_namespace)
+        .await
+        .best_effort()
 }
 
+/// Look up the `identityDefaults` of the repository a policy references for the
+/// collision guard (`None` when absent, unset, or unreadable). Cached by
+/// [`repo_key`] (kind + effective namespace + name) so listing N policies that
+/// share a repository does one get — a plain repo-name key would collide across
+/// namespaces for a namespaced `Repository`.
 async fn cluster_repo_defaults(
     client: &Client,
     repo: &RepositoryRef,
@@ -111,25 +170,9 @@ async fn cluster_repo_defaults(
     if let Some(cached) = cache.get(&key) {
         return cached.clone();
     }
-    let defaults = match repo.kind {
-        RepositoryKind::ClusterRepository => {
-            let api: Api<ClusterRepository> = Api::all(client.clone());
-            api.get_opt(&repo.name)
-                .await
-                .ok()
-                .flatten()
-                .and_then(|c| c.spec.identity_defaults)
-        }
-        RepositoryKind::Repository => {
-            let ns = repo.namespace.as_deref().unwrap_or(owner_namespace);
-            let api: Api<Repository> = Api::namespaced(client.clone(), ns);
-            api.get_opt(&repo.name)
-                .await
-                .ok()
-                .flatten()
-                .and_then(|r| r.spec.identity_defaults)
-        }
-    };
+    let defaults = repo_defaults_lookup(client, repo, owner_namespace)
+        .await
+        .best_effort();
     cache.insert(key, defaults.clone());
     defaults
 }

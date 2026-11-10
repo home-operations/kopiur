@@ -33,6 +33,11 @@ enforced at admission but silently skipped at reconcile (or vice versa).
 - [`handlers::SNAPSHOT_CLEANUP_FINALIZER`] — the finalizer the mutating pass adds.
 - [`tenancy`] — [`tenancy::evaluate_tenancy`] / [`tenancy::TenancyDecision`]:
   `ClusterRepository` consumer-allow-list enforcement.
+- [`referent`] — [`referent::fetch`] / [`referent::Referent`]: the only way the
+  webhook reads a referenced object. A referent that does not exist yet
+  (`Referent::Missing`) is admitted with a warning, never denied (GitOps apply
+  order, issue #677); a ratchet test fails the build if any other code awaits a
+  kube point-read.
 - [`metrics::WebhookMetrics`] — admission outcome counters (Prometheus pull).
 - [`config`] — every webhook env var name + default (listen addr, TLS paths).
 

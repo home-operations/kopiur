@@ -100,6 +100,66 @@ async fn record_maintenance_status_metrics(maint: &Maintenance, ctx: &Context, o
     }
 }
 
+/// **Pure.** Whether `maint` carries an ownerReference to the `ClusterRepository`
+/// named `repo_name` with uid `repo_uid` — i.e. it is that repository's own
+/// projected `spec.maintenance`. Matching the uid (not just kind + name) means a
+/// tenant cannot claim the exemption by hand-writing an ownerReference: it would
+/// need the live object's uid, and a stale/recreated repository never matches.
+fn owner_refs_name_cluster_repository(
+    maint: &Maintenance,
+    repo_name: &str,
+    repo_uid: Option<&str>,
+) -> bool {
+    let Some(uid) = repo_uid else {
+        return false;
+    };
+    maint.metadata.owner_references.iter().flatten().any(|o| {
+        o.kind == "ClusterRepository"
+            && o.name == repo_name
+            && o.uid == uid
+            && o.api_version.starts_with("kopiur.home-operations.com/")
+    })
+}
+
+/// Whether this `Maintenance` is the managed projection of the very
+/// `ClusterRepository` it targets (exempt from the consumer tenancy gate: it is
+/// the repository owner's own authorization). A namespaced `Repository` ref is
+/// never gated, so it needs no answer here. An absent repository answers `false`
+/// and the gate then reports it as a missing dependency.
+async fn owned_by_repository(
+    maint: &Maintenance,
+    repo_ref: &kopiur_api::common::RepositoryRef,
+    ctx: &Context,
+) -> Result<bool> {
+    use kopiur_api::common::RepositoryKind;
+    match repo_ref.kind {
+        RepositoryKind::Repository => Ok(false),
+        RepositoryKind::ClusterRepository => {
+            let repo = io::fetch_cluster_repository(ctx, &repo_ref.name).await?;
+            Ok(repo.is_some_and(|r| {
+                owner_refs_name_cluster_repository(maint, &repo_ref.name, r.metadata.uid.as_deref())
+            }))
+        }
+    }
+}
+
+/// The controller-side tenancy gate for a `Maintenance` (#677): admission defers
+/// the `allowedNamespaces` gate when the `ClusterRepository` did not exist yet, so
+/// it is enforced here before any Job is spawned. A `Maintenance` the
+/// `ClusterRepository` itself owns (its projected `spec.maintenance`) is the
+/// repository owner's own authorization and is not gated.
+async fn ensure_maintenance_tenancy(
+    maint: &Maintenance,
+    repo_ref: &kopiur_api::common::RepositoryRef,
+    ctx: &Context,
+    namespace: &str,
+) -> Result<()> {
+    if owned_by_repository(maint, repo_ref, ctx).await? {
+        return Ok(());
+    }
+    io::ensure_consumer_tenancy(ctx, repo_ref, namespace).await
+}
+
 async fn reconcile_inner(maint: &Maintenance, ctx: &Context) -> Result<Action> {
     let errs = validate::validate_maintenance(&maint.spec);
     if let Some(first) = errs.into_iter().next() {
@@ -113,6 +173,8 @@ async fn reconcile_inner(maint: &Maintenance, ctx: &Context) -> Result<Action> {
     let api: Api<Maintenance> = Api::namespaced(ctx.client.clone(), &namespace);
 
     let repo_ref = &maint.spec.repository;
+    // Tenancy (#677) — see `ensure_maintenance_tenancy`.
+    ensure_maintenance_tenancy(maint, repo_ref, ctx, &namespace).await?;
     // Launch-side (Job spawn inputs) — store-backed point read (#382 M2).
     let repo = io::resolve_repository_ref_cached(ctx, repo_ref, &namespace).await?;
     // GitHub #174 item 3: the last of the cascade levels for BOTH scheduling

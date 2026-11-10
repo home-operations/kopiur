@@ -3845,7 +3845,7 @@ Externally tagged — set **exactly one** of: `pvcConsumer` · `snapshot` · `wo
 | `maxUploadSpeedBytesPerSecond` | integer | — | `--max-upload-speed`: cap write throughput to the destination, in bytes/sec (kopia default: unlimited). |
 | `mustExist` | boolean | — | `--[no-]must-exist`: fail the sync instead of initializing the destination's repository-format blob (kopia default `false` — sync-to may create the destination layout on first run). |
 | `parallel` | integer | —<br><sub>min 0</sub> | `--parallel`: number of concurrent blob-copy workers (kopia default `1` — sequential, the root cause of #216's multi-week seed times to R2). |
-| `times` | boolean | — | `--[no-]times`: synchronize blob modification times to the destination, when the destination backend supports it (kopia default `true`). |
+| `times` | boolean | — | `--[no-]times`: synchronize blob modification times to the destination, when the destination backend supports it (kopia default `false`). Object stores (S3, GCS, Azure, B2) cannot set a blob's time, so kopia warns and copies without it. |
 | `update` | boolean | — | `--[no-]update`: update blobs already present at the destination when the source copy is newer (kopia default `true`). |
 
 ### RepositoryReplication `status`

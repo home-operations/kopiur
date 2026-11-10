@@ -129,6 +129,43 @@ fn selector_without_labels_fails_closed() {
     );
 }
 
+/// The tenancy gate is now evaluated by the CONTROLLER too (issue #677: a
+/// consumer admitted while its ClusterRepository did not exist yet), so the
+/// shared validator must fail CLOSED on `matchExpressions` — the old
+/// "treated as no constraint" posture would let any namespace through a
+/// `matchExpressions`-only gate once admission is out of the picture.
+#[test]
+fn selector_match_expressions_are_evaluated_fail_closed() {
+    use k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelectorRequirement;
+    let req = |operator: &str, values: Option<Vec<&str>>| LabelSelectorRequirement {
+        key: "tier".into(),
+        operator: operator.into(),
+        values: values.map(|v| v.into_iter().map(String::from).collect()),
+    };
+    let gate = |r: LabelSelectorRequirement| {
+        AllowedNamespaces::Selector(LabelSelector {
+            match_expressions: Some(vec![r]),
+            ..Default::default()
+        })
+    };
+    let gold = BTreeMap::from([("tier".to_string(), "gold".to_string())]);
+    let none = BTreeMap::new();
+    let check = |allowed: &AllowedNamespaces, labels: &BTreeMap<String, String>| {
+        validate_consumer_against_cluster_repo("ns", "repo", allowed, Some(labels)).is_ok()
+    };
+    assert!(check(&gate(req("In", Some(vec!["gold"]))), &gold));
+    assert!(!check(&gate(req("In", Some(vec!["silver"]))), &gold));
+    assert!(!check(&gate(req("In", Some(vec!["gold"]))), &none));
+    assert!(check(&gate(req("NotIn", Some(vec!["silver"]))), &gold));
+    assert!(!check(&gate(req("NotIn", Some(vec!["gold"]))), &gold));
+    assert!(check(&gate(req("Exists", None)), &gold));
+    assert!(!check(&gate(req("Exists", None)), &none));
+    assert!(check(&gate(req("DoesNotExist", None)), &none));
+    assert!(!check(&gate(req("DoesNotExist", None)), &gold));
+    // An operator this build does not know is a DENY on a security gate.
+    assert!(!check(&gate(req("Bogus", None)), &gold));
+}
+
 // --- validate_backup_deletion_policy ---
 
 #[test]

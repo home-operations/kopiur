@@ -785,6 +785,15 @@ spec:
   # or:  allowedNamespaces: { all: true } # any namespace
 ```
 
+The gate is checked in two places. The admission webhook rejects a consumer whose namespace it does not admit, at `kubectl apply` time. The operator checks it again before it does any work for a consumer, which covers the cases admission cannot:
+
+- **The `ClusterRepository` did not exist yet when the consumer was applied.** Admission lets that through with a warning, so GitOps tools can apply a bundle in any order (see [Applying before the source repository exists](/replication/#applying-before-the-source-repository-exists)). The gate is enforced once the repository appears.
+- **You narrowed the gate later.** A consumer whose namespace is no longer admitted stops starting new work and reports `Ready=False` with reason `BlockedOnGrant` (on kinds that report it there; always as a Warning Event). Widening the gate again resumes it on its own. Deleting the consumer, or its snapshots, is never blocked by the gate.
+
+A `Maintenance` that the `ClusterRepository` projects from its own `spec.maintenance` is the repository owner's own and is not gated.
+
+`selector` gates evaluate both `matchLabels` and `matchExpressions` (`In`, `NotIn`, `Exists`, `DoesNotExist`). An operator kopiur does not recognize denies.
+
 ### `identityDefaults` — per-tenant identity (CEL)
 
 kopia records every snapshot under `username@hostname:path`. For a shared repo you usually want each tenant's snapshots distinguishable. `identityDefaults` are **CEL expressions**, the `*Expr` fields, following the kromgo `valueExpr`/`colorExpr` convention. Their syntax, return type, and variable scope are **validated at admission**, so `kubectl apply` rejects a bad expression immediately. But the expression is actually **rendered against the live consumer on every reconcile**; it is not evaluated once and frozen. A consumer's explicit `spec.identity` always wins.

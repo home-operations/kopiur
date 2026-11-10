@@ -1475,6 +1475,46 @@ mod tests {
         .expect("cluster repository fixture")
     }
 
+    /// Issue #677 recovery path: a `RepositoryReplication` admitted while its
+    /// source `ClusterRepository` did not exist parks on `MissingDependency`. The
+    /// repository's CREATION must re-enqueue exactly the replications sourcing
+    /// from it, so the replication proceeds at once instead of on a requeue.
+    #[test]
+    fn cluster_repository_creation_requeues_the_replications_sourcing_it() {
+        use kube::runtime::reflector::store;
+        use kube::runtime::watcher::Event;
+        let (reader, mut writer) = store::<RepositoryReplication>();
+        let repl = |name: &str, kind: &str, source: &str| -> RepositoryReplication {
+            serde_json::from_value(serde_json::json!({
+                "apiVersion": "kopiur.home-operations.com/v1alpha1",
+                "kind": "RepositoryReplication",
+                "metadata": { "name": name, "namespace": "kopiur-system" },
+                "spec": {
+                    "sourceRef": { "kind": kind, "name": source },
+                    "destination": { "filesystem": { "path": "/mirror" } },
+                    "schedule": { "cron": "0 4 * * *" },
+                }
+            }))
+            .expect("replication fixture")
+        };
+        for r in [
+            repl("offsite", "ClusterRepository", "onsite"),
+            repl("other-cluster", "ClusterRepository", "elsewhere"),
+            // A namespaced Repository with the same NAME is not this repository.
+            repl("same-name-ns", "Repository", "onsite"),
+        ] {
+            writer.apply_watcher_event(&Event::Apply(r));
+        }
+        let hits: Vec<String> = cluster_repository_to_replications(
+            &reader,
+            &crepo_fixture("onsite", "pw", "kopiur-system"),
+        )
+        .into_iter()
+        .map(|r| r.name)
+        .collect();
+        assert_eq!(hits, vec!["offsite"]);
+    }
+
     #[test]
     fn snapshot_replication_repo_mapper_matches_source_or_destination() {
         use kube::runtime::reflector::store;

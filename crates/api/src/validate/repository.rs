@@ -59,9 +59,14 @@ pub fn validate_repository_ref(r: &RepositoryRef) -> ValidationResult {
 ///   `crates/api` crate cannot fetch a `Namespace` object, so the caller (webhook)
 ///   must supply the labels. **If `labels` is `None` we fail closed** with
 ///   [`ValidationError::SelectorLabelsUnavailable`] rather than guess — the webhook
-///   never trusts unfiltered input (ADR §3.2). Selector matching here is a simple
-///   `matchLabels` superset test (the common case); `matchExpressions` is treated
-///   as "no constraint" for now and documented as such.
+///   never trusts unfiltered input (ADR §3.2). `matchLabels` must all be present
+///   with the required values, and every `matchExpressions` term
+///   (`In`/`NotIn`/`Exists`/`DoesNotExist`) must hold. **An unknown operator
+///   denies** — this is a security gate, so unlike
+///   [`crate::expand::labels_match_selector`] it never treats an unrecognized
+///   term as "no constraint". The webhook (admission) and the controller (which
+///   re-enforces the gate for consumers admitted before their
+///   `ClusterRepository` existed, issue #677) both call this one function.
 pub fn validate_consumer_against_cluster_repo(
     consumer_namespace: &str,
     repo_name: &str,
@@ -93,10 +98,16 @@ pub fn validate_consumer_against_cluster_repo(
             };
             let match_labels = sel.match_labels.clone().unwrap_or_default();
             // Every required label must be present with the required value.
-            let matches = match_labels
+            let labels_ok = match_labels
                 .iter()
                 .all(|(k, v)| labels.get(k).map(|got| got == v).unwrap_or(false));
-            if matches {
+            let expressions_ok = sel
+                .match_expressions
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .all(|expr| tenancy_expression_satisfied(expr, labels));
+            if labels_ok && expressions_ok {
                 Ok(())
             } else {
                 Err(ValidationError::ConsumerNamespaceNotAllowed {
@@ -105,6 +116,24 @@ pub fn validate_consumer_against_cluster_repo(
                 })
             }
         }
+    }
+}
+
+/// One `matchExpressions` term of a tenancy `Selector`, **failing closed** on an
+/// unknown operator (see [`validate_consumer_against_cluster_repo`]).
+fn tenancy_expression_satisfied(
+    expr: &k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelectorRequirement,
+    labels: &BTreeMap<String, String>,
+) -> bool {
+    let values = expr.values.as_deref().unwrap_or_default();
+    let present = labels.get(&expr.key);
+    match expr.operator.as_str() {
+        "In" => present.is_some_and(|got| values.iter().any(|v| v == got)),
+        "NotIn" => present.is_none_or(|got| !values.iter().any(|v| v == got)),
+        "Exists" => present.is_some(),
+        "DoesNotExist" => present.is_none(),
+        // Unknown operator on a security gate: deny.
+        _ => false,
     }
 }
 

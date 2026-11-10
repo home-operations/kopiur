@@ -131,7 +131,7 @@ spec:
     parallel: 8 # concurrent blob-copy workers (kopia default: 1 — sequential)
     deleteExtra: false # prune destination-only blobs for a true mirror (default: false)
     mustExist: false # fail instead of initializing the destination (default: false)
-    times: true # sync blob modification times, when supported (default: true)
+    times: true # sync blob modification times, when the destination supports it (default: false)
     update: true # update blobs already at the destination when newer (default: true)
     maxDownloadSpeedBytesPerSecond: 50000000 # cap source read throughput
     maxUploadSpeedBytesPerSecond: 20000000 # cap destination write throughput
@@ -148,6 +148,42 @@ This is the correct behavior for a true 3-2-1 mirror. It also means a mistaken o
 The field is named `deleteExtra` here, rather than kopia's bare `delete`, precisely so that `deleteExtra: true` reads as deliberate instead of looking like a leftover default.
 
 :::
+
+## Applying before the source repository exists
+
+A `RepositoryReplication` may be applied **before** the repository its `sourceRef` names. That is the normal case under GitOps: Flux and Argo CD apply a bundle in an order of their choosing, `kubectl apply --dry-run=server` runs against a cluster that has none of the bundle yet, and renaming repositories briefly leaves the replication pointing at a name that does not exist.
+
+The admission webhook admits it with a warning, rather than rejecting it:
+
+```console
+Warning: spec.sourceRef: ClusterRepository "onsite" does not exist yet. Admitted anyway: kopiur reports it as MissingDependency and starts automatically once it is created ...
+repositoryreplication.kopiur.home-operations.com/offsite created
+```
+
+Until the repository exists, the replication reports `Ready=False` with reason `MissingDependency`, naming the missing repository. When the repository is created the replication picks it up on its own, with no edit and no restart. The same holds for every other kind that references a repository: `SnapshotPolicy`, `Restore`, `Maintenance`, `SnapshotReplication`, and a `Repository` seeding from another one.
+
+A `ClusterRepository`'s [`allowedNamespaces`](/repositories/#allowednamespaces--who-may-use-it-clusterrepository-only) gate still applies. The webhook cannot check it against a repository that does not exist, so the operator checks it before it does any work against the repository. A namespace the gate does not admit gets `Ready=False` with reason `BlockedOnGrant`, and nothing runs.
+
+## Swapping source and destination
+
+Turning the mirror into the source, for example because the copy that used to be the replica is now the one your backups write to, is a rename plus a new destination. Apply the changes in any order; the [section above](#applying-before-the-source-repository-exists) is what makes that safe.
+
+Expect the **first run after the swap to copy every blob again**, even though the new destination already holds all of them. kopiur does not re-initialize the destination; this is how `kopia repository sync-to` decides what to copy. A blob that exists on both sides is copied again whenever the source's copy has a newer modification time, which is what `update: true`, kopia's default, means. On an object store a blob's modification time is the moment it was uploaded, and `times` cannot change it. So every blob in the old mirror is "newer" than the original it was copied from, and swapping the roles makes the whole repository look out of date.
+
+You have two ways to deal with it:
+
+- **Let it copy once.** The full re-copy stamps every destination blob with a fresh upload time, newer than the source's, so every run after it is incremental again. Pick this if the bandwidth and the time are acceptable.
+- **Skip blobs the destination already has.** Set `update: false`. Blobs present on both sides are then left alone and only new ones are copied:
+
+  ```yaml
+  spec:
+    sync:
+      update: false # copy only blobs missing at the destination
+  ```
+
+  Keep it set: with `update: true` back, the next run would see the same "newer" timestamps and copy everything after all. kopia's data and index blobs are written once and never change, so skipping them loses nothing. The trade-off is the few small blobs kopia rewrites in place, such as the repository format blob after a `kopia repository upgrade` or `set-parameters`: those are not refreshed at the destination while `update` is `false`.
+
+`mustExist: true` is a different knob. It refuses to initialize a destination that has no repository yet, and does not prevent the re-copy described here.
 
 ## Replication draws from the source repository's concurrency pool
 
@@ -237,6 +273,14 @@ nas-primary-offsite   nas-primary   s3            0 5 * * *   8h     6d
 ```
 
 `status` surfaces `lastReplicated`, `nextScheduledAt`, and best-effort `lastReplicatedBytes` and `lastReplicatedBlobs`. It also carries the standard `Ready`, `Reconciling`, and `Stalled` conditions for `kubectl wait`, plus `manualRun` once you have [requested a run](#run-it-now).
+
+The `Ready` reason says why a replication is not running:
+
+| `Ready` reason         | Meaning                                                                                                                                             | What to do                                                                                 |
+| ---------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
+| `MissingDependency`    | The `sourceRef` repository does not exist (yet). See [Applying before the source repository exists](#applying-before-the-source-repository-exists). | Create it, or fix a typo'd `sourceRef`. The replication starts on its own once it exists.  |
+| `BlockedOnGrant`       | The source is a `ClusterRepository` whose `allowedNamespaces` does not admit this namespace.                                                        | An administrator adds the namespace to `allowedNamespaces`; the replication then proceeds. |
+| `WaitingForRepository` | The source exists but is not `Ready` yet (still bootstrapping, or degraded).                                                                        | Look at the source repository's own status.                                                |
 
 Every finished run is also counted in `kopiur_replication_runs_total{kind,trigger,outcome}`. So a Prometheus alert can catch "the nightly mirror has been failing for three days" without watching conditions.
 

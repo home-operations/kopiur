@@ -52,7 +52,9 @@ use api::error::ValidationError;
 use api::snapshot_policy::{PolicyRepositories, SnapshotPolicySpec, SnapshotPolicyStatus};
 use kube::Client;
 
-use crate::identity_collision::repo_key;
+use api::common::{IdentityDefaults, RepositoryRef};
+
+use crate::identity_collision::{RepoDefaults, repo_key};
 
 /// Whether the incoming object acknowledges an intentional re-identification via the
 /// [`ALLOW_IDENTITY_CHANGE_ANNOTATION`] (any non-empty value; presence-only).
@@ -188,7 +190,7 @@ pub async fn check_identity_fork(
     }
 
     // Removed-repo warning: informational, so it rides even an acknowledged edit.
-    let warnings: Vec<String> = removed_repo_warning(old_spec, new_spec, namespace)
+    let mut warnings: Vec<String> = removed_repo_warning(old_spec, new_spec, namespace)
         .into_iter()
         .collect();
 
@@ -237,59 +239,51 @@ pub async fn check_identity_fork(
             match old_uh {
                 None => None,
                 Some(old_uh) => {
-                    let defaults = crate::identity_collision::cluster_repo_defaults_for(
-                        client, repo, namespace,
-                    )
-                    .await;
-                    crate::identity_collision::resolve_policy_identity(
+                    let inputs = ForkInputs {
                         name,
                         namespace,
                         new_spec,
                         new_labels,
                         new_annotations,
-                        defaults.as_ref(),
-                    )
-                    .and_then(|new_id| {
-                        api::validate::detect_identity_fork(
-                            &old_uh,
-                            &uh(&new_id),
-                            has_history,
-                            acked,
-                        )
-                    })
+                        old_spec,
+                    };
+                    fork_comparison(client, repo, &inputs, old_uh, &mut warnings)
+                        .await
+                        .and_then(|(old, new)| {
+                            api::validate::detect_identity_fork(&old, &new, has_history, acked)
+                        })
                 }
             }
         }
         Ok(PolicyRepositories::Multi(_)) => {
             // Resolve the NEW identity per member repository, under that
-            // repository's identityDefaults (repo_key-keyed cache amortizes),
-            // and fork iff any repo_key present in BOTH maps differs. An added
-            // repo has no baseline (no fork); an unresolvable member is left
-            // out of the map (degrade for that member only).
-            let mut cache = BTreeMap::new();
-            let mut new_identities: BTreeMap<String, String> = BTreeMap::new();
-            for (identity, key) in crate::identity_collision::policy_pairs(
-                client,
+            // repository's identityDefaults, and fork iff any member present in
+            // BOTH maps differs. An added repo has no baseline (no fork); an
+            // unresolvable member is left out (degrade for that member only).
+            let inputs = ForkInputs {
                 name,
                 namespace,
                 new_spec,
                 new_labels,
                 new_annotations,
-                &mut cache,
-            )
-            .await
-            {
-                // policy_pairs yields the FULL identity string
-                // (username@hostname[:path]); the fork comparison is on
-                // username@hostname only, exactly like the single-repo arm.
-                let uh_only = identity
-                    .split_once(':')
-                    .map(|(uh, _)| uh.to_string())
-                    .unwrap_or(identity);
-                new_identities.insert(key, uh_only);
+                old_spec,
+            };
+            let mut effective_baselines = baselines.clone();
+            let mut new_identities: BTreeMap<String, String> = BTreeMap::new();
+            for repo in api::repository_refs(new_spec) {
+                let key = repo_key(repo, namespace);
+                let Some(old_uh) = baselines.get(&key).cloned() else {
+                    continue;
+                };
+                if let Some((old, new)) =
+                    fork_comparison(client, repo, &inputs, old_uh, &mut warnings).await
+                {
+                    effective_baselines.insert(key.clone(), old);
+                    new_identities.insert(key, new);
+                }
             }
             api::validate::detect_identity_fork_multi(
-                &baselines,
+                &effective_baselines,
                 &new_identities,
                 has_history,
                 acked,
@@ -297,6 +291,71 @@ pub async fn check_identity_fork(
         }
     };
     ForkOutcome { error, warnings }
+}
+
+/// The new object's identity inputs, plus the old spec for the missing-repository
+/// comparison (bundled to keep [`fork_comparison`]'s signature readable).
+struct ForkInputs<'a> {
+    name: &'a str,
+    namespace: &'a str,
+    new_spec: &'a SnapshotPolicySpec,
+    new_labels: Option<&'a BTreeMap<String, String>>,
+    new_annotations: Option<&'a BTreeMap<String, String>>,
+    old_spec: &'a SnapshotPolicySpec,
+}
+
+/// The `(old, new)` `username@hostname` pair to compare for one repository, or
+/// `None` to degrade to allow for it (the new identity cannot be resolved).
+///
+/// Exhaustive over what the admission-time read of the repository returned:
+///
+/// - **`Known`** — the historical comparison: the pinned baseline vs the new
+///   spec resolved under the repository's live `identityDefaults`.
+/// - **`Unreadable`** — historical too: resolved with no defaults.
+/// - **`Missing`** (issue #677) — the repository does not exist yet, so its
+///   `identityDefaults` cannot be seen and comparing the pin (which may have been
+///   rendered under them) against a no-defaults resolution would deny an
+///   UNCHANGED re-apply — exactly the GitOps steady state. Instead compare the OLD
+///   spec against the NEW spec, both resolved with no defaults: that still catches
+///   every re-identification the SPEC causes (a hostname override, a rename-driven
+///   source path), and defers the defaults-driven part, which only exists once the
+///   repository does. A warning says so.
+async fn fork_comparison(
+    client: &Client,
+    repo: &RepositoryRef,
+    inputs: &ForkInputs<'_>,
+    old_uh: String,
+    warnings: &mut Vec<String>,
+) -> Option<(String, String)> {
+    let resolve = |spec: &SnapshotPolicySpec, defaults: Option<&IdentityDefaults>| {
+        crate::identity_collision::resolve_policy_identity(
+            inputs.name,
+            inputs.namespace,
+            spec,
+            inputs.new_labels,
+            inputs.new_annotations,
+            defaults,
+        )
+        .map(|id| uh(&id))
+    };
+    match crate::identity_collision::repo_defaults_lookup(client, repo, inputs.namespace).await {
+        RepoDefaults::Known(defaults) => {
+            resolve(inputs.new_spec, defaults.as_ref()).map(|new| (old_uh, new))
+        }
+        RepoDefaults::Unreadable => resolve(inputs.new_spec, None).map(|new| (old_uh, new)),
+        RepoDefaults::Missing => {
+            let old = resolve(inputs.old_spec, None)?;
+            let new = resolve(inputs.new_spec, None)?;
+            warnings.push(format!(
+                "repository {} does not exist yet, so the part of this policy's identity that \
+                 comes from its identityDefaults cannot be checked for a re-identification now; \
+                 only spec changes were compared. kopiur resolves the identity again once the \
+                 repository exists",
+                repo_key(repo, inputs.namespace)
+            ));
+            Some((old, new))
+        }
+    }
 }
 
 #[cfg(test)]

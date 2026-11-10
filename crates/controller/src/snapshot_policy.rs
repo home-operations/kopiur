@@ -818,6 +818,10 @@ async fn reconcile_inner(config: &SnapshotPolicy, ctx: &Context) -> Result<Actio
         // Launch-side resolution (identity/retention/verification inputs) —
         // store-backed point read (#382 M2); the deletion cascade keeps the
         // live resolver.
+        // Tenancy (#677): admission defers the allowedNamespaces gate when the
+        // ClusterRepository did not exist yet, so it is enforced here, before
+        // any work against the repository.
+        io::ensure_consumer_tenancy(ctx, rref, &namespace).await?;
         let repo = io::resolve_repository_ref_cached(ctx, rref, &namespace).await?;
         let resolved =
             resolve_config_identity(config, &namespace, repo.identity_defaults.as_ref())?;

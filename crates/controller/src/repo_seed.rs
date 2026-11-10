@@ -903,6 +903,20 @@ async fn arm_migrate_seed(
     // not usable yet", both clear the same way, and a repository that is being
     // applied alongside this one passes through the first on its way to the
     // second.
+    // Tenancy (#677): a namespaced Repository seeding from a ClusterRepository is
+    // a consumer of it (the same gate admission applies to
+    // `spec.seed.from.repository`); a cluster-scoped seeder is not gated.
+    if let Some(consumer_ns) = sctx.ca_referrer_ns {
+        match io::ensure_consumer_tenancy(ctx, rref, consumer_ns).await {
+            Ok(()) => {}
+            Err(Error::MissingDependency(_)) => {
+                return Ok(SeedArming::Park(SeedPark::source_not_usable(
+                    waiting_for_seed_source_message(source_description, "it does not exist (yet)"),
+                )));
+            }
+            Err(e) => return Err(e),
+        }
+    }
     let source = match io::resolve_repository_ref_cached(ctx, rref, sctx.source_default_ns).await {
         Ok(s) => s,
         Err(Error::MissingDependency(_)) => {

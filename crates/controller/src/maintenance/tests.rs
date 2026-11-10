@@ -1,5 +1,58 @@
 use super::*;
 use crate::snapshot_schedule::{jitter_defaults, tz_defaults};
+
+/// Issue #677: a ClusterRepository's own projected Maintenance is exempt from the
+/// consumer tenancy gate — but only when the ownerReference names the LIVE
+/// repository (kind, name AND uid), so a tenant cannot claim the exemption by
+/// hand-writing an ownerReference.
+#[test]
+fn only_a_uid_matched_cluster_repository_owner_ref_exempts_maintenance() {
+    use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
+    let owner = |kind: &str, name: &str, uid: &str| OwnerReference {
+        api_version: "kopiur.home-operations.com/v1alpha1".into(),
+        kind: kind.into(),
+        name: name.into(),
+        uid: uid.into(),
+        controller: Some(true),
+        block_owner_deletion: None,
+    };
+    let with_owner = |o: Option<OwnerReference>| {
+        let mut m = maint_with("0 */6 * * *", "0 3 * * 0", None);
+        m.metadata.owner_references = o.map(|o| vec![o]);
+        m
+    };
+    let owned = with_owner(Some(owner("ClusterRepository", "shared", "uid-1")));
+    assert!(owner_refs_name_cluster_repository(
+        &owned,
+        "shared",
+        Some("uid-1")
+    ));
+    // Wrong uid (forged, or the repository was recreated).
+    assert!(!owner_refs_name_cluster_repository(
+        &owned,
+        "shared",
+        Some("uid-2")
+    ));
+    // Unknown live uid.
+    assert!(!owner_refs_name_cluster_repository(&owned, "shared", None));
+    // Another repository, another kind, no owner at all.
+    assert!(!owner_refs_name_cluster_repository(
+        &owned,
+        "other",
+        Some("uid-1")
+    ));
+    let repo_owned = with_owner(Some(owner("Repository", "shared", "uid-1")));
+    assert!(!owner_refs_name_cluster_repository(
+        &repo_owned,
+        "shared",
+        Some("uid-1")
+    ));
+    assert!(!owner_refs_name_cluster_repository(
+        &with_owner(None),
+        "shared",
+        Some("uid-1")
+    ));
+}
 use kopiur_api::common::{CronSpec, RepositoryKind, RepositoryRef};
 use kopiur_api::maintenance::RunStatus;
 use kopiur_api::{MaintenanceSpec, MaintenanceStatus, Ownership, TakeoverPolicy};
