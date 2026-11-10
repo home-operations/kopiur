@@ -630,6 +630,21 @@ pub struct RestoreOptions {
     pub parallel: Option<u32>,
 }
 
+/// What a snapshot-relative path names inside a snapshot, as probed by
+/// [`KopiaClient::snapshot_path_kind`] before a partial restore (#689).
+///
+/// Exhaustive by design: a partial restore must refuse to run when a selected
+/// path is [`SnapshotPathKind::Missing`] instead of silently restoring nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotPathKind {
+    /// A directory: restoring it restores its whole subtree.
+    Directory,
+    /// A file or symlink (anything kopia does not list as a directory).
+    NonDirectory,
+    /// No entry by that name exists in the snapshot.
+    Missing,
+}
+
 /// Options for `kopia repository sync-to` (ADR-0005 §13(d) / issue #216). Every
 /// field's `None`/`false` reproduces kopia's own default — an all-`None`,
 /// `delete_extra: false` instance yields the exact same argv `sync_to_args`
@@ -699,7 +714,12 @@ pub struct PolicyArgs {
     /// `--ignore-unknown-types` tri-state. ADR-0005 §13(b).
     pub ignore_unknown_types: Option<bool>,
     /// `--max-parallel-snapshots` upload parallelism. ADR-0005 §13(f).
-    pub max_parallel_snapshots: Option<u32>,
+    ///
+    /// The one knob that can carry an explicit `inherit`
+    /// ([`PolicyInt::Inherit`]): kopia rejects it on a path scope, so Kopiur
+    /// writes it at the identity scope, which it rewrites but never deletes,
+    /// so an unset value must be written as a reset rather than omitted (#681).
+    pub max_parallel_snapshots: Option<PolicyInt>,
     /// `--max-parallel-file-reads` upload parallelism. ADR-0005 §13(f).
     pub max_parallel_file_reads: Option<u32>,
     /// `--keep-latest`: most-recent-N backups to keep per source.
@@ -724,6 +744,48 @@ pub struct PolicyArgs {
     pub keep_annual: Option<i64>,
     /// Verbatim extra `policy set` flags (the CRD escape hatch).
     pub extra_args: Vec<String>,
+}
+
+/// The value of an integer `kopia policy set` knob that is written rather than
+/// omitted: an explicit setting, or `inherit`, which clears the value stored at
+/// that scope so the parent scope's applies.
+///
+/// It sits in an `Option` on [`PolicyArgs`], giving kopia's three argv states:
+/// `None` omits the flag (kopia KEEPS whatever the scope already stores),
+/// `Some(Set(n))` writes `n`, `Some(Inherit)` writes `inherit`. Omission is the
+/// trap: on a scope Kopiur does not [replace](KopiaClient::policy_replace), a
+/// value removed from the spec would otherwise stay stored forever (#681).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicyInt {
+    /// Write this value.
+    Set(u32),
+    /// Write `inherit`: drop this scope's value, fall back to the parent's.
+    Inherit,
+}
+
+impl PolicyInt {
+    /// The flag's argv value (`"4"`, `"inherit"`). Verified against kopia
+    /// 0.23.1's `applyOptionalInt`, which accepts `inherit` (and `default`).
+    fn argv_value(self) -> String {
+        match self {
+            PolicyInt::Set(n) => n.to_string(),
+            PolicyInt::Inherit => "inherit".into(),
+        }
+    }
+}
+
+/// The kopia invocations that make a target's DEFINED policy exactly a
+/// [`PolicyArgs`] (see [`KopiaClient::policy_replace`]). Pure, so the argv is
+/// unit-testable without spawning kopia.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PolicyReplacePlan {
+    /// `kopia policy delete <target>`: always runs first. A no-op success
+    /// when the target has no policy yet.
+    pub(crate) delete: Vec<String>,
+    /// `kopia policy set <target> …`, or `None` when the spec writes no flag
+    /// at all, where the delete alone leaves the target exactly as specified
+    /// (and a flagless `policy set` fails with "no changes specified").
+    pub(crate) set: Option<Vec<String>>,
 }
 
 /// Create-time-fixed repository options applied at `kopia repository create`
@@ -2289,6 +2351,54 @@ impl KopiaClient {
         self.run_ok(&args).await.map(|_| ())
     }
 
+    /// Restore ONE snapshot-relative path (`rel_path`, a file or a directory) to
+    /// the same relative location under `target_root`:
+    /// `kopia snapshot restore <id>/<rel_path> <target_root>/<rel_path>` (#689).
+    ///
+    /// kopia resolves the `<manifest id>/<path>` form itself and handles files
+    /// and directories alike. Two behaviors the caller must know, both verified
+    /// against kopia 0.23.1 by `crates/kopia/tests/integration_roundtrip.rs`:
+    ///
+    /// - a DIRECTORY restore creates any missing parent directories, but a FILE
+    ///   restore does not (`open …: no such file or directory`) — so the caller
+    ///   creates `<target_root>/<parent of rel_path>` first;
+    /// - `delete_extra` prunes only inside `<target_root>/<rel_path>`; nothing
+    ///   outside the selected path is touched.
+    ///
+    /// `rel_path` must already be validated (relative, normalized, no `..`) —
+    /// `kopiur_api::validate::validate_path_selection` does that at admission.
+    pub async fn snapshot_restore_path(
+        &self,
+        id: &str,
+        rel_path: &str,
+        target_root: &str,
+        opts: &RestoreOptions,
+    ) -> Result<(), KopiaError> {
+        let args = restore_path_args(id, rel_path, target_root, opts);
+        self.run_ok(&args).await.map(|_| ())
+    }
+
+    /// Probe what `rel_path` names inside snapshot `id` without restoring it
+    /// (`kopia ls <id>/<rel_path>`), so a partial restore can fail BEFORE writing
+    /// anything when a selected path does not exist.
+    ///
+    /// kopia's `ls` succeeds for a directory, refuses a file with "is not a
+    /// directory object", and reports a missing entry as "error reading
+    /// directory: entry not found" — [`classify_snapshot_path_probe`] maps those
+    /// three. Anything else (a stale/unknown snapshot id, an unreachable
+    /// repository) stays an error for the caller to handle.
+    pub async fn snapshot_path_kind(
+        &self,
+        id: &str,
+        rel_path: &str,
+    ) -> Result<SnapshotPathKind, KopiaError> {
+        let args = vec!["ls".to_string(), snapshot_subpath(id, rel_path)];
+        match self.run_ok(&args).await {
+            Ok(_) => Ok(SnapshotPathKind::Directory),
+            Err(e) => classify_snapshot_path_probe(e),
+        }
+    }
+
     /// Verify repository/snapshot integrity (`kopia snapshot verify`). Success is
     /// exit code 0; a verification failure surfaces as a non-zero exit.
     pub async fn snapshot_verify(&self, opts: &VerifyOptions) -> Result<(), KopiaError> {
@@ -2358,6 +2468,47 @@ impl KopiaClient {
     pub async fn policy_set(&self, target: &str, policy: &PolicyArgs) -> Result<(), KopiaError> {
         let args = policy_set_args(target, policy);
         self.run_ok(&args).await.map(|_| ())
+    }
+
+    /// Remove the policy defined at `target` (`kopia policy delete <target>`),
+    /// so the target inherits everything from its parent scopes again. kopia
+    /// treats a target with no policy as success (it deletes the manifests
+    /// labelled for the target, of which there may be none).
+    pub async fn policy_delete(&self, target: &str) -> Result<(), KopiaError> {
+        self.run_ok(&policy_delete_args(target)).await.map(|_| ())
+    }
+
+    /// Make the policy DEFINED at `target` exactly `policy`: delete what kopia
+    /// stores there, then `policy set` the spec onto the now-empty policy.
+    ///
+    /// [`Self::policy_set`] cannot do this on its own, and that is #681: every
+    /// list flag (`--add-ignore`, `--add-never-compress`, …) is a set union into
+    /// the stored list, and an omitted scalar flag keeps its stored value, so a
+    /// rule or knob removed from the spec stays in force. The single-call
+    /// alternative does not exist either: kopia 0.23.1's `--clear-ignore`
+    /// returns before applying the `--add-ignore` flags beside it, so clear+add
+    /// in one call stores an EMPTY list.
+    ///
+    /// Only for a target the caller owns outright (the mover's per-source path
+    /// scope): anything set there out of band is deleted too. NOT for
+    /// `--global` or an identity scope, which hold settings Kopiur does not own.
+    ///
+    /// Two kopia calls, so not atomic: between them the target inherits its
+    /// parents. A snapshot of the same source that reads its policy inside
+    /// that window runs without this scope's settings; the next replace
+    /// rewrites them. If the set fails, the error is returned and the target
+    /// is left with no policy until the next successful replace.
+    pub async fn policy_replace(
+        &self,
+        target: &str,
+        policy: &PolicyArgs,
+    ) -> Result<(), KopiaError> {
+        let plan = policy_replace_plan(target, policy);
+        self.run_ok(&plan.delete).await?;
+        if let Some(set) = &plan.set {
+            self.run_ok(set).await?;
+        }
+        Ok(())
     }
 
     /// Show the effective policy for `target` (`kopia policy show <target>
@@ -2700,6 +2851,65 @@ fn restore_args(id: &str, target_dir: &str, opts: &RestoreOptions) -> Vec<String
     args
 }
 
+/// `<id>/<rel_path>`: kopia's sub-path source form for `snapshot restore` /
+/// `ls`. Accepts a snapshot MANIFEST id (unlike `kopia show`, which needs the
+/// root object id). A leading/trailing `/` on `rel_path` is tolerated.
+fn snapshot_subpath(id: &str, rel_path: &str) -> String {
+    format!("{id}/{}", rel_path.trim_matches('/'))
+}
+
+/// `<target_root>/<rel_path>`: where a partial restore writes one selected path —
+/// the SAME relative location it had under the snapshot root.
+pub fn restore_path_target(target_root: &str, rel_path: &str) -> String {
+    format!(
+        "{}/{}",
+        target_root.trim_end_matches('/'),
+        rel_path.trim_matches('/')
+    )
+}
+
+/// Args for restoring one selected path (#689): the whole-root
+/// [`restore_args`] shape with `<id>/<rel>` as the source and
+/// `<target_root>/<rel>` as the target, so every restore flag applies
+/// identically to a partial restore.
+fn restore_path_args(
+    id: &str,
+    rel_path: &str,
+    target_root: &str,
+    opts: &RestoreOptions,
+) -> Vec<String> {
+    restore_args(
+        &snapshot_subpath(id, rel_path),
+        &restore_path_target(target_root, rel_path),
+        opts,
+    )
+}
+
+/// Map a failed `kopia ls <id>/<path>` onto a [`SnapshotPathKind`], or hand the
+/// error back when it is not one of the two "the snapshot resolved, here is
+/// what the entry is" outcomes. Pure so the stderr contract is unit-tested.
+///
+/// The phrasings are kopia 0.23.1's (pinned; re-verified by the real-kopia
+/// integration test): a file is "… is not a directory object", a missing entry
+/// is "… error reading directory: entry not found". A STALE or unknown manifest
+/// id reads differently ("entry not found \"x\": parent is not a directory")
+/// and deliberately stays an error so the mover can self-heal the id.
+fn classify_snapshot_path_probe(err: KopiaError) -> Result<SnapshotPathKind, KopiaError> {
+    match &err {
+        KopiaError::NonZeroExit { stderr_tail, .. }
+            if stderr_tail.contains("is not a directory object") =>
+        {
+            Ok(SnapshotPathKind::NonDirectory)
+        }
+        KopiaError::NonZeroExit { stderr_tail, .. }
+            if stderr_tail.contains("error reading directory: entry not found") =>
+        {
+            Ok(SnapshotPathKind::Missing)
+        }
+        _ => Err(err),
+    }
+}
+
 /// Build the args for `kopia snapshot create <source> --json [flags]` plus
 /// options. Pure so it is unit-testable without spawning kopia. `--fail-fast`
 /// is a kingpin `--[no-]flag` tri-state (smoke-tested against the pinned
@@ -2932,7 +3142,7 @@ fn policy_set_args(target: &str, policy: &PolicyArgs) -> Vec<String> {
     );
     if let Some(n) = policy.max_parallel_snapshots {
         args.push("--max-parallel-snapshots".into());
-        args.push(n.to_string());
+        args.push(n.argv_value());
     }
     if let Some(n) = policy.max_parallel_file_reads {
         args.push("--max-parallel-file-reads".into());
@@ -2964,6 +3174,24 @@ fn policy_set_args(target: &str, policy: &PolicyArgs) -> Vec<String> {
     }
     args.extend(policy.extra_args.iter().cloned());
     args
+}
+
+/// Build the args for `kopia policy delete <target>`. Pure.
+fn policy_delete_args(target: &str) -> Vec<String> {
+    vec!["policy".into(), "delete".into(), target.to_string()]
+}
+
+/// Plan [`KopiaClient::policy_replace`]: the delete, then the spec's
+/// `policy set` unless it carries no flag. Pure.
+fn policy_replace_plan(target: &str, policy: &PolicyArgs) -> PolicyReplacePlan {
+    let set = policy_set_args(target, policy);
+    // `policy_set_args` always starts with `policy set <target>`; anything past
+    // those three words is a flag kopia will apply.
+    let writes_something = set.len() > 3;
+    PolicyReplacePlan {
+        delete: policy_delete_args(target),
+        set: writes_something.then_some(set),
+    }
 }
 
 /// Build the args for `kopia server start` (everything except the secret password,

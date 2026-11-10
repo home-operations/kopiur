@@ -31,7 +31,11 @@ That column is plain inventory rather than a warning. A repository shared by sev
 
 ## `doctor`
 
-Diagnoses an installation and exits 1 if anything failed. There are nine checks: the 9 CRDs are installed and serve `v1alpha1`; the controller Deployment is ready, and the webhook Deployment too when it is installed; a **live dry-run admission probe** succeeds, using an intentionally invalid SnapshotPolicy that must be denied, and changing nothing in the cluster; every repository is `Ready` and unblocked; every repository's credential Secrets resolve; no work is **blocked or stuck**; no Snapshot or Restore failed within `--failure-lookback`, which defaults to `24h`; and recent Warning events are summarized.
+Diagnoses an installation and exits 1 if anything failed. There are ten checks: the 9 CRDs are installed and serve `v1alpha1`; the controller Deployment is ready, and the webhook Deployment too when it is installed; a **live dry-run admission probe** succeeds, using an intentionally invalid SnapshotPolicy that must be denied, and changing nothing in the cluster; every repository is `Ready` and unblocked; every repository's credential Secrets resolve; every `SnapshotReplication` is healthy; no work is **blocked or stuck**; no Snapshot or Restore failed within `--failure-lookback`, which defaults to `24h`; and recent Warning events are summarized.
+
+**Doctor reads every namespace unless you pass `-n`.** Unlike the listing commands, it does not narrow itself to your kubeconfig context's namespace: it diagnoses the installation, exactly like the web console's Doctor page, so the two always report the same thing for the same cluster. `-n media` narrows the namespaced checks to `media`, the same as the console's namespace switcher. The summary line names the scope the run read. Earlier releases took the context namespace, so a context pointed at `kopiur-system` printed `ok` for failures the console showed in every other namespace.
+
+**Failures older than the window** are retained history, not a current problem: they warn and never change the exit code. The warning says how many there are, per namespace, and why they are still there. Each `SnapshotSchedule` keeps its newest [`failedJobsHistoryLimit`](/repository-health/#bounding-failed-snapshots) failed Snapshots, default `10`, per repository, and failed manual Snapshots keep the newest `10` per `SnapshotPolicy`. Older ones are deleted only as newer failures arrive, so a burst of failures stays until you delete the ones you have diagnosed or lower the limit. `-o json` lists every object.
 
 ```console
 $ kubectl kopiur doctor -n media
@@ -43,11 +47,12 @@ $ kubectl kopiur doctor -n media
   FAIL  credential secrets present: Repository/nas: secret media/kopia-creds not found
         why: every run against that repository fails without it
         fix: create the Secret in the named namespace (or enable credentialProjection)
+  ok    snapshot replications healthy
   ok    no blocked or stuck work
   ok    no recent failed snapshots/restores
   ok    recent warning events
 
-9 check(s): 1 failed, 0 warning(s)
+10 check(s): 1 failed, 0 warning(s) (scope: namespace media)
 ```
 
 Checks the user lacks RBAC for degrade to warnings that name the missing grant, so doctor never crashes on a restricted kubeconfig. Warnings do **not** change the exit code: `doctor` exits `1` only when a check _failed_, and `0` otherwise — including a run that could not fully verify itself. In CI, read the `warning(s)` count in the summary line (or the `outcome` fields of `-o json`) when "could not check" needs to be distinguished from "all clear".
@@ -183,11 +188,12 @@ $ kubectl kopiur doctor -n media
   ok    webhook admission (live dry-run probe)
   ok    repositories ready
   ok    credential secrets present
+  ok    snapshot replications healthy
   ok    no blocked or stuck work
   ok    no recent failed snapshots/restores
   ok    recent warning events
 
-9 check(s): 0 failed, 0 warning(s)
+10 check(s): 0 failed, 0 warning(s) (scope: namespace media)
 ```
 
 **3. Pause and unpause** the schedule. It is idempotent, so re-running prints `unchanged`:

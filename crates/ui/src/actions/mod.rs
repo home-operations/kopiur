@@ -59,7 +59,7 @@ use kube::api::{Api, DeleteParams};
 
 use kopiur_api::common::{RepositoryKind, RepositoryRef};
 use kopiur_api::consts::DELETION_HELD_CONDITION;
-use kopiur_api::restore::{FromPolicy, IdentitySource, PvcTemplate, RestoreOptions};
+use kopiur_api::restore::{FromPolicy, IdentitySource, PathSelection, PvcTemplate, RestoreOptions};
 use kopiur_api::{
     ManualRunMode, ObjectRef, RestoreSource, RestoreTarget, Snapshot, SnapshotPolicy,
 };
@@ -550,6 +550,21 @@ fn restore_options(overwrite: Option<bool>) -> Option<RestoreOptions> {
     })
 }
 
+/// `spec.selection` for a partial restore (#689), or `None` when no path was
+/// given — an empty list is "restore everything", never an empty selection the
+/// CRD would reject. Blank entries (a trailing newline in the form) are
+/// dropped; everything else is passed verbatim for the shared validator to
+/// judge, so the console and the webhook can never disagree on a path.
+fn restore_selection(paths: Option<&[String]>) -> Option<PathSelection> {
+    let paths: Vec<String> = paths
+        .unwrap_or_default()
+        .iter()
+        .filter(|p| !p.trim().is_empty())
+        .cloned()
+        .collect();
+    (!paths.is_empty()).then_some(PathSelection { paths })
+}
+
 /// The full `kopiur_ops` request for one [`RestoreBody`].
 fn restore_request(body: &RestoreBody) -> Result<RestoreRequest, ApiError> {
     Ok(RestoreRequest {
@@ -557,6 +572,7 @@ fn restore_request(body: &RestoreBody) -> Result<RestoreRequest, ApiError> {
         target: restore_target(&body.target),
         repository: body.repository.as_ref().map(repository_ref).transpose()?,
         options: restore_options(body.overwrite),
+        selection: restore_selection(body.paths.as_deref()),
         // Missing-snapshot behavior, credential projection and the mover's
         // failure controls are deployment policy, not per-click choices: `None`
         // leaves the operator's defaults, exactly as a bare `kubectl kopiur
@@ -1007,6 +1023,32 @@ mod tests {
     /// The minimal `snapshotRef` source, for the target-focused fixtures.
     fn snapshot_ref_source() -> serde_json::Value {
         serde_json::json!({ "snapshotRef": { "name": "nightly-1" } })
+    }
+
+    #[test]
+    fn restore_body_paths_land_on_spec_selection() {
+        // #689: the console's partial restore reaches `spec.selection.paths`
+        // verbatim; blank entries are dropped, and none at all is a whole-root
+        // restore with no `selection` on the wire.
+        let wire = built_spec(serde_json::json!({
+            "namespace": "media",
+            "source": snapshot_ref_source(),
+            "target": pvc_ref_target(),
+            "paths": ["docs/report.odt", "  ", "music/album"],
+        }));
+        assert_eq!(
+            wire["spec"]["selection"]["paths"],
+            serde_json::json!(["docs/report.odt", "music/album"])
+        );
+        for paths in [serde_json::json!([]), serde_json::json!(["", " "])] {
+            let wire = built_spec(serde_json::json!({
+                "namespace": "media",
+                "source": snapshot_ref_source(),
+                "target": pvc_ref_target(),
+                "paths": paths,
+            }));
+            assert!(wire["spec"].get("selection").is_none(), "{wire}");
+        }
     }
 
     async fn problem_of(response: axum::response::Response) -> Problem {
@@ -1902,6 +1944,7 @@ mod tests {
                     namespace: None,
                 }),
                 options: None,
+                selection: None,
                 policy: None,
                 credential_projection: None,
                 mover: None,

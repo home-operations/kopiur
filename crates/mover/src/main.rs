@@ -24,7 +24,7 @@ use kopiur_api::snapshot::SnapshotInfo;
 use kopiur_api::{LeaseAction, lease_action};
 use kopiur_kopia::{
     ConnectOptions, ConnectSpec, KopiaClient, KopiaError, KopiaErrorClass, MigrateSources,
-    SnapshotMigrateOptions, SnapshotSource, filter_as_of, pick_offset,
+    SnapshotMigrateOptions, SnapshotPathKind, SnapshotSource, filter_as_of, pick_offset,
 };
 use tracing::{error, info, warn};
 
@@ -47,11 +47,12 @@ use kopiur_mover::status::{
     snapshot_replicate_no_match_message, snapshot_replicate_ok_body,
     snapshot_replicate_success_message, split_api_version, verify_failed_body, verify_ok_body,
 };
+use kopiur_mover::verify::quick_coverage;
 use kopiur_mover::workspec::{
     self, BootstrapRepositoryOp, BrowseSessionOp, KOPIA_KEEP_MAX, KOPIUR_PIN_NAME, MaintenanceOp,
-    MoverWorkSpec, Operation, ReplicateOp, RestoreOp, RestoreSelection, RestoreSelector,
-    SnapshotAnchor, SnapshotDeleteBatchOp, SnapshotPinOp, SnapshotReplicateOp, ThrottleSpec,
-    VerifyOp, VerifyTier, maintenance_restamp_target,
+    MoverWorkSpec, Operation, ReplicateOp, RestoreOp, RestoreScope, RestoreSelection,
+    RestoreSelector, SnapshotAnchor, SnapshotDeleteBatchOp, SnapshotPinOp, SnapshotReplicateOp,
+    ThrottleSpec, VerifyOp, VerifyTier, maintenance_restamp_target, restore_scope,
 };
 #[cfg(test)]
 use kopiur_mover::workspec::{SnapshotDeleteItem, SnapshotDeleteOp};
@@ -552,34 +553,36 @@ async fn run_operation(
             let id = &spec.identity;
             let override_source = format!("{}@{}:{}", id.username, id.hostname, id.source_path);
             let identity_scope = format!("{}@{}", id.username, id.hostname);
-            // Apply the resolved kopia `policy set` knobs (compression / never-compress
+            // Apply the resolved kopia policy knobs (compression / never-compress
             // / ignore rules / ignore-cache-dirs / backup-side error handling / upload
             // parallelism / extraArgs) against this snapshot's source identity BEFORE
             // creating the snapshot, so SnapshotPolicy.spec.{compression,files,
             // errorHandling,upload,extraArgs} actually reach kopia (ADR-0005 §13(b)/§13(f),
-            // ADR-0004 §4b). The path-scoped `policy set` is skipped when nothing is
-            // configured, but the identity-scoped one below ALWAYS runs — it also
-            // carries the mandatory `KOPIA_KEEP_MAX` retention pin (see its doc
-            // comment): kopia's `snapshot create` unconditionally applies the
-            // source's OWN retention policy after every create, so an unset
-            // identity policy would otherwise fall back to kopia's defaults
-            // (keep-latest 10, …), silently deleting manifests a Kopiur `Snapshot`
-            // CR still references.
-            let mut user_identity_policy = None;
-            if !op.policy.is_empty() {
-                // kopia rejects `--max-parallel-snapshots` on a path-scoped
-                // policy ("only global, username@hostname or @hostname"), so
-                // that one knob is folded into the identity-scope policy_set
-                // below instead of the path-scoped one (the policy_knobs e2e
-                // regression).
-                let (path_policy, split_identity_policy) =
-                    kopiur_kopia::split_policy_scopes(op.policy.to_kopia());
-                client
-                    .policy_set(&override_source, &path_policy)
-                    .await
-                    .map_err(kopia(KopiaOp::PolicySet))?;
-                user_identity_policy = split_identity_policy;
-            }
+            // ADR-0004 §4b).
+            //
+            // kopia rejects `--max-parallel-snapshots` on a path-scoped policy
+            // ("only global, username@hostname or @hostname"), so that one knob
+            // is folded into the identity-scope policy_set below instead of the
+            // path-scoped one (the policy_knobs e2e regression).
+            let (path_policy, user_identity_policy) =
+                kopiur_kopia::split_policy_scopes(op.policy.to_kopia());
+            // The path scope is REPLACED, every run, even when the spec is
+            // empty: kopia stores the policy and `policy set` only adds to it,
+            // so a rule or knob dropped from the spec would otherwise stay in
+            // force (#681). Kopiur owns this scope outright: it is per source,
+            // and nothing else in Kopiur writes it.
+            client
+                .policy_replace(&override_source, &path_policy)
+                .await
+                .map_err(kopia(KopiaOp::PolicyReplace))?;
+            // The identity-scoped `policy set` ALWAYS runs too: it carries the
+            // mandatory `KOPIA_KEEP_MAX` retention pin (see its doc comment).
+            // kopia's `snapshot create` unconditionally applies the source's OWN
+            // retention policy after every create, so an unset identity policy
+            // would otherwise fall back to kopia's defaults (keep-latest 10, …),
+            // silently deleting manifests a Kopiur `Snapshot` CR still
+            // references. It is written, never replaced: that scope can hold
+            // settings Kopiur does not own.
             client
                 .policy_set(
                     &identity_scope,
@@ -724,9 +727,7 @@ async fn run_operation(
                     // restore of a snapshot pinned before this fix points at a deleted
                     // manifest. On a not-found, self-heal by re-resolving the live id
                     // from the snapshot's stable identity (source path + start time).
-                    let restored_id = restore_with_heal(client, op, id)
-                        .await
-                        .map_err(kopia(KopiaOp::SnapshotRestore))?;
+                    let restored_id = restore_snapshot(client, op, id).await?;
                     // Restore's terminal success phase is `Completed`, not `Succeeded`
                     // (the Snapshot phase) — the Restore CRD enum rejects `Succeeded`.
                     Ok(StatusUpdate::completed(&restored_id, chrono::Utc::now()))
@@ -976,6 +977,229 @@ fn anchor_source_filter(anchor: &SnapshotAnchor) -> Option<SnapshotSource> {
     })
 }
 
+/// Restore what `op` selects out of `snapshot_id` into the mounted target —
+/// the whole snapshot root, or only `spec.selection.paths` (#689) — self-healing
+/// a stale id either way. Returns the id actually restored. Exhaustive over
+/// [`RestoreScope`], so a selection can never silently become a whole-root
+/// restore (or the reverse).
+async fn restore_snapshot(
+    client: &KopiaClient,
+    op: &RestoreOp,
+    snapshot_id: &str,
+) -> Result<String> {
+    match restore_scope(op) {
+        RestoreScope::WholeRoot => {
+            restore_with_heal(client, op, snapshot_id)
+                .await
+                .map_err(|source| MoverError::Kopia {
+                    op: KopiaOp::SnapshotRestore,
+                    source,
+                })
+        }
+        RestoreScope::Paths(paths) => restore_selected_paths(client, op, snapshot_id, paths).await,
+    }
+}
+
+/// Partial, in-place restore (#689): restore each selected snapshot-relative
+/// path to the same relative location under the target, touching nothing else.
+///
+/// Every path is PROBED first (`kopia ls <id>/<path>`), so a path absent from
+/// the snapshot fails the run before a single byte is written — a typo in one
+/// path must not leave the live PVC half-restored. The probe also heals a stale
+/// manifest id (kopia rewrites the id on pin): a not-found that is NOT "entry
+/// not found" re-resolves the live id from the anchor and probes again.
+///
+/// A selected FILE is restored into its parent directory, which kopia does not
+/// create, so the mover creates it (owned by the mover's uid). A selected
+/// DIRECTORY restores its whole subtree; with `enableFileDeletion` kopia's
+/// `--delete-extra` prunes only inside that directory.
+///
+/// Symlinks in the LIVE target are refused, for every selected path, before
+/// anything is written ([`check_selected_target`]): a `docs -> /elsewhere` link
+/// on the volume would otherwise redirect both the mover's `mkdir` and kopia's
+/// writes outside the target PVC — into another mount of the mover pod.
+async fn restore_selected_paths(
+    client: &KopiaClient,
+    op: &RestoreOp,
+    snapshot_id: &str,
+    paths: &[String],
+) -> Result<String> {
+    let probe_err = |source| MoverError::Kopia {
+        op: KopiaOp::RestorePathProbe,
+        source,
+    };
+    let (snapshot_id, kinds) = match probe_selection(client, snapshot_id, paths).await {
+        Ok(kinds) => (snapshot_id.to_string(), kinds),
+        Err(e) if e.class() == KopiaErrorClass::NotFound => {
+            match resolve_live_id(client, &op.anchor).await {
+                Some(live) if live != snapshot_id => {
+                    warn!(
+                        stale = %snapshot_id,
+                        live = %live,
+                        "restore snapshot id not found (changed by a pin); using the current id",
+                    );
+                    let kinds = probe_selection(client, &live, paths)
+                        .await
+                        .map_err(probe_err)?;
+                    (live, kinds)
+                }
+                _ => return Err(probe_err(e)),
+            }
+        }
+        Err(e) => return Err(probe_err(e)),
+    };
+    let missing = missing_selection_paths(&kinds);
+    if !missing.is_empty() {
+        return Err(MoverError::RestorePathsMissing {
+            snapshot_id,
+            missing,
+        });
+    }
+
+    // Refuse a symlinked target for ANY path before restoring the first one, so
+    // a refusal never leaves the live volume half-restored.
+    let root = std::path::Path::new(&op.target_path);
+    for (path, _) in &kinds {
+        check_selected_target(root, path, TargetPrep::CheckOnly)?;
+    }
+    let opts = op.restore_options();
+    for (path, kind) in &kinds {
+        let target = kopiur_kopia::restore_path_target(&op.target_path, path);
+        // Re-checked (and missing parents created, never through a symlink)
+        // right before each restore, narrowing the window a live workload has
+        // to swap a directory for a link.
+        check_selected_target(root, path, TargetPrep::CreateParents)?;
+        client
+            .snapshot_restore_path(&snapshot_id, path, &op.target_path, &opts)
+            .await
+            .map_err(|source| MoverError::Kopia {
+                op: KopiaOp::SnapshotRestore,
+                source,
+            })?;
+        info!(snapshot = %snapshot_id, path = %path, kind = ?kind, target = %target, "restored selected path");
+    }
+    Ok(snapshot_id)
+}
+
+/// Whether [`check_selected_target`] may create missing parent directories.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TargetPrep {
+    /// Only inspect: report a symlink or non-directory ancestor, create nothing.
+    CheckOnly,
+    /// Inspect AND create each missing parent directory, one level at a time,
+    /// with `mkdir` (which never follows a link) and re-inspect what it made.
+    CreateParents,
+}
+
+/// Make sure restoring snapshot path `rel` to `<root>/<rel>` can only write
+/// INSIDE `root`: no existing ancestor of the target — and not the target
+/// itself — may be a symbolic link, and every ancestor must be a directory.
+///
+/// Walks the components with `symlink_metadata` (lstat, never following a
+/// link). With [`TargetPrep::CreateParents`] a missing ancestor is created with
+/// a single-level `create_dir` — never `create_dir_all`, which would follow a
+/// link planted mid-path — and then inspected again, so a link swapped in by the
+/// live workload between the check and the `mkdir` is still caught. `rel` is
+/// admission-validated (relative, no `..`), so joining it cannot climb out.
+fn check_selected_target(root: &std::path::Path, rel: &str, prep: TargetPrep) -> Result<()> {
+    let segments: Vec<&str> = rel.split('/').filter(|s| !s.is_empty()).collect();
+    let mut cur = root.to_path_buf();
+    for (i, segment) in segments.iter().enumerate() {
+        cur.push(segment);
+        let is_last = i + 1 == segments.len();
+        match std::fs::symlink_metadata(&cur) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(MoverError::RestoreTargetSymlink { path: cur });
+            }
+            Ok(_) if is_last => {}
+            Ok(meta) if meta.is_dir() => {}
+            Ok(_) => {
+                return Err(MoverError::RestoreTargetDir {
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::NotADirectory,
+                        "exists in the target but is not a directory",
+                    ),
+                    path: cur,
+                });
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // The selected path itself may be absent (it is what the restore
+                // writes), and so may its parents until CreateParents makes them.
+                if is_last {
+                    return Ok(());
+                }
+                match prep {
+                    TargetPrep::CheckOnly => return Ok(()),
+                    TargetPrep::CreateParents => create_one_dir(&cur)?,
+                }
+            }
+            Err(source) => return Err(MoverError::RestoreTargetDir { path: cur, source }),
+        }
+    }
+    Ok(())
+}
+
+/// `mkdir` exactly one level and confirm a real directory now stands there (a
+/// concurrent `mkdir` by the workload is fine; a concurrent symlink is not).
+fn create_one_dir(path: &std::path::Path) -> Result<()> {
+    match std::fs::create_dir(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(source) => {
+            return Err(MoverError::RestoreTargetDir {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    }
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => Err(MoverError::RestoreTargetSymlink {
+            path: path.to_path_buf(),
+        }),
+        Ok(meta) if meta.is_dir() => Ok(()),
+        Ok(_) => Err(MoverError::RestoreTargetDir {
+            path: path.to_path_buf(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::NotADirectory,
+                "exists in the target but is not a directory",
+            ),
+        }),
+        Err(source) => Err(MoverError::RestoreTargetDir {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+/// Probe every selected path in `snapshot_id`, in selection order.
+async fn probe_selection(
+    client: &KopiaClient,
+    snapshot_id: &str,
+    paths: &[String],
+) -> std::result::Result<Vec<(String, SnapshotPathKind)>, KopiaError> {
+    let mut kinds = Vec::with_capacity(paths.len());
+    for path in paths {
+        kinds.push((
+            path.clone(),
+            client.snapshot_path_kind(snapshot_id, path).await?,
+        ));
+    }
+    Ok(kinds)
+}
+
+/// The selected paths the probe found absent from the snapshot, in selection
+/// order. Exhaustive over [`SnapshotPathKind`] so a new kind must decide whether
+/// it is restorable.
+fn missing_selection_paths(kinds: &[(String, SnapshotPathKind)]) -> Vec<String> {
+    kinds
+        .iter()
+        .filter_map(|(path, kind)| match kind {
+            SnapshotPathKind::Missing => Some(path.clone()),
+            SnapshotPathKind::Directory | SnapshotPathKind::NonDirectory => None,
+        })
+        .collect()
+}
+
 async fn restore_with_heal(
     client: &KopiaClient,
     op: &RestoreOp,
@@ -1046,13 +1270,7 @@ async fn resolve_and_restore(
             identity = %filter.identity(),
             "reusing the snapshot pinned by a prior attempt; restoring",
         );
-        let restored_id =
-            restore_with_heal(client, op, id)
-                .await
-                .map_err(|source| MoverError::Kopia {
-                    op: KopiaOp::SnapshotRestore,
-                    source,
-                })?;
+        let restored_id = restore_snapshot(client, op, id).await?;
         let identity = prior.identity.unwrap_or_else(|| ResolvedIdentity {
             username: sel.username.clone(),
             hostname: sel.hostname.clone(),
@@ -1122,12 +1340,7 @@ async fn resolve_and_restore(
                     ..Default::default()
                 })
                 .await;
-            let restored_id = restore_with_heal(client, op, &entry.id)
-                .await
-                .map_err(|source| MoverError::Kopia {
-                    op: KopiaOp::SnapshotRestore,
-                    source,
-                })?;
+            let restored_id = restore_snapshot(client, op, &entry.id).await?;
             return Ok(StatusUpdate::completed_resolved(
                 &restored_id,
                 identity,
@@ -1481,9 +1694,11 @@ async fn run_bootstrap_flow(
 /// create` (M0b, confirmed data-loss bug): kopia's six `--keep-*` retention
 /// fields, ALWAYS pinned to [`KOPIA_KEEP_MAX`], with `user_identity_policy`
 /// (the one knob `split_policy_scopes` moves to the identity scope —
-/// currently only `max_parallel_snapshots`) folded in on top when the
-/// operator configured it. Pulled out of `run_operation` so the mandatory
-/// pin is unit-testable without spawning kopia.
+/// currently only `max_parallel_snapshots`) folded in on top. That knob is
+/// written as `inherit` when the operator did not configure it: this scope is
+/// written but never replaced, so omitting the flag would keep a value an
+/// earlier spec stored there (#681). Pulled out of `run_operation` so the
+/// mandatory pin is unit-testable without spawning kopia.
 fn identity_retention_policy(
     user_identity_policy: Option<kopiur_kopia::PolicyArgs>,
 ) -> kopiur_kopia::PolicyArgs {
@@ -1508,7 +1723,11 @@ fn identity_retention_policy(
         // bug. An opt-in (`files.ignoreIdenticalSnapshots: true`) overrides this
         // from the more specific path scope.
         ignore_identical_snapshots: Some(false),
-        max_parallel_snapshots: user_identity_policy.and_then(|p| p.max_parallel_snapshots),
+        max_parallel_snapshots: Some(
+            user_identity_policy
+                .and_then(|p| p.max_parallel_snapshots)
+                .unwrap_or(kopiur_kopia::PolicyInt::Inherit),
+        ),
         ..Default::default()
     }
 }
@@ -3237,33 +3456,6 @@ fn probe_scratch_writable(path: &str) -> std::io::Result<()> {
     std::fs::remove_file(&probe)
 }
 
-/// **Pure.** The quick tier's `successExpr` environment derived from the newest
-/// snapshot manifest for its identity: `(stats, snapshot id)`.
-///
-/// `kopia snapshot verify` reports no machine-readable file/byte counts of its
-/// own, so a healthy quick verify of a non-empty snapshot satisfies the common
-/// `stats.files > 0` predicate from the manifest instead of always failing on a
-/// hardcoded 0. `errors` is 0 — a passing verify found no integrity errors.
-/// Counts saturate rather than wrap, so an absurd manifest cannot make a
-/// predicate read a small number.
-///
-/// Deliberately takes the manifest that WAS found. "No manifest for this
-/// identity" is not an environment to report, it is a terminal verdict
-/// ([`MoverError::VerifyNoSnapshot`]): `kopia snapshot verify --sources` exits 0
-/// when its filter matches ZERO manifests, so reporting success there stamps
-/// `status.lastVerified` for a source path the repository holds no snapshot for
-/// — the #456 false pass.
-fn quick_coverage(entry: kopiur_kopia::SnapshotListEntry) -> (kopiur_api::VerifyStats, String) {
-    (
-        kopiur_api::VerifyStats {
-            files: i64::try_from(entry.stats.file_count).unwrap_or(i64::MAX),
-            bytes: i64::try_from(entry.stats.total_size).unwrap_or(i64::MAX),
-            errors: 0,
-        },
-        entry.id,
-    )
-}
-
 /// Drive a `Verify` run (ADR-0005 §4): connect, run the quick (`kopia snapshot
 /// verify`) or deep (scratch-restore) tier, evaluate the optional CEL `successExpr`
 /// over the result, and PATCH the `SnapshotPolicy` `.status.lastVerified` on
@@ -4427,38 +4619,102 @@ fn build_client(spec: &MoverWorkSpec, kopia_binary: Option<&str>) -> KopiaClient
 mod tests {
     use super::*;
 
-    // --- #456: the quick tier's coverage verdict -----------------------------
+    // --- #689: partial restore selection probe -------------------------------
 
-    /// A manifest entry with the given counts, for [`quick_coverage`].
-    fn manifest(id: &str, files: u64, bytes: u64) -> kopiur_kopia::SnapshotListEntry {
-        let mut e: kopiur_kopia::SnapshotListEntry = serde_json::from_value(serde_json::json!({
-            "id": id,
-            "source": { "host": "h", "userName": "u", "path": "/pvc/data" },
-            "startTime": "2026-08-01T00:00:00Z",
-            "endTime": "2026-08-01T00:01:00Z",
-        }))
-        .expect("typed manifest entry");
-        e.stats.file_count = files;
-        e.stats.total_size = bytes;
-        e
+    #[cfg(unix)]
+    #[test]
+    fn check_selected_target_refuses_symlinks_and_creates_real_parents() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let r = root.path();
+        std::fs::create_dir_all(r.join("docs")).unwrap();
+        std::fs::write(r.join("docs/other.txt"), b"x").unwrap();
+        symlink(outside.path(), r.join("linked")).unwrap();
+        symlink(outside.path(), r.join("docs/album")).unwrap();
+        std::fs::write(r.join("afile"), b"x").unwrap();
+
+        // Fine: an existing parent, and a missing parent chain (created on demand).
+        check_selected_target(r, "docs/report.odt", TargetPrep::CreateParents).unwrap();
+        check_selected_target(r, "new/deep/f.txt", TargetPrep::CheckOnly).unwrap();
+        assert!(!r.join("new").exists(), "CheckOnly creates nothing");
+        check_selected_target(r, "new/deep/f.txt", TargetPrep::CreateParents).unwrap();
+        assert!(r.join("new/deep").is_dir());
+        assert!(
+            !r.join("new/deep/f.txt").exists(),
+            "the selected path itself is not created"
+        );
+
+        // A symlinked ANCESTOR, or a symlinked target, is refused — and nothing
+        // is created through it.
+        for rel in [
+            "linked/sub/report.odt",
+            "linked",
+            "docs/album",
+            "docs/album/01.mp3",
+        ] {
+            for prep in [TargetPrep::CheckOnly, TargetPrep::CreateParents] {
+                let err = check_selected_target(r, rel, prep).unwrap_err();
+                assert!(
+                    matches!(err, MoverError::RestoreTargetSymlink { .. }),
+                    "{rel} {prep:?}: {err:?}"
+                );
+            }
+        }
+        assert!(
+            std::fs::read_dir(outside.path()).unwrap().next().is_none(),
+            "nothing may be written outside the target"
+        );
+
+        // A file where a directory is needed is refused, not followed.
+        assert!(matches!(
+            check_selected_target(r, "afile/x", TargetPrep::CreateParents),
+            Err(MoverError::RestoreTargetDir { .. })
+        ));
+        let msg = MoverError::RestoreTargetSymlink {
+            path: r.join("linked"),
+        }
+        .to_string();
+        assert!(
+            msg.contains("symbolic link") && msg.contains("Fix:"),
+            "{msg}"
+        );
     }
 
     #[test]
-    fn quick_coverage_reports_the_manifest_counts_and_saturates() {
-        let (stats, id) = quick_coverage(manifest("k1", 42, 4096));
-        assert_eq!(id, "k1");
-        assert_eq!(stats.files, 42);
-        assert_eq!(stats.bytes, 4096);
+    fn missing_selection_paths_keeps_only_absent_paths_in_order() {
+        let kinds = vec![
+            (
+                "docs/report.odt".to_string(),
+                SnapshotPathKind::NonDirectory,
+            ),
+            ("typo/x".to_string(), SnapshotPathKind::Missing),
+            ("music/album".to_string(), SnapshotPathKind::Directory),
+            ("also/gone".to_string(), SnapshotPathKind::Missing),
+        ];
         assert_eq!(
-            stats.errors, 0,
-            "a passing quick verify found no integrity errors"
+            missing_selection_paths(&kinds),
+            vec!["typo/x".to_string(), "also/gone".to_string()]
         );
-        // Saturate, never wrap: a wrapped count could make `stats.files > 0`
-        // read false (or a byte budget read small) on an absurd manifest.
-        let (stats, _) = quick_coverage(manifest("k2", u64::MAX, u64::MAX));
-        assert_eq!(stats.files, i64::MAX);
-        assert_eq!(stats.bytes, i64::MAX);
+        assert!(missing_selection_paths(&kinds[..1]).is_empty());
     }
+
+    #[test]
+    fn restore_paths_missing_message_is_actionable_and_terminal() {
+        let err = MoverError::RestorePathsMissing {
+            snapshot_id: "k123".into(),
+            missing: vec!["docs/typo.odt".into()],
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("\"docs/typo.odt\""), "{msg}");
+        assert!(msg.contains("k123"), "{msg}");
+        assert!(msg.contains("Nothing was restored"), "{msg}");
+        assert!(msg.contains("Fix: correct spec.selection.paths"), "{msg}");
+        // A missing path never appears by retrying the same Job.
+        assert!(!err.retry_recommended());
+    }
+
+    // --- #456: the quick tier's coverage verdict -----------------------------
 
     #[test]
     fn a_quick_verify_that_covered_no_snapshot_is_a_terminal_failure_not_a_pass() {
@@ -4747,12 +5003,15 @@ mod tests {
         // more specific PATH scope (from `files.ignoreIdenticalSnapshots`) may.
         let user = kopiur_kopia::PolicyArgs {
             ignore_identical_snapshots: Some(true),
-            max_parallel_snapshots: Some(4),
+            max_parallel_snapshots: Some(kopiur_kopia::PolicyInt::Set(4)),
             ..Default::default()
         };
         let p = identity_retention_policy(Some(user));
         assert_eq!(p.ignore_identical_snapshots, Some(false));
-        assert_eq!(p.max_parallel_snapshots, Some(4));
+        assert_eq!(
+            p.max_parallel_snapshots,
+            Some(kopiur_kopia::PolicyInt::Set(4))
+        );
     }
 
     #[test]
@@ -4764,7 +5023,13 @@ mod tests {
         assert_eq!(p.keep_weekly, Some(KOPIA_KEEP_MAX));
         assert_eq!(p.keep_monthly, Some(KOPIA_KEEP_MAX));
         assert_eq!(p.keep_annual, Some(KOPIA_KEEP_MAX));
-        assert_eq!(p.max_parallel_snapshots, None);
+        // #681: unset is written as an explicit reset, never omitted. The
+        // identity scope is not replaced, so an omitted flag would keep a
+        // `maxParallelSnapshots` an earlier spec stored there.
+        assert_eq!(
+            p.max_parallel_snapshots,
+            Some(kopiur_kopia::PolicyInt::Inherit)
+        );
     }
 
     #[test]
@@ -4773,13 +5038,16 @@ mod tests {
         // (`split_policy_scopes`) rides alongside the mandatory pin, not
         // instead of it.
         let user = kopiur_kopia::PolicyArgs {
-            max_parallel_snapshots: Some(3),
+            max_parallel_snapshots: Some(kopiur_kopia::PolicyInt::Set(3)),
             ..Default::default()
         };
         let p = identity_retention_policy(Some(user));
         assert_eq!(p.keep_latest, Some(KOPIA_KEEP_MAX));
         assert_eq!(p.keep_annual, Some(KOPIA_KEEP_MAX));
-        assert_eq!(p.max_parallel_snapshots, Some(3));
+        assert_eq!(
+            p.max_parallel_snapshots,
+            Some(kopiur_kopia::PolicyInt::Set(3))
+        );
     }
 
     // --- `kopiur-mover ready` probe mode: the pure marker decision ---

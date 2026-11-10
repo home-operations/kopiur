@@ -77,6 +77,8 @@ pub const REPO_SUBPATHS: &[&str] = &[
     "vfydeep",
     "vfyinh",
     "vfygate",
+    // #646: quick verify of a 100%-cache-hit snapshot (verification.rs).
+    "vfycache",
     "repl-src",
     "repl-dst",
     "repl-s3-src",
@@ -161,6 +163,10 @@ pub const REPO_SUBPATHS: &[&str] = &[
     // the whole repo runs at uid/gid 3001 (bootstrap AND backup — kopia's 0600 control
     // files must share one owner), so it cannot share the restore shard's 65532 seed repo.
     "recrestore",
+    // #689 partial in-place restore (restore.rs::
+    // partial_in_place_restore_brings_back_only_the_selected_paths): backs up its
+    // OWN mutable live PVC, so its kopia repo must not mix with the shared seed's.
+    "partial",
     // #380: the waitTimeout window must open when the restore can first PROCEED
     // (repository Ready), not at the Restore's creation — needs its own repo, created
     // SUSPENDED so it is cold until the scenario releases it.

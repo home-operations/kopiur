@@ -141,6 +141,7 @@ fn restore_roundtrip() {
             ignore_errors: Some(false),
             skip_existing: Some(true),
             delete_extra: true,
+            paths: vec![],
         }),
         identity: sample_identity(),
         repository: RepositoryConnect::S3 {
@@ -240,6 +241,7 @@ fn restore_resolve_source_roundtrips_and_wire_shape() {
             ignore_errors: None,
             skip_existing: None,
             delete_extra: false,
+            paths: vec![],
         }),
         identity: sample_identity(),
         repository: RepositoryConnect::S3 {
@@ -952,6 +954,7 @@ fn restore_op_maps_options_and_defaults_absent() {
         ignore_errors: None,
         skip_existing: None,
         delete_extra: true,
+        paths: vec![],
     };
     let opts = op.restore_options();
     assert_eq!(opts.ignore_permission_errors, Some(false));
@@ -1186,7 +1189,10 @@ fn policy_args_from_policy_maps_all_flattened_knobs() {
     let args = p.to_kopia();
     assert_eq!(args.compression.as_deref(), Some("zstd"));
     assert_eq!(args.ignore_file_errors, Some(true));
-    assert_eq!(args.max_parallel_snapshots, Some(4));
+    assert_eq!(
+        args.max_parallel_snapshots,
+        Some(kopiur_kopia::PolicyInt::Set(4))
+    );
     // No per-policy splitter (ADR-0004 §4b).
     assert_eq!(args.splitter, None);
     // M0b: the create-time retention `keep_*` pin is NOT user-configurable and
@@ -3063,5 +3069,38 @@ fn bootstrap_max_returned_snapshots_hook_defaults_absent_and_round_trips() {
     assert_eq!(
         serde_json::from_value::<BootstrapRepositoryOp>(v).unwrap(),
         armed
+    );
+}
+
+#[test]
+fn restore_op_paths_round_trip_and_resolve_the_scope() {
+    // #689 partial restore. Older work-spec JSON (no `paths`) is a whole-root
+    // restore; a selection round-trips under `paths` and resolves to
+    // `RestoreScope::Paths`.
+    let legacy: RestoreOp =
+        serde_json::from_str(r#"{"source":{"snapshot":"s"},"targetPath":"/data"}"#).unwrap();
+    assert_eq!(restore_scope(&legacy), RestoreScope::WholeRoot);
+    assert!(
+        serde_json::to_value(&legacy)
+            .unwrap()
+            .get("paths")
+            .is_none(),
+        "an empty selection is omitted from the wire"
+    );
+
+    let selected = RestoreOp {
+        paths: vec!["docs/report.odt".into(), "music/album".into()],
+        ..legacy
+    };
+    let wire = serde_json::to_value(&selected).unwrap();
+    assert_eq!(
+        wire["paths"],
+        serde_json::json!(["docs/report.odt", "music/album"])
+    );
+    let back: RestoreOp = serde_json::from_value(wire).unwrap();
+    assert_eq!(back, selected);
+    assert_eq!(
+        restore_scope(&back),
+        RestoreScope::Paths(&["docs/report.odt".to_string(), "music/album".to_string()])
     );
 }

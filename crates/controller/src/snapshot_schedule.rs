@@ -1969,8 +1969,19 @@ fn snapshot_terminal_time(s: &Snapshot) -> Option<DateTime<Utc>> {
 /// recoverable backup. Those CRs are kept; only artifact-less failures (preflight,
 /// pre-snapshot errors) are history-bounded here.
 pub(crate) fn failed_snapshots_to_prune(snapshots: &[Snapshot], limit: u32) -> Vec<String> {
+    failed_rows_to_prune(snapshots.iter(), limit)
+}
+
+/// [`failed_snapshots_to_prune`] over any population of rows — the schedule's
+/// own children, or (`snapshot_policy::manual_failed_snapshots_to_prune`) a
+/// policy's failed manual runs. One selection rule, so the data-safety skips
+/// below cannot drift between the two bounds.
+pub(crate) fn failed_rows_to_prune<'a>(
+    snapshots: impl Iterator<Item = &'a Snapshot>,
+    limit: u32,
+) -> Vec<String> {
     use kopiur_api::SnapshotPhase;
-    let failed = snapshots.iter().filter(|s| {
+    let failed = snapshots.filter(|s| {
         let st = s.status.as_ref();
         // Exhaustive, not `== Failed`: this set's members get DELETED, so
         // every phase must say out loud whether it belongs in the
