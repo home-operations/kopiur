@@ -1,7 +1,7 @@
 [
   {
     "id": "1a971cb3ebdbd5a1c17409de36e240e6",
-    "source": { "host": "desktop", "userName": "perf3ct", "path": "/tmp/tmp.mjtMOfio2h/src" },
+    "source": { "host": "e2e", "userName": "kopiur", "path": "/pvc/data" },
     "description": "",
     "startTime": "2026-11-09T23:39:05.827161926Z",
     "endTime": "2026-11-09T23:39:05.827874368Z",
@@ -18,7 +18,7 @@
       "errorCount": 0
     },
     "rootEntry": {
-      "name": "src",
+      "name": "data",
       "type": "d",
       "mode": "0755",
       "mtime": "2026-11-09T23:39:05.461941589Z",
@@ -38,7 +38,7 @@
   },
   {
     "id": "d901956efaf80d8ba0597651343bf4b0",
-    "source": { "host": "desktop", "userName": "perf3ct", "path": "/tmp/tmp.mjtMOfio2h/src" },
+    "source": { "host": "e2e", "userName": "kopiur", "path": "/pvc/data" },
     "description": "",
     "startTime": "2026-11-09T23:39:05.925868966Z",
     "endTime": "2026-11-09T23:39:05.926036367Z",
@@ -55,7 +55,7 @@
       "errorCount": 0
     },
     "rootEntry": {
-      "name": "src",
+      "name": "data",
       "type": "d",
       "mode": "0755",
       "mtime": "2026-11-09T23:39:05.461941589Z",
