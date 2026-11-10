@@ -800,6 +800,7 @@ pub fn resolved_run_status(
     namespace: &str,
     work_spec: &MoverWorkSpec,
     repo_ref: &RepositoryRef,
+    cache: kopiur_api::common::ResolvedCache,
 ) -> kopiur_api::snapshot::ResolvedSnapshot {
     let config_ns = config.namespace().unwrap_or_else(|| namespace.to_string());
     let pvc = config
@@ -817,6 +818,8 @@ pub fn resolved_run_status(
             source_path: Some(work_spec.identity.source_path.clone()),
         }],
         credential_projection: Some(projection_to_pin(config)),
+        // #613: the budgets the mover was given, and the capacity they fit.
+        cache: Some(cache),
     }
 }
 

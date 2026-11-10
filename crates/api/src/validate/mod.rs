@@ -483,7 +483,34 @@ pub fn validate_mover(mover: &MoverSpec, context: &str) -> ValidationResult {
     if let Some(resources) = &mover.resources {
         validate_resources(resources, context)?;
     }
+    if let Some(cache) = &mover.cache {
+        crate::common::validate_cache_shape(cache, &format!("{context} cache"))?;
+    }
     Ok(())
+}
+
+/// Validate a repository's `moverDefaults.cache` and `maintenance.mover.cache`
+/// budgets (#613) — the repository-level counterpart of the cache half of
+/// [`validate_mover`]. Shape-only for legacy `*CacheSizeMb` values (see
+/// [`crate::common::validate_cache_shape`]), so a stored repository keeps
+/// reconciling; the capacity bound on those lives in
+/// [`validate_cache_legacy_budgets`].
+pub fn validate_repository_caches(
+    mover_defaults: Option<&crate::common::MoverDefaults>,
+    maintenance_mover: Option<&MoverSpec>,
+) -> Vec<ValidationError> {
+    let mut errs = Vec::new();
+    if let Some(c) = mover_defaults.and_then(|m| m.cache.as_ref())
+        && let Err(e) = crate::common::validate_cache_shape(c, "spec.moverDefaults.cache")
+    {
+        errs.push(e);
+    }
+    if let Some(c) = maintenance_mover.and_then(|m| m.cache.as_ref())
+        && let Err(e) = crate::common::validate_cache_shape(c, "spec.maintenance.mover.cache")
+    {
+        errs.push(e);
+    }
+    errs
 }
 
 /// The first resource key whose `requests` value exceeds its `limits` value (both present
@@ -949,3 +976,6 @@ pub(crate) fn forbid_inherit(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod cache_tests;

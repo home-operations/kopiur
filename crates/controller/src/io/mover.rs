@@ -1394,12 +1394,125 @@ fn pod_key(p: &Pod) -> (String, String) {
     )
 }
 
+/// What [`ensure_cache_pvc`] did about an existing cache PVC's size (#613).
+/// Kubernetes can grow a PVC (when its StorageClass allows expansion) but never
+/// shrink one, so a changed `mover.cache.capacity` lands in exactly one of these.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CachePvcResize {
+    /// Just created, or already at the requested size: nothing to do.
+    Unchanged,
+    /// The requested capacity was larger and the claim was grown to it. The volume
+    /// itself resizes asynchronously (CSI resizer / kubelet).
+    Expanded {
+        /// The claim's previous request.
+        from: String,
+        /// The new request.
+        to: String,
+    },
+    /// The requested capacity was larger, but the claim could not be grown.
+    ExpansionNotAllowed {
+        /// The claim's current request (kept).
+        current: String,
+        /// The capacity the spec asks for.
+        requested: String,
+        /// Why — the StorageClass's `allowVolumeExpansion`, or the apiserver's refusal.
+        reason: String,
+    },
+    /// The requested capacity was smaller. A PVC cannot shrink, so the claim keeps
+    /// its size.
+    ShrinkRefused {
+        /// The claim's current request (kept).
+        current: String,
+        /// The smaller capacity the spec asks for.
+        requested: String,
+    },
+}
+
+/// The outcome of [`ensure_cache_pvc`]: the claim to mount, the size kopia's cache
+/// budgets must fit in, and what happened to the claim's size.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnsuredCachePvc {
+    /// Name of the cache PVC.
+    pub claim_name: String,
+    /// The capacity cache budgets are resolved against: the SMALLEST of the
+    /// requested capacity, the claim's request, and its bound capacity — so a
+    /// pending or refused resize can never let kopia's budgets outgrow the volume.
+    pub capacity: String,
+    /// What was done about the claim's size.
+    pub resize: CachePvcResize,
+}
+
+/// Which way a cache PVC would have to change size to match the spec.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResizeDirection {
+    /// Already the requested size (or a size that cannot be compared).
+    Same,
+    /// The spec asks for more.
+    Grow,
+    /// The spec asks for less.
+    Shrink,
+}
+
+/// Compare a claim's current storage request with the requested capacity.
+/// Unparseable quantities compare as [`ResizeDirection::Same`] — never a resize on
+/// a guess. Pure.
+pub(crate) fn resize_direction(current: &str, requested: &str) -> ResizeDirection {
+    use kube_quantity::ParsedQuantity;
+    match (
+        ParsedQuantity::try_from(current.trim()),
+        ParsedQuantity::try_from(requested.trim()),
+    ) {
+        (Ok(c), Ok(r)) if r > c => ResizeDirection::Grow,
+        (Ok(c), Ok(r)) if r < c => ResizeDirection::Shrink,
+        _ => ResizeDirection::Same,
+    }
+}
+
+/// A PVC's `spec.resources.requests.storage`, if set.
+pub(crate) fn pvc_requested_storage(pvc: &PersistentVolumeClaim) -> Option<String> {
+    pvc.spec
+        .as_ref()?
+        .resources
+        .as_ref()?
+        .requests
+        .as_ref()?
+        .get("storage")
+        .map(|q| q.0.clone())
+}
+
+/// The capacity a cache PVC can actually hold right now for budget purposes: the
+/// smallest of the `requested` spec capacity, the claim's request, and its bound
+/// `status.capacity.storage`. Unparseable values are ignored. Pure.
+pub(crate) fn effective_cache_capacity(requested: &str, pvc: &PersistentVolumeClaim) -> String {
+    use kube_quantity::ParsedQuantity;
+    let bound = pvc
+        .status
+        .as_ref()
+        .and_then(|s| s.capacity.as_ref())
+        .and_then(|c| c.get("storage"))
+        .map(|q| q.0.clone());
+    [
+        Some(requested.to_string()),
+        pvc_requested_storage(pvc),
+        bound,
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(|q| ParsedQuantity::try_from(q.trim()).ok().map(|p| (p, q)))
+    .min_by(|a, b| a.0.cmp(&b.0))
+    .map_or_else(|| requested.to_string(), |(_, q)| q)
+}
+
 /// Ensure a controller-owned **persistent** kopia cache PVC named `name` exists in
-/// `ns` (a warm cache reused across this owner's runs, ADR §3.1). Idempotent:
-/// returns the claim name if it already exists (the spec is immutable, so we never
-/// re-apply over it), otherwise creates it `ReadWriteOnce` at `capacity` with the
-/// optional `storage_class`, owner-referenced so it is GC'd with `owner`. Because it
-/// is `ReadWriteOnce`, persistent cache assumes non-overlapping runs for the owner.
+/// `ns` (a warm cache reused across this owner's runs, ADR §3.1). Creates it
+/// `ReadWriteOnce` at `capacity` with the optional `storage_class`, owner-referenced
+/// so it is GC'd with `owner`. Because it is `ReadWriteOnce`, persistent cache
+/// assumes non-overlapping runs for the owner.
+///
+/// An existing claim is reconciled toward `capacity` grow-only (#613): a larger
+/// capacity patches `spec.resources.requests.storage` when the claim's
+/// StorageClass allows volume expansion; a smaller one is never applied. Either
+/// refusal is returned in [`EnsuredCachePvc::resize`] for the caller to surface.
 pub async fn ensure_cache_pvc(
     client: &kube::Client,
     ns: &str,
@@ -1407,16 +1520,115 @@ pub async fn ensure_cache_pvc(
     owner: OwnerReference,
     capacity: &str,
     storage_class: Option<&str>,
-) -> Result<String> {
+) -> Result<EnsuredCachePvc> {
     let api: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), ns);
-    if api.get_opt(name).await?.is_some() {
-        return Ok(name.to_string());
+    let fresh = |resize| EnsuredCachePvc {
+        claim_name: name.to_string(),
+        capacity: capacity.to_string(),
+        resize,
+    };
+    let Some(existing) = api.get_opt(name).await? else {
+        let pvc = cache_pvc(ns, name, owner, capacity, storage_class);
+        return match api.create(&PostParams::default(), &pvc).await {
+            Ok(_) => Ok(fresh(CachePvcResize::Unchanged)),
+            // A concurrent reconcile won the create race: the PVC is there, reuse it.
+            Err(kube::Error::Api(e)) if e.code == 409 => Ok(fresh(CachePvcResize::Unchanged)),
+            Err(e) => Err(Error::Kube(e)),
+        };
+    };
+    let Some(current) = pvc_requested_storage(&existing) else {
+        return Ok(fresh(CachePvcResize::Unchanged));
+    };
+    let (resize, after) = match resize_direction(&current, capacity) {
+        ResizeDirection::Same => (CachePvcResize::Unchanged, existing),
+        ResizeDirection::Shrink => (
+            CachePvcResize::ShrinkRefused {
+                current,
+                requested: capacity.to_string(),
+            },
+            existing,
+        ),
+        ResizeDirection::Grow => grow_cache_pvc(client, &api, existing, &current, capacity).await?,
+    };
+    Ok(EnsuredCachePvc {
+        claim_name: name.to_string(),
+        capacity: effective_cache_capacity(capacity, &after),
+        resize,
+    })
+}
+
+/// Whether a StorageClass lets its PVCs be expanded (`allowVolumeExpansion: true`;
+/// absent means no). Pure.
+pub(crate) fn storage_class_allows_expansion(
+    sc: &k8s_openapi::api::storage::v1::StorageClass,
+) -> bool {
+    sc.allow_volume_expansion == Some(true)
+}
+
+/// Grow an existing cache PVC to `capacity`, checking its StorageClass first.
+/// Returns the outcome and the claim as it now stands.
+async fn grow_cache_pvc(
+    client: &kube::Client,
+    api: &Api<PersistentVolumeClaim>,
+    pvc: PersistentVolumeClaim,
+    current: &str,
+    capacity: &str,
+) -> Result<(CachePvcResize, PersistentVolumeClaim)> {
+    use k8s_openapi::api::storage::v1::StorageClass;
+    let refused = |reason: String| CachePvcResize::ExpansionNotAllowed {
+        current: current.to_string(),
+        requested: capacity.to_string(),
+        reason,
+    };
+    if let Some(class) = pvc.spec.as_ref().and_then(|s| s.storage_class_name.clone()) {
+        let classes: Api<StorageClass> = Api::all(client.clone());
+        match classes.get_opt(&class).await {
+            Ok(Some(sc)) if !storage_class_allows_expansion(&sc) => {
+                return Ok((
+                    refused(format!(
+                        "its StorageClass `{class}` does not set `allowVolumeExpansion: true`"
+                    )),
+                    pvc,
+                ));
+            }
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                return Ok((
+                    refused(format!("its StorageClass `{class}` no longer exists")),
+                    pvc,
+                ));
+            }
+            // A namespace-scoped install cannot read StorageClasses (cluster-scoped):
+            // try the patch and let the apiserver decide.
+            Err(kube::Error::Api(e)) if e.code == 403 => {}
+            Err(e) => return Err(Error::Kube(e)),
+        }
     }
-    let pvc = cache_pvc(ns, name, owner, capacity, storage_class);
-    match api.create(&PostParams::default(), &pvc).await {
-        Ok(_) => Ok(name.to_string()),
-        // A concurrent reconcile won the create race: the PVC is there, reuse it.
-        Err(kube::Error::Api(e)) if e.code == 409 => Ok(name.to_string()),
+    let name = pvc.name_any();
+    let patch = serde_json::json!({
+        "spec": { "resources": { "requests": { "storage": capacity } } }
+    });
+    match api
+        .patch(
+            &name,
+            &kube::api::PatchParams::default(),
+            &kube::api::Patch::Merge(&patch),
+        )
+        .await
+    {
+        Ok(grown) => Ok((
+            CachePvcResize::Expanded {
+                from: current.to_string(),
+                to: capacity.to_string(),
+            },
+            grown,
+        )),
+        // 403/422: the apiserver's own expansion admission refused it (e.g. a
+        // StorageClass we could not read does not allow expansion).
+        Err(kube::Error::Api(e)) if matches!(e.code, 403 | 422) => Ok((
+            refused(format!("the API server refused: {}", e.message)),
+            pvc,
+        )),
         Err(e) => Err(Error::Kube(e)),
     }
 }

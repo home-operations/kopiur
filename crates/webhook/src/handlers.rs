@@ -224,6 +224,10 @@ async fn handle_snapshot_policy(
     errs.extend(api::validate::validate_backup_config_admission_extras(
         &spec,
     ));
+    errs.extend(api::validate::validate_cache_legacy_budgets_for(
+        &spec,
+        decode_old_spec::<SnapshotPolicySpec>(req).as_ref(),
+    ));
     if !errs.is_empty() {
         return Err(AdmissionError::Invalid(errs));
     }
@@ -356,7 +360,11 @@ async fn handle_snapshot(
         ),
     };
 
-    let errs = api::validate::validate_backup(&spec, origin);
+    let mut errs = api::validate::validate_backup(&spec, origin);
+    errs.extend(api::validate::validate_cache_legacy_budgets_for(
+        &spec,
+        decode_old_spec::<SnapshotSpec>(req).as_ref(),
+    ));
     if !errs.is_empty() {
         return Err(AdmissionError::Invalid(errs));
     }
@@ -719,7 +727,11 @@ async fn handle_restore(
             source,
         })?;
 
-    let errs = api::validate::validate_restore_spec(&spec);
+    let mut errs = api::validate::validate_restore_spec(&spec);
+    errs.extend(api::validate::validate_cache_legacy_budgets_for(
+        &spec,
+        decode_old_spec::<RestoreSpec>(req).as_ref(),
+    ));
     if !errs.is_empty() {
         return Err(AdmissionError::Invalid(errs));
     }
@@ -818,6 +830,10 @@ async fn handle_maintenance(
     // Admission-only: the quick/full jitter windows, which the shared aggregate has
     // never validated at all — so PARSE and bound are both new rejections here.
     errs.extend(api::validate::validate_maintenance_admission_extras(&spec));
+    errs.extend(api::validate::validate_cache_legacy_budgets_for(
+        &spec,
+        decode_old_spec::<MaintenanceSpec>(req).as_ref(),
+    ));
     if !errs.is_empty() {
         return Err(AdmissionError::Invalid(errs));
     }
@@ -885,6 +901,10 @@ async fn handle_repository_replication(
     let mut errs = api::validate::validate_repository_replication(&spec);
     // Admission-only: the schedule jitter, never validated by the shared aggregate.
     errs.extend(api::validate::validate_repository_replication_admission_extras(&spec));
+    errs.extend(api::validate::validate_cache_legacy_budgets_for(
+        &spec,
+        decode_old_spec::<RepositoryReplicationSpec>(req).as_ref(),
+    ));
     if !errs.is_empty() {
         return Err(AdmissionError::Invalid(errs));
     }
@@ -952,6 +972,10 @@ async fn handle_snapshot_replication(
     let mut errs = api::validate::validate_snapshot_replication(&spec);
     // Admission-only: the jitter 24h cap (the parse half is already shared).
     errs.extend(api::validate::validate_snapshot_replication_admission_extras(&spec));
+    errs.extend(api::validate::validate_cache_legacy_budgets_for(
+        &spec,
+        decode_old_spec::<SnapshotReplicationSpec>(req).as_ref(),
+    ));
     if !errs.is_empty() {
         return Err(AdmissionError::Invalid(errs));
     }
@@ -1133,6 +1157,10 @@ async fn handle_cluster_repository(
         .flatten();
 
     let mut errs = api::validate::validate_cluster_repository(&spec);
+    errs.extend(api::validate::validate_cache_legacy_budgets_for(
+        &spec,
+        old_spec.as_ref(),
+    ));
     // Create-time immutability (ADR-0005 §7): on UPDATE, reject changes to
     // `create.{splitter,hash,encryption,ecc}` — kopia bakes them into the repository
     // format. The password Secret reference is intentionally NOT locked (a rename with
@@ -1231,6 +1259,10 @@ async fn handle_repository(
         .flatten();
 
     let mut errs = api::validate::validate_repository(&spec);
+    errs.extend(api::validate::validate_cache_legacy_budgets_for(
+        &spec,
+        old_spec.as_ref(),
+    ));
     // Create-time immutability (ADR-0005 §7), UPDATE-only: `create.*` algorithms only;
     // the password Secret reference is mutable (a rename with identical content passes).
     if let Some(old) = &old_spec {

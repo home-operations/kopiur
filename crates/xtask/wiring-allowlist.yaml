@@ -103,6 +103,24 @@ allow:
     reason: >-
       Consumed by kopiur_api::repository::resolve_index_blob_warn_threshold,
       called from controller/src/{repository,cluster_repository}.rs.
+  - path: "*.cache.contentCacheSize"
+    reason: >-
+      Consumed by kopiur_api::common::resolve_cache_budgets
+      (api/src/common/cache_budget.rs, #613), called from controller/src/cache.rs
+      (cache_budgets/cache_tuning) for every mover's --content-cache-size-mb.
+  - path: "*.cache.contentCacheSize.percent"
+    reason: >-
+      The CacheSize::Percent variant, matched by resolve_cache_budgets
+      (api/src/common/cache_budget.rs), called from controller/src/cache.rs.
+  - path: "*.cache.metadataCacheSize"
+    reason: >-
+      Consumed by kopiur_api::common::resolve_cache_budgets
+      (api/src/common/cache_budget.rs, #613), called from controller/src/cache.rs
+      (cache_budgets/cache_tuning) for every mover's --metadata-cache-size-mb.
+  - path: "*.cache.metadataCacheSize.percent"
+    reason: >-
+      The CacheSize::Percent variant, matched by resolve_cache_budgets
+      (api/src/common/cache_budget.rs), called from controller/src/cache.rs.
   - path: "*.catalog.periodicRefresh"
     reason: >-
       Consumed by CatalogBounds::periodic_refresh_enabled

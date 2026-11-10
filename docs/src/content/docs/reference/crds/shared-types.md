@@ -134,10 +134,12 @@ The resolved context still enters as the recipe layer, so the hardened base stil
 
 How a mover's kopia cache volume is provisioned and sized.
 
-- **`capacity`** is the size of the PVC backing the cache, `10Gi` for example.
+- **`capacity`** is the size of the volume backing the cache, `10Gi` for example. When it is set, unset budgets default to 60% (content) and 15% (metadata) of it. Raising it on a `Persistent` cache grows the existing PVC if its StorageClass allows expansion; a smaller value is never applied to an existing PVC.
 - **`storageClassName`** is the StorageClass for the cache PVC. Leave it out to use the cluster default.
-- **`metadataCacheSizeMb`** is kopia's metadata cache budget in MiB, and maps to `--metadata-cache-size-mb`.
-- **`contentCacheSizeMb`** is kopia's content cache budget in MiB, and maps to `--content-cache-size-mb`.
+- **`contentCacheSize`** is kopia's content cache budget (`--content-cache-size-mb`): exactly one of `percent` (1–100, a share of `capacity`) or `size` (a quantity such as `4Gi`). Values round down to whole MiB.
+- **`metadataCacheSize`** is kopia's metadata cache budget (`--metadata-cache-size-mb`), in the same two forms.
+- **`contentCacheSizeMb`** / **`metadataCacheSizeMb`** are the original spellings of the two budgets, in MiB. Set one spelling per budget, not both.
+- With a `capacity`, the two budgets together may claim at most 90% of it, because kopia overshoots its budgets between cache sweeps. The webhook enforces this; see [Backups → Sizing the kopia cache](/backups/#sizing-the-kopia-cache).
 - **`mode`** is `Ephemeral` or `Persistent`. `Ephemeral` is the default and gives a fresh cache that lives only for the run. `Persistent` keeps a warm cache across runs in a controller-owned `ReadWriteOnce` PVC, which assumes that runs for a given owner do not overlap.
 
 ## ScratchDefaults

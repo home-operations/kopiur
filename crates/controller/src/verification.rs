@@ -1172,13 +1172,19 @@ pub fn build_verify_work_spec(
         },
         hook_plan: Default::default(),
         options: MoverOptions::default(),
-        cache: crate::cache::cache_tuning(
-            crate::cache::effective_cache(
+        cache: {
+            // #613: budgets fit the (always per-run) verify cache volume — the same
+            // `verify_cache_volume` the Job mounts.
+            let effective = crate::cache::effective_cache(
                 repo,
                 config.spec.mover.as_ref().and_then(|m| m.cache.as_ref()),
-            )
-            .as_ref(),
-        ),
+            );
+            let volume = crate::cache::verify_cache_volume(effective.as_ref());
+            crate::cache::cache_tuning(
+                effective.as_ref(),
+                crate::cache::configured_capacity(&volume),
+            )?
+        },
         throttle: io::throttle_spec(repo.mover_defaults.as_ref()),
     })
 }
