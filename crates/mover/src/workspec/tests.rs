@@ -1189,7 +1189,10 @@ fn policy_args_from_policy_maps_all_flattened_knobs() {
     let args = p.to_kopia();
     assert_eq!(args.compression.as_deref(), Some("zstd"));
     assert_eq!(args.ignore_file_errors, Some(true));
-    assert_eq!(args.max_parallel_snapshots, Some(4));
+    assert_eq!(
+        args.max_parallel_snapshots,
+        Some(kopiur_kopia::PolicyInt::Set(4))
+    );
     // No per-policy splitter (ADR-0004 §4b).
     assert_eq!(args.splitter, None);
     // M0b: the create-time retention `keep_*` pin is NOT user-configurable and

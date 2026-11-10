@@ -22,8 +22,10 @@ pub enum KopiaOp {
     RepositoryConnect,
     /// `repository throttle set` (moverDefaults.throttle).
     ThrottleSet,
-    /// `policy set` against the snapshot's source identity.
+    /// `policy set` against the snapshot's identity scope (`username@hostname`).
     PolicySet,
+    /// `kopia policy delete` + `policy set` on the source's path scope (#681).
+    PolicyReplace,
     /// `snapshot create`.
     SnapshotCreate,
     /// `snapshot restore`.
@@ -114,6 +116,7 @@ impl KopiaOp {
             KopiaOp::RepositoryConnect => "repository connect",
             KopiaOp::ThrottleSet => "repository throttle set",
             KopiaOp::PolicySet => "policy set",
+            KopiaOp::PolicyReplace => "policy replace",
             KopiaOp::SnapshotCreate => "snapshot create",
             KopiaOp::SnapshotRestore => "snapshot restore",
             KopiaOp::SnapshotDelete => "snapshot delete",
@@ -712,6 +715,7 @@ mod tests {
             KopiaOp::RepositoryConnect,
             KopiaOp::ThrottleSet,
             KopiaOp::PolicySet,
+            KopiaOp::PolicyReplace,
             KopiaOp::SnapshotCreate,
             KopiaOp::SnapshotRestore,
             KopiaOp::SnapshotDelete,

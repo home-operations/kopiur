@@ -714,7 +714,12 @@ pub struct PolicyArgs {
     /// `--ignore-unknown-types` tri-state. ADR-0005 §13(b).
     pub ignore_unknown_types: Option<bool>,
     /// `--max-parallel-snapshots` upload parallelism. ADR-0005 §13(f).
-    pub max_parallel_snapshots: Option<u32>,
+    ///
+    /// The one knob that can carry an explicit `inherit`
+    /// ([`PolicyInt::Inherit`]): kopia rejects it on a path scope, so Kopiur
+    /// writes it at the identity scope, which it rewrites but never deletes,
+    /// so an unset value must be written as a reset rather than omitted (#681).
+    pub max_parallel_snapshots: Option<PolicyInt>,
     /// `--max-parallel-file-reads` upload parallelism. ADR-0005 §13(f).
     pub max_parallel_file_reads: Option<u32>,
     /// `--keep-latest`: most-recent-N backups to keep per source.
@@ -739,6 +744,48 @@ pub struct PolicyArgs {
     pub keep_annual: Option<i64>,
     /// Verbatim extra `policy set` flags (the CRD escape hatch).
     pub extra_args: Vec<String>,
+}
+
+/// The value of an integer `kopia policy set` knob that is written rather than
+/// omitted: an explicit setting, or `inherit`, which clears the value stored at
+/// that scope so the parent scope's applies.
+///
+/// It sits in an `Option` on [`PolicyArgs`], giving kopia's three argv states:
+/// `None` omits the flag (kopia KEEPS whatever the scope already stores),
+/// `Some(Set(n))` writes `n`, `Some(Inherit)` writes `inherit`. Omission is the
+/// trap: on a scope Kopiur does not [replace](KopiaClient::policy_replace), a
+/// value removed from the spec would otherwise stay stored forever (#681).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicyInt {
+    /// Write this value.
+    Set(u32),
+    /// Write `inherit`: drop this scope's value, fall back to the parent's.
+    Inherit,
+}
+
+impl PolicyInt {
+    /// The flag's argv value (`"4"`, `"inherit"`). Verified against kopia
+    /// 0.23.1's `applyOptionalInt`, which accepts `inherit` (and `default`).
+    fn argv_value(self) -> String {
+        match self {
+            PolicyInt::Set(n) => n.to_string(),
+            PolicyInt::Inherit => "inherit".into(),
+        }
+    }
+}
+
+/// The kopia invocations that make a target's DEFINED policy exactly a
+/// [`PolicyArgs`] (see [`KopiaClient::policy_replace`]). Pure, so the argv is
+/// unit-testable without spawning kopia.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PolicyReplacePlan {
+    /// `kopia policy delete <target>`: always runs first. A no-op success
+    /// when the target has no policy yet.
+    pub(crate) delete: Vec<String>,
+    /// `kopia policy set <target> …`, or `None` when the spec writes no flag
+    /// at all, where the delete alone leaves the target exactly as specified
+    /// (and a flagless `policy set` fails with "no changes specified").
+    pub(crate) set: Option<Vec<String>>,
 }
 
 /// Create-time-fixed repository options applied at `kopia repository create`
@@ -2423,6 +2470,47 @@ impl KopiaClient {
         self.run_ok(&args).await.map(|_| ())
     }
 
+    /// Remove the policy defined at `target` (`kopia policy delete <target>`),
+    /// so the target inherits everything from its parent scopes again. kopia
+    /// treats a target with no policy as success (it deletes the manifests
+    /// labelled for the target, of which there may be none).
+    pub async fn policy_delete(&self, target: &str) -> Result<(), KopiaError> {
+        self.run_ok(&policy_delete_args(target)).await.map(|_| ())
+    }
+
+    /// Make the policy DEFINED at `target` exactly `policy`: delete what kopia
+    /// stores there, then `policy set` the spec onto the now-empty policy.
+    ///
+    /// [`Self::policy_set`] cannot do this on its own, and that is #681: every
+    /// list flag (`--add-ignore`, `--add-never-compress`, …) is a set union into
+    /// the stored list, and an omitted scalar flag keeps its stored value, so a
+    /// rule or knob removed from the spec stays in force. The single-call
+    /// alternative does not exist either: kopia 0.23.1's `--clear-ignore`
+    /// returns before applying the `--add-ignore` flags beside it, so clear+add
+    /// in one call stores an EMPTY list.
+    ///
+    /// Only for a target the caller owns outright (the mover's per-source path
+    /// scope): anything set there out of band is deleted too. NOT for
+    /// `--global` or an identity scope, which hold settings Kopiur does not own.
+    ///
+    /// Two kopia calls, so not atomic: between them the target inherits its
+    /// parents. A snapshot of the same source that reads its policy inside
+    /// that window runs without this scope's settings; the next replace
+    /// rewrites them. If the set fails, the error is returned and the target
+    /// is left with no policy until the next successful replace.
+    pub async fn policy_replace(
+        &self,
+        target: &str,
+        policy: &PolicyArgs,
+    ) -> Result<(), KopiaError> {
+        let plan = policy_replace_plan(target, policy);
+        self.run_ok(&plan.delete).await?;
+        if let Some(set) = &plan.set {
+            self.run_ok(set).await?;
+        }
+        Ok(())
+    }
+
     /// Show the effective policy for `target` (`kopia policy show <target>
     /// --json`), parsed as a generic JSON value.
     pub async fn policy_show(&self, target: &str) -> Result<serde_json::Value, KopiaError> {
@@ -3054,7 +3142,7 @@ fn policy_set_args(target: &str, policy: &PolicyArgs) -> Vec<String> {
     );
     if let Some(n) = policy.max_parallel_snapshots {
         args.push("--max-parallel-snapshots".into());
-        args.push(n.to_string());
+        args.push(n.argv_value());
     }
     if let Some(n) = policy.max_parallel_file_reads {
         args.push("--max-parallel-file-reads".into());
@@ -3086,6 +3174,24 @@ fn policy_set_args(target: &str, policy: &PolicyArgs) -> Vec<String> {
     }
     args.extend(policy.extra_args.iter().cloned());
     args
+}
+
+/// Build the args for `kopia policy delete <target>`. Pure.
+fn policy_delete_args(target: &str) -> Vec<String> {
+    vec!["policy".into(), "delete".into(), target.to_string()]
+}
+
+/// Plan [`KopiaClient::policy_replace`]: the delete, then the spec's
+/// `policy set` unless it carries no flag. Pure.
+fn policy_replace_plan(target: &str, policy: &PolicyArgs) -> PolicyReplacePlan {
+    let set = policy_set_args(target, policy);
+    // `policy_set_args` always starts with `policy set <target>`; anything past
+    // those three words is a flag kopia will apply.
+    let writes_something = set.len() > 3;
+    PolicyReplacePlan {
+        delete: policy_delete_args(target),
+        set: writes_something.then_some(set),
+    }
 }
 
 /// Build the args for `kopia server start` (everything except the secret password,

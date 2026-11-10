@@ -14,9 +14,10 @@ pub mod testutil;
 pub use client::{
     CacheTuning, ConnectOptions, ConnectSpec, CreateOptions, DEFAULT_STDIN_FINALIZE_TIMEOUT,
     KopiaClient, KopiaClientBuilder, MaintenanceMode, MigratePolicies, MigrateSources, PolicyArgs,
-    RestoreOptions, STDIN_FINALIZE_GRACE, ServerAuthMode, ServerStartSpec, SnapshotCreateOptions,
-    SnapshotMigrateOptions, SnapshotPathKind, StdinOutcome, StdinSnapshot, StdinWriter,
-    SyncToOptions, ThrottleArgs, VerifyOptions, restore_path_target, split_policy_scopes,
+    PolicyInt, RestoreOptions, STDIN_FINALIZE_GRACE, ServerAuthMode, ServerStartSpec,
+    SnapshotCreateOptions, SnapshotMigrateOptions, SnapshotPathKind, StdinOutcome, StdinSnapshot,
+    StdinWriter, SyncToOptions, ThrottleArgs, VerifyOptions, restore_path_target,
+    split_policy_scopes,
 };
 pub use error::{
     KopiaError, KopiaErrorClass, notfound_is_uninitialized, snapshot_skipped_unchanged,
