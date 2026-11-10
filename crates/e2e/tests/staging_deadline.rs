@@ -400,6 +400,54 @@ async fn recover_body(client: &kube::Client, prefix: &str) -> anyhow::Result<()>
         "a recovered transient VS error must hold the Snapshot Pending (not Failed), \
          got {phase:?}"
     );
+
+    // #695: the whole wait happened inside the staging deadline, so it is an
+    // expected wait — announced as a `Normal` Event named by its reason, never
+    // the `Warning` `MissingDependency` it used to publish on every poll (which
+    // doctor's recent-warnings check then flagged on a run that succeeded).
+    let events: Api<Event> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let regarding_backup = |e: &Event| {
+        e.regarding.as_ref().is_some_and(|r| {
+            r.kind.as_deref() == Some("Snapshot") && r.name.as_deref() == Some(prefix)
+        })
+    };
+    wait_until(
+        "the in-deadline staging wait is announced as a Normal Event",
+        default_timeout(),
+        poll_interval(),
+        || async {
+            let list = events.list(&ListParams::default()).await?;
+            Ok(list
+                .items
+                .into_iter()
+                .find(|e| {
+                    regarding_backup(e)
+                        && e.type_.as_deref() == Some("Normal")
+                        && e.reason.as_deref() == Some("WaitingForVolumeSnapshot")
+                })
+                .map(|_| ()))
+        },
+    )
+    .await
+    .context("an in-deadline staging wait must publish a Normal WaitingForVolumeSnapshot Event")?;
+    let warnings: Vec<String> = events
+        .list(&ListParams::default())
+        .await?
+        .items
+        .into_iter()
+        .filter(|e| regarding_backup(e) && e.type_.as_deref() == Some("Warning"))
+        .map(|e| {
+            format!(
+                "{}: {}",
+                e.reason.unwrap_or_default(),
+                e.note.unwrap_or_default()
+            )
+        })
+        .collect();
+    ensure!(
+        warnings.is_empty(),
+        "a staging wait inside its deadline must publish no Warning Event, got: {warnings:?}"
+    );
     Ok(())
 }
 

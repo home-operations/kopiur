@@ -120,6 +120,41 @@ pub fn unchanged_snapshots_to_prune(
         .collect()
 }
 
+/// **Pure.** The failed MANUAL Snapshots to prune: everything past the newest
+/// `limit` per repository, by the exact rule a schedule applies to its own
+/// failures ([`crate::snapshot_schedule::failed_rows_to_prune`] — artifact-
+/// owning and terminating rows are never selected).
+///
+/// A schedule bounds the failures it fires (`failedJobsHistoryLimit`), but a
+/// manual run (`kubectl kopiur snapshot now`, a GitOps-applied `Snapshot`)
+/// carries no schedule label, so no schedule ever counted it: failed manual
+/// runs accumulated without bound, against the locked "failures are bounded by
+/// a flat `failedJobsHistoryLimit`" contract (#695). Bounded here, over the
+/// policy's `CONFIG_LABEL` children, by the flat default — exactly how the
+/// `Unchanged` rows above are bounded for the same reason.
+///
+/// Only rows whose origin is `Manual` AND that carry no schedule label are
+/// this bound's business. Scheduled rows belong to their schedule's own
+/// (configurable) limit; discovered/adopted/replicated rows are catalog history
+/// and never `Failed` runs of this policy. Exhaustive over [`Origin`] so a new
+/// origin must say which bound owns it.
+pub fn manual_failed_snapshots_to_prune(backups: &[Snapshot], limit: u32) -> Vec<String> {
+    let manual = backups.iter().filter(|s| {
+        let manual_origin = match crate::snapshot::resolve_origin(s) {
+            Some(kopiur_api::Origin::Manual) => true,
+            Some(
+                kopiur_api::Origin::Scheduled
+                | kopiur_api::Origin::Discovered
+                | kopiur_api::Origin::Adopted
+                | kopiur_api::Origin::Replicated,
+            )
+            | None => false,
+        };
+        manual_origin && !s.labels().contains_key(kopiur_api::consts::SCHEDULE_LABEL)
+    });
+    crate::snapshot_schedule::failed_rows_to_prune(manual, limit)
+}
+
 /// Upper bound on spec-pin backfill patches issued per reconcile pass — keeps
 /// a thousand-child policy's single→multi edit from turning one reconcile into
 /// a thousand-write burst; the steady requeue drains the rest.
@@ -961,6 +996,25 @@ async fn reconcile_inner(config: &SnapshotPolicy, ctx: &Context) -> Result<Actio
         // breaker stays out of the way.
         io::annotate_then_delete_snapshot(&backup_api, &cr_name, PrunedBy::FailedHistory).await?;
         tracing::info!(config = %name, backup = %cr_name, "pruned Unchanged Snapshot (history limit)");
+    }
+
+    // Failed MANUAL runs: no schedule bounds them, so the policy does, by the
+    // flat default (#695). Same execution idiom as the `Unchanged` bound above.
+    let manual_failed_prunes = executable_prunes(
+        manual_failed_snapshots_to_prune(
+            &backups,
+            kopiur_api::consts::effective_failed_jobs_history_limit(None),
+        ),
+        &backups,
+        &ready_keys,
+        all_ready,
+    );
+    for cr_name in manual_failed_prunes {
+        if !io::confirm_row_live(&backup_api, &cr_name).await? {
+            continue;
+        }
+        io::annotate_then_delete_snapshot(&backup_api, &cr_name, PrunedBy::FailedHistory).await?;
+        tracing::info!(config = %name, backup = %cr_name, "pruned failed manual Snapshot (failedJobsHistoryLimit default)");
     }
 
     if let Some(retention) = config.spec.retention.as_ref() {
@@ -2735,6 +2789,71 @@ mod tests {
         assert!(
             del.is_empty(),
             "the only real snapshot must survive keepLatest=1, got {del:?}"
+        );
+    }
+
+    fn manual_failed(name: &str, end: DateTime<Utc>) -> Snapshot {
+        let mut b = failed_backup(name, end);
+        if let Some(s) = b.status.as_mut() {
+            s.origin = Some(Origin::Manual);
+        }
+        b
+    }
+
+    /// #695: failed MANUAL runs carry no schedule label, so no schedule's
+    /// `failedJobsHistoryLimit` ever counted them and they accumulated without
+    /// bound. The policy now bounds them by the flat default, newest kept.
+    #[test]
+    fn failed_manual_runs_beyond_the_history_limit_are_pruned_oldest_first() {
+        let t = |h: u32| Utc.with_ymd_and_hms(2026, 10, 20, h, 0, 0).unwrap();
+        let rows: Vec<Snapshot> = (0..14)
+            .map(|i| manual_failed(&format!("m{i}"), t(i)))
+            .collect();
+        let limit = kopiur_api::consts::effective_failed_jobs_history_limit(None);
+        let mut pruned = manual_failed_snapshots_to_prune(&rows, limit);
+        pruned.sort();
+        assert_eq!(
+            pruned,
+            vec!["m0", "m1", "m2", "m3"],
+            "the 4 oldest beyond 10"
+        );
+        assert!(manual_failed_snapshots_to_prune(&rows[..10], limit).is_empty());
+    }
+
+    #[test]
+    fn the_manual_failure_bound_leaves_scheduled_artifacts_and_terminating_rows_alone() {
+        let t = |h: u32| Utc.with_ymd_and_hms(2026, 10, 20, h, 0, 0).unwrap();
+        // Scheduled failures: their schedule's own (configurable) limit owns them.
+        let mut scheduled = failed_backup("sched-old", t(0));
+        scheduled.metadata.labels = Some(
+            [(
+                kopiur_api::consts::SCHEDULE_LABEL.to_string(),
+                "hourly".to_string(),
+            )]
+            .into(),
+        );
+        // A manual-origin row that still carries a schedule label is the
+        // schedule's, too — never double-counted.
+        let mut labelled_manual = manual_failed("labelled", t(0));
+        labelled_manual.metadata.labels = scheduled.metadata.labels.clone();
+        // A failed run that owns a kopia snapshot must never be auto-deleted.
+        let mut with_artifact = manual_failed("artifact", t(0));
+        with_artifact.status.as_mut().unwrap().snapshot =
+            succeeded_backup("x", t(0)).status.unwrap().snapshot;
+        // Already terminating.
+        let mut terminating = manual_failed("terminating", t(0));
+        terminating.metadata.deletion_timestamp =
+            Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+                k8s_openapi::jiff::Timestamp::UNIX_EPOCH,
+            ));
+        let mut rows = vec![scheduled, labelled_manual, with_artifact, terminating];
+        rows.extend((1..=3).map(|i| manual_failed(&format!("m{i}"), t(i))));
+        let mut pruned = manual_failed_snapshots_to_prune(&rows, 1);
+        pruned.sort();
+        assert_eq!(
+            pruned,
+            vec!["m1".to_string(), "m2".to_string()],
+            "only the plain manual failures are bounded; m3 (newest) is kept"
         );
     }
 

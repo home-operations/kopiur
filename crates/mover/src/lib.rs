@@ -15,4 +15,5 @@ pub mod resolve;
 pub mod serve;
 pub mod status;
 pub mod stream;
+pub mod verify;
 pub mod workspec;

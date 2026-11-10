@@ -292,7 +292,11 @@ pub struct SnapshotStats {
     /// Size excluded by policy.
     #[serde(default)]
     pub excluded_total_size: u64,
-    /// Number of files included.
+    /// Number of files kopia READ (hashed) during this snapshot — NOT the number
+    /// of files in it. kopia increments this only for files it uploads in full;
+    /// a file served from cache bumps [`Self::cached_files`] instead, so a
+    /// snapshot of an unchanged source reports `0` here (#646). For "how many
+    /// files does this snapshot hold" use [`SnapshotListEntry::files_in_snapshot`].
     #[serde(default)]
     pub file_count: u64,
     /// Files served from cache (unchanged since the prior snapshot).
@@ -379,6 +383,43 @@ pub struct SnapshotListEntry {
 }
 
 impl SnapshotListEntry {
+    /// How many files this snapshot HOLDS, whether kopia read them this run or
+    /// served them from its cache.
+    ///
+    /// Prefers `rootEntry.summ.files` — the directory tree's own count, and the
+    /// same source [`SnapshotCreateResult::file_count`] reads — falling back to
+    /// `stats.fileCount + stats.cachedFiles` (saturating) when the root summary
+    /// is absent. Never read `stats.file_count` alone as the total: it counts
+    /// only files kopia hashed, so it is `0` for a snapshot of an unchanged
+    /// source (#646).
+    ///
+    /// ```
+    /// use kopiur_kopia::SnapshotListEntry;
+    ///
+    /// // A snapshot of an unchanged source: every file came from cache.
+    /// let json = r#"{
+    ///     "id": "k1",
+    ///     "source": {"host": "h", "userName": "u", "path": "/data"},
+    ///     "startTime": "2026-06-02T03:13:59Z",
+    ///     "endTime": "2026-06-02T03:14:00Z",
+    ///     "stats": {"totalSize": 6, "fileCount": 0, "cachedFiles": 2}
+    /// }"#;
+    /// let entry: SnapshotListEntry = serde_json::from_str(json).unwrap();
+    /// assert_eq!(entry.stats.file_count, 0);
+    /// assert_eq!(entry.files_in_snapshot(), 2);
+    /// ```
+    pub fn files_in_snapshot(&self) -> u64 {
+        self.root_entry
+            .as_ref()
+            .and_then(|r| r.summary.as_ref())
+            .map(|s| s.files)
+            .unwrap_or_else(|| {
+                self.stats
+                    .file_count
+                    .saturating_add(self.stats.cached_files)
+            })
+    }
+
     /// Why this manifest is NOT a complete snapshot, or `None` for a complete
     /// one. Reads the top-level marker, falling back to `rootEntry.summ`
     /// (kopia writes both); an empty string is kopia's `omitempty` "complete".

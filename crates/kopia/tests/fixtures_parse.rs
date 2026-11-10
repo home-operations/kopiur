@@ -16,6 +16,13 @@ const SNAPSHOT_LIST: &str = include_str!("fixtures/snapshot_list.json");
 /// proves JSON mode emits incomplete manifests WITHOUT `--incomplete` — the
 /// text-mode-only filter that issue #477 was bitten by.
 const SNAPSHOT_LIST_INCOMPLETE: &str = include_str!("fixtures/snapshot_list_incomplete.json");
+/// `kopia snapshot list --json --all` captured from a REAL kopia 0.23.1
+/// filesystem repository after snapshotting the SAME unchanged two-file
+/// directory twice. The second manifest is served entirely from kopia's
+/// cache: `fileCount: 0, cachedFiles: 2` — kopia's `fileCount` counts only
+/// files it READ, not files IN the snapshot (issue #646). `rootEntry.summ.files`
+/// is the true total in both.
+const SNAPSHOT_LIST_CACHE_HIT: &str = include_str!("fixtures/snapshot_list_cache_hit.json");
 const REPOSITORY_STATUS: &str = include_str!("fixtures/repository_status.json");
 const MAINTENANCE_INFO: &str = include_str!("fixtures/maintenance_info.json");
 /// `kopia maintenance info --json` captured from a REAL kopia 0.23.1 filesystem
@@ -69,6 +76,54 @@ fn parse_snapshot_list() {
     // GFS retention reasons.
     assert!(e.retention_reason.contains(&"latest-1".to_string()));
     assert!(e.retention_reason.contains(&"daily-1".to_string()));
+}
+
+#[test]
+fn a_fully_cached_manifest_still_counts_every_file_in_the_snapshot() {
+    // #646: kopia only bumps `fileCount` for files it hashed in full. A
+    // snapshot of an unchanged source is 100% cache hits, so its manifest says
+    // `fileCount: 0` — reading that as "files in the snapshot" made the quick
+    // verify's `stats.files > 0` fail forever on a perfectly healthy repo.
+    let entries: Vec<SnapshotListEntry> = serde_json::from_str(SNAPSHOT_LIST_CACHE_HIT).unwrap();
+    let [first, second] = entries.as_slice() else {
+        panic!("fixture holds exactly two manifests");
+    };
+    // The trap, pinned so a future reader sees why the raw field is wrong.
+    assert_eq!(first.stats.file_count, 2);
+    assert_eq!(
+        second.stats.file_count, 0,
+        "kopia's fileCount excludes cached files"
+    );
+    assert_eq!(second.stats.cached_files, 2);
+    // The fix: both manifests hold the same two files.
+    assert_eq!(first.files_in_snapshot(), 2);
+    assert_eq!(second.files_in_snapshot(), 2);
+}
+
+#[test]
+fn files_in_snapshot_falls_back_to_hashed_plus_cached_without_a_root_summary() {
+    // A list entry slimmed of its `rootEntry` (the mover's bootstrap catalog
+    // does this) still reports the true total: hashed + cached.
+    let entry = |file_count: u64, cached: u64| -> SnapshotListEntry {
+        let mut e: SnapshotListEntry = serde_json::from_value(serde_json::json!({
+            "id": "k1",
+            "source": {"host": "h", "userName": "u", "path": "/p"},
+            "startTime": "2026-06-02T03:13:59Z",
+            "endTime": "2026-06-02T03:14:00Z",
+        }))
+        .unwrap();
+        e.stats.file_count = file_count;
+        e.stats.cached_files = cached;
+        e
+    };
+    assert_eq!(entry(0, 7).files_in_snapshot(), 7, "100% cache hit");
+    assert_eq!(entry(3, 4).files_in_snapshot(), 7, "mixed");
+    assert_eq!(entry(0, 0).files_in_snapshot(), 0, "genuinely empty");
+    assert_eq!(
+        entry(u64::MAX, 1).files_in_snapshot(),
+        u64::MAX,
+        "saturates, never wraps to a small count"
+    );
 }
 
 #[test]

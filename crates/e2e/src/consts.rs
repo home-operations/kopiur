@@ -77,6 +77,8 @@ pub const REPO_SUBPATHS: &[&str] = &[
     "vfydeep",
     "vfyinh",
     "vfygate",
+    // #646: quick verify of a 100%-cache-hit snapshot (verification.rs).
+    "vfycache",
     "repl-src",
     "repl-dst",
     "repl-s3-src",
