@@ -18,8 +18,8 @@
 use std::collections::BTreeMap;
 
 use kopiur_kopia::{
-    ConnectOptions, ConnectSpec, KopiaClient, MaintenanceMode, PolicyArgs, RestoreOptions,
-    SnapshotSource, SyncToOptions, VerifyOptions,
+    ConnectOptions, ConnectSpec, KopiaClient, MaintenanceMode, PolicyArgs, PolicyInt,
+    RestoreOptions, SnapshotSource, SyncToOptions, VerifyOptions,
 };
 
 /// Build a client whose env isolates kopia state inside `config_dir` so the
@@ -714,6 +714,155 @@ async fn identity_scope_keep_max_pin_survives_twelve_creates() {
         12,
         "all 12 manifests must survive with the identity-scope keep-* pin applied; \
          without it kopia's own default keep-latest=10 would have pruned 2, got {list:?}"
+    );
+}
+
+/// Real-kopia guard for #681: removing a rule from `files.ignoreRules` must stop
+/// kopia ignoring it on the very next snapshot.
+///
+/// Reproduces the report end to end against the pinned kopia: two directories
+/// ignored, the rules dropped from the spec, the next snapshot must contain
+/// them. With the old `policy_set` alone the second snapshot still had 1 file,
+/// because `--add-ignore` unions into the stored list. Also pins the two kopia
+/// behaviors the fix rests on: `--clear-ignore` beside `--add-ignore` stores an
+/// EMPTY list (why the fix is delete-then-set, not clear+add), and
+/// `--max-parallel-snapshots inherit` resets the identity scope.
+#[tokio::test]
+#[cfg_attr(not(feature = "integration"), ignore)]
+async fn policy_replace_removes_rules_dropped_from_the_spec() {
+    let repo_dir = tempfile::tempdir().unwrap();
+    let config_dir = tempfile::tempdir().unwrap();
+    let source_dir = tempfile::tempdir().unwrap();
+    for dir in ["thumbs", "encoded-video", "library"] {
+        std::fs::create_dir(source_dir.path().join(dir)).unwrap();
+        std::fs::write(source_dir.path().join(dir).join("f"), dir.as_bytes()).unwrap();
+    }
+    let source = source_dir.path().to_str().unwrap();
+
+    let client = isolated_client(config_dir.path());
+    client
+        .repository_create(
+            &ConnectSpec::Filesystem {
+                path: repo_dir.path().to_path_buf(),
+            },
+            Default::default(),
+            &Default::default(),
+        )
+        .await
+        .expect("repository create");
+
+    let target = "immich@photos:/pvc/immich";
+    let effective_ignore = |shown: serde_json::Value| -> Vec<String> {
+        shown["files"]["ignore"]
+            .as_array()
+            .map(|a| a.iter().map(|v| v.as_str().unwrap().to_owned()).collect())
+            .unwrap_or_default()
+    };
+
+    // 1. The reporter's first spec: two extra rules, plus a scalar knob.
+    client
+        .policy_replace(
+            target,
+            &PolicyArgs {
+                ignore: vec!["/thumbs".into(), "/encoded-video".into()],
+                ignore_file_errors: Some(true),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("first policy replace");
+    let first = client
+        .snapshot_create(source, &BTreeMap::new(), Some(target))
+        .await
+        .expect("first snapshot");
+    assert_eq!(first.file_count(), 1, "thumbs/ and encoded-video/ ignored");
+
+    // 2. Both rules and the scalar removed from the spec.
+    client
+        .policy_replace(
+            target,
+            &PolicyArgs {
+                ignore: vec!["/lost+found".into()],
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("second policy replace");
+    let shown = client.policy_show(target).await.expect("policy show");
+    assert_eq!(effective_ignore(shown.clone()), vec!["/lost+found"]);
+    assert_ne!(
+        shown["errorHandling"]["ignoreFileErrors"],
+        serde_json::json!(true),
+        "a scalar removed from the spec must not stay stored: {shown}"
+    );
+    let second = client
+        .snapshot_create(source, &BTreeMap::new(), Some(target))
+        .await
+        .expect("second snapshot");
+    assert_eq!(
+        second.file_count(),
+        3,
+        "rules removed from the spec must stop applying on the next snapshot (#681)"
+    );
+
+    // 3. `ignoreRules: []` with no other knob: nothing to set, the delete alone
+    //    must clear the stored rules.
+    client
+        .policy_replace(
+            target,
+            &PolicyArgs {
+                ignore: vec!["/library".into()],
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("third policy replace");
+    client
+        .policy_replace(target, &PolicyArgs::default())
+        .await
+        .expect("empty policy replace");
+    let shown = client.policy_show(target).await.expect("policy show");
+    assert!(effective_ignore(shown.clone()).is_empty(), "{shown}");
+
+    // 4. The kopia behavior that rules out the one-call fix: clear+add stores
+    //    NOTHING. If a kopia upgrade ever applies the adds after the clear, this
+    //    flips and the simpler single-call form becomes possible.
+    client
+        .policy_set(
+            target,
+            &PolicyArgs {
+                ignore: vec!["/thumbs".into()],
+                extra_args: vec!["--clear-ignore".into()],
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("clear+add policy set");
+    let shown = client.policy_show(target).await.expect("policy show");
+    assert!(
+        effective_ignore(shown.clone()).is_empty(),
+        "kopia 0.23.1 drops --add-ignore beside --clear-ignore: {shown}"
+    );
+
+    // 5. Identity scope: kopia accepts `inherit`, and it clears a stored value.
+    let identity = "immich@photos";
+    for value in [PolicyInt::Set(4), PolicyInt::Inherit] {
+        client
+            .policy_set(
+                identity,
+                &PolicyArgs {
+                    max_parallel_snapshots: Some(value),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_or_else(|e| panic!("identity policy set {value:?}: {e}"));
+    }
+    let shown = client.policy_show(identity).await.expect("policy show");
+    assert_ne!(
+        shown["upload"]["maxParallelSnapshots"],
+        serde_json::json!(4),
+        "`inherit` must drop the stored value: {shown}"
     );
 }
 

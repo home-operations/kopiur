@@ -607,6 +607,102 @@ async fn policy_set_passes_flags() {
         .expect("policy set flags must pass through");
 }
 
+/// A shim that appends each invocation's argv (with the client's common
+/// `--no-auto-maintenance` suffix) to `calls.log` beside itself and
+/// exits 0, or 7 for any invocation whose argv starts with `fail_prefix`.
+/// Returns the shim and the log path.
+fn recording_shim(fail_prefix: &str) -> (Shim, PathBuf) {
+    let dir = tempfile::tempdir().unwrap();
+    let log = dir.path().join("calls.log");
+    let path = dir.path().join("kopia-shim.sh");
+    kopiur_kopia::testutil::write_executable(
+        &path,
+        &format!(
+            r#"#!/bin/sh
+echo "$*" >> '{log}'
+case "$*" in
+  "{fail_prefix}"*) echo "boom" 1>&2; exit 7 ;;
+esac
+exit 0
+"#,
+            log = log.display(),
+        ),
+    );
+    (Shim { _dir: dir, path }, log)
+}
+
+fn recorded_calls(log: &std::path::Path) -> Vec<String> {
+    std::fs::read_to_string(log)
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_owned)
+        .collect()
+}
+
+/// #681: the replace must DELETE the stored policy strictly before the set, as
+/// two invocations. The reverse order would delete what was just written.
+#[tokio::test]
+async fn policy_replace_deletes_then_sets() {
+    let (s, log) = recording_shim("never-matches");
+    client_for(&s)
+        .policy_replace(
+            "u@h:/pvc/d",
+            &PolicyArgs {
+                ignore: vec!["/thumbs".into()],
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("policy replace");
+    assert_eq!(
+        recorded_calls(&log),
+        vec![
+            "policy delete u@h:/pvc/d --no-auto-maintenance",
+            "policy set u@h:/pvc/d --add-ignore /thumbs --no-auto-maintenance"
+        ]
+    );
+}
+
+/// `files.ignoreRules: []` and nothing else: the delete is the whole job, and a
+/// flagless `policy set` would fail with "no changes specified".
+#[tokio::test]
+async fn policy_replace_with_an_empty_spec_only_deletes() {
+    let (s, log) = recording_shim("never-matches");
+    client_for(&s)
+        .policy_replace("u@h:/pvc/d", &PolicyArgs::default())
+        .await
+        .expect("policy replace");
+    assert_eq!(
+        recorded_calls(&log),
+        vec!["policy delete u@h:/pvc/d --no-auto-maintenance"]
+    );
+}
+
+/// A failed delete surfaces and stops: the set is never run on top of a policy
+/// whose stale rules are still stored.
+#[tokio::test]
+async fn policy_replace_stops_when_the_delete_fails() {
+    let (s, log) = recording_shim("policy delete");
+    let err = client_for(&s)
+        .policy_replace(
+            "u@h:/pvc/d",
+            &PolicyArgs {
+                ignore: vec!["/thumbs".into()],
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("a failed delete must fail the replace");
+    assert!(
+        err.to_string().contains("policy delete"),
+        "the error names the failing step: {err}"
+    );
+    assert_eq!(
+        recorded_calls(&log),
+        vec!["policy delete u@h:/pvc/d --no-auto-maintenance"]
+    );
+}
+
 #[tokio::test]
 async fn policy_show_parses_json() {
     let s = shim(
