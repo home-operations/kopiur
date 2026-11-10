@@ -27,11 +27,11 @@ use serde::Deserialize;
 use std::collections::BTreeSet;
 use std::time::Duration;
 
+use kopiur_ops::OpsCtx;
 use kopiur_ops::doctor::{
     DoctorCheck, DoctorParams, DoctorReport, FindingKind, FindingSeverity, ObjectFinding, Outcome,
-    run_all,
+    doctor_scope, run_all,
 };
-use kopiur_ops::{OpsCtx, Scope};
 use kopiur_ui_model::views::{
     DoctorCheckView, DoctorObjectView, DoctorReportView, DoctorScopeView, ObjectKind,
 };
@@ -119,33 +119,17 @@ fn doctor_ctx(cfg: &UiConfig, client: kube::Client, namespace: Option<&str>) -> 
 
 /// **Pure.** Narrow a cluster-wide context to one namespace's *scope*, leaving
 /// its `namespace` — the operator's — alone. See [`doctor_ctx`].
-fn scoped_for(mut ctx: OpsCtx, namespace: Option<&str>) -> OpsCtx {
-    if let Some(ns) = namespace {
-        ctx.scope = Scope::Namespace(ns.to_string());
-    }
+pub fn scoped_for(mut ctx: OpsCtx, namespace: Option<&str>) -> OpsCtx {
+    // The same decision the CLI makes (`kopiur_ops::doctor::doctor_scope`), so
+    // the two surfaces read the same objects for the same request (#695).
+    ctx.scope = doctor_scope(namespace);
     ctx
 }
 
-/// **Pure.** The stable identifier for one check — its variant name in
-/// kebab-case, so `CrdsInstalled` becomes `crds-installed`.
-///
-/// Derived from the variant name rather than written out per variant: the
-/// `Debug` name *is* the identifier, so the two cannot drift apart when a check
-/// is added or renamed.
+/// **Pure.** The stable identifier for one check: [`DoctorCheck::id`], the one
+/// derivation every surface shares.
 pub fn check_id(check: DoctorCheck) -> String {
-    let name = format!("{check:?}");
-    let mut out = String::with_capacity(name.len() + 4);
-    for (i, c) in name.char_indices() {
-        if c.is_uppercase() {
-            if i != 0 {
-                out.push('-');
-            }
-            out.extend(c.to_lowercase());
-        } else {
-            out.push(c);
-        }
-    }
-    out
+    check.id()
 }
 
 /// **Pure.** Every check id this endpoint accepts, comma-separated, for a
@@ -270,16 +254,16 @@ pub fn view_check(
     outcome: &Outcome,
     objects: &[ObjectFinding],
 ) -> DoctorCheckView {
-    let (label, what, why, fix) = match outcome {
-        Outcome::Pass => ("Pass", None, None, None),
-        Outcome::Warn(message) => ("Warn", Some(message.clone()), None, None),
-        Outcome::Fail { what, why, fix } => (
-            "Fail",
-            Some(what.clone()),
-            Some(why.clone()),
-            Some(fix.clone()),
-        ),
+    let (what, why, fix) = match outcome {
+        Outcome::Pass => (None, None, None),
+        Outcome::Warn(message) => (Some(message.clone()), None, None),
+        Outcome::Fail { what, why, fix } => {
+            (Some(what.clone()), Some(why.clone()), Some(fix.clone()))
+        }
     };
+    // The label comes from the shared severity, never restated here, so the
+    // console's lamp and the CLI's `ok`/`warn`/`FAIL` cannot diverge (#695).
+    let label = outcome.severity().label();
     DoctorCheckView {
         check: check_id(check),
         title: check.title().to_string(),
@@ -386,6 +370,7 @@ async fn handler(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kopiur_ops::Scope;
     use kopiur_ops::doctor::CheckResult;
 
     /// A context pointed at a closed port: nothing here makes a request, and a
