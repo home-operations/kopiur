@@ -19,7 +19,8 @@ use std::collections::BTreeMap;
 
 use kopiur_kopia::{
     ConnectOptions, ConnectSpec, KopiaClient, MaintenanceMode, PolicyArgs, PolicyInt,
-    RestoreOptions, SnapshotSource, SyncToOptions, VerifyOptions,
+    RestoreOptions, SnapshotPathKind, SnapshotSource, SyncToOptions, VerifyOptions,
+    restore_path_target,
 };
 
 /// Build a client whose env isolates kopia state inside `config_dir` so the
@@ -437,6 +438,166 @@ async fn restore_accepts_m2_flag_sweep_and_deletes_extra_files() {
         !restore_dir.path().join("stale.txt").exists(),
         "stale.txt should have been deleted by --delete-extra"
     );
+}
+
+/// Real-kopia guard for partial, in-place restore (#689): restoring a single
+/// FILE and a single DIRECTORY out of a snapshot into an existing, populated
+/// target writes exactly those paths at the same relative location, and leaves
+/// every sibling — including files the snapshot never saw — untouched. Also pins
+/// the three facts the mover relies on:
+///
+/// - `kopia ls <id>/<path>` distinguishes directory / file / missing
+///   ([`KopiaClient::snapshot_path_kind`]), so a missing selected path fails
+///   before anything is written;
+/// - a FILE sub-path restore does NOT create missing parent directories (the
+///   mover creates them), while a DIRECTORY restore does;
+/// - `--delete-extra` on a sub-path restore prunes only inside that sub-path.
+#[tokio::test]
+#[cfg_attr(not(feature = "integration"), ignore)]
+async fn partial_restore_writes_only_selected_paths_in_place() {
+    let repo_dir = tempfile::tempdir().unwrap();
+    let config_dir = tempfile::tempdir().unwrap();
+    let source_dir = tempfile::tempdir().unwrap();
+    let target_dir = tempfile::tempdir().unwrap();
+    let src = source_dir.path();
+    let tgt = target_dir.path();
+    let tgt_str = tgt.to_str().unwrap();
+
+    std::fs::create_dir_all(src.join("docs")).unwrap();
+    std::fs::create_dir_all(src.join("music/album")).unwrap();
+    std::fs::create_dir_all(src.join("a b")).unwrap();
+    std::fs::write(src.join("docs/report.odt"), b"the report\n").unwrap();
+    std::fs::write(src.join("docs/other.txt"), b"snapshot other\n").unwrap();
+    std::fs::write(src.join("music/album/01.mp3"), b"track one\n").unwrap();
+    std::fs::write(src.join("music/album/02.mp3"), b"track two\n").unwrap();
+    std::fs::write(src.join("top.txt"), b"snapshot top\n").unwrap();
+    std::fs::write(src.join("a b/c d.txt"), b"spaced\n").unwrap();
+
+    let client = isolated_client(config_dir.path());
+    client
+        .repository_create(
+            &ConnectSpec::Filesystem {
+                path: repo_dir.path().to_path_buf(),
+            },
+            Default::default(),
+            &Default::default(),
+        )
+        .await
+        .expect("repository create");
+    let created = client
+        .snapshot_create(src.to_str().unwrap(), &BTreeMap::new(), Some("u@h:/data"))
+        .await
+        .expect("snapshot create");
+    let id = created.id.as_str();
+
+    // The live PVC moved on after the backup: report.odt was deleted, other.txt
+    // and top.txt were edited, a new sibling appeared, and the album was
+    // partially reorganized (02 deleted, a stray file added).
+    std::fs::create_dir_all(tgt.join("docs")).unwrap();
+    std::fs::create_dir_all(tgt.join("music/album")).unwrap();
+    std::fs::write(tgt.join("docs/other.txt"), b"edited after backup\n").unwrap();
+    std::fs::write(tgt.join("docs/new-since-backup.txt"), b"new\n").unwrap();
+    std::fs::write(tgt.join("top.txt"), b"edited top\n").unwrap();
+    std::fs::write(tgt.join("music/album/01.mp3"), b"track one\n").unwrap();
+    std::fs::write(tgt.join("music/album/stray.mp3"), b"stray\n").unwrap();
+
+    // Probe: directory / file / missing.
+    assert_eq!(
+        client.snapshot_path_kind(id, "music/album").await.unwrap(),
+        SnapshotPathKind::Directory
+    );
+    assert_eq!(
+        client
+            .snapshot_path_kind(id, "docs/report.odt")
+            .await
+            .unwrap(),
+        SnapshotPathKind::NonDirectory
+    );
+    assert_eq!(
+        client
+            .snapshot_path_kind(id, "docs/never-existed.txt")
+            .await
+            .unwrap(),
+        SnapshotPathKind::Missing
+    );
+    assert_eq!(
+        client.snapshot_path_kind(id, "no/such/dir").await.unwrap(),
+        SnapshotPathKind::Missing
+    );
+    assert_eq!(
+        client.snapshot_path_kind(id, "a b/c d.txt").await.unwrap(),
+        SnapshotPathKind::NonDirectory
+    );
+    // An unknown manifest id is an ERROR, never "missing path".
+    assert!(
+        client
+            .snapshot_path_kind("deadbeefdeadbeefdeadbeefdeadbeef", "docs")
+            .await
+            .is_err()
+    );
+
+    // 1. A single deleted FILE back into its existing directory.
+    client
+        .snapshot_restore_path(id, "docs/report.odt", tgt_str, &RestoreOptions::default())
+        .await
+        .expect("restore one file in place");
+    assert_eq!(
+        std::fs::read(tgt.join("docs/report.odt")).unwrap(),
+        b"the report\n"
+    );
+
+    // 2. A DIRECTORY, with --delete-extra: mirrors music/album exactly...
+    client
+        .snapshot_restore_path(
+            id,
+            "music/album",
+            tgt_str,
+            &RestoreOptions {
+                delete_extra: Some(true),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("restore one directory in place");
+    assert_eq!(
+        std::fs::read(tgt.join("music/album/02.mp3")).unwrap(),
+        b"track two\n"
+    );
+    assert!(
+        !tgt.join("music/album/stray.mp3").exists(),
+        "--delete-extra prunes inside the selected directory"
+    );
+
+    // ...and NOTHING outside the selected paths changed — not even under
+    // --delete-extra, and not even siblings in the same directory.
+    assert_eq!(
+        std::fs::read(tgt.join("docs/other.txt")).unwrap(),
+        b"edited after backup\n"
+    );
+    assert_eq!(
+        std::fs::read(tgt.join("docs/new-since-backup.txt")).unwrap(),
+        b"new\n"
+    );
+    assert_eq!(std::fs::read(tgt.join("top.txt")).unwrap(), b"edited top\n");
+
+    // 3. A file whose parent directory is gone: kopia will NOT create it (the
+    // mover's job) — the restore fails until the parent exists.
+    let defaults = RestoreOptions::default();
+    let restore_spaced = || client.snapshot_restore_path(id, "a b/c d.txt", tgt_str, &defaults);
+    assert!(
+        restore_spaced().await.is_err(),
+        "kopia does not create a file restore's missing parent directory"
+    );
+    std::fs::create_dir_all(
+        std::path::Path::new(&restore_path_target(tgt_str, "a b/c d.txt"))
+            .parent()
+            .unwrap(),
+    )
+    .unwrap();
+    restore_spaced()
+        .await
+        .expect("file restore once the parent exists");
+    assert_eq!(std::fs::read(tgt.join("a b/c d.txt")).unwrap(), b"spaced\n");
 }
 
 #[tokio::test]

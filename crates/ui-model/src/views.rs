@@ -1030,6 +1030,10 @@ pub struct RestoreDetail {
     /// what the run will actually read, not what the spec asks for.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<RestoreSourceView>,
+    /// `spec.selection.paths` — a partial restore's selected snapshot paths,
+    /// each written to the same relative location in the target. Empty means
+    /// the whole snapshot is restored.
+    pub selected_paths: Vec<String>,
     /// `status.target` — where the data is actually being written.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target: Option<RestoreTargetView>,

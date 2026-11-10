@@ -1,6 +1,6 @@
 use super::*;
 use crate::error::{ValidationError, ValidationResult};
-use crate::restore::{RestoreSource, RestoreSpec, RestoreTarget};
+use crate::restore::{PathSelection, RestoreSource, RestoreSpec, RestoreTarget};
 
 /// A `Restore` spec is internally consistent (ADR §3.6/§4.6 / ADR-0005 §9).
 ///
@@ -140,6 +140,24 @@ pub fn validate_restore(spec: &RestoreSpec) -> ValidationResult {
         }
         RestoreTarget::Pvc(_) | RestoreTarget::PvcRef(_) => {}
     }
+    // Partial restore (#689). Exhaustive over the target: a stream target already
+    // selects exactly one virtual file (`fileName`), so a path selection on top of
+    // it would be silently ignored — reject it instead.
+    if let Some(sel) = &spec.selection {
+        match &spec.target {
+            RestoreTarget::StreamExec(_) => {
+                return Err(ValidationError::MutuallyExclusive {
+                    a: "restore.selection".to_string(),
+                    b: "restore.target.streamExec".to_string(),
+                    context: "streamExec already restores exactly one file (fileName); \
+                              Fix: drop spec.selection, or restore into a pvcRef/pvc target"
+                        .to_string(),
+                });
+            }
+            RestoreTarget::Pvc(_) | RestoreTarget::PvcRef(_) | RestoreTarget::Populator(_) => {}
+        }
+        validate_path_selection(sel)?;
+    }
     // Access modes on a create-target PVC: canonical/unique/RWOP-sole. Fail-fast on
     // the first problem (this validator's contract); the accumulate wrapper reports
     // the rest. A legacy stored value decodes as `PvcAccessMode::Unknown` (never a
@@ -165,6 +183,163 @@ pub fn validate_restore(spec: &RestoreSpec) -> ValidationResult {
         validate_mover(m, "Restore mover")?;
     }
     Ok(())
+}
+
+/// Upper bound on `spec.selection.paths` entries — mirrors the CRD schema's
+/// `maxItems` so the webhook and the API server agree.
+pub const MAX_SELECTION_PATHS: usize = 64;
+/// Upper bound on one `spec.selection.paths` entry, in bytes (Linux `PATH_MAX`);
+/// mirrors the schema's `maxLength`.
+pub const MAX_SELECTION_PATH_BYTES: usize = 4096;
+/// Upper bound on ALL `spec.selection.paths` entries together, in bytes. The
+/// selection rides the mover work spec, which a pod carries under a hard size
+/// cap (`kopiur_mover::jobs::MAX_WORK_SPEC_BYTES`, 100 KiB), so 64 paths at the
+/// per-path maximum would be admitted and then never start. 16 KiB leaves room
+/// for worst-case JSON escaping (2x) plus the rest of the work spec; the
+/// controller test `selection_budget_fits_the_work_spec` pins that arithmetic.
+pub const MAX_SELECTION_TOTAL_BYTES: usize = 16 * 1024;
+/// Upper bound on one path segment, in bytes (Linux `NAME_MAX`).
+const MAX_SELECTION_SEGMENT_BYTES: usize = 255;
+
+/// A partial-restore selection is safe to join onto the target mount.
+///
+/// Each path must be relative, `/`-separated and normalized — no leading or
+/// trailing `/`, no empty, `.` or `..` segment, no control character — so that
+/// `<target>/<path>` can never resolve outside the target (`..`) and two
+/// spellings of one path cannot both be selected. Duplicates and a path nested
+/// inside another selected path are rejected too: selecting `docs` already
+/// restores `docs/report.odt`, and restoring one tree twice is never what was
+/// meant.
+///
+/// ```
+/// use kopiur_api::restore::PathSelection;
+/// use kopiur_api::validate::validate_path_selection;
+///
+/// let ok = PathSelection { paths: vec!["docs/report.odt".into(), "music/album".into()] };
+/// assert!(validate_path_selection(&ok).is_ok());
+///
+/// let escape = PathSelection { paths: vec!["../etc/passwd".into()] };
+/// assert!(validate_path_selection(&escape).is_err());
+/// ```
+pub fn validate_path_selection(sel: &PathSelection) -> ValidationResult {
+    if sel.paths.is_empty() {
+        return Err(ValidationError::MissingRequiredField {
+            field: "restore.selection.paths (at least one path; omit spec.selection to \
+                    restore the whole snapshot)"
+                .to_string(),
+        });
+    }
+    if sel.paths.len() > MAX_SELECTION_PATHS {
+        return Err(ValidationError::InvalidFieldValue {
+            field: "restore.selection.paths".to_string(),
+            reason: format!(
+                "{} paths selected, more than the {MAX_SELECTION_PATHS} allowed. Fix: select \
+                 a common parent directory instead, or split into several Restores",
+                sel.paths.len()
+            ),
+        });
+    }
+    let total: usize = sel.paths.iter().map(String::len).sum();
+    if total > MAX_SELECTION_TOTAL_BYTES {
+        return Err(ValidationError::InvalidFieldValue {
+            field: "restore.selection.paths".to_string(),
+            reason: format!(
+                "the paths add up to {total} bytes, more than the {MAX_SELECTION_TOTAL_BYTES} \
+                 bytes a restore Job can carry. Fix: select a common parent directory instead, \
+                 or split into several Restores"
+            ),
+        });
+    }
+    for (index, path) in sel.paths.iter().enumerate() {
+        if let Some(reason) = selection_path_problem(path) {
+            return Err(ValidationError::RestoreSelectionPathInvalid {
+                index,
+                path: path.clone(),
+                reason,
+            });
+        }
+    }
+    for (index, path) in sel.paths.iter().enumerate() {
+        for (other_index, other) in sel.paths.iter().enumerate() {
+            if index == other_index {
+                continue;
+            }
+            if path == other && other_index < index {
+                return Err(ValidationError::RestoreSelectionPathInvalid {
+                    index,
+                    path: path.clone(),
+                    reason: format!(
+                        "duplicates spec.selection.paths[{other_index}]. Fix: list each path once"
+                    ),
+                });
+            }
+            if path.len() > other.len()
+                && path.starts_with(other.as_str())
+                && path.as_bytes()[other.len()] == b'/'
+            {
+                return Err(ValidationError::RestoreSelectionPathInvalid {
+                    index,
+                    path: path.clone(),
+                    reason: format!(
+                        "is inside spec.selection.paths[{other_index}] = {other:?}, which \
+                         already restores it. Fix: drop the nested path"
+                    ),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Why one selection path is unusable, or `None` when it is fine. Pure so the
+/// per-shape rules are unit-testable in isolation.
+fn selection_path_problem(path: &str) -> Option<String> {
+    if path.is_empty() {
+        return Some("is empty. Fix: name a file or directory inside the snapshot".to_string());
+    }
+    if path.len() > MAX_SELECTION_PATH_BYTES {
+        return Some(format!(
+            "is {} bytes, longer than the {MAX_SELECTION_PATH_BYTES}-byte limit",
+            path.len()
+        ));
+    }
+    if let Some(c) = path.chars().find(|c| c.is_control()) {
+        return Some(format!("contains the control character {c:?}"));
+    }
+    if path.starts_with('/') {
+        return Some(format!(
+            "is absolute. Fix: make it relative to the snapshot root, e.g. {:?}",
+            path.trim_start_matches('/')
+        ));
+    }
+    if path.ends_with('/') {
+        return Some(format!(
+            "ends with '/'. Fix: drop the trailing slash, e.g. {:?}",
+            path.trim_end_matches('/')
+        ));
+    }
+    for segment in path.split('/') {
+        let problem = match segment {
+            "" => Some("has an empty segment ('//'). Fix: use a single '/' between names"),
+            "." => Some("has a '.' segment. Fix: remove it, paths must be normalized"),
+            ".." => Some(
+                "has a '..' segment, which could escape the restore target. Fix: name the path \
+                 from the snapshot root without '..'",
+            ),
+            _ => None,
+        };
+        if let Some(p) = problem {
+            return Some(p.to_string());
+        }
+        if segment.len() > MAX_SELECTION_SEGMENT_BYTES {
+            return Some(format!(
+                "has a {}-byte name, longer than the {MAX_SELECTION_SEGMENT_BYTES}-byte \
+                 file-name limit",
+                segment.len()
+            ));
+        }
+    }
+    None
 }
 
 /// An `asOf` point-in-time selector must be a valid RFC3339 timestamp — the

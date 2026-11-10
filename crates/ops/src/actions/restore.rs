@@ -8,7 +8,7 @@
 
 use chrono::{DateTime, Utc};
 use kopiur_api::common::{CredentialProjection, FailurePolicy, RepositoryRef};
-use kopiur_api::restore::{RestoreOptions, RestorePolicy, RestoreSpec};
+use kopiur_api::restore::{PathSelection, RestoreOptions, RestorePolicy, RestoreSpec};
 use kopiur_api::{Restore, RestorePhase, RestoreSource, RestoreTarget};
 use kube::api::{Api, PostParams};
 
@@ -32,6 +32,9 @@ pub struct RestoreRequest {
     pub repository: Option<RepositoryRef>,
     /// kopia restore tuning; `None` leaves the operator's defaults.
     pub options: Option<RestoreOptions>,
+    /// Partial restore (#689): only these snapshot-relative paths, each to the
+    /// same relative location under the target; `None` restores everything.
+    pub selection: Option<PathSelection>,
     /// Missing-snapshot behavior and the source-wait budget; `None` leaves the
     /// operator's defaults.
     pub policy: Option<RestorePolicy>,
@@ -75,6 +78,7 @@ pub fn build_restore(req: &RestoreRequest, namespace: &str, now: DateTime<Utc>) 
             source: req.source.clone(),
             target: req.target.clone(),
             options: req.options.clone(),
+            selection: req.selection.clone(),
             policy: req.policy.clone(),
             credential_projection: req
                 .credential_projection
@@ -152,7 +156,8 @@ pub fn success_summary(restore: &Restore) -> String {
             .collect();
         let n = claims.len();
         return format!(
-            "restore {name} completed: {n} claim{} — {}\n",
+            "restore {name} completed{}: {n} claim{} — {}\n",
+            selection_note(restore),
             if n == 1 { "" } else { "s" },
             per_claim.join("; ")
         );
@@ -173,7 +178,34 @@ pub fn success_summary(restore: &Restore) -> String {
         .and_then(|t| t.pvc_ref.as_ref())
         .map(|p| format!("pvc/{}", p.name))
         .unwrap_or_else(|| "target".into());
-    format!("restore {name} completed: {id}, {bytes} / {files} files into {target}\n")
+    format!(
+        "restore {name} completed{}: {id}, {bytes} / {files} files into {target}\n",
+        selection_note(restore)
+    )
+}
+
+/// ` (partial: a, b)` for a restore with `spec.selection` (#689), so a summary
+/// never reads like a whole-volume restore when only some paths were written;
+/// empty otherwise. Lists up to three paths, then counts. Pure.
+pub fn selection_note(restore: &Restore) -> String {
+    const LISTED: usize = 3;
+    let Some(sel) = restore
+        .spec
+        .selection
+        .as_ref()
+        .filter(|s| !s.paths.is_empty())
+    else {
+        return String::new();
+    };
+    if sel.paths.len() <= LISTED {
+        format!(" (partial: {})", sel.paths.join(", "))
+    } else {
+        format!(
+            " (partial: {}, and {} more)",
+            sel.paths[..LISTED].join(", "),
+            sel.paths.len() - LISTED
+        )
+    }
 }
 
 /// Render one failure block + log tail pair (the mover's last words), shared by
@@ -273,6 +305,7 @@ mod tests {
             }),
             repository: None,
             options: None,
+            selection: None,
             policy: None,
             credential_projection: false,
             failure_policy: None,
@@ -410,6 +443,9 @@ mod tests {
                 ignore_errors: Some(false),
                 skip_existing: Some(true),
             }),
+            selection: Some(PathSelection {
+                paths: vec!["docs/report.odt".into(), "music/album".into()],
+            }),
             policy: Some(RestorePolicy {
                 on_missing_snapshot: Some(OnMissingSnapshot::Continue),
                 wait_timeout: Some("5m".into()),
@@ -454,6 +490,10 @@ mod tests {
         assert_eq!(spec["repository"]["kind"], "ClusterRepository");
         assert_eq!(spec["repository"]["name"], "nas");
         assert_eq!(spec["credentialProjection"]["enabled"], true);
+        assert_eq!(
+            spec["selection"]["paths"],
+            serde_json::json!(["docs/report.odt", "music/album"])
+        );
     }
 
     /// The same sweep for the 13 kopia restore options, split into its own test
@@ -478,6 +518,23 @@ mod tests {
     }
 
     #[test]
+    fn selection_note_names_a_partial_restore() {
+        let mut restore = build_restore(&req(), "media", at());
+        assert_eq!(selection_note(&restore), "");
+        restore.spec.selection = Some(PathSelection {
+            paths: vec!["docs/report.odt".into()],
+        });
+        assert_eq!(selection_note(&restore), " (partial: docs/report.odt)");
+        restore.spec.selection = Some(PathSelection {
+            paths: (1..=5).map(|i| format!("p{i}")).collect(),
+        });
+        assert_eq!(
+            selection_note(&restore),
+            " (partial: p1, p2, p3, and 2 more)"
+        );
+    }
+
+    #[test]
     fn minimal_restore_has_no_optional_noise_on_the_wire() {
         let wire = serde_json::to_value(build_restore(&req(), "media", at())).unwrap();
         assert_eq!(wire["metadata"]["name"], "restore-snap1-20260611030012");
@@ -486,6 +543,7 @@ mod tests {
         assert_eq!(spec["target"]["pvcRef"]["name"], "data");
         for key in [
             "options",
+            "selection",
             "policy",
             "failurePolicy",
             "repository",

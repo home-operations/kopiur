@@ -24,7 +24,7 @@ use kopiur_api::snapshot::SnapshotInfo;
 use kopiur_api::{LeaseAction, lease_action};
 use kopiur_kopia::{
     ConnectOptions, ConnectSpec, KopiaClient, KopiaError, KopiaErrorClass, MigrateSources,
-    SnapshotMigrateOptions, SnapshotSource, filter_as_of, pick_offset,
+    SnapshotMigrateOptions, SnapshotPathKind, SnapshotSource, filter_as_of, pick_offset,
 };
 use tracing::{error, info, warn};
 
@@ -50,9 +50,9 @@ use kopiur_mover::status::{
 use kopiur_mover::verify::quick_coverage;
 use kopiur_mover::workspec::{
     self, BootstrapRepositoryOp, BrowseSessionOp, KOPIA_KEEP_MAX, KOPIUR_PIN_NAME, MaintenanceOp,
-    MoverWorkSpec, Operation, ReplicateOp, RestoreOp, RestoreSelection, RestoreSelector,
-    SnapshotAnchor, SnapshotDeleteBatchOp, SnapshotPinOp, SnapshotReplicateOp, ThrottleSpec,
-    VerifyOp, VerifyTier, maintenance_restamp_target,
+    MoverWorkSpec, Operation, ReplicateOp, RestoreOp, RestoreScope, RestoreSelection,
+    RestoreSelector, SnapshotAnchor, SnapshotDeleteBatchOp, SnapshotPinOp, SnapshotReplicateOp,
+    ThrottleSpec, VerifyOp, VerifyTier, maintenance_restamp_target, restore_scope,
 };
 #[cfg(test)]
 use kopiur_mover::workspec::{SnapshotDeleteItem, SnapshotDeleteOp};
@@ -727,9 +727,7 @@ async fn run_operation(
                     // restore of a snapshot pinned before this fix points at a deleted
                     // manifest. On a not-found, self-heal by re-resolving the live id
                     // from the snapshot's stable identity (source path + start time).
-                    let restored_id = restore_with_heal(client, op, id)
-                        .await
-                        .map_err(kopia(KopiaOp::SnapshotRestore))?;
+                    let restored_id = restore_snapshot(client, op, id).await?;
                     // Restore's terminal success phase is `Completed`, not `Succeeded`
                     // (the Snapshot phase) — the Restore CRD enum rejects `Succeeded`.
                     Ok(StatusUpdate::completed(&restored_id, chrono::Utc::now()))
@@ -979,6 +977,229 @@ fn anchor_source_filter(anchor: &SnapshotAnchor) -> Option<SnapshotSource> {
     })
 }
 
+/// Restore what `op` selects out of `snapshot_id` into the mounted target —
+/// the whole snapshot root, or only `spec.selection.paths` (#689) — self-healing
+/// a stale id either way. Returns the id actually restored. Exhaustive over
+/// [`RestoreScope`], so a selection can never silently become a whole-root
+/// restore (or the reverse).
+async fn restore_snapshot(
+    client: &KopiaClient,
+    op: &RestoreOp,
+    snapshot_id: &str,
+) -> Result<String> {
+    match restore_scope(op) {
+        RestoreScope::WholeRoot => {
+            restore_with_heal(client, op, snapshot_id)
+                .await
+                .map_err(|source| MoverError::Kopia {
+                    op: KopiaOp::SnapshotRestore,
+                    source,
+                })
+        }
+        RestoreScope::Paths(paths) => restore_selected_paths(client, op, snapshot_id, paths).await,
+    }
+}
+
+/// Partial, in-place restore (#689): restore each selected snapshot-relative
+/// path to the same relative location under the target, touching nothing else.
+///
+/// Every path is PROBED first (`kopia ls <id>/<path>`), so a path absent from
+/// the snapshot fails the run before a single byte is written — a typo in one
+/// path must not leave the live PVC half-restored. The probe also heals a stale
+/// manifest id (kopia rewrites the id on pin): a not-found that is NOT "entry
+/// not found" re-resolves the live id from the anchor and probes again.
+///
+/// A selected FILE is restored into its parent directory, which kopia does not
+/// create, so the mover creates it (owned by the mover's uid). A selected
+/// DIRECTORY restores its whole subtree; with `enableFileDeletion` kopia's
+/// `--delete-extra` prunes only inside that directory.
+///
+/// Symlinks in the LIVE target are refused, for every selected path, before
+/// anything is written ([`check_selected_target`]): a `docs -> /elsewhere` link
+/// on the volume would otherwise redirect both the mover's `mkdir` and kopia's
+/// writes outside the target PVC — into another mount of the mover pod.
+async fn restore_selected_paths(
+    client: &KopiaClient,
+    op: &RestoreOp,
+    snapshot_id: &str,
+    paths: &[String],
+) -> Result<String> {
+    let probe_err = |source| MoverError::Kopia {
+        op: KopiaOp::RestorePathProbe,
+        source,
+    };
+    let (snapshot_id, kinds) = match probe_selection(client, snapshot_id, paths).await {
+        Ok(kinds) => (snapshot_id.to_string(), kinds),
+        Err(e) if e.class() == KopiaErrorClass::NotFound => {
+            match resolve_live_id(client, &op.anchor).await {
+                Some(live) if live != snapshot_id => {
+                    warn!(
+                        stale = %snapshot_id,
+                        live = %live,
+                        "restore snapshot id not found (changed by a pin); using the current id",
+                    );
+                    let kinds = probe_selection(client, &live, paths)
+                        .await
+                        .map_err(probe_err)?;
+                    (live, kinds)
+                }
+                _ => return Err(probe_err(e)),
+            }
+        }
+        Err(e) => return Err(probe_err(e)),
+    };
+    let missing = missing_selection_paths(&kinds);
+    if !missing.is_empty() {
+        return Err(MoverError::RestorePathsMissing {
+            snapshot_id,
+            missing,
+        });
+    }
+
+    // Refuse a symlinked target for ANY path before restoring the first one, so
+    // a refusal never leaves the live volume half-restored.
+    let root = std::path::Path::new(&op.target_path);
+    for (path, _) in &kinds {
+        check_selected_target(root, path, TargetPrep::CheckOnly)?;
+    }
+    let opts = op.restore_options();
+    for (path, kind) in &kinds {
+        let target = kopiur_kopia::restore_path_target(&op.target_path, path);
+        // Re-checked (and missing parents created, never through a symlink)
+        // right before each restore, narrowing the window a live workload has
+        // to swap a directory for a link.
+        check_selected_target(root, path, TargetPrep::CreateParents)?;
+        client
+            .snapshot_restore_path(&snapshot_id, path, &op.target_path, &opts)
+            .await
+            .map_err(|source| MoverError::Kopia {
+                op: KopiaOp::SnapshotRestore,
+                source,
+            })?;
+        info!(snapshot = %snapshot_id, path = %path, kind = ?kind, target = %target, "restored selected path");
+    }
+    Ok(snapshot_id)
+}
+
+/// Whether [`check_selected_target`] may create missing parent directories.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TargetPrep {
+    /// Only inspect: report a symlink or non-directory ancestor, create nothing.
+    CheckOnly,
+    /// Inspect AND create each missing parent directory, one level at a time,
+    /// with `mkdir` (which never follows a link) and re-inspect what it made.
+    CreateParents,
+}
+
+/// Make sure restoring snapshot path `rel` to `<root>/<rel>` can only write
+/// INSIDE `root`: no existing ancestor of the target — and not the target
+/// itself — may be a symbolic link, and every ancestor must be a directory.
+///
+/// Walks the components with `symlink_metadata` (lstat, never following a
+/// link). With [`TargetPrep::CreateParents`] a missing ancestor is created with
+/// a single-level `create_dir` — never `create_dir_all`, which would follow a
+/// link planted mid-path — and then inspected again, so a link swapped in by the
+/// live workload between the check and the `mkdir` is still caught. `rel` is
+/// admission-validated (relative, no `..`), so joining it cannot climb out.
+fn check_selected_target(root: &std::path::Path, rel: &str, prep: TargetPrep) -> Result<()> {
+    let segments: Vec<&str> = rel.split('/').filter(|s| !s.is_empty()).collect();
+    let mut cur = root.to_path_buf();
+    for (i, segment) in segments.iter().enumerate() {
+        cur.push(segment);
+        let is_last = i + 1 == segments.len();
+        match std::fs::symlink_metadata(&cur) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(MoverError::RestoreTargetSymlink { path: cur });
+            }
+            Ok(_) if is_last => {}
+            Ok(meta) if meta.is_dir() => {}
+            Ok(_) => {
+                return Err(MoverError::RestoreTargetDir {
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::NotADirectory,
+                        "exists in the target but is not a directory",
+                    ),
+                    path: cur,
+                });
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // The selected path itself may be absent (it is what the restore
+                // writes), and so may its parents until CreateParents makes them.
+                if is_last {
+                    return Ok(());
+                }
+                match prep {
+                    TargetPrep::CheckOnly => return Ok(()),
+                    TargetPrep::CreateParents => create_one_dir(&cur)?,
+                }
+            }
+            Err(source) => return Err(MoverError::RestoreTargetDir { path: cur, source }),
+        }
+    }
+    Ok(())
+}
+
+/// `mkdir` exactly one level and confirm a real directory now stands there (a
+/// concurrent `mkdir` by the workload is fine; a concurrent symlink is not).
+fn create_one_dir(path: &std::path::Path) -> Result<()> {
+    match std::fs::create_dir(path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(source) => {
+            return Err(MoverError::RestoreTargetDir {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    }
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => Err(MoverError::RestoreTargetSymlink {
+            path: path.to_path_buf(),
+        }),
+        Ok(meta) if meta.is_dir() => Ok(()),
+        Ok(_) => Err(MoverError::RestoreTargetDir {
+            path: path.to_path_buf(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::NotADirectory,
+                "exists in the target but is not a directory",
+            ),
+        }),
+        Err(source) => Err(MoverError::RestoreTargetDir {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+/// Probe every selected path in `snapshot_id`, in selection order.
+async fn probe_selection(
+    client: &KopiaClient,
+    snapshot_id: &str,
+    paths: &[String],
+) -> std::result::Result<Vec<(String, SnapshotPathKind)>, KopiaError> {
+    let mut kinds = Vec::with_capacity(paths.len());
+    for path in paths {
+        kinds.push((
+            path.clone(),
+            client.snapshot_path_kind(snapshot_id, path).await?,
+        ));
+    }
+    Ok(kinds)
+}
+
+/// The selected paths the probe found absent from the snapshot, in selection
+/// order. Exhaustive over [`SnapshotPathKind`] so a new kind must decide whether
+/// it is restorable.
+fn missing_selection_paths(kinds: &[(String, SnapshotPathKind)]) -> Vec<String> {
+    kinds
+        .iter()
+        .filter_map(|(path, kind)| match kind {
+            SnapshotPathKind::Missing => Some(path.clone()),
+            SnapshotPathKind::Directory | SnapshotPathKind::NonDirectory => None,
+        })
+        .collect()
+}
+
 async fn restore_with_heal(
     client: &KopiaClient,
     op: &RestoreOp,
@@ -1049,13 +1270,7 @@ async fn resolve_and_restore(
             identity = %filter.identity(),
             "reusing the snapshot pinned by a prior attempt; restoring",
         );
-        let restored_id =
-            restore_with_heal(client, op, id)
-                .await
-                .map_err(|source| MoverError::Kopia {
-                    op: KopiaOp::SnapshotRestore,
-                    source,
-                })?;
+        let restored_id = restore_snapshot(client, op, id).await?;
         let identity = prior.identity.unwrap_or_else(|| ResolvedIdentity {
             username: sel.username.clone(),
             hostname: sel.hostname.clone(),
@@ -1125,12 +1340,7 @@ async fn resolve_and_restore(
                     ..Default::default()
                 })
                 .await;
-            let restored_id = restore_with_heal(client, op, &entry.id)
-                .await
-                .map_err(|source| MoverError::Kopia {
-                    op: KopiaOp::SnapshotRestore,
-                    source,
-                })?;
+            let restored_id = restore_snapshot(client, op, &entry.id).await?;
             return Ok(StatusUpdate::completed_resolved(
                 &restored_id,
                 identity,
@@ -4408,6 +4618,101 @@ fn build_client(spec: &MoverWorkSpec, kopia_binary: Option<&str>) -> KopiaClient
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- #689: partial restore selection probe -------------------------------
+
+    #[cfg(unix)]
+    #[test]
+    fn check_selected_target_refuses_symlinks_and_creates_real_parents() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let r = root.path();
+        std::fs::create_dir_all(r.join("docs")).unwrap();
+        std::fs::write(r.join("docs/other.txt"), b"x").unwrap();
+        symlink(outside.path(), r.join("linked")).unwrap();
+        symlink(outside.path(), r.join("docs/album")).unwrap();
+        std::fs::write(r.join("afile"), b"x").unwrap();
+
+        // Fine: an existing parent, and a missing parent chain (created on demand).
+        check_selected_target(r, "docs/report.odt", TargetPrep::CreateParents).unwrap();
+        check_selected_target(r, "new/deep/f.txt", TargetPrep::CheckOnly).unwrap();
+        assert!(!r.join("new").exists(), "CheckOnly creates nothing");
+        check_selected_target(r, "new/deep/f.txt", TargetPrep::CreateParents).unwrap();
+        assert!(r.join("new/deep").is_dir());
+        assert!(
+            !r.join("new/deep/f.txt").exists(),
+            "the selected path itself is not created"
+        );
+
+        // A symlinked ANCESTOR, or a symlinked target, is refused — and nothing
+        // is created through it.
+        for rel in [
+            "linked/sub/report.odt",
+            "linked",
+            "docs/album",
+            "docs/album/01.mp3",
+        ] {
+            for prep in [TargetPrep::CheckOnly, TargetPrep::CreateParents] {
+                let err = check_selected_target(r, rel, prep).unwrap_err();
+                assert!(
+                    matches!(err, MoverError::RestoreTargetSymlink { .. }),
+                    "{rel} {prep:?}: {err:?}"
+                );
+            }
+        }
+        assert!(
+            std::fs::read_dir(outside.path()).unwrap().next().is_none(),
+            "nothing may be written outside the target"
+        );
+
+        // A file where a directory is needed is refused, not followed.
+        assert!(matches!(
+            check_selected_target(r, "afile/x", TargetPrep::CreateParents),
+            Err(MoverError::RestoreTargetDir { .. })
+        ));
+        let msg = MoverError::RestoreTargetSymlink {
+            path: r.join("linked"),
+        }
+        .to_string();
+        assert!(
+            msg.contains("symbolic link") && msg.contains("Fix:"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn missing_selection_paths_keeps_only_absent_paths_in_order() {
+        let kinds = vec![
+            (
+                "docs/report.odt".to_string(),
+                SnapshotPathKind::NonDirectory,
+            ),
+            ("typo/x".to_string(), SnapshotPathKind::Missing),
+            ("music/album".to_string(), SnapshotPathKind::Directory),
+            ("also/gone".to_string(), SnapshotPathKind::Missing),
+        ];
+        assert_eq!(
+            missing_selection_paths(&kinds),
+            vec!["typo/x".to_string(), "also/gone".to_string()]
+        );
+        assert!(missing_selection_paths(&kinds[..1]).is_empty());
+    }
+
+    #[test]
+    fn restore_paths_missing_message_is_actionable_and_terminal() {
+        let err = MoverError::RestorePathsMissing {
+            snapshot_id: "k123".into(),
+            missing: vec!["docs/typo.odt".into()],
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("\"docs/typo.odt\""), "{msg}");
+        assert!(msg.contains("k123"), "{msg}");
+        assert!(msg.contains("Nothing was restored"), "{msg}");
+        assert!(msg.contains("Fix: correct spec.selection.paths"), "{msg}");
+        // A missing path never appears by retrying the same Job.
+        assert!(!err.retry_recommended());
+    }
 
     // --- #456: the quick tier's coverage verdict -----------------------------
 

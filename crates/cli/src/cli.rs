@@ -5,7 +5,9 @@
 use std::path::PathBuf;
 
 use kopiur_api::common::{FailurePolicy, ObjectRef, RepositoryRef};
-use kopiur_api::restore::{FromPolicy, IdentitySource, PvcTemplate, RestoreOptions, RestorePolicy};
+use kopiur_api::restore::{
+    FromPolicy, IdentitySource, PathSelection, PvcTemplate, RestoreOptions, RestorePolicy,
+};
 use kopiur_api::{PopulatorTarget, RestoreSource, RestoreTarget};
 use kopiur_ops::actions::restore::RestoreRequest;
 use kopiur_ops::actions::snapshot::SnapshotNowRequest;
@@ -559,9 +561,18 @@ pub struct RestoreArgs {
     )]
     pub access_modes: Vec<kopiur_api::common::PvcAccessMode>,
 
+    // --- partial restore ---
+    /// Restore only this path out of the snapshot (a file or a directory,
+    /// relative to the snapshot root, e.g. `docs/report.odt`), to the same
+    /// relative location in the target; repeatable. Sibling files in the target
+    /// are left untouched. Default: restore everything.
+    #[arg(long = "path", value_name = "PATH")]
+    pub paths: Vec<String>,
+
     // --- kopia restore options ---
     /// Delete files in the target that are not in the snapshot (exact mirror;
-    /// default is additive restore).
+    /// default is additive restore). With `--path`, scoped to each selected
+    /// directory.
     #[arg(long)]
     pub enable_file_deletion: bool,
 
@@ -717,6 +728,9 @@ impl TryFrom<&RestoreArgs> for RestoreRequest {
             target,
             repository,
             options: restore_options_from_args(args),
+            selection: (!args.paths.is_empty()).then(|| PathSelection {
+                paths: args.paths.clone(),
+            }),
             policy,
             credential_projection: args.credential_projection,
             failure_policy: failure_policy_from(
@@ -1625,6 +1639,33 @@ mod tests {
         // The selectors it excludes stay absent.
         assert!(identity.as_of.is_none());
         assert!(identity.offset.is_none());
+    }
+
+    /// `--path` (repeatable) is the partial-restore selection (#689): every
+    /// occurrence reaches `spec.selection.paths` in order, and no `--path`
+    /// leaves `selection` absent (a whole-root restore).
+    #[test]
+    fn path_flags_reach_the_selection() {
+        let args = restore_args(&[
+            "--from-snapshot",
+            "snap1",
+            "--to-pvc",
+            "mp3",
+            "--path",
+            "docs/report.odt",
+            "--path",
+            "music/album",
+        ]);
+        let req = RestoreRequest::try_from(&args).expect("valid flags");
+        assert_eq!(
+            req.selection,
+            Some(PathSelection {
+                paths: vec!["docs/report.odt".into(), "music/album".into()],
+            })
+        );
+
+        let whole = restore_args(&["--from-snapshot", "snap1", "--to-pvc", "mp3"]);
+        assert_eq!(RestoreRequest::try_from(&whole).unwrap().selection, None);
     }
 
     #[test]

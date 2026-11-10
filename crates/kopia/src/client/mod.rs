@@ -630,6 +630,21 @@ pub struct RestoreOptions {
     pub parallel: Option<u32>,
 }
 
+/// What a snapshot-relative path names inside a snapshot, as probed by
+/// [`KopiaClient::snapshot_path_kind`] before a partial restore (#689).
+///
+/// Exhaustive by design: a partial restore must refuse to run when a selected
+/// path is [`SnapshotPathKind::Missing`] instead of silently restoring nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotPathKind {
+    /// A directory: restoring it restores its whole subtree.
+    Directory,
+    /// A file or symlink (anything kopia does not list as a directory).
+    NonDirectory,
+    /// No entry by that name exists in the snapshot.
+    Missing,
+}
+
 /// Options for `kopia repository sync-to` (ADR-0005 §13(d) / issue #216). Every
 /// field's `None`/`false` reproduces kopia's own default — an all-`None`,
 /// `delete_extra: false` instance yields the exact same argv `sync_to_args`
@@ -2336,6 +2351,54 @@ impl KopiaClient {
         self.run_ok(&args).await.map(|_| ())
     }
 
+    /// Restore ONE snapshot-relative path (`rel_path`, a file or a directory) to
+    /// the same relative location under `target_root`:
+    /// `kopia snapshot restore <id>/<rel_path> <target_root>/<rel_path>` (#689).
+    ///
+    /// kopia resolves the `<manifest id>/<path>` form itself and handles files
+    /// and directories alike. Two behaviors the caller must know, both verified
+    /// against kopia 0.23.1 by `crates/kopia/tests/integration_roundtrip.rs`:
+    ///
+    /// - a DIRECTORY restore creates any missing parent directories, but a FILE
+    ///   restore does not (`open …: no such file or directory`) — so the caller
+    ///   creates `<target_root>/<parent of rel_path>` first;
+    /// - `delete_extra` prunes only inside `<target_root>/<rel_path>`; nothing
+    ///   outside the selected path is touched.
+    ///
+    /// `rel_path` must already be validated (relative, normalized, no `..`) —
+    /// `kopiur_api::validate::validate_path_selection` does that at admission.
+    pub async fn snapshot_restore_path(
+        &self,
+        id: &str,
+        rel_path: &str,
+        target_root: &str,
+        opts: &RestoreOptions,
+    ) -> Result<(), KopiaError> {
+        let args = restore_path_args(id, rel_path, target_root, opts);
+        self.run_ok(&args).await.map(|_| ())
+    }
+
+    /// Probe what `rel_path` names inside snapshot `id` without restoring it
+    /// (`kopia ls <id>/<rel_path>`), so a partial restore can fail BEFORE writing
+    /// anything when a selected path does not exist.
+    ///
+    /// kopia's `ls` succeeds for a directory, refuses a file with "is not a
+    /// directory object", and reports a missing entry as "error reading
+    /// directory: entry not found" — [`classify_snapshot_path_probe`] maps those
+    /// three. Anything else (a stale/unknown snapshot id, an unreachable
+    /// repository) stays an error for the caller to handle.
+    pub async fn snapshot_path_kind(
+        &self,
+        id: &str,
+        rel_path: &str,
+    ) -> Result<SnapshotPathKind, KopiaError> {
+        let args = vec!["ls".to_string(), snapshot_subpath(id, rel_path)];
+        match self.run_ok(&args).await {
+            Ok(_) => Ok(SnapshotPathKind::Directory),
+            Err(e) => classify_snapshot_path_probe(e),
+        }
+    }
+
     /// Verify repository/snapshot integrity (`kopia snapshot verify`). Success is
     /// exit code 0; a verification failure surfaces as a non-zero exit.
     pub async fn snapshot_verify(&self, opts: &VerifyOptions) -> Result<(), KopiaError> {
@@ -2786,6 +2849,65 @@ fn restore_args(id: &str, target_dir: &str, opts: &RestoreOptions) -> Vec<String
         args.push(p.to_string());
     }
     args
+}
+
+/// `<id>/<rel_path>`: kopia's sub-path source form for `snapshot restore` /
+/// `ls`. Accepts a snapshot MANIFEST id (unlike `kopia show`, which needs the
+/// root object id). A leading/trailing `/` on `rel_path` is tolerated.
+fn snapshot_subpath(id: &str, rel_path: &str) -> String {
+    format!("{id}/{}", rel_path.trim_matches('/'))
+}
+
+/// `<target_root>/<rel_path>`: where a partial restore writes one selected path —
+/// the SAME relative location it had under the snapshot root.
+pub fn restore_path_target(target_root: &str, rel_path: &str) -> String {
+    format!(
+        "{}/{}",
+        target_root.trim_end_matches('/'),
+        rel_path.trim_matches('/')
+    )
+}
+
+/// Args for restoring one selected path (#689): the whole-root
+/// [`restore_args`] shape with `<id>/<rel>` as the source and
+/// `<target_root>/<rel>` as the target, so every restore flag applies
+/// identically to a partial restore.
+fn restore_path_args(
+    id: &str,
+    rel_path: &str,
+    target_root: &str,
+    opts: &RestoreOptions,
+) -> Vec<String> {
+    restore_args(
+        &snapshot_subpath(id, rel_path),
+        &restore_path_target(target_root, rel_path),
+        opts,
+    )
+}
+
+/// Map a failed `kopia ls <id>/<path>` onto a [`SnapshotPathKind`], or hand the
+/// error back when it is not one of the two "the snapshot resolved, here is
+/// what the entry is" outcomes. Pure so the stderr contract is unit-tested.
+///
+/// The phrasings are kopia 0.23.1's (pinned; re-verified by the real-kopia
+/// integration test): a file is "… is not a directory object", a missing entry
+/// is "… error reading directory: entry not found". A STALE or unknown manifest
+/// id reads differently ("entry not found \"x\": parent is not a directory")
+/// and deliberately stays an error so the mover can self-heal the id.
+fn classify_snapshot_path_probe(err: KopiaError) -> Result<SnapshotPathKind, KopiaError> {
+    match &err {
+        KopiaError::NonZeroExit { stderr_tail, .. }
+            if stderr_tail.contains("is not a directory object") =>
+        {
+            Ok(SnapshotPathKind::NonDirectory)
+        }
+        KopiaError::NonZeroExit { stderr_tail, .. }
+            if stderr_tail.contains("error reading directory: entry not found") =>
+        {
+            Ok(SnapshotPathKind::Missing)
+        }
+        _ => Err(err),
+    }
 }
 
 /// Build the args for `kopia snapshot create <source> --json [flags]` plus
