@@ -255,6 +255,10 @@ pub const REPO_SUBPATHS: &[&str] = &[
     // mover writes root-owned kopia blobs that a 65532 mover sharing the repo
     // could no longer read.
     "privroot",
+    // #613 cache budgets (`cache_budgets.rs`): percent budgets reaching kopia, and
+    // the Persistent cache PVC growing with `capacity`.
+    "cachebudget",
+    "cachegrow",
 ];
 // --- web console (kopiur-ui) roles and bindings ---------------------------------
 /// The aggregate human ClusterRole the chart renders (`ui.rbac.userRoles`). Bound
