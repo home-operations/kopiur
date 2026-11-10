@@ -12,6 +12,7 @@ import {
   replicationHealth,
   replicationLag,
   replicationPhaseLabel,
+  replicationStateLabel,
   replicationRows,
 } from "./replication";
 
@@ -130,7 +131,8 @@ describe("replicationHealth", () => {
     expect(replicationHealth("replicating", false)).toBe("pending");
     expect(replicationHealth("pending", false)).toBe("pending");
     expect(replicationHealth("failed", false)).toBe("failed");
-    expect(replicationHealth("suspended", false)).toBe("suspended");
+    // #689: a stale suspended phase on a resumed spec is pending, not suspended.
+    expect(replicationHealth("suspended", false)).toBe("pending");
     expect(replicationHealth("succeeded", true)).toBe("suspended");
     expect(replicationHealth("failed", true)).toBe("suspended");
   });
@@ -199,5 +201,49 @@ describe("lastRunSummary", () => {
     // rather than a summary that would always be the empty cell.
     const rows = replicationRows({ repository: [repositoryRow()], snapshot: [] });
     expect(lastRunSummary(nth(rows, 0))).toBeNull();
+  });
+});
+
+// #689 finding 2: "State: Suspended" on a replication with `suspend: false`
+// whose run had started. The phase the operator last stamped can be stale;
+// `suspended` (spec.suspend) is the only source of "suspended".
+describe("replication state — suspension comes from the spec only", () => {
+  const phases = [
+    null,
+    undefined,
+    "pending",
+    "replicating",
+    "succeeded",
+    "failed",
+    "suspended",
+    { unknown: { raw: "Paused" } },
+  ] as const;
+
+  it("suspend: true is Suspended whatever the phase", () => {
+    for (const phase of phases) {
+      expect(replicationHealth(phase, true)).toBe("suspended");
+      expect(replicationStateLabel(phase, true)).toBe("Suspended");
+    }
+  });
+
+  it("suspend: false is never suspended, whatever the phase", () => {
+    for (const phase of phases) {
+      expect(replicationHealth(phase, false)).not.toBe("suspended");
+      expect(replicationStateLabel(phase, false)).not.toBe("Suspended");
+    }
+  });
+
+  it("a stale suspended phase on a resumed replication reads as resuming", () => {
+    expect(replicationHealth("suspended", false)).toBe("pending");
+    expect(replicationStateLabel("suspended", false)).toBe("Resuming");
+  });
+
+  it("every other phase keeps its own word once resumed", () => {
+    expect(replicationStateLabel("replicating", false)).toBe("Replicating");
+    expect(replicationStateLabel("succeeded", false)).toBe("Succeeded");
+    expect(replicationStateLabel("failed", false)).toBe("Failed");
+    expect(replicationStateLabel("pending", false)).toBe("Pending");
+    expect(replicationStateLabel(null, false)).toBe(EMPTY_CELL);
+    expect(replicationStateLabel({ unknown: { raw: "Paused" } }, false)).toBe("Paused");
   });
 });

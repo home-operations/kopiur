@@ -9,7 +9,7 @@ import { EMPTY_CELL, humanBytes, humanDuration } from "../util/format";
 import { type Lamp, healthLamp } from "./health";
 import type { InspectTarget } from "./inspect";
 import { parseRef } from "./kind";
-import { replicationHealth, replicationPhaseLabel } from "./replication";
+import { replicationHealth, replicationStateLabel } from "./replication";
 import { restorePhaseLamp } from "./restore";
 import { snapshotPhaseLamp } from "./snapshot";
 
@@ -119,7 +119,7 @@ export function activity(sources: ActivitySources): ActivityItem[] {
       target: { kind: "repositoryReplication", namespace: r.namespace, name: r.name },
       lamp: {
         ...healthLamp(replicationHealth(r.phase, r.suspended)),
-        word: replicationPhaseLabel(r.phase),
+        word: replicationStateLabel(r.phase, r.suspended),
       },
       what: line(
         arrow(refName(r.source), r.destinationBackend ?? null),
@@ -138,7 +138,7 @@ export function activity(sources: ActivitySources): ActivityItem[] {
       target: { kind: "snapshotReplication", namespace: r.namespace, name: r.name },
       lamp: {
         ...healthLamp(replicationHealth(r.phase, r.suspended)),
-        word: replicationPhaseLabel(r.phase),
+        word: replicationStateLabel(r.phase, r.suspended),
       },
       what: line(arrow(refName(r.source), refName(r.destination)), copied),
       at: r.lastReplicated,

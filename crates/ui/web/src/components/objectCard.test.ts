@@ -190,3 +190,39 @@ describe("cardFacts — each kind carries the three facts that say whether it is
     ]);
   });
 });
+
+// #689: the pill a card shows must take "suspended" from the object's own
+// `spec.suspend` (the row's `suspended`) and from nothing else — a stale
+// `phase: "suspended"` on a resumed replication once made a running copy read
+// "State: Suspended". Every suspendable kind, both polarities.
+describe("cardFacts — suspension comes from spec.suspend for every suspendable kind", () => {
+  const cards = (suspended: boolean) =>
+    [
+      {
+        kind: "repository",
+        row: { ...repo, health: suspended ? "suspended" : "healthy", suspended },
+      },
+      { kind: "snapshotPolicy", row: { ...policy, suspended } },
+      { kind: "snapshotSchedule", row: { ...schedule, suspended } },
+      // A replication whose phase still SAYS suspended: only the spec decides.
+      { kind: "repositoryReplication", row: { ...repoRepl, phase: "suspended", suspended } },
+      { kind: "snapshotReplication", row: { ...snapRepl, phase: "suspended", suspended } },
+    ] as const;
+
+  it("suspend: true reads Suspended on every kind", () => {
+    for (const card of cards(true)) {
+      expect(cardFacts(card, NOW).lamp, card.kind).toMatchObject({
+        key: "suspended",
+        word: "Suspended",
+      });
+    }
+  });
+
+  it("suspend: false never reads Suspended, even over a stale suspended phase", () => {
+    for (const card of cards(false)) {
+      const lamp = cardFacts(card, NOW).lamp;
+      expect(lamp.key, card.kind).not.toBe("suspended");
+      expect(lamp.word, card.kind).not.toBe("Suspended");
+    }
+  });
+});

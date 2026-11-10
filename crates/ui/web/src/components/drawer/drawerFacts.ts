@@ -3,7 +3,7 @@ import { admitsText } from "../admits";
 import type { InspectTarget } from "../inspect";
 import { parseRef } from "../kind";
 import type { CardRow } from "../objectCard";
-import { replicationPhaseLabel } from "../replication";
+import { replicationStateLabel } from "../replication";
 import { repositoryPhaseLabel } from "../repository";
 import { restorePhaseLabel } from "../restore";
 import { deletionPolicyLabel, originLabel } from "../snapshot";
@@ -173,7 +173,7 @@ export function drawerFacts(card: CardRow): DrawerFacts {
       const r = card.row;
       b.fact("Destination", text(r.destinationBackend))
         .fact("Cron", r.cron, true)
-        .fact("Phase", text(replicationPhaseLabel(r.phase)))
+        .fact("Phase", text(replicationStateLabel(r.phase, r.suspended)))
         .fact("Suspended", yesNo(r.suspended));
       b.ref("Source", r.source, "before");
       return b.done();
@@ -181,7 +181,7 @@ export function drawerFacts(card: CardRow): DrawerFacts {
     case "snapshotReplication": {
       const r = card.row;
       b.fact("Cron", r.cron, true)
-        .fact("Phase", text(replicationPhaseLabel(r.phase)))
+        .fact("Phase", text(replicationStateLabel(r.phase, r.suspended)))
         .fact("Suspended", yesNo(r.suspended))
         .fact("Identities selected", count(r.identitiesSelected))
         .fact("Pruned", count(r.pruned));
