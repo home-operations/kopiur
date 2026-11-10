@@ -683,8 +683,9 @@ async fn repository_replication_applied_before_its_cluster_repository_converges(
     let repls: Api<RepositoryReplication> = Api::namespaced(client.clone(), E2E_NAMESPACE);
     let crepo = "e2e-677-onsite";
     let name = "e2e-677-offsite";
-    // A unique prefix in each bucket keeps this scenario off the S3→S3 one's data.
-    let prefix = "issue-677/";
+    // Dedicated buckets (see `consts::BUCKET_REPL_APPLY_ORDER_SRC`): kopia refuses
+    // to create a repository in a bucket that already holds objects, so this
+    // scenario must not share a bucket with any other.
 
     // Rerun hygiene: the replication first (it holds no finalizer), then the
     // repository, and wait both out so step 1 really starts with no referent.
@@ -714,12 +715,11 @@ async fn repository_replication_applied_before_its_cluster_repository_converges(
                 "spec": {
                     "sourceRef": { "kind": "ClusterRepository", "name": crepo },
                     "destination": { "s3": {
-                        "bucket": consts::S3_REPL_DST_BUCKET,
-                        "prefix": prefix,
+                        "bucket": consts::BUCKET_REPL_APPLY_ORDER_DST,
                         "endpoint": consts::MINIO_ENDPOINT,
                         "region": "us-east-1",
                         "tls": { "disableTls": true },
-                        "auth": { "secretRef": { "name": consts::SECRET_S3_REPL_DST } }
+                        "auth": { "secretRef": { "name": consts::SECRET_S3_CREDS } }
                     }},
                     "schedule": { "cron": "* * * * *" }
                 }
@@ -773,17 +773,16 @@ async fn repository_replication_applied_before_its_cluster_repository_converges(
                 "metadata": { "name": crepo },
                 "spec": {
                     "backend": { "s3": {
-                        "bucket": consts::S3_REPL_SRC_BUCKET,
-                        "prefix": prefix,
+                        "bucket": consts::BUCKET_REPL_APPLY_ORDER_SRC,
                         "endpoint": consts::MINIO_ENDPOINT,
                         "region": "us-east-1",
                         "tls": { "disableTls": true },
                         "auth": { "secretRef": {
-                            "name": consts::SECRET_S3_REPL_SRC, "namespace": E2E_NAMESPACE
+                            "name": consts::SECRET_S3_CREDS, "namespace": E2E_NAMESPACE
                         } }
                     }},
                     "encryption": { "passwordSecretRef": {
-                        "name": consts::SECRET_S3_REPL_SRC,
+                        "name": consts::SECRET_S3_CREDS,
                         "namespace": E2E_NAMESPACE,
                         "key": consts::KEY_KOPIA_PASSWORD
                     }},

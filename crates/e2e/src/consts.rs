@@ -365,6 +365,11 @@ pub const S3_REPL_SRC_SECRET: &str = "replsrcsecret123";
 pub const S3_REPL_DST_KEY: &str = "repldstuser";
 /// Secret key of the destination-scoped MinIO user.
 pub const S3_REPL_DST_SECRET: &str = "repldstsecret123";
+/// Source bucket for the #677 apply-order scenario (a `ClusterRepository` created
+/// after the `RepositoryReplication` that references it).
+pub const BUCKET_REPL_APPLY_ORDER_SRC: &str = "kopiur-repl-677-src";
+/// Destination bucket for the #677 apply-order scenario.
+pub const BUCKET_REPL_APPLY_ORDER_DST: &str = "kopiur-repl-677-dst";
 /// Source bucket for the S3→S3 isolation scenario (writable only by [`S3_REPL_SRC_KEY`]).
 pub const S3_REPL_SRC_BUCKET: &str = "kopiur-repl-s2s-src";
 /// Destination bucket for the S3→S3 isolation scenario (writable only by [`S3_REPL_DST_KEY`]).
@@ -498,6 +503,12 @@ pub const BUCKETS: &[&str] = &[
     // MinIO user, so a passing replication proves the destination creds are used.
     S3_REPL_SRC_BUCKET,
     S3_REPL_DST_BUCKET,
+    // #677 apply-order scenario (replication.rs): a replication applied before its
+    // ClusterRepository. Its OWN buckets: kopia refuses `repository create` in a
+    // bucket that already holds objects, so sharing (even under a prefix) the
+    // S3→S3 scenario's bucket-root repository broke that scenario's bootstrap.
+    BUCKET_REPL_APPLY_ORDER_SRC,
+    BUCKET_REPL_APPLY_ORDER_DST,
     // Multi-cluster shared-repository scenarios (M7a, crates/e2e/tests/multi_cluster.rs):
     // one isolated bucket per scenario so identity/catalog/lease state from one
     // scenario can never leak into another's counts/assertions.
