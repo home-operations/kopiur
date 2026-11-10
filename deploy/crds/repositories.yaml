@@ -3776,7 +3776,7 @@ spec:
                     type: object
                 type: object
               suspend:
-                description: "Pause this repository: skip connect/bootstrap and maintenance projection."
+                description: Pause ALL new work against this repository (backups, restores, maintenance, replication, seeding, verification); held work resumes once unsuspended.
                 type: boolean
             required:
             - backend

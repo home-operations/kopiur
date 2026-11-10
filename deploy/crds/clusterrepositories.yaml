@@ -3834,7 +3834,7 @@ spec:
                 - namespace
                 type: object
               suspend:
-                description: "Pause this cluster repository: skip connect/bootstrap and maintenance projection."
+                description: Pause ALL new work against this cluster repository (backups, restores, maintenance, replication, seeding, verification); held work resumes once unsuspended.
                 type: boolean
             required:
             - allowedNamespaces

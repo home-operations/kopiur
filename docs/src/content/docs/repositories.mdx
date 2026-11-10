@@ -40,7 +40,7 @@ spec:
   maintenance: { ... } # default-managed; see the Maintenance guide
   onNamespaceDelete: Orphan # Orphan (default) | Delete — kubectl delete ns behavior
   mode: ReadWrite # ReadWrite (default) | ReadOnly
-  suspend: false # pause connect/bootstrap + maintenance
+  suspend: false # pause ALL new work against this repository
 ```
 
 Only `backend` and `encryption` are required. The rest have sane defaults.
@@ -744,7 +744,29 @@ Full field set and rationale: [Maintenance → when maintenance is running and t
 
 ## `suspend` — pause a repository
 
-`suspend: true` pauses connect, bootstrap and maintenance projection declaratively, without deleting the `Repository`. It is surfaced via a condition. `suspend` is consistent across `Repository`, `ClusterRepository`, `SnapshotPolicy` and `RepositoryReplication`.
+`suspend: true` pauses **all new work against the repository** declaratively, without deleting the `Repository` or `ClusterRepository`. Both kinds behave the same way. While it is suspended:
+
+| Work against the repository                                             | What happens while suspended                                                                                                     |
+| ----------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| Connect, bootstrap, maintenance projection                              | Skipped by the repository's own reconcile. Its `Ready` condition reads `Suspended`.                                              |
+| A `Snapshot` (scheduled or manual) that has not started yet             | Stays `Pending` with reason `RepositorySuspended`. No mover Job is created.                                                      |
+| A `Restore` that has not started yet                                    | Stays `Pending` with reason `RepositorySuspended`. Time spent suspended does not count against `waitTimeout`.                    |
+| `Maintenance`, owned or one you wrote yourself                          | Waits with `LeaseOwned=False`, reason `RepositorySuspended`.                                                                     |
+| `RepositoryReplication` (source) and `SnapshotReplication` (either end) | Waits with `Ready=False`, reason `RepositorySuspended`, and names the suspended repository.                                      |
+| `SnapshotPolicy` retention prunes and verification                      | Skipped for that repository. `RepositoriesReady=False` names it as suspended, and the other repositories of the policy carry on. |
+| Seeding another repository from it (`spec.seed.from.repository`)        | The seeding repository stays `Pending` until the source is unsuspended.                                                          |
+| Pinning or unpinning an existing `Snapshot` (`spec.pin`)                | Held until the repository is unsuspended.                                                                                        |
+
+Set `suspend: false` and held work resumes on its own, typically within 15 seconds. You don't need to re-create anything.
+
+Two things are deliberately **not** paused:
+
+- **Work that has already started.** A mover Job that is running when you suspend finishes. Suspend stops new work. It does not kill work in flight.
+- **Deleting `Snapshot`s.** A `Snapshot` deletion still runs, so a finalizer never wedges because a repository is paused. To keep kopia snapshots while a repository is down, use the `kopiur.home-operations.com/skip-snapshot-cleanup` annotation or `deletionPolicy: Retain`.
+
+With a schedule on the default `concurrencyPolicy: Forbid`, at most one `Pending` `Snapshot` per schedule piles up while the repository is suspended. With `Allow`, every slot mints one, and they all start when you unsuspend.
+
+`suspend` is also available on `SnapshotPolicy`, `SnapshotSchedule` (as `schedule.suspend`), `RepositoryReplication` and `SnapshotReplication`. There it pauses only that object.
 
 ## `server` — the kopia web UI
 
@@ -899,7 +921,7 @@ A complete, apply-ready example is [`deploy/examples/02-cluster-repository.yaml`
 | `onNamespaceDelete`                                    | `Orphan` (default) / `Delete` on namespace delete.                                                                                                                                                                                                                                                        |
 | `deletionProtection.threshold`                         | Mass-deletion breaker: HOLD external destructive Snapshot deletions at/above this count (default 10; `0` disables).                                                                                                                                                                                       |
 | `mode`                                                 | `ReadWrite` (default) / `ReadOnly`.                                                                                                                                                                                                                                                                       |
-| `suspend`                                              | Pause connect/bootstrap + maintenance.                                                                                                                                                                                                                                                                    |
+| `suspend`                                              | Pause all new work against the repository; it resumes on unsuspend.                                                                                                                                                                                                                                       |
 
 ## See also
 

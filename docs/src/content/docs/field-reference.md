@@ -48,7 +48,7 @@ This page is **generated** from the `kopiur-api` CRD schemas by `cargo xtask gen
 | `scheduleDefaults` | [object](#repository-specscheduledefaults) | — | Scheduling defaults (`timezone`, `jitter`) inherited by consumers that don't set their own equivalent field — backup, verification, replication, and maintenance schedules; set once here instead of repeating it on every cron. |
 | `seed` | [object](#repository-specseed) | — | Initialize this repository from an existing replica on its FIRST bootstrap (issue #380) — a disaster-recovery entry point.<br>Armed only while the repository has never been initialized (`status.uniqueId` unset) **and** the mover's connect reports the backend uninitialized; on an already-initialized repository it is a documented no-op (`Seeded=True`, reason `AlreadyInitialized`), so it is safe to leave standing in a GitOps manifest. When armed it also replaces `spec.create`'s fallback: the repository is seeded or the bootstrap fails, never silently created empty. |
 | `server` | [object](#repository-specserver) | — | Optional kopia web-UI server, exposed via a `Service` in this namespace. |
-| `suspend` | boolean | — | Pause this repository: skip connect/bootstrap and maintenance projection. |
+| `suspend` | boolean | — | Pause ALL new work against this repository (backups, restores, maintenance, replication, seeding, verification); held work resumes once unsuspended. |
 
 **Validation rules** (enforced at admission):
 
@@ -1103,7 +1103,7 @@ Externally tagged — set **exactly one** of: `generate` · `insecure` · `secre
 | `scheduleDefaults` | [object](#clusterrepository-specscheduledefaults) | — | Scheduling defaults (`timezone`, `jitter`) inherited by consumers that don't set their own equivalent field — backup, verification, replication, and maintenance schedules; set once here instead of repeating it on every cron. |
 | `seed` | [object](#clusterrepository-specseed) | — | Initialize this repository from an existing replica on its FIRST bootstrap (issue #380) — a disaster-recovery entry point.<br>Armed only while the repository has never been initialized (`status.uniqueId` unset) **and** the mover's connect reports the backend uninitialized; on an already-initialized repository it is a documented no-op (`Seeded=True`, reason `AlreadyInitialized`), so it is safe to leave standing in a GitOps manifest. When armed it also replaces `spec.create`'s fallback: the repository is seeded or the bootstrap fails, never silently created empty. |
 | `server` | [object](#clusterrepository-specserver) | — | Optional kopia web-UI server (the target `namespace` is required). |
-| `suspend` | boolean | — | Pause this cluster repository: skip connect/bootstrap and maintenance projection. |
+| `suspend` | boolean | — | Pause ALL new work against this cluster repository (backups, restores, maintenance, replication, seeding, verification); held work resumes once unsuspended. |
 
 **Validation rules** (enforced at admission):
 
