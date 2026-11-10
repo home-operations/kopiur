@@ -34,9 +34,9 @@ The repository to read from. It is derived from `source` when you leave it out, 
 
 ### `selection`
 
-Restore only part of the snapshot. `paths` lists 1 to 64 snapshot-root-relative paths, files or directories, such as `docs/report.odt` or `music/album`. Each is written to the same relative location under the target, and nothing outside the selected paths is read or written. Leave `selection` out to restore the whole snapshot.
+Restore only part of the snapshot. `paths` lists 1 to 64 (16 KiB in total) snapshot-root-relative paths, files or directories, such as `docs/report.odt` or `music/album`. Each is written to the same relative location under the target, and nothing outside the selected paths is read or written. Leave `selection` out to restore the whole snapshot.
 
-The paths are validated at admission: relative and `/`-separated, normalized (no `..`, `.`, empty segment or trailing `/`), no duplicates, and no path nested inside another. `selection` cannot be combined with a `streamExec` target. Every path must exist in the snapshot; if one does not, the restore fails before writing anything and names the missing path. With `options.enableFileDeletion: true`, deletion is scoped to each selected directory. See [Restores → selection](/restores/#restore-only-some-files--selection).
+The paths are validated at admission: relative and `/`-separated, normalized (no `..`, `.`, empty segment or trailing `/`), no duplicates, and no path nested inside another. `selection` cannot be combined with a `streamExec` target. Every path must exist in the snapshot; if one does not, the restore fails before writing anything and names the missing path. A symbolic link in the live target on the way to a selected path is refused the same way. With `options.enableFileDeletion: true`, deletion is scoped to each selected directory. See [Restores → selection](/restores/#restore-only-some-files--selection).
 
 ### `options`
 

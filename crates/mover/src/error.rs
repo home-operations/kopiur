@@ -365,6 +365,22 @@ pub enum MoverError {
         source: std::io::Error,
     },
 
+    /// A partial restore (#689) found a symbolic link on the way to a selected
+    /// path in the live target. Writing through it could land outside the
+    /// target volume (into another mount of the mover pod), so the run is
+    /// refused before anything is written.
+    #[error(
+        "partial restore refused: {} in the restore target is a symbolic link, so restoring \
+         the selected path through it could write outside the target volume. Nothing was \
+         restored. Fix: replace the link with a real directory in the PVC, or restore into a \
+         new PVC (target.pvc) and copy the files across",
+        path.display()
+    )]
+    RestoreTargetSymlink {
+        /// The symlinked path inside the target.
+        path: std::path::PathBuf,
+    },
+
     /// A restore selector's `asOf` was not a valid RFC3339 timestamp. The webhook
     /// validates this at admission, so this is the defensive in-Job path.
     #[error("restore source asOf {as_of:?} is not an RFC3339 timestamp: {message}")]
@@ -650,6 +666,7 @@ impl MoverError {
             | MoverError::RestoreAsOfInvalid { .. }
             | MoverError::RestorePathsMissing { .. }
             | MoverError::RestoreTargetDir { .. }
+            | MoverError::RestoreTargetSymlink { .. }
             | MoverError::ScratchNotWritable { .. }
             // A failed dump command / unresolvable pod is the user's config, not a
             // transient fault: re-running the same Job re-runs the same command.

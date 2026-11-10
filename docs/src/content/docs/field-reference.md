@@ -3239,7 +3239,7 @@ Externally tagged — set **exactly one** of: `pvcConsumer` · `snapshot` · `wo
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| `paths` | []string | **required**<br><sub>minItems 1; maxItems 64</sub> | Snapshot-root-relative paths to restore (files or directories), e.g. `docs/report.odt` or `music/album`. Relative, `/`-separated, normalized: no leading `/`, no `.` or `..` segments, no empty segments (`a//b`), no trailing `/`. At most 64 paths, no duplicates, and no path inside another selected path (selecting `docs` already restores `docs/report.odt`). |
+| `paths` | []string | **required**<br><sub>minItems 1; maxItems 64</sub> | Snapshot-root-relative paths to restore (files or directories), e.g. `docs/report.odt` or `music/album`. Relative, `/`-separated, normalized: no leading `/`, no `.` or `..` segments, no empty segments (`a//b`), no trailing `/`. At most 64 paths and 16 KiB in total, no duplicates, and no path inside another selected path (selecting `docs` already restores `docs/report.odt`). |
 
 ### Restore `status`
 

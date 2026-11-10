@@ -335,14 +335,20 @@ pub struct RestoreOptions {
 /// selected DIRECTORY: files under `<target>/<path>` that are absent from the
 /// snapshot's `<path>` are deleted; nothing outside a selected path is ever
 /// deleted. A selected file is simply overwritten.
+///
+/// A symbolic link in the live target on the way to a selected path (e.g.
+/// `docs -> /elsewhere` when `docs/report.odt` is selected) fails the restore
+/// before anything is written, since writing through it could land outside the
+/// target volume.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct PathSelection {
     /// Snapshot-root-relative paths to restore (files or directories), e.g.
     /// `docs/report.odt` or `music/album`. Relative, `/`-separated, normalized:
     /// no leading `/`, no `.` or `..` segments, no empty segments (`a//b`), no
-    /// trailing `/`. At most 64 paths, no duplicates, and no path inside another
-    /// selected path (selecting `docs` already restores `docs/report.odt`).
+    /// trailing `/`. At most 64 paths and 16 KiB in total, no duplicates, and no
+    /// path inside another selected path (selecting `docs` already restores
+    /// `docs/report.odt`).
     #[schemars(length(min = 1, max = 64), inner(length(min = 1, max = 4096)))]
     pub paths: Vec<String>,
 }

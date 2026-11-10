@@ -2351,6 +2351,19 @@ fn restore_flags_enable_file_deletion_regression() {
 }
 
 #[test]
+fn selection_budget_fits_the_work_spec() {
+    // A selection at the admission cap, every byte JSON-escaped to two bytes,
+    // plus generous headroom for the rest of the restore work spec, must stay
+    // under the pod's work-spec cap — or an admitted Restore could never start.
+    const {
+        assert!(
+            2 * kopiur_api::validate::MAX_SELECTION_TOTAL_BYTES + 32 * 1024
+                <= kopiur_mover::jobs::MAX_WORK_SPEC_BYTES
+        );
+    }
+}
+
+#[test]
 fn restore_paths_carries_the_selection_onto_the_work_spec() {
     // #689: a dropped `spec.selection` would silently turn a one-file restore
     // into a FULL in-place restore of a live PVC. The controller glue must

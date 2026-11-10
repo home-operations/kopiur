@@ -8839,6 +8839,16 @@ fn restore_selection_rejects_empty_and_oversized_lists() {
         err.to_string().contains("more than the 64 allowed"),
         "{err}"
     );
+
+    // 64 distinct paths each under the per-path cap still must not exceed the
+    // total the work spec can carry, or the Restore is admitted but never starts.
+    let long: Vec<String> = (0..MAX_SELECTION_PATHS)
+        .map(|i| format!("{i:02}/{}/{}", "x".repeat(250), "y".repeat(250)))
+        .collect();
+    let refs: Vec<&str> = long.iter().map(String::as_str).collect();
+    assert!(long.iter().map(String::len).sum::<usize>() > MAX_SELECTION_TOTAL_BYTES);
+    let err = validate_restore(&restore_selecting(&refs)).unwrap_err();
+    assert!(err.to_string().contains("a restore Job can carry"), "{err}");
 }
 
 #[test]

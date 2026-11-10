@@ -11,11 +11,13 @@
 # The rules, enforced at admission (webhook) and again by the controller:
 #   - relative to the snapshot root, '/'-separated: `docs/report.odt`, not `/docs/...`
 #   - normalized: no `..`, no `.`, no empty segment (`a//b`), no trailing '/'
-#   - 1 to 64 paths, no duplicates, no path inside another selected path
+#   - 1 to 64 paths (16 KiB total), no duplicates, no path inside another selected path
 #   - not allowed with `target.streamExec` (that already selects one file)
 # A selected path that does not exist in the snapshot FAILS the Restore before
 # anything is written, naming the missing path. Browse the snapshot first if you are
-# not sure of the exact name (`kubectl kopiur browse`, or the console).
+# not sure of the exact name (`kubectl kopiur browse`, or the console). A symlink in
+# the live PVC on the way to a selected path is refused the same way (it could
+# redirect the write outside the volume).
 #
 # Where the volume is still mounted by the running app, that is fine: for a
 # ReadWriteOnce claim Kopiur schedules the mover on the same node as the pod holding

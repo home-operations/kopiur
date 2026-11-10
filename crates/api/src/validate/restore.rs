@@ -191,6 +191,13 @@ pub const MAX_SELECTION_PATHS: usize = 64;
 /// Upper bound on one `spec.selection.paths` entry, in bytes (Linux `PATH_MAX`);
 /// mirrors the schema's `maxLength`.
 pub const MAX_SELECTION_PATH_BYTES: usize = 4096;
+/// Upper bound on ALL `spec.selection.paths` entries together, in bytes. The
+/// selection rides the mover work spec, which a pod carries under a hard size
+/// cap (`kopiur_mover::jobs::MAX_WORK_SPEC_BYTES`, 100 KiB), so 64 paths at the
+/// per-path maximum would be admitted and then never start. 16 KiB leaves room
+/// for worst-case JSON escaping (2x) plus the rest of the work spec; the
+/// controller test `selection_budget_fits_the_work_spec` pins that arithmetic.
+pub const MAX_SELECTION_TOTAL_BYTES: usize = 16 * 1024;
 /// Upper bound on one path segment, in bytes (Linux `NAME_MAX`).
 const MAX_SELECTION_SEGMENT_BYTES: usize = 255;
 
@@ -229,6 +236,17 @@ pub fn validate_path_selection(sel: &PathSelection) -> ValidationResult {
                 "{} paths selected, more than the {MAX_SELECTION_PATHS} allowed. Fix: select \
                  a common parent directory instead, or split into several Restores",
                 sel.paths.len()
+            ),
+        });
+    }
+    let total: usize = sel.paths.iter().map(String::len).sum();
+    if total > MAX_SELECTION_TOTAL_BYTES {
+        return Err(ValidationError::InvalidFieldValue {
+            field: "restore.selection.paths".to_string(),
+            reason: format!(
+                "the paths add up to {total} bytes, more than the {MAX_SELECTION_TOTAL_BYTES} \
+                 bytes a restore Job can carry. Fix: select a common parent directory instead, \
+                 or split into several Restores"
             ),
         });
     }

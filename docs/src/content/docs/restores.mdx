@@ -300,13 +300,15 @@ The web console's Restore form has the same field, one path per line, and a rest
 
 :::caution[What a path may look like (webhook-enforced)]
 
-Paths are relative to the snapshot root and `/`-separated: `docs/report.odt`, not `/docs/report.odt`. They must be normalized, with no `..`, no `.` and no empty segment (`a//b`), and no trailing `/`. You can list 1 to 64 paths, with no duplicates and no path inside another selected path (selecting `docs` already restores `docs/report.odt`). `selection` is not allowed with a `streamExec` target, which already picks exactly one file.
+Paths are relative to the snapshot root and `/`-separated: `docs/report.odt`, not `/docs/report.odt`. They must be normalized, with no `..`, no `.` and no empty segment (`a//b`), and no trailing `/`. You can list 1 to 64 paths (16 KiB in total), with no duplicates and no path inside another selected path (selecting `docs` already restores `docs/report.odt`). `selection` is not allowed with a `streamExec` target, which already picks exactly one file.
 
 :::
 
 :::note[A path that is not in the snapshot fails the restore — before anything is written]
 
 Kopiur checks every selected path against the snapshot first. If one does not exist, the `Restore` goes to `Failed` and `status.failure.message` names the missing path(s), and **nothing** was written to the target. Use [`kubectl kopiur browse`](/cli/browse/) or the console's snapshot browser to check the exact name, or pick a snapshot taken while the file still existed.
+
+The same goes for a **symbolic link** in the live PVC on the way to a selected path, for example `docs` being a link when `docs/report.odt` is selected. Writing through it could land outside the volume, so the restore is refused and the message names the link. Replace the link with a real directory, or restore into a new PVC and copy the file across.
 
 :::
 
