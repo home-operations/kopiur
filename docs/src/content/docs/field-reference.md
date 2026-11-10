@@ -3185,6 +3185,7 @@ Externally tagged — set **exactly one** of: `pvc`.
 | `options` | [object](#restore-specoptions) | — | kopia restore behavior (file deletion, permission/atomicity handling). |
 | `policy` | [object](#restore-specpolicy) | — | What to do when the referenced snapshot doesn't exist yet, and how long to wait. |
 | `repository` | [object](#restore-specrepository) | — | The repository to read from; derived from `source` when omitted, required only with `source.identity`. |
+| `selection` | [object](#restore-specselection) | — | Restore only some paths out of the snapshot instead of its whole root — a partial restore (e.g. bring back one deleted file into a live, shared PVC). Absent restores everything. Not allowed with `target.streamExec`, which already selects exactly one file. |
 
 **Validation rules** (enforced at admission):
 
@@ -3382,6 +3383,12 @@ Externally tagged — set **exactly one** of: `pvcConsumer` · `snapshot` · `wo
 | `name` | string | **required** | Name of the referenced `Repository`/`ClusterRepository`. |
 | `kind` | enum: Repository \| ClusterRepository | `Repository` | Which repository CRD this points at; defaults to `RepositoryKind::Repository`. |
 | `namespace` | string | — | Cross-namespace `Repository` reference; ignored/forbidden for `ClusterRepository`. |
+
+#### Restore `spec.selection`
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `paths` | []string | **required**<br><sub>minItems 1; maxItems 64</sub> | Snapshot-root-relative paths to restore (files or directories), e.g. `docs/report.odt` or `music/album`. Relative, `/`-separated, normalized: no leading `/`, no `.` or `..` segments, no empty segments (`a//b`), no trailing `/`. At most 64 paths and 16 KiB in total, no duplicates, and no path inside another selected path (selecting `docs` already restores `docs/report.odt`). |
 
 ### Restore `status`
 

@@ -610,6 +610,34 @@ pub struct RestoreOp {
     /// additive.
     #[serde(default)]
     pub delete_extra: bool,
+    /// Partial restore (#689): snapshot-root-relative paths to restore, each to
+    /// the same relative location under `target_path`. Empty ⇒ restore the whole
+    /// snapshot root (the pre-#689 behavior; `#[serde(default)]` keeps older
+    /// work-spec JSON decoding to exactly that). Read it through
+    /// [`restore_scope`], never by testing emptiness inline. Validated at
+    /// admission by `kopiur_api::validate::validate_path_selection`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paths: Vec<String>,
+}
+
+/// How much of the snapshot a filesystem [`RestoreOp`] restores. Resolved from
+/// [`RestoreOp::paths`] by [`restore_scope`]; exhaustive so the mover cannot
+/// quietly treat a selection as a whole-root restore (or vice versa).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestoreScope<'a> {
+    /// Restore the whole snapshot root into `target_path`.
+    WholeRoot,
+    /// Restore only these snapshot-relative paths (non-empty).
+    Paths(&'a [String]),
+}
+
+/// THE resolver for how much of the snapshot a restore run restores.
+pub fn restore_scope(op: &RestoreOp) -> RestoreScope<'_> {
+    if op.paths.is_empty() {
+        RestoreScope::WholeRoot
+    } else {
+        RestoreScope::Paths(&op.paths)
+    }
 }
 
 impl RestoreOp {
@@ -639,6 +667,7 @@ impl RestoreOp {
     ///     ignore_errors: Some(false),
     ///     skip_existing: Some(true),
     ///     delete_extra: true,
+    ///     paths: vec![],
     /// };
     /// let opts = op.restore_options();
     /// assert_eq!(opts.ignore_permission_errors, Some(false));

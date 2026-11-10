@@ -213,6 +213,30 @@ fn new_optional_example_keys_survive_the_round_trip() {
     );
 }
 
+/// Example 47 (#689 partial in-place restore) documents a selection that
+/// survives the round trip AND passes the shared admission validator — a
+/// misspelled `selection`/`paths` key would deserialize, drop silently, and turn
+/// the documented one-file restore into a FULL in-place restore of a live PVC.
+#[test]
+fn the_partial_restore_example_keeps_its_selection_and_admits() {
+    let text = std::fs::read_to_string(examples_dir().join("47-restore-partial-in-place.yaml"))
+        .expect("read example 47");
+    let docs: Vec<serde_json::Value> = serde_saphyr::from_multiple(&text).expect("yaml docs");
+    let restore = docs
+        .iter()
+        .find(|d| d.get("kind").and_then(|k| k.as_str()) == Some("Restore"))
+        .expect("example 47 has a Restore");
+    let spec: RestoreSpec =
+        serde_json::from_value(restore["spec"].clone()).expect("RestoreSpec shape");
+    let selection = spec
+        .selection
+        .as_ref()
+        .expect("spec.selection must survive");
+    assert_eq!(selection.paths, vec!["docs/report.odt", "music/album"]);
+    assert_eq!(spec.target.kind_str(), "PvcRef", "the example is IN PLACE");
+    assert_eq!(kopiur_api::validate::validate_restore(&spec), Ok(()));
+}
+
 /// Every `Repository` document in `file`, round-tripped through `RepositorySpec`.
 ///
 /// The scenario bundles deliberately carry several same-named `Repository`

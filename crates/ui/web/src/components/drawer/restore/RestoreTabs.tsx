@@ -8,7 +8,7 @@ import { DrawerSection } from "../DrawerSection";
 
 /** What the restore reads: the source as it resolved, once, at creation. */
 export function SourceTab({ detail, now }: { detail: RestoreDetail; now: Date }) {
-  const { row, source } = detail;
+  const { row, source, selectedPaths } = detail;
   return (
     <DrawerSection title="What it reads" icon={Database}>
       <Facts
@@ -38,6 +38,15 @@ export function SourceTab({ detail, now }: { detail: RestoreDetail; now: Date })
           { term: "Kopia manifest", value: <Mono value={row.kopiaSnapshotId} /> },
           { term: "Kopia identity", value: <Mono value={source?.identity} /> },
           { term: "Repository", value: <Mono value={row.repository} /> },
+          {
+            term: "Paths",
+            value:
+              selectedPaths.length === 0 ? (
+                "the whole snapshot"
+              ) : (
+                <span className="mono">{selectedPaths.join(", ")}</span>
+              ),
+          },
           {
             term: "Pinned at",
             value: <Instant at={source?.pinnedAt} now={now} absent="not pinned yet" />,

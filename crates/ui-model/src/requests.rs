@@ -86,6 +86,13 @@ pub struct RestoreBody {
     /// `Snapshot` was written from.
     #[serde(default)]
     pub source_path: Option<String>,
+    /// Partial restore (#689): restore only these snapshot-relative paths
+    /// (files or directories, e.g. `docs/report.odt`), each to the same
+    /// relative location in the target; sibling files are left untouched.
+    /// Omitted or empty restores the whole snapshot. Lands on the CRD's
+    /// `spec.selection.paths`, validated there (relative, normalized, no `..`).
+    #[serde(default)]
+    pub paths: Option<Vec<String>>,
 }
 
 /// Which snapshot to restore, as an externally-tagged union — exactly one

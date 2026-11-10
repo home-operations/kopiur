@@ -3747,6 +3747,7 @@ async fn run_restore_mover(
             ignore_errors: flags.ignore_errors,
             skip_existing: flags.skip_existing,
             delete_extra: flags.delete_extra,
+            paths: restore_paths(&restore.spec.selection),
         }),
         identity,
         repository: restore_connect(&repo)?,
@@ -5308,6 +5309,19 @@ fn restore_flags(options: &Option<kopiur_api::restore::RestoreOptions>) -> Resto
         skip_existing: o.skip_existing,
         delete_extra: o.enable_file_deletion,
     }
+}
+
+/// Map `Restore.spec.selection` onto the mover work-spec's `paths` (#689).
+/// Absent ⇒ empty ⇒ the mover restores the whole snapshot root, exactly as
+/// before partial restore existed. Pure so the CRD-field → work-spec glue is
+/// unit-tested: the same "settable but consumed by nothing" bug class
+/// [`restore_flags`] guards, where a dropped selection would silently turn a
+/// one-file restore into a FULL in-place restore of a live PVC.
+fn restore_paths(selection: &Option<kopiur_api::restore::PathSelection>) -> Vec<String> {
+    selection
+        .as_ref()
+        .map(|s| s.paths.clone())
+        .unwrap_or_default()
 }
 
 /// Mover `Job` limits from the restore's `failurePolicy`, falling back to ADR

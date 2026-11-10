@@ -47,4 +47,12 @@ overwrite?: boolean | null,
  * Meaningless with a `snapshotRef` source, which already pins the path its
  * `Snapshot` was written from.
  */
-sourcePath?: string | null, };
+sourcePath?: string | null,
+/**
+ * Partial restore (#689): restore only these snapshot-relative paths
+ * (files or directories, e.g. `docs/report.odt`), each to the same
+ * relative location in the target; sibling files are left untouched.
+ * Omitted or empty restores the whole snapshot. Lands on the CRD's
+ * `spec.selection.paths`, validated there (relative, normalized, no `..`).
+ */
+paths?: Array<string> | null, };

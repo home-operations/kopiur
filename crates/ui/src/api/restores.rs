@@ -97,6 +97,12 @@ pub fn view_detail(r: &Restore) -> RestoreDetail {
                     .map(kopiur_api::identity::identity_string),
             }
         }),
+        selected_paths: r
+            .spec
+            .selection
+            .as_ref()
+            .map(|s| s.paths.clone())
+            .unwrap_or_default(),
         target: status
             .and_then(|s| s.target.as_ref())
             .map(|t| RestoreTargetView {

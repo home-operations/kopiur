@@ -13072,6 +13072,32 @@ spec:
                 required:
                 - name
                 type: object
+              selection:
+                description: |-
+                  Restore only some paths out of the snapshot instead of its whole root —
+                  a partial restore (e.g. bring back one deleted file into a live, shared
+                  PVC). Absent restores everything. Not allowed with `target.streamExec`,
+                  which already selects exactly one file.
+                nullable: true
+                properties:
+                  paths:
+                    description: |-
+                      Snapshot-root-relative paths to restore (files or directories), e.g.
+                      `docs/report.odt` or `music/album`. Relative, `/`-separated, normalized:
+                      no leading `/`, no `.` or `..` segments, no empty segments (`a//b`), no
+                      trailing `/`. At most 64 paths and 16 KiB in total, no duplicates, and no
+                      path inside another selected path (selecting `docs` already restores
+                      `docs/report.odt`).
+                    items:
+                      maxLength: 4096
+                      minLength: 1
+                      type: string
+                    maxItems: 64
+                    minItems: 1
+                    type: array
+                required:
+                - paths
+                type: object
               source:
                 description: Where to read data from (snapshotRef, fromPolicy, or identity).
                 oneOf:

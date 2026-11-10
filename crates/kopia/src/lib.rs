@@ -15,8 +15,9 @@ pub use client::{
     CacheTuning, ConnectOptions, ConnectSpec, CreateOptions, DEFAULT_STDIN_FINALIZE_TIMEOUT,
     KopiaClient, KopiaClientBuilder, MaintenanceMode, MigratePolicies, MigrateSources, PolicyArgs,
     PolicyInt, RestoreOptions, STDIN_FINALIZE_GRACE, ServerAuthMode, ServerStartSpec,
-    SnapshotCreateOptions, SnapshotMigrateOptions, StdinOutcome, StdinSnapshot, StdinWriter,
-    SyncToOptions, ThrottleArgs, VerifyOptions, split_policy_scopes,
+    SnapshotCreateOptions, SnapshotMigrateOptions, SnapshotPathKind, StdinOutcome, StdinSnapshot,
+    StdinWriter, SyncToOptions, ThrottleArgs, VerifyOptions, restore_path_target,
+    split_policy_scopes,
 };
 pub use error::{
     KopiaError, KopiaErrorClass, notfound_is_uninitialized, snapshot_skipped_unchanged,

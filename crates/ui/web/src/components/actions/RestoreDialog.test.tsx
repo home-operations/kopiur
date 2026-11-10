@@ -62,6 +62,28 @@ describe("RestoreDialog", () => {
     expect(sentBody(RESTORE)).toEqual(expected);
   });
 
+  it("sends only the selected paths for a partial, in-place restore", async () => {
+    mockApi({ [RESTORE]: jsonResponse(receipt) });
+    renderWithClient(<RestoreDialog namespace="media" />);
+    const user = await open();
+    await user.type(screen.getByLabelText("Snapshot name"), "nightly-1");
+    await user.type(screen.getByLabelText("Claim name"), "data");
+    await user.type(
+      screen.getByLabelText(/Only these paths/),
+      "docs/report.odt{Enter}{Enter}  music/album  {Enter}",
+    );
+    await user.click(screen.getByRole("radio", { name: /Overwrite them/ }));
+    await user.click(screen.getByRole("button", { name: "Create the restore" }));
+    const expected: RestoreBody = {
+      namespace: "media",
+      source: { snapshotRef: { name: "nightly-1" } },
+      target: { pvcRef: { name: "data" } },
+      overwrite: true,
+      paths: ["docs/report.odt", "music/album"],
+    };
+    expect(sentBody(RESTORE)).toEqual(expected);
+  });
+
   it("builds a fromPolicy source into a claim it creates, with the step-back and the instant", async () => {
     mockApi({ [RESTORE]: jsonResponse(receipt) });
     renderWithClient(<RestoreDialog namespace="media" />);
