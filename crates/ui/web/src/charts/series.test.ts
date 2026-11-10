@@ -81,6 +81,58 @@ describe("sizeSeries", () => {
   });
 });
 
+describe("sizeSeries over a multi-source policy (#689)", () => {
+  // 8 PVCs, 3 runs: one Snapshot per PVC per run, as a pvcSelector policy mints.
+  const pvcs = ["a", "b", "c", "d", "e", "f", "g", "h"];
+  const days = ["2026-09-07", "2026-09-08", "2026-09-09"];
+  const rows = days.flatMap((day, run) =>
+    pvcs.map((pvc, i) =>
+      row({
+        name: `samba-${day}-${pvc}`,
+        policy: "samba",
+        identity: `samba@samba:/pvc/${pvc}`,
+        endTime: `${day}T06:0${String(i)}:00Z`,
+        sizeBytes: (i + 1) * 1_000_000_000 + run,
+      }),
+    ),
+  );
+
+  it("is one series per source, never one line through every PVC", () => {
+    const series = sizeSeries(rows);
+    expect(series).toHaveLength(8);
+    for (const s of series) {
+      expect(s.policy).toBe("samba");
+      expect(s.sourcesInPolicy).toBe(8);
+      expect(s.points).toHaveLength(3);
+      // Every point of a series is the same volume, so the line is monotone
+      // here (each PVC grows by a byte per run) — no saw-tooth.
+      const bytes = s.points.map((p) => p.bytes);
+      expect([...bytes].sort((x, y) => x - y)).toEqual(bytes);
+      expect(new Set(s.points.map((p) => p.name.slice(-1))).size).toBe(1);
+    }
+    expect(series.map((s) => s.source)).toEqual(pvcs.map((p) => `samba@samba:/pvc/${p}`));
+  });
+
+  it("keeps a single-source policy as one series with sourcesInPolicy 1", () => {
+    const series = sizeSeries([
+      row({ name: "x" }),
+      row({ name: "y", endTime: "2026-09-10T00:00:00Z" }),
+    ]);
+    expect(series).toHaveLength(1);
+    expect(series[0]?.sourcesInPolicy).toBe(1);
+    expect(series[0]?.source).toBe("kopiur@media:/data");
+  });
+
+  it("falls back to one series per policy when rows carry no identity", () => {
+    const series = sizeSeries([
+      row({ name: "x", identity: null }),
+      row({ name: "y", identity: null }),
+    ]);
+    expect(series).toHaveLength(1);
+    expect(series[0]?.source).toBeNull();
+  });
+});
+
 describe("plotArea", () => {
   const older: SizePoint = {
     name: "a",

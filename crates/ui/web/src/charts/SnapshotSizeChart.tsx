@@ -5,7 +5,7 @@ import { NotReported } from "../components/NotReported";
 import { formatTimestamp, humanBytes } from "../util/format";
 import {
   CHART,
-  type PolicySeries,
+  type SizeSeries,
   type SizePoint,
   areaPath,
   linePath,
@@ -14,7 +14,14 @@ import {
 } from "./series";
 
 /**
- * Snapshot size over time, one small multiple per `SnapshotPolicy`.
+ * Snapshot size over time, one small multiple per (`SnapshotPolicy`, source).
+ *
+ * **What is plotted** is each snapshot's LOGICAL size (`status.stats.sizeBytes`
+ * — the size of the tree kopia captured, before deduplication), one line per
+ * SOURCE. A policy that backs up several PVCs mints one `Snapshot` per PVC per
+ * run, and those are different volumes: drawing them as one line made a
+ * saw-tooth between unrelated sizes (#689). Each source (kopia identity) is
+ * its own series, and the caption says which one and how many the policy has.
  *
  * Five decisions, in the order the dataviz procedure asks them.
  *
@@ -55,17 +62,18 @@ import {
  */
 export interface SnapshotSizeChartProps {
   rows: readonly SnapshotRow[];
-  /** How many policies to draw before naming the rest instead. */
-  maxPolicies?: number | undefined;
+  /** How many (policy, source) series to draw before naming the rest instead. */
+  maxSeries?: number | undefined;
   /**
-   * The snapshot this chart is about (a drawer's own): its point is the one
-   * the readout shows until the pointer moves, instead of the newest.
+   * The snapshot this chart is about (a drawer's own): its SOURCE's series is
+   * drawn first, and its point is the one the readout shows until the pointer
+   * moves, instead of the newest.
    */
   focus?: { namespace: string; name: string } | undefined;
 }
 
-export function SnapshotSizeChart({ rows, maxPolicies = 4, focus }: SnapshotSizeChartProps) {
-  const series = sizeSeries(rows);
+export function SnapshotSizeChart({ rows, maxSeries = 4, focus }: SnapshotSizeChartProps) {
+  const series = focusFirst(sizeSeries(rows), focus);
   if (series.length === 0) {
     return (
       <p className="page__section-note">
@@ -73,18 +81,22 @@ export function SnapshotSizeChart({ rows, maxPolicies = 4, focus }: SnapshotSize
       </p>
     );
   }
-  const drawn = series.slice(0, maxPolicies);
+  const drawn = series.slice(0, maxSeries);
   const hidden = series.length - drawn.length;
 
   return (
     <div className="charts">
       {drawn.map((policySeries) => (
-        <PolicyChart key={policySeries.policy} series={policySeries} focus={focus} />
+        <PolicyChart
+          key={`${policySeries.policy}/${policySeries.source ?? ""}`}
+          series={policySeries}
+          focus={focus}
+        />
       ))}
       {hidden > 0 ? (
         <p className="page__section-note">
-          {hidden} more {hidden === 1 ? "policy is" : "policies are"} in this list and not drawn —
-          filter by policy to chart one of them.
+          {hidden} more {hidden === 1 ? "series is" : "series are"} in this list and not drawn —
+          each source a policy backs up is charted on its own.
         </p>
       ) : null}
       <p className="page__section-note">
@@ -96,8 +108,53 @@ export function SnapshotSizeChart({ rows, maxPolicies = 4, focus }: SnapshotSize
   );
 }
 
+/**
+ * The series the focused snapshot belongs to, moved to the front so a drawer
+ * capped at one chart draws the snapshot's OWN source — never a sibling PVC's.
+ * Every other series keeps its order.
+ */
+function focusFirst(series: SizeSeries[], focus: SnapshotSizeChartProps["focus"]): SizeSeries[] {
+  if (focus === undefined) return series;
+  const index = series.findIndex((s) =>
+    s.points.some((p) => p.name === focus.name && p.namespace === focus.namespace),
+  );
+  if (index <= 0) return series;
+  const own = series[index];
+  if (own === undefined) return series;
+  return [own, ...series.slice(0, index), ...series.slice(index + 1)];
+}
+
+/** The chart's title: the quantity, then whose it is. */
+function ChartTitle({ series }: { series: SizeSeries }) {
+  return (
+    <span className="chart__title">
+      Logical size per snapshot · <span className="mono">{series.policy}</span>
+      {series.source !== null ? (
+        <>
+          {" "}
+          · <span className="mono">{series.source}</span>
+        </>
+      ) : null}
+    </span>
+  );
+}
+
+/**
+ * Says this line is ONE of several sources, so nobody reads one PVC's size as
+ * the policy's total.
+ */
+function SourcesNote({ series }: { series: SizeSeries }) {
+  if (series.sourcesInPolicy <= 1) return null;
+  return (
+    <p className="page__section-note">
+      One of {series.sourcesInPolicy} sources this policy backs up. Each source is charted on its
+      own: their sizes are different volumes, not one series.
+    </p>
+  );
+}
+
 interface PolicyChartProps {
-  series: PolicySeries;
+  series: SizeSeries;
   focus?: SnapshotSizeChartProps["focus"];
 }
 
@@ -127,9 +184,7 @@ function PolicyChart({ series, focus }: PolicyChartProps) {
   return (
     <figure className="chart">
       <figcaption className="chart__caption">
-        <span className="chart__title">
-          Snapshot size · <span className="mono">{series.policy}</span>
-        </span>
+        <ChartTitle series={series} />
         <span className="chart__readout" role="status">
           {shown !== undefined ? (
             <>
@@ -203,6 +258,7 @@ function PolicyChart({ series, focus }: PolicyChartProps) {
         </svg>
       </div>
 
+      <SourcesNote series={series} />
       <details className="chart__data">
         <summary>{tableSummary(series)}</summary>
         <SizeTable series={series} />
@@ -224,11 +280,9 @@ function PolicyTile({ series }: PolicyChartProps) {
     return null;
   }
   return (
-    <figure className="chart" aria-label={`Snapshot size for ${series.policy}`}>
+    <figure className="chart" aria-label={`Logical snapshot size for ${seriesName(series)}`}>
       <figcaption className="chart__caption">
-        <span className="chart__title">
-          Snapshot size · <span className="mono">{series.policy}</span>
-        </span>
+        <ChartTitle series={series} />
       </figcaption>
       <p className="chart__figure">
         <span className="chart__figure-value">{humanBytes(point.bytes)}</span>{" "}
@@ -237,16 +291,22 @@ function PolicyTile({ series }: PolicyChartProps) {
         </span>
       </p>
       <p className="page__section-note">
-        Only one run recorded a size under this policy; a second successful run makes this a chart.
+        Only one run recorded a size for this source; a second successful run makes this a chart.
         {series.excluded > 0 ? ` ${excludedText(series.excluded)}` : ""}
       </p>
+      <SourcesNote series={series} />
       <SizeTable series={series} />
     </figure>
   );
 }
 
+/** The series' name for an accessible label: policy, and source when known. */
+function seriesName(series: SizeSeries): string {
+  return series.source !== null ? `${series.policy} (${series.source})` : series.policy;
+}
+
 /** The disclosure's own line: how many points, and what was left out. */
-function tableSummary(series: PolicySeries): string {
+function tableSummary(series: SizeSeries): string {
   const { length } = series.points;
   const head = `${String(length)} ${length === 1 ? "measurement" : "measurements"} as a table`;
   return series.excluded > 0 ? `${head} · ${excludedText(series.excluded)}` : head;
@@ -261,13 +321,13 @@ function excludedText(excluded: number): string {
 function SizeTable({ series }: PolicyChartProps) {
   return (
     <div className="ledger-scroll">
-      <table className="ledger" aria-label={`Snapshot sizes for ${series.policy}`}>
+      <table className="ledger" aria-label={`Logical snapshot sizes for ${seriesName(series)}`}>
         <thead>
           <tr>
             <th scope="col">Snapshot</th>
             <th scope="col">Backed up</th>
             <th scope="col" className="num">
-              Size
+              Logical size
             </th>
           </tr>
         </thead>

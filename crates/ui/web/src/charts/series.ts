@@ -33,13 +33,34 @@ export interface SizePoint {
   bytes: number;
 }
 
-/** One policy's plottable history. */
-export interface PolicySeries {
+/**
+ * One SOURCE's plottable history under one policy.
+ *
+ * The unit of a series is the (policy, source) pair, never the policy alone
+ * (#689): a policy that backs up eight PVCs mints eight `Snapshot`s per run,
+ * one per PVC, and joining all of them into one line drew a saw-tooth that
+ * jumped between unrelated volumes' sizes — a 90 GiB share, then a 2 MiB one,
+ * then the 90 GiB share again — which reads as a backup collapsing and
+ * recovering on every run. A source is the snapshot's kopia identity
+ * (`user@host:/path`), which is stable for one PVC across runs.
+ */
+export interface SizeSeries {
   policy: string;
+  /**
+   * The kopia identity every point in this series was written under, or
+   * `null` when the rows carry none (they are then one series per policy,
+   * which is the best the data allows).
+   */
+  source: string | null;
   /** Oldest first — a time axis reads left to right. */
   points: SizePoint[];
-  /** Rows in this policy with no size or no usable instant. */
+  /** Rows in this series with no size or no usable instant. */
   excluded: number;
+  /**
+   * How many plottable sources the same policy has — `1` for the common
+   * single-source policy; more says this series is one volume of several.
+   */
+  sourcesInPolicy: number;
 }
 
 /**
@@ -62,24 +83,30 @@ function instantOf(row: SnapshotRow): { at: string; ms: number } | null {
   return null;
 }
 
+function nonEmpty(value: string | null | undefined): string | null {
+  return value !== null && value !== undefined && value.length > 0 ? value : null;
+}
+
 /**
- * The rows grouped into one series per policy, each oldest first.
+ * The rows grouped into one series per (policy, source), each oldest first.
  *
- * A policy whose rows are all unplottable is dropped entirely rather than
- * drawn as an empty frame; a policy with some plottable rows keeps its
- * `excluded` count so the chart can say what is missing.
+ * A series whose rows are all unplottable is dropped entirely rather than
+ * drawn as an empty frame; a series with some plottable rows keeps its
+ * `excluded` count so the chart can say what is missing. Ordered by policy,
+ * then source, so a poll that returns the same rows never reorders the charts.
  */
-export function sizeSeries(rows: readonly SnapshotRow[]): PolicySeries[] {
-  const groups = new Map<string, PolicySeries>();
+export function sizeSeries(rows: readonly SnapshotRow[]): SizeSeries[] {
+  const groups = new Map<string, SizeSeries>();
   for (const row of rows) {
-    const policy =
-      row.policy !== null && row.policy !== undefined && row.policy.length > 0
-        ? row.policy
-        : NO_POLICY;
-    let group = groups.get(policy);
+    const policy = nonEmpty(row.policy) ?? NO_POLICY;
+    const source = nonEmpty(row.identity);
+    // NUL cannot occur in a policy name or a kopia identity, so the key is
+    // unambiguous.
+    const key = `${policy}\u0000${source ?? ""}`;
+    let group = groups.get(key);
     if (group === undefined) {
-      group = { policy, points: [], excluded: 0 };
-      groups.set(policy, group);
+      group = { policy, source, points: [], excluded: 0, sourcesInPolicy: 1 };
+      groups.set(key, group);
     }
     const instant = instantOf(row);
     const { sizeBytes } = row;
@@ -95,13 +122,20 @@ export function sizeSeries(rows: readonly SnapshotRow[]): PolicySeries[] {
       bytes: sizeBytes,
     });
   }
-  return [...groups.values()]
-    .filter((group) => group.points.length > 0)
+  const plotted = [...groups.values()].filter((group) => group.points.length > 0);
+  const perPolicy = new Map<string, number>();
+  for (const group of plotted) {
+    perPolicy.set(group.policy, (perPolicy.get(group.policy) ?? 0) + 1);
+  }
+  return plotted
     .map((group) => ({
       ...group,
+      sourcesInPolicy: perPolicy.get(group.policy) ?? 1,
       points: [...group.points].sort((a, b) => a.ms - b.ms || a.name.localeCompare(b.name)),
     }))
-    .sort((a, b) => a.policy.localeCompare(b.policy));
+    .sort(
+      (a, b) => a.policy.localeCompare(b.policy) || (a.source ?? "").localeCompare(b.source ?? ""),
+    );
 }
 
 /** The chart's drawing box, in the SVG's own user units. */

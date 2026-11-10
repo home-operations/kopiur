@@ -134,7 +134,7 @@ function SizeHistory({ detail }: { detail: SnapshotDetailData }) {
       </p>
       <SnapshotSizeChart
         rows={history.data.items}
-        maxPolicies={1}
+        maxSeries={1}
         focus={{ namespace: row.namespace, name: row.name }}
       />
     </>
