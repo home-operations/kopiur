@@ -11,22 +11,68 @@ pub enum CacheVolumeMode {
     Persistent,
 }
 
+/// One kopia cache budget (#613): a share of the cache volume's `capacity`, or an
+/// absolute size. Exactly one of the two — `{ percent: 60 }` or `{ size: 1Gi }`.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub enum CacheSize {
+    /// Percent of the cache volume's `capacity` (1–100). Needs a `capacity`, set on
+    /// this layer or inherited from `moverDefaults.cache`. Rounded down to whole MiB.
+    Percent(u32),
+    /// An absolute size as a Kubernetes quantity (e.g. `1Gi`, `500Mi`). Rounded down
+    /// to whole MiB; must be at least `1Mi` and, when a `capacity` is known, fit in it.
+    Size(String),
+}
+
+impl CacheSize {
+    /// `percent` / `size`, for messages.
+    pub fn kind_str(&self) -> &'static str {
+        match self {
+            Self::Percent(_) => "percent",
+            Self::Size(_) => "size",
+        }
+    }
+}
+
 /// kopia cache defaults inherited by every mover unless overridden per-recipe.
+///
+/// Each kopia cache budget can be written two ways: `contentCacheSize` /
+/// `metadataCacheSize` (a percent of `capacity`, or a size) or the original
+/// `contentCacheSizeMb` / `metadataCacheSizeMb` (MiB). Set at most one spelling per
+/// budget. When a `capacity` is known and a budget is unset, it defaults to a
+/// percentage of the capacity (content 60%, metadata 15%), so kopia's cache cannot
+/// outgrow the volume (#613).
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct CacheDefaults {
-    /// Size of the PVC backing the mover's kopia cache (e.g. `10Gi`).
+    /// Size of the volume backing the mover's kopia cache (e.g. `10Gi`). When set,
+    /// unset cache budgets default to a percentage of it (content 60%, metadata
+    /// 15%) and the two budgets together may claim at most 90% of it. Raising it on
+    /// a `Persistent` cache grows the existing PVC when its StorageClass allows
+    /// volume expansion; a smaller value is never applied to an existing PVC.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capacity: Option<String>,
     /// StorageClass for the cache PVC; absent uses the cluster default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_class_name: Option<String>,
-    /// kopia metadata cache budget in MiB (`--metadata-cache-size-mb`).
+    /// kopia metadata cache budget in MiB (`--metadata-cache-size-mb`). The original
+    /// spelling of `metadataCacheSize`; set one or the other, not both.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata_cache_size_mb: Option<i64>,
-    /// kopia content cache budget in MiB (`--content-cache-size-mb`).
+    /// kopia content cache budget in MiB (`--content-cache-size-mb`). The original
+    /// spelling of `contentCacheSize`; set one or the other, not both.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content_cache_size_mb: Option<i64>,
+    /// kopia content cache budget (`--content-cache-size-mb`): `{ percent: N }` of
+    /// `capacity`, or `{ size: <quantity> }`. Absent with a known `capacity`, it
+    /// defaults to 60% of it. Mutually exclusive with `contentCacheSizeMb`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_cache_size: Option<CacheSize>,
+    /// kopia metadata cache budget (`--metadata-cache-size-mb`): `{ percent: N }` of
+    /// `capacity`, or `{ size: <quantity> }`. Absent with a known `capacity`, it
+    /// defaults to 15% of it. Mutually exclusive with `metadataCacheSizeMb`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata_cache_size: Option<CacheSize>,
     /// How the cache volume is provisioned (`Ephemeral` default, or `Persistent`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<CacheVolumeMode>,
@@ -37,6 +83,11 @@ impl CacheDefaults {
     /// otherwise `base`'s is kept. Resolves a mover's effective cache config from the
     /// repository's `cacheDefaults` (base) and the run's `mover.cache` (override).
     /// Returns `None` only when both are absent.
+    ///
+    /// Each budget's two spellings (`contentCacheSize` / `contentCacheSizeMb`, and the
+    /// metadata pair) merge as ONE field: an override that sets either spelling
+    /// replaces the base's budget entirely, so a recipe's `{ percent: 50 }` is never
+    /// combined with an inherited `contentCacheSizeMb` (which would be a conflict).
     pub fn merge(
         base: Option<&CacheDefaults>,
         over: Option<&CacheDefaults>,
@@ -45,17 +96,41 @@ impl CacheDefaults {
             (None, None) => None,
             (Some(b), None) => Some(b.clone()),
             (None, Some(o)) => Some(o.clone()),
-            (Some(b), Some(o)) => Some(CacheDefaults {
-                capacity: o.capacity.clone().or_else(|| b.capacity.clone()),
-                storage_class_name: o
-                    .storage_class_name
-                    .clone()
-                    .or_else(|| b.storage_class_name.clone()),
-                metadata_cache_size_mb: o.metadata_cache_size_mb.or(b.metadata_cache_size_mb),
-                content_cache_size_mb: o.content_cache_size_mb.or(b.content_cache_size_mb),
-                mode: o.mode.or(b.mode),
-            }),
+            (Some(b), Some(o)) => {
+                let content_src = if o.content_budget_set() { o } else { b };
+                let metadata_src = if o.metadata_budget_set() { o } else { b };
+                let (content_cache_size, content_cache_size_mb) = (
+                    content_src.content_cache_size.clone(),
+                    content_src.content_cache_size_mb,
+                );
+                let (metadata_cache_size, metadata_cache_size_mb) = (
+                    metadata_src.metadata_cache_size.clone(),
+                    metadata_src.metadata_cache_size_mb,
+                );
+                Some(CacheDefaults {
+                    capacity: o.capacity.clone().or_else(|| b.capacity.clone()),
+                    storage_class_name: o
+                        .storage_class_name
+                        .clone()
+                        .or_else(|| b.storage_class_name.clone()),
+                    metadata_cache_size_mb,
+                    content_cache_size_mb,
+                    content_cache_size,
+                    metadata_cache_size,
+                    mode: o.mode.or(b.mode),
+                })
+            }
         }
+    }
+
+    /// Whether this layer sets the content budget (either spelling).
+    pub fn content_budget_set(&self) -> bool {
+        self.content_cache_size.is_some() || self.content_cache_size_mb.is_some()
+    }
+
+    /// Whether this layer sets the metadata budget (either spelling).
+    pub fn metadata_budget_set(&self) -> bool {
+        self.metadata_cache_size.is_some() || self.metadata_cache_size_mb.is_some()
     }
 
     /// The provisioning mode, defaulting to `Ephemeral` when unset.

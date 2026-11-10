@@ -73,7 +73,9 @@ spec:
     podSecurityContext:
       fsGroup: 1000 # make freshly-provisioned restore volumes group-writable
       fsGroupChangePolicy: OnRootMismatch
-    # Sized kopia cache shared by every mover (former cacheDefaults).
+    # Sized kopia cache shared by every mover (former cacheDefaults). With no
+    # budgets set, kopia gets 60% of `capacity` for its content cache and 15% for
+    # its metadata cache, so the cache can never fill this volume.
     cache:
       capacity: 10Gi
       storageClassName: fast-ssd
@@ -168,9 +170,12 @@ spec:
         memory: 4Gi
     # Per-run kopia cache budgets (see the note above). A `capacity`/
     # `storageClassName` here would also size THIS Job's cache volume, since this
-    # policy's cache is Ephemeral.
+    # policy's cache is Ephemeral. 80% of the inherited 10Gi instead of the
+    # default 60%; the metadata budget then shrinks to the 10% that is left under
+    # the 90% ceiling.
     cache:
-      contentCacheSizeMb: 20000
+      contentCacheSize:
+        percent: 80
     # Keep this Job around longer than the 1h default so you can read its logs.
     ttlSecondsAfterFinished: 21600
 # endregion snapshot-mover

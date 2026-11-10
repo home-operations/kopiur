@@ -5,7 +5,9 @@
 //! cache identically (ADR §3.1).
 
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
-use kopiur_api::common::{CacheDefaults, CacheVolumeMode, ScratchDefaults};
+use kopiur_api::common::{
+    CacheDefaults, CacheVolumeMode, LegacyBudgets, ResolvedCache, ScratchDefaults,
+};
 use kopiur_api::snapshot_policy::DeepVerification;
 use kopiur_kopia::CacheTuning;
 
@@ -52,15 +54,181 @@ pub fn effective_scratch(
     )
 }
 
-/// The kopia connect-time cache budgets (`--content/metadata-cache-size-mb`) from an
-/// effective cache config. Empty (kopia defaults) when unset.
-pub fn cache_tuning(effective: Option<&CacheDefaults>) -> CacheTuning {
-    effective
-        .map(|c| CacheTuning {
-            content_cache_size_mb: c.content_cache_size_mb,
-            metadata_cache_size_mb: c.metadata_cache_size_mb,
-        })
-        .unwrap_or_default()
+/// The kopia cache budgets (`--content/metadata-cache-size-mb`) for an effective
+/// cache config, resolved against `capacity` — the size of the cache volume the
+/// mover actually mounts (`None` for an `emptyDir`; see [`ResolvedCacheVolume`]).
+///
+/// Thin wrapper over [`kopiur_api::common::resolve_cache_budgets`], the one place the
+/// math lives (#613): percent/size/MiB budgets, the capacity defaults (content 60%,
+/// metadata 15%), and the 90%-of-capacity bound. Legacy `*CacheSizeMb` values pass
+/// through unchanged so an object admitted before the bound keeps running. An
+/// unresolvable merged config (e.g. a `{ percent }` with no capacity on any layer)
+/// is a typed `Validation` error naming the field and the fix.
+pub fn cache_budgets(
+    effective: Option<&CacheDefaults>,
+    capacity: Option<&str>,
+) -> Result<ResolvedCache> {
+    let Some(c) = effective else {
+        return Ok(ResolvedCache::default());
+    };
+    kopiur_api::common::resolve_cache_budgets(
+        c,
+        capacity,
+        LegacyBudgets::PassThrough,
+        "mover.cache",
+    )
+    .map_err(|e| {
+        crate::error::Error::Validation(format!(
+            "the effective mover cache (moverDefaults.cache merged with mover.cache) cannot be \
+             resolved: {e}"
+        ))
+    })
+}
+
+/// [`cache_budgets`] projected onto the mover's connect-time [`CacheTuning`].
+pub fn cache_tuning(
+    effective: Option<&CacheDefaults>,
+    capacity: Option<&str>,
+) -> Result<CacheTuning> {
+    cache_budgets(effective, capacity).map(|r| tuning_of(&r))
+}
+
+/// The connect-time flags for resolved budgets.
+pub fn tuning_of(r: &ResolvedCache) -> CacheTuning {
+    CacheTuning {
+        content_cache_size_mb: r.content_cache_size_mb,
+        metadata_cache_size_mb: r.metadata_cache_size_mb,
+    }
+}
+
+/// The capacity cache budgets resolve against for a per-run volume decided purely
+/// from config: a sized ephemeral volume's `capacity`, nothing for an `emptyDir`.
+/// (A persistent PVC's capacity comes from [`resolve_cache_volume`], which reads
+/// the live claim.)
+pub fn configured_capacity(volume: &CacheVolume) -> Option<&str> {
+    match volume {
+        CacheVolume::Ephemeral { capacity, .. } => Some(capacity),
+        CacheVolume::EmptyDir | CacheVolume::Pvc { .. } => None,
+    }
+}
+
+/// A resolved cache volume plus the capacity kopia's budgets must fit in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedCacheVolume {
+    /// The volume the mover mounts.
+    pub volume: CacheVolume,
+    /// The capacity budgets resolve against: `None` for an `emptyDir`, the sized
+    /// ephemeral volume's `capacity`, or a persistent claim's EFFECTIVE capacity
+    /// (see [`crate::io::EnsuredCachePvc::capacity`]).
+    pub capacity: Option<String>,
+}
+
+impl ResolvedCacheVolume {
+    fn per_run(volume: CacheVolume) -> Self {
+        let capacity = configured_capacity(&volume).map(str::to_string);
+        Self { volume, capacity }
+    }
+}
+
+/// Surface what [`crate::io::ensure_cache_pvc`] did about a cache PVC's size (#613)
+/// as an Event on the claim's owner: `Normal` for a grow, `Warning` (what / why /
+/// fix) when a capacity change could not be applied. Best-effort, never fatal.
+pub async fn report_cache_pvc_resize(
+    ctx: &crate::context::Context,
+    ns: &str,
+    owner: &OwnerReference,
+    ensured: &crate::io::EnsuredCachePvc,
+) {
+    let regarding = k8s_openapi::api::core::v1::ObjectReference {
+        api_version: Some(owner.api_version.clone()),
+        kind: Some(owner.kind.clone()),
+        name: Some(owner.name.clone()),
+        uid: Some(owner.uid.clone()),
+        // A ClusterRepository is cluster-scoped; every other owner lives in `ns`.
+        namespace: (owner.kind != "ClusterRepository").then(|| ns.to_string()),
+        ..Default::default()
+    };
+    let Some(ev) = cache_pvc_resize_event(&ensured.claim_name, &ensured.resize) else {
+        return;
+    };
+    match ev.severity {
+        ResizeEventSeverity::Normal => {
+            crate::io::publish_normal_event_on_ref(ctx, &regarding, ev.reason, "Resize", &ev.note)
+                .await;
+        }
+        ResizeEventSeverity::Warning => {
+            crate::io::publish_warning_event_on_ref(ctx, &regarding, ev.reason, "Resize", &ev.note)
+                .await;
+        }
+    }
+}
+
+/// Event severity for a cache-PVC resize outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResizeEventSeverity {
+    /// The resize happened.
+    Normal,
+    /// A capacity change could not be applied.
+    Warning,
+}
+
+/// The Event a cache-PVC resize outcome produces.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResizeEvent {
+    /// `Normal` or `Warning`.
+    pub severity: ResizeEventSeverity,
+    /// Machine-readable reason.
+    pub reason: &'static str,
+    /// What happened, why, and the fix.
+    pub note: String,
+}
+
+/// The Event for a cache-PVC resize outcome; `None` when nothing changed. Pure, so
+/// the what/why/fix wording is unit-tested.
+pub fn cache_pvc_resize_event(
+    claim: &str,
+    resize: &crate::io::CachePvcResize,
+) -> Option<ResizeEvent> {
+    use crate::io::CachePvcResize;
+    // Exhaustive (no `_ =>`): a new outcome must decide whether it is surfaced.
+    match resize {
+        CachePvcResize::Unchanged => None,
+        CachePvcResize::Expanded { from, to } => Some(ResizeEvent {
+            severity: ResizeEventSeverity::Normal,
+            reason: "CachePvcExpanded",
+            note: format!(
+                "Grew kopia cache PVC `{claim}` from {from} to {to} to match mover.cache.capacity. \
+                 The volume resizes in the background; cache budgets use the smaller size until \
+                 it has."
+            ),
+        }),
+        CachePvcResize::ExpansionNotAllowed {
+            current,
+            requested,
+            reason,
+        } => Some(ResizeEvent {
+            severity: ResizeEventSeverity::Warning,
+            reason: "CachePvcExpansionNotAllowed",
+            note: format!(
+                "kopia cache PVC `{claim}` is {current} but mover.cache.capacity asks for \
+                 {requested}; it was not grown because {reason}. Backups continue with cache \
+                 budgets sized to {current}. Fix: use a StorageClass with \
+                 `allowVolumeExpansion: true`, or delete the PVC so the next run recreates it at \
+                 {requested} (the cache is rebuilt; no backup data is lost)."
+            ),
+        }),
+        CachePvcResize::ShrinkRefused { current, requested } => Some(ResizeEvent {
+            severity: ResizeEventSeverity::Warning,
+            reason: "CachePvcShrinkRefused",
+            note: format!(
+                "mover.cache.capacity {requested} is smaller than kopia cache PVC `{claim}` \
+                 ({current}), and Kubernetes cannot shrink a PVC, so it keeps {current}. Cache \
+                 budgets follow the smaller {requested}. Fix: delete the PVC so the next run \
+                 recreates it at {requested} (the cache is rebuilt; no backup data is lost), or \
+                 set capacity back to {current}."
+            ),
+        }),
+    }
 }
 
 /// Resolve how the mover's kopia cache **volume** is provisioned from an effective
@@ -73,37 +241,46 @@ pub fn cache_tuning(effective: Option<&CacheDefaults>) -> CacheTuning {
 ///
 /// `cache_owner` owns a persistent cache PVC (e.g. the `SnapshotPolicy` for backups, so
 /// the warm cache survives individual `Snapshot` CRs); `claim_name` is its stable name.
+///
+/// An existing persistent PVC is grown (never shrunk) toward `capacity`, and any
+/// resize outcome is reported on `cache_owner` ([`report_cache_pvc_resize`]).
 pub async fn resolve_cache_volume(
-    client: &kube::Client,
+    ctx: &crate::context::Context,
     ns: &str,
     cache_owner: OwnerReference,
     claim_name: &str,
     effective: Option<&CacheDefaults>,
-) -> Result<CacheVolume> {
+) -> Result<ResolvedCacheVolume> {
     let Some(c) = effective else {
-        return Ok(CacheVolume::EmptyDir);
+        return Ok(ResolvedCacheVolume::per_run(CacheVolume::EmptyDir));
     };
     // A sized volume needs a capacity; without one, fall back to an emptyDir.
     let Some(capacity) = c.capacity.clone() else {
-        return Ok(CacheVolume::EmptyDir);
+        return Ok(ResolvedCacheVolume::per_run(CacheVolume::EmptyDir));
     };
     match c.effective_mode() {
         CacheVolumeMode::Persistent => {
-            let claim = crate::io::ensure_cache_pvc(
-                client,
+            let ensured = crate::io::ensure_cache_pvc(
+                &ctx.client,
                 ns,
                 claim_name,
-                cache_owner,
+                cache_owner.clone(),
                 &capacity,
                 c.storage_class_name.as_deref(),
             )
             .await?;
-            Ok(CacheVolume::Pvc { claim_name: claim })
+            report_cache_pvc_resize(ctx, ns, &cache_owner, &ensured).await;
+            Ok(ResolvedCacheVolume {
+                volume: CacheVolume::Pvc {
+                    claim_name: ensured.claim_name,
+                },
+                capacity: Some(ensured.capacity),
+            })
         }
-        CacheVolumeMode::Ephemeral => Ok(CacheVolume::Ephemeral {
+        CacheVolumeMode::Ephemeral => Ok(ResolvedCacheVolume::per_run(CacheVolume::Ephemeral {
             capacity,
             storage_class: c.storage_class_name.clone(),
-        }),
+        })),
     }
 }
 
@@ -222,28 +399,34 @@ pub fn snapdel_cache_plan(
 /// left in place if the repository later stops using `mode: Persistent`, and is
 /// garbage-collected with the repository.
 pub async fn resolve_snapdel_cache_volume(
-    client: &kube::Client,
+    ctx: &crate::context::Context,
     ns: &str,
     owner: OwnerReference,
     plan: &SnapdelCachePlan,
-) -> Result<CacheVolume> {
+) -> Result<ResolvedCacheVolume> {
     match plan {
-        SnapdelCachePlan::Volume(v) => Ok(v.clone()),
+        SnapdelCachePlan::Volume(v) => Ok(ResolvedCacheVolume::per_run(v.clone())),
         SnapdelCachePlan::Persistent {
             claim_name,
             capacity,
             storage_class,
         } => {
-            let claim = crate::io::ensure_cache_pvc(
-                client,
+            let ensured = crate::io::ensure_cache_pvc(
+                &ctx.client,
                 ns,
                 claim_name,
-                owner,
+                owner.clone(),
                 capacity,
                 storage_class.as_deref(),
             )
             .await?;
-            Ok(CacheVolume::Pvc { claim_name: claim })
+            report_cache_pvc_resize(ctx, ns, &owner, &ensured).await;
+            Ok(ResolvedCacheVolume {
+                volume: CacheVolume::Pvc {
+                    claim_name: ensured.claim_name,
+                },
+                capacity: Some(ensured.capacity),
+            })
         }
     }
 }
@@ -296,7 +479,7 @@ mod tests {
         }));
         // No mover override → repo defaults flow through as the connect budgets.
         let eff = effective_cache(&repo, None);
-        let tuning = cache_tuning(eff.as_ref());
+        let tuning = cache_tuning(eff.as_ref(), None).unwrap();
         assert_eq!(tuning.metadata_cache_size_mb, Some(1024));
         assert_eq!(tuning.content_cache_size_mb, Some(4096));
 
@@ -306,7 +489,7 @@ mod tests {
             ..Default::default()
         };
         let eff = effective_cache(&repo, Some(&mover));
-        let tuning = cache_tuning(eff.as_ref());
+        let tuning = cache_tuning(eff.as_ref(), None).unwrap();
         assert_eq!(tuning.content_cache_size_mb, Some(16384));
         assert_eq!(tuning.metadata_cache_size_mb, Some(1024));
     }
@@ -314,7 +497,11 @@ mod tests {
     #[test]
     fn no_cache_anywhere_is_kopia_defaults() {
         let repo = repo_with(None);
-        assert!(cache_tuning(effective_cache(&repo, None).as_ref()).is_unset());
+        assert!(
+            cache_tuning(effective_cache(&repo, None).as_ref(), None)
+                .unwrap()
+                .is_unset()
+        );
     }
 
     fn repo_with_scratch(scratch: Option<ScratchDefaults>) -> ResolvedRepository {
@@ -518,5 +705,103 @@ mod tests {
             storage_class: None,
         };
         assert_eq!(SnapdelCachePlan::Volume(v.clone()).volume(), v);
+    }
+
+    // --- #613: budgets against the mounted volume; resize Events ---------------
+
+    #[test]
+    fn cache_tuning_defaults_against_the_volume_capacity() {
+        let eff = CacheDefaults {
+            capacity: Some("10Gi".into()),
+            ..Default::default()
+        };
+        // The capacity handed in (the volume actually mounted) wins over the config's.
+        let t = cache_tuning(Some(&eff), Some("4Gi")).unwrap();
+        assert_eq!(t.content_cache_size_mb, Some(2457));
+        assert_eq!(t.metadata_cache_size_mb, Some(614));
+        // An emptyDir has no capacity: nothing to default against.
+        assert!(cache_tuning(Some(&eff), None).unwrap().is_unset());
+    }
+
+    #[test]
+    fn cache_budgets_error_is_a_validation_error_naming_the_fix() {
+        let eff = CacheDefaults {
+            content_cache_size: Some(kopiur_api::common::CacheSize::Percent(40)),
+            ..Default::default()
+        };
+        let err = cache_budgets(Some(&eff), None).unwrap_err();
+        let msg = err.to_string();
+        assert!(matches!(err, crate::error::Error::Validation(_)), "{msg}");
+        assert!(msg.contains("Fix:"), "{msg}");
+    }
+
+    #[test]
+    fn configured_capacity_only_for_sized_per_run_volumes() {
+        assert_eq!(configured_capacity(&CacheVolume::EmptyDir), None);
+        assert_eq!(
+            configured_capacity(&CacheVolume::Ephemeral {
+                capacity: "8Gi".into(),
+                storage_class: None
+            }),
+            Some("8Gi")
+        );
+        assert_eq!(
+            configured_capacity(&CacheVolume::Pvc {
+                claim_name: "c".into()
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn resize_events_say_what_why_and_fix_within_the_note_limit() {
+        use crate::io::CachePvcResize;
+        let claim = "kopiur-cache-some-very-long-policy-name-ns-abcdef";
+        assert_eq!(
+            cache_pvc_resize_event(claim, &CachePvcResize::Unchanged),
+            None
+        );
+
+        let grown = cache_pvc_resize_event(
+            claim,
+            &CachePvcResize::Expanded {
+                from: "1Gi".into(),
+                to: "2Gi".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(grown.severity, ResizeEventSeverity::Normal);
+        assert_eq!(grown.reason, "CachePvcExpanded");
+
+        let refused = cache_pvc_resize_event(
+            claim,
+            &CachePvcResize::ExpansionNotAllowed {
+                current: "1Gi".into(),
+                requested: "2Gi".into(),
+                reason: "its StorageClass `standard` does not set `allowVolumeExpansion: true`"
+                    .into(),
+            },
+        )
+        .unwrap();
+        let shrink = cache_pvc_resize_event(
+            claim,
+            &CachePvcResize::ShrinkRefused {
+                current: "4Gi".into(),
+                requested: "2Gi".into(),
+            },
+        )
+        .unwrap();
+        for (ev, reason) in [
+            (&refused, "CachePvcExpansionNotAllowed"),
+            (&shrink, "CachePvcShrinkRefused"),
+        ] {
+            assert_eq!(ev.severity, ResizeEventSeverity::Warning);
+            assert_eq!(ev.reason, reason);
+            assert!(ev.note.contains(claim), "names the PVC: {}", ev.note);
+            assert!(ev.note.contains("Fix:"), "carries the fix: {}", ev.note);
+            assert!(ev.note.len() <= 1024, "Event note limit: {}", ev.note.len());
+        }
+        assert!(refused.note.contains("allowVolumeExpansion"));
+        assert!(shrink.note.contains("cannot shrink"));
     }
 }

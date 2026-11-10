@@ -38,12 +38,35 @@ fn yaml_files(dir: &Path) -> Vec<PathBuf> {
 
 /// Deserialize the `.spec` of a kopiur.home-operations.com document into a typed spec, asserting it
 /// matches the real CRD field surface.
-fn check_spec<T: DeserializeOwned>(kind: &str, doc: &serde_json::Value, file: &str) {
+fn check_spec<T: DeserializeOwned>(kind: &str, doc: &serde_json::Value, file: &str) -> T {
     let spec = doc
         .get("spec")
         .unwrap_or_else(|| panic!("{file}: {kind} has no spec"));
     let typed: Result<T, _> = serde_json::from_value(spec.clone());
-    typed.unwrap_or_else(|e| panic!("{file}: {kind}.spec does not match CRD type: {e}"));
+    typed.unwrap_or_else(|e| panic!("{file}: {kind}.spec does not match CRD type: {e}"))
+}
+
+/// Typed AND admissible: every mover cache block in an example passes the webhook's
+/// cache rules (#613) — the shape/percent/size checks and the admission-only bound
+/// on `*CacheSizeMb`. An example teaching budgets that overflow their volume is the
+/// exact misconfiguration #613 is about.
+fn check_spec_and_cache<T: DeserializeOwned + kopiur_api::validate::CacheBlocks>(
+    kind: &str,
+    doc: &serde_json::Value,
+    file: &str,
+) {
+    let typed: T = check_spec(kind, doc, file);
+    for (field, cache) in typed.cache_blocks() {
+        if let Some(c) = cache {
+            kopiur_api::common::validate_cache_shape(c, field)
+                .unwrap_or_else(|e| panic!("{file}: {kind} {field} is not admissible: {e}"));
+        }
+    }
+    let errs = kopiur_api::validate::validate_cache_legacy_budgets_for(&typed, None);
+    assert!(
+        errs.is_empty(),
+        "{file}: {kind} cache budgets refused: {errs:?}"
+    );
 }
 
 #[test]
@@ -101,17 +124,23 @@ fn all_examples_match_crd_field_shapes() {
             }
             kopia_docs += 1;
             match kind {
-                "Repository" => check_spec::<RepositorySpec>(kind, &json, &file),
-                "ClusterRepository" => check_spec::<ClusterRepositorySpec>(kind, &json, &file),
-                "SnapshotPolicy" => check_spec::<SnapshotPolicySpec>(kind, &json, &file),
-                "Snapshot" => check_spec::<SnapshotSpec>(kind, &json, &file),
-                "SnapshotSchedule" => check_spec::<SnapshotScheduleSpec>(kind, &json, &file),
-                "Restore" => check_spec::<RestoreSpec>(kind, &json, &file),
-                "Maintenance" => check_spec::<MaintenanceSpec>(kind, &json, &file),
-                "RepositoryReplication" => {
-                    check_spec::<RepositoryReplicationSpec>(kind, &json, &file)
+                "Repository" => check_spec_and_cache::<RepositorySpec>(kind, &json, &file),
+                "ClusterRepository" => {
+                    check_spec_and_cache::<ClusterRepositorySpec>(kind, &json, &file)
                 }
-                "SnapshotReplication" => check_spec::<SnapshotReplicationSpec>(kind, &json, &file),
+                "SnapshotPolicy" => check_spec_and_cache::<SnapshotPolicySpec>(kind, &json, &file),
+                "Snapshot" => check_spec_and_cache::<SnapshotSpec>(kind, &json, &file),
+                "SnapshotSchedule" => {
+                    check_spec::<SnapshotScheduleSpec>(kind, &json, &file);
+                }
+                "Restore" => check_spec_and_cache::<RestoreSpec>(kind, &json, &file),
+                "Maintenance" => check_spec_and_cache::<MaintenanceSpec>(kind, &json, &file),
+                "RepositoryReplication" => {
+                    check_spec_and_cache::<RepositoryReplicationSpec>(kind, &json, &file)
+                }
+                "SnapshotReplication" => {
+                    check_spec_and_cache::<SnapshotReplicationSpec>(kind, &json, &file)
+                }
                 other => panic!("{file}: unexpected kopiur.home-operations.com kind {other}"),
             }
         }

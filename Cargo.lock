@@ -1796,6 +1796,7 @@ dependencies = [
  "kopiur-mover",
  "kopiur-telemetry",
  "kube",
+ "kube_quantity",
  "libc",
  "mimalloc",
  "opentelemetry",

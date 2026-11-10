@@ -239,7 +239,7 @@ jobs:
           # the populator-restore handshake (repository_lifecycle) and copyMethod
           # Snapshot/Clone (copy_methods) tests run for real instead of self-skipping.
           - shard: reshape-core
-            bins: "mover_config data_integrity repository_lifecycle tenancy copy_methods"
+            bins: "mover_config data_integrity repository_lifecycle tenancy copy_methods cache_budgets"
             backends: false
             csi: true
           # Hooks (ADR §4.8) + GFS time-bucketed retention + policy knobs. The

@@ -770,6 +770,11 @@ pub struct ResolvedSnapshot {
     /// writes it, including `enabled: false`, so absent stays distinguishable from off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential_projection: Option<CredentialProjection>,
+    /// The kopia cache budgets this run's mover was given, resolved from
+    /// `mover.cache` (percent/size/MiB and the capacity defaults) against the cache
+    /// volume it mounted (#613). Absent on a `Snapshot` that predates the pin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache: Option<crate::common::ResolvedCache>,
 }
 
 /// Lineage of an `origin: replicated` row: where the copy came from.

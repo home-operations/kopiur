@@ -817,6 +817,29 @@ pub const SEED_FAILURE_REASONS: &[&str] = &[
     SEED_MOVER_TOO_OLD_REASON,
 ];
 
+/// Default kopia **content** cache budget, as a percentage of the mover cache
+/// volume's `capacity`, applied when a `capacity` is known and no content budget
+/// is set (#613). See [`MAX_CACHE_BUDGET_PERCENT`] for why the defaults leave
+/// headroom.
+pub const DEFAULT_CONTENT_CACHE_PERCENT: u32 = 60;
+
+/// Default kopia **metadata** cache budget, as a percentage of the mover cache
+/// volume's `capacity`, applied when a `capacity` is known and no metadata budget
+/// is set (#613).
+pub const DEFAULT_METADATA_CACHE_PERCENT: u32 = 15;
+
+/// The most of a cache volume's `capacity` the content + metadata budgets may
+/// claim together (#613).
+///
+/// kopia's cache budgets are SOFT limits: kopia only evicts down to them on its
+/// periodic cache sweep, so between sweeps a busy run writes past them. kopia
+/// also keeps more than the two caches on that volume (the repository config,
+/// logs, blob-list and index caches). Budgets summing to 100% therefore fill the
+/// volume and fail the snapshot with `no space left on device` — the bug in
+/// #613. Capping the sum at 90% (and defaulting to 60% + 15% = 75%) keeps that
+/// overshoot on the volume.
+pub const MAX_CACHE_BUDGET_PERCENT: u32 = 90;
+
 #[cfg(test)]
 mod tests {
     use super::*;

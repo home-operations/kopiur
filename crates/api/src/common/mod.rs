@@ -9,11 +9,13 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 mod cache;
+mod cache_budget;
 mod mover;
 mod privileged;
 mod secctx;
 
 pub use cache::*;
+pub use cache_budget::*;
 pub use mover::*;
 pub use privileged::*;
 pub use secctx::*;

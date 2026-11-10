@@ -433,11 +433,31 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc`.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| `capacity` | string | — | Size of the PVC backing the mover's kopia cache (e.g. `10Gi`). |
-| `contentCacheSizeMb` | integer | — | kopia content cache budget in MiB (`--content-cache-size-mb`). |
-| `metadataCacheSizeMb` | integer | — | kopia metadata cache budget in MiB (`--metadata-cache-size-mb`). |
+| `capacity` | string | — | Size of the volume backing the mover's kopia cache (e.g. `10Gi`). When set, unset cache budgets default to a percentage of it (content 60%, metadata 15%) and the two budgets together may claim at most 90% of it. Raising it on a `Persistent` cache grows the existing PVC when its StorageClass allows volume expansion; a smaller value is never applied to an existing PVC. |
+| `contentCacheSize` | [union](#repository-specmaintenancemovercachecontentcachesize) | — | kopia content cache budget (`--content-cache-size-mb`): `{ percent: N }` of `capacity`, or `{ size: &lt;quantity&gt; }`. Absent with a known `capacity`, it defaults to 60% of it. Mutually exclusive with `contentCacheSizeMb`. |
+| `contentCacheSizeMb` | integer | — | kopia content cache budget in MiB (`--content-cache-size-mb`). The original spelling of `contentCacheSize`; set one or the other, not both. |
+| `metadataCacheSize` | [union](#repository-specmaintenancemovercachemetadatacachesize) | — | kopia metadata cache budget (`--metadata-cache-size-mb`): `{ percent: N }` of `capacity`, or `{ size: &lt;quantity&gt; }`. Absent with a known `capacity`, it defaults to 15% of it. Mutually exclusive with `metadataCacheSizeMb`. |
+| `metadataCacheSizeMb` | integer | — | kopia metadata cache budget in MiB (`--metadata-cache-size-mb`). The original spelling of `metadataCacheSize`; set one or the other, not both. |
 | `mode` | enum: Ephemeral \| Persistent | — | How a mover's kopia cache volume is provisioned. |
 | `storageClassName` | string | — | StorageClass for the cache PVC; absent uses the cluster default. |
+
+###### Repository `spec.maintenance.mover.cache.contentCacheSize`
+
+Externally tagged — set **exactly one** of: `percent` · `size`.
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `percent` | integer | —<br><sub>min 0</sub> | Percent of the cache volume's `capacity` (1–100). Needs a `capacity`, set on this layer or inherited from `moverDefaults.cache`. Rounded down to whole MiB. |
+| `size` | string | — | An absolute size as a Kubernetes quantity (e.g. `1Gi`, `500Mi`). Rounded down to whole MiB; must be at least `1Mi` and, when a `capacity` is known, fit in it. |
+
+###### Repository `spec.maintenance.mover.cache.metadataCacheSize`
+
+Externally tagged — set **exactly one** of: `percent` · `size`.
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `percent` | integer | —<br><sub>min 0</sub> | Percent of the cache volume's `capacity` (1–100). Needs a `capacity`, set on this layer or inherited from `moverDefaults.cache`. Rounded down to whole MiB. |
+| `size` | string | — | An absolute size as a Kubernetes quantity (e.g. `1Gi`, `500Mi`). Rounded down to whole MiB; must be at least `1Mi` and, when a `capacity` is known, fit in it. |
 
 ###### Repository `spec.maintenance.mover.inheritSecurityContextFrom`
 
@@ -508,11 +528,31 @@ Externally tagged — set **exactly one** of: `pvcConsumer` · `snapshot` · `wo
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| `capacity` | string | — | Size of the PVC backing the mover's kopia cache (e.g. `10Gi`). |
-| `contentCacheSizeMb` | integer | — | kopia content cache budget in MiB (`--content-cache-size-mb`). |
-| `metadataCacheSizeMb` | integer | — | kopia metadata cache budget in MiB (`--metadata-cache-size-mb`). |
+| `capacity` | string | — | Size of the volume backing the mover's kopia cache (e.g. `10Gi`). When set, unset cache budgets default to a percentage of it (content 60%, metadata 15%) and the two budgets together may claim at most 90% of it. Raising it on a `Persistent` cache grows the existing PVC when its StorageClass allows volume expansion; a smaller value is never applied to an existing PVC. |
+| `contentCacheSize` | [union](#repository-specmoverdefaultscachecontentcachesize) | — | kopia content cache budget (`--content-cache-size-mb`): `{ percent: N }` of `capacity`, or `{ size: &lt;quantity&gt; }`. Absent with a known `capacity`, it defaults to 60% of it. Mutually exclusive with `contentCacheSizeMb`. |
+| `contentCacheSizeMb` | integer | — | kopia content cache budget in MiB (`--content-cache-size-mb`). The original spelling of `contentCacheSize`; set one or the other, not both. |
+| `metadataCacheSize` | [union](#repository-specmoverdefaultscachemetadatacachesize) | — | kopia metadata cache budget (`--metadata-cache-size-mb`): `{ percent: N }` of `capacity`, or `{ size: &lt;quantity&gt; }`. Absent with a known `capacity`, it defaults to 15% of it. Mutually exclusive with `metadataCacheSizeMb`. |
+| `metadataCacheSizeMb` | integer | — | kopia metadata cache budget in MiB (`--metadata-cache-size-mb`). The original spelling of `metadataCacheSize`; set one or the other, not both. |
 | `mode` | enum: Ephemeral \| Persistent | — | How a mover's kopia cache volume is provisioned. |
 | `storageClassName` | string | — | StorageClass for the cache PVC; absent uses the cluster default. |
+
+###### Repository `spec.moverDefaults.cache.contentCacheSize`
+
+Externally tagged — set **exactly one** of: `percent` · `size`.
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `percent` | integer | —<br><sub>min 0</sub> | Percent of the cache volume's `capacity` (1–100). Needs a `capacity`, set on this layer or inherited from `moverDefaults.cache`. Rounded down to whole MiB. |
+| `size` | string | — | An absolute size as a Kubernetes quantity (e.g. `1Gi`, `500Mi`). Rounded down to whole MiB; must be at least `1Mi` and, when a `capacity` is known, fit in it. |
+
+###### Repository `spec.moverDefaults.cache.metadataCacheSize`
+
+Externally tagged — set **exactly one** of: `percent` · `size`.
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `percent` | integer | —<br><sub>min 0</sub> | Percent of the cache volume's `capacity` (1–100). Needs a `capacity`, set on this layer or inherited from `moverDefaults.cache`. Rounded down to whole MiB. |
+| `size` | string | — | An absolute size as a Kubernetes quantity (e.g. `1Gi`, `500Mi`). Rounded down to whole MiB; must be at least `1Mi` and, when a `capacity` is known, fit in it. |
 
 ##### Repository `spec.moverDefaults.scratch`
 
@@ -1504,11 +1544,31 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc`.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| `capacity` | string | — | Size of the PVC backing the mover's kopia cache (e.g. `10Gi`). |
-| `contentCacheSizeMb` | integer | — | kopia content cache budget in MiB (`--content-cache-size-mb`). |
-| `metadataCacheSizeMb` | integer | — | kopia metadata cache budget in MiB (`--metadata-cache-size-mb`). |
+| `capacity` | string | — | Size of the volume backing the mover's kopia cache (e.g. `10Gi`). When set, unset cache budgets default to a percentage of it (content 60%, metadata 15%) and the two budgets together may claim at most 90% of it. Raising it on a `Persistent` cache grows the existing PVC when its StorageClass allows volume expansion; a smaller value is never applied to an existing PVC. |
+| `contentCacheSize` | [union](#clusterrepository-specmaintenancemovercachecontentcachesize) | — | kopia content cache budget (`--content-cache-size-mb`): `{ percent: N }` of `capacity`, or `{ size: &lt;quantity&gt; }`. Absent with a known `capacity`, it defaults to 60% of it. Mutually exclusive with `contentCacheSizeMb`. |
+| `contentCacheSizeMb` | integer | — | kopia content cache budget in MiB (`--content-cache-size-mb`). The original spelling of `contentCacheSize`; set one or the other, not both. |
+| `metadataCacheSize` | [union](#clusterrepository-specmaintenancemovercachemetadatacachesize) | — | kopia metadata cache budget (`--metadata-cache-size-mb`): `{ percent: N }` of `capacity`, or `{ size: &lt;quantity&gt; }`. Absent with a known `capacity`, it defaults to 15% of it. Mutually exclusive with `metadataCacheSizeMb`. |
+| `metadataCacheSizeMb` | integer | — | kopia metadata cache budget in MiB (`--metadata-cache-size-mb`). The original spelling of `metadataCacheSize`; set one or the other, not both. |
 | `mode` | enum: Ephemeral \| Persistent | — | How a mover's kopia cache volume is provisioned. |
 | `storageClassName` | string | — | StorageClass for the cache PVC; absent uses the cluster default. |
+
+###### ClusterRepository `spec.maintenance.mover.cache.contentCacheSize`
+
+Externally tagged — set **exactly one** of: `percent` · `size`.
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `percent` | integer | —<br><sub>min 0</sub> | Percent of the cache volume's `capacity` (1–100). Needs a `capacity`, set on this layer or inherited from `moverDefaults.cache`. Rounded down to whole MiB. |
+| `size` | string | — | An absolute size as a Kubernetes quantity (e.g. `1Gi`, `500Mi`). Rounded down to whole MiB; must be at least `1Mi` and, when a `capacity` is known, fit in it. |
+
+###### ClusterRepository `spec.maintenance.mover.cache.metadataCacheSize`
+
+Externally tagged — set **exactly one** of: `percent` · `size`.
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `percent` | integer | —<br><sub>min 0</sub> | Percent of the cache volume's `capacity` (1–100). Needs a `capacity`, set on this layer or inherited from `moverDefaults.cache`. Rounded down to whole MiB. |
+| `size` | string | — | An absolute size as a Kubernetes quantity (e.g. `1Gi`, `500Mi`). Rounded down to whole MiB; must be at least `1Mi` and, when a `capacity` is known, fit in it. |
 
 ###### ClusterRepository `spec.maintenance.mover.inheritSecurityContextFrom`
 
@@ -1579,11 +1639,31 @@ Externally tagged — set **exactly one** of: `pvcConsumer` · `snapshot` · `wo
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| `capacity` | string | — | Size of the PVC backing the mover's kopia cache (e.g. `10Gi`). |
-| `contentCacheSizeMb` | integer | — | kopia content cache budget in MiB (`--content-cache-size-mb`). |
-| `metadataCacheSizeMb` | integer | — | kopia metadata cache budget in MiB (`--metadata-cache-size-mb`). |
+| `capacity` | string | — | Size of the volume backing the mover's kopia cache (e.g. `10Gi`). When set, unset cache budgets default to a percentage of it (content 60%, metadata 15%) and the two budgets together may claim at most 90% of it. Raising it on a `Persistent` cache grows the existing PVC when its StorageClass allows volume expansion; a smaller value is never applied to an existing PVC. |
+| `contentCacheSize` | [union](#clusterrepository-specmoverdefaultscachecontentcachesize) | — | kopia content cache budget (`--content-cache-size-mb`): `{ percent: N }` of `capacity`, or `{ size: &lt;quantity&gt; }`. Absent with a known `capacity`, it defaults to 60% of it. Mutually exclusive with `contentCacheSizeMb`. |
+| `contentCacheSizeMb` | integer | — | kopia content cache budget in MiB (`--content-cache-size-mb`). The original spelling of `contentCacheSize`; set one or the other, not both. |
+| `metadataCacheSize` | [union](#clusterrepository-specmoverdefaultscachemetadatacachesize) | — | kopia metadata cache budget (`--metadata-cache-size-mb`): `{ percent: N }` of `capacity`, or `{ size: &lt;quantity&gt; }`. Absent with a known `capacity`, it defaults to 15% of it. Mutually exclusive with `metadataCacheSizeMb`. |
+| `metadataCacheSizeMb` | integer | — | kopia metadata cache budget in MiB (`--metadata-cache-size-mb`). The original spelling of `metadataCacheSize`; set one or the other, not both. |
 | `mode` | enum: Ephemeral \| Persistent | — | How a mover's kopia cache volume is provisioned. |
 | `storageClassName` | string | — | StorageClass for the cache PVC; absent uses the cluster default. |
+
+###### ClusterRepository `spec.moverDefaults.cache.contentCacheSize`
+
+Externally tagged — set **exactly one** of: `percent` · `size`.
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `percent` | integer | —<br><sub>min 0</sub> | Percent of the cache volume's `capacity` (1–100). Needs a `capacity`, set on this layer or inherited from `moverDefaults.cache`. Rounded down to whole MiB. |
+| `size` | string | — | An absolute size as a Kubernetes quantity (e.g. `1Gi`, `500Mi`). Rounded down to whole MiB; must be at least `1Mi` and, when a `capacity` is known, fit in it. |
+
+###### ClusterRepository `spec.moverDefaults.cache.metadataCacheSize`
+
+Externally tagged — set **exactly one** of: `percent` · `size`.
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `percent` | integer | —<br><sub>min 0</sub> | Percent of the cache volume's `capacity` (1–100). Needs a `capacity`, set on this layer or inherited from `moverDefaults.cache`. Rounded down to whole MiB. |
+| `size` | string | — | An absolute size as a Kubernetes quantity (e.g. `1Gi`, `500Mi`). Rounded down to whole MiB; must be at least `1Mi` and, when a `capacity` is known, fit in it. |
 
 ##### ClusterRepository `spec.moverDefaults.scratch`
 
@@ -2341,11 +2421,31 @@ Externally tagged — set **exactly one** of: `httpRequest` · `runJob` · `work
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| `capacity` | string | — | Size of the PVC backing the mover's kopia cache (e.g. `10Gi`). |
-| `contentCacheSizeMb` | integer | — | kopia content cache budget in MiB (`--content-cache-size-mb`). |
-| `metadataCacheSizeMb` | integer | — | kopia metadata cache budget in MiB (`--metadata-cache-size-mb`). |
+| `capacity` | string | — | Size of the volume backing the mover's kopia cache (e.g. `10Gi`). When set, unset cache budgets default to a percentage of it (content 60%, metadata 15%) and the two budgets together may claim at most 90% of it. Raising it on a `Persistent` cache grows the existing PVC when its StorageClass allows volume expansion; a smaller value is never applied to an existing PVC. |
+| `contentCacheSize` | [union](#snapshotpolicy-specmovercachecontentcachesize) | — | kopia content cache budget (`--content-cache-size-mb`): `{ percent: N }` of `capacity`, or `{ size: &lt;quantity&gt; }`. Absent with a known `capacity`, it defaults to 60% of it. Mutually exclusive with `contentCacheSizeMb`. |
+| `contentCacheSizeMb` | integer | — | kopia content cache budget in MiB (`--content-cache-size-mb`). The original spelling of `contentCacheSize`; set one or the other, not both. |
+| `metadataCacheSize` | [union](#snapshotpolicy-specmovercachemetadatacachesize) | — | kopia metadata cache budget (`--metadata-cache-size-mb`): `{ percent: N }` of `capacity`, or `{ size: &lt;quantity&gt; }`. Absent with a known `capacity`, it defaults to 15% of it. Mutually exclusive with `metadataCacheSizeMb`. |
+| `metadataCacheSizeMb` | integer | — | kopia metadata cache budget in MiB (`--metadata-cache-size-mb`). The original spelling of `metadataCacheSize`; set one or the other, not both. |
 | `mode` | enum: Ephemeral \| Persistent | — | How a mover's kopia cache volume is provisioned. |
 | `storageClassName` | string | — | StorageClass for the cache PVC; absent uses the cluster default. |
+
+###### SnapshotPolicy `spec.mover.cache.contentCacheSize`
+
+Externally tagged — set **exactly one** of: `percent` · `size`.
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `percent` | integer | —<br><sub>min 0</sub> | Percent of the cache volume's `capacity` (1–100). Needs a `capacity`, set on this layer or inherited from `moverDefaults.cache`. Rounded down to whole MiB. |
+| `size` | string | — | An absolute size as a Kubernetes quantity (e.g. `1Gi`, `500Mi`). Rounded down to whole MiB; must be at least `1Mi` and, when a `capacity` is known, fit in it. |
+
+###### SnapshotPolicy `spec.mover.cache.metadataCacheSize`
+
+Externally tagged — set **exactly one** of: `percent` · `size`.
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `percent` | integer | —<br><sub>min 0</sub> | Percent of the cache volume's `capacity` (1–100). Needs a `capacity`, set on this layer or inherited from `moverDefaults.cache`. Rounded down to whole MiB. |
+| `size` | string | — | An absolute size as a Kubernetes quantity (e.g. `1Gi`, `500Mi`). Rounded down to whole MiB; must be at least `1Mi` and, when a `capacity` is known, fit in it. |
 
 ##### SnapshotPolicy `spec.mover.inheritSecurityContextFrom`
 
@@ -2682,11 +2782,31 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc` · `pvcSelector` ·
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| `capacity` | string | — | Size of the PVC backing the mover's kopia cache (e.g. `10Gi`). |
-| `contentCacheSizeMb` | integer | — | kopia content cache budget in MiB (`--content-cache-size-mb`). |
-| `metadataCacheSizeMb` | integer | — | kopia metadata cache budget in MiB (`--metadata-cache-size-mb`). |
+| `capacity` | string | — | Size of the volume backing the mover's kopia cache (e.g. `10Gi`). When set, unset cache budgets default to a percentage of it (content 60%, metadata 15%) and the two budgets together may claim at most 90% of it. Raising it on a `Persistent` cache grows the existing PVC when its StorageClass allows volume expansion; a smaller value is never applied to an existing PVC. |
+| `contentCacheSize` | [union](#snapshot-specmovercachecontentcachesize) | — | kopia content cache budget (`--content-cache-size-mb`): `{ percent: N }` of `capacity`, or `{ size: &lt;quantity&gt; }`. Absent with a known `capacity`, it defaults to 60% of it. Mutually exclusive with `contentCacheSizeMb`. |
+| `contentCacheSizeMb` | integer | — | kopia content cache budget in MiB (`--content-cache-size-mb`). The original spelling of `contentCacheSize`; set one or the other, not both. |
+| `metadataCacheSize` | [union](#snapshot-specmovercachemetadatacachesize) | — | kopia metadata cache budget (`--metadata-cache-size-mb`): `{ percent: N }` of `capacity`, or `{ size: &lt;quantity&gt; }`. Absent with a known `capacity`, it defaults to 15% of it. Mutually exclusive with `metadataCacheSizeMb`. |
+| `metadataCacheSizeMb` | integer | — | kopia metadata cache budget in MiB (`--metadata-cache-size-mb`). The original spelling of `metadataCacheSize`; set one or the other, not both. |
 | `mode` | enum: Ephemeral \| Persistent | — | How a mover's kopia cache volume is provisioned. |
 | `storageClassName` | string | — | StorageClass for the cache PVC; absent uses the cluster default. |
+
+###### Snapshot `spec.mover.cache.contentCacheSize`
+
+Externally tagged — set **exactly one** of: `percent` · `size`.
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `percent` | integer | —<br><sub>min 0</sub> | Percent of the cache volume's `capacity` (1–100). Needs a `capacity`, set on this layer or inherited from `moverDefaults.cache`. Rounded down to whole MiB. |
+| `size` | string | — | An absolute size as a Kubernetes quantity (e.g. `1Gi`, `500Mi`). Rounded down to whole MiB; must be at least `1Mi` and, when a `capacity` is known, fit in it. |
+
+###### Snapshot `spec.mover.cache.metadataCacheSize`
+
+Externally tagged — set **exactly one** of: `percent` · `size`.
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `percent` | integer | —<br><sub>min 0</sub> | Percent of the cache volume's `capacity` (1–100). Needs a `capacity`, set on this layer or inherited from `moverDefaults.cache`. Rounded down to whole MiB. |
+| `size` | string | — | An absolute size as a Kubernetes quantity (e.g. `1Gi`, `500Mi`). Rounded down to whole MiB; must be at least `1Mi` and, when a `capacity` is known, fit in it. |
 
 ##### Snapshot `spec.mover.inheritSecurityContextFrom`
 
@@ -2851,9 +2971,18 @@ Externally tagged — set **exactly one** of: `pvc`.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
+| `cache` | [object](#snapshot-statusresolvedcache) | — | The kopia cache budgets this run's mover was given, resolved from `mover.cache` (percent/size/MiB and the capacity defaults) against the cache volume it mounted (#613). Absent on a `Snapshot` that predates the pin. |
 | `credentialProjection` | [object](#snapshot-statusresolvedcredentialprojection) | — | The recipe's `spec.credentialProjection` as it stood for this run.<br>The deletion path re-projects the mover's credentials, but the opt-in lives on the `SnapshotPolicy` — which a user may delete first. Pinning it here lets the finalizer honor the opt-in that was actually in force, instead of reading an absent recipe as "projection off" and blocking on a Secret that was never meant to be namespace-local (#255). Absent only on a `Snapshot` that predates the pin or never ran; a run always writes it, including `enabled: false`, so absent stays distinguishable from off. |
 | `repository` | [object](#snapshot-statusresolvedrepository) | — | The repository this run targeted, frozen at run time. |
 | `sources` | [][object](#snapshot-statusresolvedsources) | — | The concrete PVCs + source paths backed up this run. |
+
+##### Snapshot `status.resolved.cache`
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `capacity` | string | — | The cache volume size the budgets were resolved against. Absent for an `emptyDir` cache, which has no fixed size. |
+| `contentCacheSizeMb` | integer | — | The `--content-cache-size-mb` kopia was given; absent means kopia's own default. |
+| `metadataCacheSizeMb` | integer | — | The `--metadata-cache-size-mb` kopia was given; absent means kopia's own default. |
 
 ##### Snapshot `status.resolved.credentialProjection`
 
@@ -3172,11 +3301,31 @@ Externally tagged — set **exactly one** of: `populator` · `pvc` · `pvcRef` �
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| `capacity` | string | — | Size of the PVC backing the mover's kopia cache (e.g. `10Gi`). |
-| `contentCacheSizeMb` | integer | — | kopia content cache budget in MiB (`--content-cache-size-mb`). |
-| `metadataCacheSizeMb` | integer | — | kopia metadata cache budget in MiB (`--metadata-cache-size-mb`). |
+| `capacity` | string | — | Size of the volume backing the mover's kopia cache (e.g. `10Gi`). When set, unset cache budgets default to a percentage of it (content 60%, metadata 15%) and the two budgets together may claim at most 90% of it. Raising it on a `Persistent` cache grows the existing PVC when its StorageClass allows volume expansion; a smaller value is never applied to an existing PVC. |
+| `contentCacheSize` | [union](#restore-specmovercachecontentcachesize) | — | kopia content cache budget (`--content-cache-size-mb`): `{ percent: N }` of `capacity`, or `{ size: &lt;quantity&gt; }`. Absent with a known `capacity`, it defaults to 60% of it. Mutually exclusive with `contentCacheSizeMb`. |
+| `contentCacheSizeMb` | integer | — | kopia content cache budget in MiB (`--content-cache-size-mb`). The original spelling of `contentCacheSize`; set one or the other, not both. |
+| `metadataCacheSize` | [union](#restore-specmovercachemetadatacachesize) | — | kopia metadata cache budget (`--metadata-cache-size-mb`): `{ percent: N }` of `capacity`, or `{ size: &lt;quantity&gt; }`. Absent with a known `capacity`, it defaults to 15% of it. Mutually exclusive with `metadataCacheSizeMb`. |
+| `metadataCacheSizeMb` | integer | — | kopia metadata cache budget in MiB (`--metadata-cache-size-mb`). The original spelling of `metadataCacheSize`; set one or the other, not both. |
 | `mode` | enum: Ephemeral \| Persistent | — | How a mover's kopia cache volume is provisioned. |
 | `storageClassName` | string | — | StorageClass for the cache PVC; absent uses the cluster default. |
+
+###### Restore `spec.mover.cache.contentCacheSize`
+
+Externally tagged — set **exactly one** of: `percent` · `size`.
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `percent` | integer | —<br><sub>min 0</sub> | Percent of the cache volume's `capacity` (1–100). Needs a `capacity`, set on this layer or inherited from `moverDefaults.cache`. Rounded down to whole MiB. |
+| `size` | string | — | An absolute size as a Kubernetes quantity (e.g. `1Gi`, `500Mi`). Rounded down to whole MiB; must be at least `1Mi` and, when a `capacity` is known, fit in it. |
+
+###### Restore `spec.mover.cache.metadataCacheSize`
+
+Externally tagged — set **exactly one** of: `percent` · `size`.
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `percent` | integer | —<br><sub>min 0</sub> | Percent of the cache volume's `capacity` (1–100). Needs a `capacity`, set on this layer or inherited from `moverDefaults.cache`. Rounded down to whole MiB. |
+| `size` | string | — | An absolute size as a Kubernetes quantity (e.g. `1Gi`, `500Mi`). Rounded down to whole MiB; must be at least `1Mi` and, when a `capacity` is known, fit in it. |
 
 ##### Restore `spec.mover.inheritSecurityContextFrom`
 
@@ -3422,11 +3571,31 @@ Externally tagged — set **exactly one** of: `pvcConsumer` · `snapshot` · `wo
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| `capacity` | string | — | Size of the PVC backing the mover's kopia cache (e.g. `10Gi`). |
-| `contentCacheSizeMb` | integer | — | kopia content cache budget in MiB (`--content-cache-size-mb`). |
-| `metadataCacheSizeMb` | integer | — | kopia metadata cache budget in MiB (`--metadata-cache-size-mb`). |
+| `capacity` | string | — | Size of the volume backing the mover's kopia cache (e.g. `10Gi`). When set, unset cache budgets default to a percentage of it (content 60%, metadata 15%) and the two budgets together may claim at most 90% of it. Raising it on a `Persistent` cache grows the existing PVC when its StorageClass allows volume expansion; a smaller value is never applied to an existing PVC. |
+| `contentCacheSize` | [union](#maintenance-specmovercachecontentcachesize) | — | kopia content cache budget (`--content-cache-size-mb`): `{ percent: N }` of `capacity`, or `{ size: &lt;quantity&gt; }`. Absent with a known `capacity`, it defaults to 60% of it. Mutually exclusive with `contentCacheSizeMb`. |
+| `contentCacheSizeMb` | integer | — | kopia content cache budget in MiB (`--content-cache-size-mb`). The original spelling of `contentCacheSize`; set one or the other, not both. |
+| `metadataCacheSize` | [union](#maintenance-specmovercachemetadatacachesize) | — | kopia metadata cache budget (`--metadata-cache-size-mb`): `{ percent: N }` of `capacity`, or `{ size: &lt;quantity&gt; }`. Absent with a known `capacity`, it defaults to 15% of it. Mutually exclusive with `metadataCacheSizeMb`. |
+| `metadataCacheSizeMb` | integer | — | kopia metadata cache budget in MiB (`--metadata-cache-size-mb`). The original spelling of `metadataCacheSize`; set one or the other, not both. |
 | `mode` | enum: Ephemeral \| Persistent | — | How a mover's kopia cache volume is provisioned. |
 | `storageClassName` | string | — | StorageClass for the cache PVC; absent uses the cluster default. |
+
+###### Maintenance `spec.mover.cache.contentCacheSize`
+
+Externally tagged — set **exactly one** of: `percent` · `size`.
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `percent` | integer | —<br><sub>min 0</sub> | Percent of the cache volume's `capacity` (1–100). Needs a `capacity`, set on this layer or inherited from `moverDefaults.cache`. Rounded down to whole MiB. |
+| `size` | string | — | An absolute size as a Kubernetes quantity (e.g. `1Gi`, `500Mi`). Rounded down to whole MiB; must be at least `1Mi` and, when a `capacity` is known, fit in it. |
+
+###### Maintenance `spec.mover.cache.metadataCacheSize`
+
+Externally tagged — set **exactly one** of: `percent` · `size`.
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `percent` | integer | —<br><sub>min 0</sub> | Percent of the cache volume's `capacity` (1–100). Needs a `capacity`, set on this layer or inherited from `moverDefaults.cache`. Rounded down to whole MiB. |
+| `size` | string | — | An absolute size as a Kubernetes quantity (e.g. `1Gi`, `500Mi`). Rounded down to whole MiB; must be at least `1Mi` and, when a `capacity` is known, fit in it. |
 
 ##### Maintenance `spec.mover.inheritSecurityContextFrom`
 
@@ -3807,11 +3976,31 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc`.
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| `capacity` | string | — | Size of the PVC backing the mover's kopia cache (e.g. `10Gi`). |
-| `contentCacheSizeMb` | integer | — | kopia content cache budget in MiB (`--content-cache-size-mb`). |
-| `metadataCacheSizeMb` | integer | — | kopia metadata cache budget in MiB (`--metadata-cache-size-mb`). |
+| `capacity` | string | — | Size of the volume backing the mover's kopia cache (e.g. `10Gi`). When set, unset cache budgets default to a percentage of it (content 60%, metadata 15%) and the two budgets together may claim at most 90% of it. Raising it on a `Persistent` cache grows the existing PVC when its StorageClass allows volume expansion; a smaller value is never applied to an existing PVC. |
+| `contentCacheSize` | [union](#repositoryreplication-specmovercachecontentcachesize) | — | kopia content cache budget (`--content-cache-size-mb`): `{ percent: N }` of `capacity`, or `{ size: &lt;quantity&gt; }`. Absent with a known `capacity`, it defaults to 60% of it. Mutually exclusive with `contentCacheSizeMb`. |
+| `contentCacheSizeMb` | integer | — | kopia content cache budget in MiB (`--content-cache-size-mb`). The original spelling of `contentCacheSize`; set one or the other, not both. |
+| `metadataCacheSize` | [union](#repositoryreplication-specmovercachemetadatacachesize) | — | kopia metadata cache budget (`--metadata-cache-size-mb`): `{ percent: N }` of `capacity`, or `{ size: &lt;quantity&gt; }`. Absent with a known `capacity`, it defaults to 15% of it. Mutually exclusive with `metadataCacheSizeMb`. |
+| `metadataCacheSizeMb` | integer | — | kopia metadata cache budget in MiB (`--metadata-cache-size-mb`). The original spelling of `metadataCacheSize`; set one or the other, not both. |
 | `mode` | enum: Ephemeral \| Persistent | — | How a mover's kopia cache volume is provisioned. |
 | `storageClassName` | string | — | StorageClass for the cache PVC; absent uses the cluster default. |
+
+###### RepositoryReplication `spec.mover.cache.contentCacheSize`
+
+Externally tagged — set **exactly one** of: `percent` · `size`.
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `percent` | integer | —<br><sub>min 0</sub> | Percent of the cache volume's `capacity` (1–100). Needs a `capacity`, set on this layer or inherited from `moverDefaults.cache`. Rounded down to whole MiB. |
+| `size` | string | — | An absolute size as a Kubernetes quantity (e.g. `1Gi`, `500Mi`). Rounded down to whole MiB; must be at least `1Mi` and, when a `capacity` is known, fit in it. |
+
+###### RepositoryReplication `spec.mover.cache.metadataCacheSize`
+
+Externally tagged — set **exactly one** of: `percent` · `size`.
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `percent` | integer | —<br><sub>min 0</sub> | Percent of the cache volume's `capacity` (1–100). Needs a `capacity`, set on this layer or inherited from `moverDefaults.cache`. Rounded down to whole MiB. |
+| `size` | string | — | An absolute size as a Kubernetes quantity (e.g. `1Gi`, `500Mi`). Rounded down to whole MiB; must be at least `1Mi` and, when a `capacity` is known, fit in it. |
 
 ##### RepositoryReplication `spec.mover.inheritSecurityContextFrom`
 
@@ -3980,11 +4169,31 @@ Externally tagged — set **exactly one** of: `pvcConsumer` · `snapshot` · `wo
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| `capacity` | string | — | Size of the PVC backing the mover's kopia cache (e.g. `10Gi`). |
-| `contentCacheSizeMb` | integer | — | kopia content cache budget in MiB (`--content-cache-size-mb`). |
-| `metadataCacheSizeMb` | integer | — | kopia metadata cache budget in MiB (`--metadata-cache-size-mb`). |
+| `capacity` | string | — | Size of the volume backing the mover's kopia cache (e.g. `10Gi`). When set, unset cache budgets default to a percentage of it (content 60%, metadata 15%) and the two budgets together may claim at most 90% of it. Raising it on a `Persistent` cache grows the existing PVC when its StorageClass allows volume expansion; a smaller value is never applied to an existing PVC. |
+| `contentCacheSize` | [union](#snapshotreplication-specmovercachecontentcachesize) | — | kopia content cache budget (`--content-cache-size-mb`): `{ percent: N }` of `capacity`, or `{ size: &lt;quantity&gt; }`. Absent with a known `capacity`, it defaults to 60% of it. Mutually exclusive with `contentCacheSizeMb`. |
+| `contentCacheSizeMb` | integer | — | kopia content cache budget in MiB (`--content-cache-size-mb`). The original spelling of `contentCacheSize`; set one or the other, not both. |
+| `metadataCacheSize` | [union](#snapshotreplication-specmovercachemetadatacachesize) | — | kopia metadata cache budget (`--metadata-cache-size-mb`): `{ percent: N }` of `capacity`, or `{ size: &lt;quantity&gt; }`. Absent with a known `capacity`, it defaults to 15% of it. Mutually exclusive with `metadataCacheSizeMb`. |
+| `metadataCacheSizeMb` | integer | — | kopia metadata cache budget in MiB (`--metadata-cache-size-mb`). The original spelling of `metadataCacheSize`; set one or the other, not both. |
 | `mode` | enum: Ephemeral \| Persistent | — | How a mover's kopia cache volume is provisioned. |
 | `storageClassName` | string | — | StorageClass for the cache PVC; absent uses the cluster default. |
+
+###### SnapshotReplication `spec.mover.cache.contentCacheSize`
+
+Externally tagged — set **exactly one** of: `percent` · `size`.
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `percent` | integer | —<br><sub>min 0</sub> | Percent of the cache volume's `capacity` (1–100). Needs a `capacity`, set on this layer or inherited from `moverDefaults.cache`. Rounded down to whole MiB. |
+| `size` | string | — | An absolute size as a Kubernetes quantity (e.g. `1Gi`, `500Mi`). Rounded down to whole MiB; must be at least `1Mi` and, when a `capacity` is known, fit in it. |
+
+###### SnapshotReplication `spec.mover.cache.metadataCacheSize`
+
+Externally tagged — set **exactly one** of: `percent` · `size`.
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `percent` | integer | —<br><sub>min 0</sub> | Percent of the cache volume's `capacity` (1–100). Needs a `capacity`, set on this layer or inherited from `moverDefaults.cache`. Rounded down to whole MiB. |
+| `size` | string | — | An absolute size as a Kubernetes quantity (e.g. `1Gi`, `500Mi`). Rounded down to whole MiB; must be at least `1Mi` and, when a `capacity` is known, fit in it. |
 
 ##### SnapshotReplication `spec.mover.inheritSecurityContextFrom`
 

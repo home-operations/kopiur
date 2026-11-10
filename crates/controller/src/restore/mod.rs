@@ -3698,7 +3698,9 @@ async fn run_restore_mover(
         &repo,
         restore.spec.mover.as_ref().and_then(|m| m.cache.as_ref()),
     );
-    let cache = crate::cache::cache_tuning(effective_cache.as_ref());
+    // The budgets need the cache volume's capacity, known only once the volume is
+    // resolved below (a persistent claim's LIVE size, #613); filled in there.
+    let cache = kopiur_kopia::CacheTuning::default();
     // Stable anchors so the mover can heal a stale pinned id (kopia rewrites the
     // manifest id on pin). Only meaningful for a concrete id; a Resolve selector
     // lists fresh in-Job, so it carries no anchor.
@@ -3706,7 +3708,7 @@ async fn run_restore_mover(
         RestoreSelection::Snapshot(_) => restore_source_anchor(ctx, restore, namespace).await,
         RestoreSelection::Resolve(_) => SnapshotAnchor::default(),
     };
-    let work_spec = MoverWorkSpec {
+    let mut work_spec = MoverWorkSpec {
         version: 2,
         operation: Operation::Restore(RestoreOp {
             // A stream destination replaces the filesystem write entirely: the
@@ -3773,14 +3775,19 @@ async fn run_restore_mover(
             read_only: true,
         });
     // Resolve the cache VOLUME; a persistent cache PVC is owned by this Restore.
-    let cache_volume = crate::cache::resolve_cache_volume(
-        &ctx.client,
+    let resolved_volume = crate::cache::resolve_cache_volume(
+        ctx,
         namespace,
         owner.clone(),
         &format!("kopiur-cache-{job_name}"),
         effective_cache.as_ref(),
     )
     .await?;
+    work_spec.cache = crate::cache::cache_tuning(
+        effective_cache.as_ref(),
+        resolved_volume.capacity.as_deref(),
+    )?;
+    let cache_volume = resolved_volume.volume;
     // RWO Multi-Attach avoidance for the restore DESTINATION PVC: when restoring into
     // an existing ReadWriteOnce PVC held by a running app pod, pin the restore mover to
     // that node so the kubelet can attach the volume (a freshly-created `target.pvc`

@@ -68,6 +68,7 @@ fn cache_defaults_merge_overlays_field_by_field() {
         metadata_cache_size_mb: Some(1024),
         content_cache_size_mb: Some(4096),
         mode: Some(CacheVolumeMode::Ephemeral),
+        ..Default::default()
     };
     // Only base → base verbatim.
     assert_eq!(CacheDefaults::merge(Some(&repo), None), Some(repo.clone()));
@@ -79,6 +80,7 @@ fn cache_defaults_merge_overlays_field_by_field() {
         metadata_cache_size_mb: None,
         content_cache_size_mb: Some(16384),
         mode: Some(CacheVolumeMode::Persistent),
+        ..Default::default()
     };
     let merged = CacheDefaults::merge(Some(&repo), Some(&mover)).unwrap();
     assert_eq!(merged.capacity.as_deref(), Some("32Gi")); // override
