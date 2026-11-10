@@ -422,6 +422,151 @@ async fn cluster_repository_backup_lifecycle() {
     let _ = crepos.delete("e2e-crepo", &DeleteParams::default()).await;
 }
 
+/// The `Ready` condition's `reason`, if any.
+fn ready_reason(status: &serde_json::Value) -> Option<String> {
+    status
+        .get("conditions")
+        .and_then(|c| c.as_array())?
+        .iter()
+        .find(|c| c.get("type").and_then(|t| t.as_str()) == Some("Ready"))
+        .and_then(|c| c.get("reason").and_then(|s| s.as_str()))
+        .map(str::to_string)
+}
+
+/// Regression guard for #689: while a `ClusterRepository` is `suspend: true`,
+/// a Snapshot against it must NOT run. It must park `Pending` with reason
+/// `RepositorySuspended`, and complete on its own once the repository is
+/// unsuspended. Before the fix the Snapshot gate read only `status.phase`
+/// (which suspend leaves at `Ready`), so the backup ran straight to
+/// `Succeeded` while the repository was suspended — this test would fail at
+/// the "still Pending" assertion.
+#[tokio::test]
+#[ignore = "requires the e2e harness (mise run //crates/e2e:test): kind + built images + helm install"]
+async fn suspended_cluster_repository_holds_a_backup_until_unsuspended() {
+    let Some(world) = World::connect().await else {
+        return;
+    };
+    world
+        .ensure(&[Need::Filesystem])
+        .await
+        .expect("provision filesystem fixtures");
+    let client = world.client().clone();
+    let crepos: Api<ClusterRepository> = Api::all(client.clone());
+    let configs: Api<SnapshotPolicy> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let backups: Api<Snapshot> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let pp = PatchParams::default();
+
+    // 1. A healthy ClusterRepository, then suspended. Wait until the repository
+    //    reconcile has observed the suspend (its own Ready reason flips), so the
+    //    Snapshot below meets a suspended, still-`phase: Ready` repository —
+    //    exactly the reported shape.
+    crepos
+        .create(
+            &PostParams::default(),
+            &cr(cluster_repository_json("e2e-crepo-susp")),
+        )
+        .await
+        .expect("create ClusterRepository");
+    wait_phase(&crepos, "e2e-crepo-susp", "Ready")
+        .await
+        .expect("ClusterRepository should reach Ready");
+    crepos
+        .patch(
+            "e2e-crepo-susp",
+            &pp,
+            &Patch::Merge(serde_json::json!({ "spec": { "suspend": true } })),
+        )
+        .await
+        .expect("suspend the ClusterRepository");
+    wait_until(
+        "ClusterRepository Ready reason = Suspended",
+        default_timeout(),
+        poll_interval(),
+        || async {
+            let st = status_json(&crepos, "e2e-crepo-susp").await;
+            Ok((ready_reason(&st).as_deref() == Some("Suspended")).then_some(()))
+        },
+    )
+    .await
+    .expect("the suspend should be observed by the repository reconcile");
+
+    // 2. A Snapshot against it parks Pending/RepositorySuspended — no run.
+    configs
+        .create(
+            &PostParams::default(),
+            &cr(cluster_backup_config_json(
+                "e2e-cfg-crepo-susp",
+                "e2e-crepo-susp",
+                "e2e-src",
+            )),
+        )
+        .await
+        .expect("create SnapshotPolicy (suspended ClusterRepository)");
+    backups
+        .create(
+            &PostParams::default(),
+            &cr(backup_json(
+                "e2e-backup-crepo-susp",
+                "e2e-cfg-crepo-susp",
+                "Retain",
+            )),
+        )
+        .await
+        .expect("create Snapshot");
+    wait_until(
+        "Snapshot parked Pending with reason RepositorySuspended",
+        default_timeout(),
+        poll_interval(),
+        || async {
+            let st = status_json(&backups, "e2e-backup-crepo-susp").await;
+            let pending = st.get("phase").and_then(|p| p.as_str()) == Some("Pending");
+            let held = ready_reason(&st).as_deref() == Some("RepositorySuspended");
+            Ok((pending && held).then_some(()))
+        },
+    )
+    .await
+    .expect("a Snapshot against a suspended ClusterRepository must park, not run");
+    // Give a (buggy) controller ample time to launch anyway: still parked.
+    tokio::time::sleep(Duration::from_secs(20)).await;
+    let st = status_json(&backups, "e2e-backup-crepo-susp").await;
+    assert_eq!(
+        st.get("phase").and_then(|p| p.as_str()),
+        Some("Pending"),
+        "the backup must still be held while the repository is suspended, got {st}"
+    );
+    assert!(
+        st.get("snapshot").is_none(),
+        "no kopia snapshot may be written while suspended, got {st}"
+    );
+
+    // 3. Unsuspend: the held backup resumes on its own and succeeds.
+    crepos
+        .patch(
+            "e2e-crepo-susp",
+            &pp,
+            &Patch::Merge(serde_json::json!({ "spec": { "suspend": false } })),
+        )
+        .await
+        .expect("unsuspend the ClusterRepository");
+    wait_phase(&backups, "e2e-backup-crepo-susp", "Succeeded")
+        .await
+        .expect("the held Snapshot should complete once the repository is unsuspended");
+    let st = status_json(&backups, "e2e-backup-crepo-susp").await;
+    let snap_id = st
+        .get("snapshot")
+        .and_then(|s| s.get("kopiaSnapshotID"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    assert!(!snap_id.is_empty(), "a real kopia snapshot id, got {st}");
+
+    let _ = backups
+        .delete("e2e-backup-crepo-susp", &DeleteParams::default())
+        .await;
+    let _ = crepos
+        .delete("e2e-crepo-susp", &DeleteParams::default())
+        .await;
+}
+
 /// Cross-namespace mover RBAC + credentials (ADR §4.12). A Snapshot in a workload
 /// namespace SEPARATE from the operator's must (a) get a least-privilege
 /// `kopiur-mover` ServiceAccount + RoleBinding MINTED in that namespace by the

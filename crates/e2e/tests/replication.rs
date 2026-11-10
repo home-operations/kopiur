@@ -649,5 +649,52 @@ async fn repository_replication_runs_on_demand_from_the_run_requested_annotation
          stamp must not still be standing; got {parked}"
     );
 
+    // #689 finding 2: the suspended arm stamps `phase: Suspended`, and nothing
+    // replaced it on resume until the next run ENDED — so the console showed a
+    // running replication as "Suspended". Unsuspend and require the phase to
+    // leave `Suspended` (the parked request starts a run, so it reads
+    // `Replicating`, or already `Succeeded`).
+    wait_until(
+        "the suspended replication reports phase Suspended",
+        default_timeout(),
+        poll_interval(),
+        || {
+            let repls = repls.clone();
+            async move {
+                let s = status_json(&repls, name).await;
+                Ok((s.get("phase").and_then(|p| p.as_str()) == Some("Suspended")).then_some(()))
+            }
+        },
+    )
+    .await
+    .expect("a suspended replication reports phase Suspended");
+    repls
+        .patch(
+            name,
+            &PatchParams::default(),
+            &Patch::Merge(serde_json::json!({ "spec": { "suspend": false } })),
+        )
+        .await
+        .expect("unsuspend");
+    let resumed = wait_until(
+        "the resumed replication's phase leaves Suspended",
+        default_timeout(),
+        poll_interval(),
+        || {
+            let repls = repls.clone();
+            async move {
+                let s = status_json(&repls, name).await;
+                let phase = s.get("phase").and_then(|p| p.as_str()).map(str::to_string);
+                Ok(phase.filter(|p| p != "Suspended"))
+            }
+        },
+    )
+    .await
+    .expect("a resumed replication must not keep reporting phase Suspended");
+    assert!(
+        ["Replicating", "Pending", "Succeeded"].contains(&resumed.as_str()),
+        "unexpected phase after resume: {resumed}"
+    );
+
     let _ = repls.delete(name, &DeleteParams::default()).await;
 }
