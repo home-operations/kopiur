@@ -3,7 +3,9 @@
 //! `compression` / `upload` tuning (asserted at the controller→mover work-spec
 //! contract, the seam where a regression would silently drop them while the
 //! snapshot still succeeded), and the default `files.ignoreRules` OS-artifact
-//! exclude set (task PR4 — proven against a REAL `lost+found` dir end to end).
+//! exclude set (task PR4 — proven against a REAL `lost+found` dir end to end),
+//! and a rule REMOVED from `files.ignoreRules` no longer excluding its path on
+//! the next snapshot (#681).
 //!
 //! Gated by `#[cfg(feature = "e2e")]` + `#[ignore]`; skip gracefully off-cluster.
 
@@ -620,4 +622,164 @@ async fn default_ignore_rules_exclude_lost_and_found_end_to_end() {
             "with ignoreRules: [] (opt-out), lost+found must SURVIVE the round trip — if this \
              failed, the fixture no longer proves the positive case above meant anything",
         );
+}
+
+// --- #681: a rule removed from `files.ignoreRules` must stop applying ---
+
+/// Restore `snapshot` into a fresh PVC and run `script` (a `sh -c` test against
+/// `/restore`) in a reader pod; panic with `why` unless it exits 0.
+async fn assert_restored_tree(client: &Client, snapshot: &str, script: &str, why: &str) {
+    let restores: Api<Restore> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let name = format!("{snapshot}-verify");
+    let dst = format!("{snapshot}-dst");
+    let restore = serde_json::json!({
+        "apiVersion": "kopiur.home-operations.com/v1alpha1",
+        "kind": "Restore",
+        "metadata": { "name": name, "namespace": E2E_NAMESPACE },
+        "spec": {
+            "repository": { "kind": "Repository", "name": REPO },
+            "source": { "snapshotRef": { "name": snapshot } },
+            "target": { "pvc": { "name": dst, "capacity": "1Gi" } }
+        }
+    });
+    let _ = restores.create(&PostParams::default(), &cr(restore)).await;
+    wait_phase(&restores, &name, "Completed")
+        .await
+        .unwrap_or_else(|e| panic!("restore of {snapshot} should complete: {e}"));
+
+    let reader = format!("{snapshot}-reader");
+    let pods: Api<Pod> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    if pods.get_opt(&reader).await.ok().flatten().is_none() {
+        let pod = builders::one_shot_pod(
+            E2E_NAMESPACE,
+            &reader,
+            &["sh", "-c", script],
+            &[(dst.as_str(), "/restore")],
+        );
+        let _ = pods.create(&PostParams::default(), &pod).await;
+    }
+    wait::pod_succeeded(client, E2E_NAMESPACE, &reader)
+        .await
+        .unwrap_or_else(|e| panic!("{snapshot}: {why} (`{script}`): {e}"));
+    let _ = restores.delete(&name, &DeleteParams::default()).await;
+    let _ = pods.delete(&reader, &DeleteParams::default()).await;
+}
+
+/// #681, end to end: kopia STORES the per-source policy, and the mover used to
+/// only `--add-ignore` into it, so a rule removed from the `SnapshotPolicy`
+/// kept excluding its path on every later snapshot. One policy, one PVC, three
+/// snapshots, each restored and inspected:
+///
+/// 1. `[/thumbs, /cache]`: both excluded (the control: the rules were stored).
+/// 2. `[/cache]`: `thumbs/` must be BACK, and `cache/` still excluded. On the
+///    old code `thumbs/` stays missing; a naive `--clear-ignore --add-ignore`
+///    fix would bring `cache/` back too (kopia drops the adds beside a clear).
+/// 3. `[]`: `cache/` must be back. The old mover skipped kopia entirely for a
+///    spec this empty, so the stored rule survived.
+#[tokio::test]
+#[ignore = "requires the e2e harness (mise run //crates/e2e:test)"]
+async fn removing_an_ignore_rule_stops_excluding_it_end_to_end() {
+    use kube::api::{Patch, PatchParams};
+
+    let Some(world) = World::connect().await else {
+        return;
+    };
+    world
+        .ensure(&[Need::Filesystem])
+        .await
+        .expect("fixtures ready");
+    let client = world.client().clone();
+    ensure_knobs_repo(&client).await;
+
+    let src = "e2e-ignorechange-src";
+    {
+        use kopiur_e2e::apply::{Fixture, apply_all};
+        let fixtures: Vec<Fixture> = vec![builders::dynamic_pvc(E2E_NAMESPACE, src, "1Gi").into()];
+        apply_all(&client, &fixtures).await.expect("source PVC");
+        let seeder = format!("{src}-seed");
+        let pods: Api<Pod> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+        if pods.get_opt(&seeder).await.ok().flatten().is_none() {
+            let pod = builders::one_shot_pod(
+                E2E_NAMESPACE,
+                &seeder,
+                &[
+                    "sh",
+                    "-c",
+                    "mkdir -p /data/thumbs /data/cache && echo t > /data/thumbs/t.txt \
+                     && echo c > /data/cache/c.txt && echo keep > /data/keep.txt",
+                ],
+                &[(src, "/data")],
+            );
+            let _ = pods.create(&PostParams::default(), &pod).await;
+        }
+        wait::pod_succeeded(&client, E2E_NAMESPACE, &seeder)
+            .await
+            .expect("ignore-change source seeder pod should succeed");
+    }
+
+    let configs: Api<SnapshotPolicy> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let backups: Api<Snapshot> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let cfg = "e2e-ignorechange-cfg";
+    let _ = configs
+        .create(
+            &PostParams::default(),
+            &cr(snapshot_policy_json(
+                E2E_NAMESPACE,
+                cfg,
+                "Repository",
+                REPO,
+                serde_json::json!({
+                    "sources": [ { "pvc": { "name": src } } ],
+                    "files": { "ignoreRules": ["/thumbs", "/cache"] }
+                }),
+            )),
+        )
+        .await;
+
+    let steps: [(&[&str], &str, &str, &str); 3] = [
+        (
+            &["/thumbs", "/cache"],
+            "e2e-ignorechange-1",
+            "test -f /restore/keep.txt && test ! -e /restore/thumbs && test ! -e /restore/cache",
+            "both rules must exclude their dirs (control: the fixture and rules are real)",
+        ),
+        (
+            &["/cache"],
+            "e2e-ignorechange-2",
+            "test -f /restore/keep.txt && test -f /restore/thumbs/t.txt && test ! -e /restore/cache",
+            "/thumbs was removed from ignoreRules so thumbs/ must be backed up again (#681), \
+             while the kept /cache rule must still exclude cache/",
+        ),
+        (
+            &[],
+            "e2e-ignorechange-3",
+            "test -f /restore/keep.txt && test -f /restore/thumbs/t.txt && test -f /restore/cache/c.txt",
+            "with ignoreRules: [] nothing may be excluded, including a rule an earlier run stored",
+        ),
+    ];
+    for (rules, snapshot, script, why) in steps {
+        configs
+            .patch(
+                cfg,
+                &PatchParams::default(),
+                &Patch::Merge(serde_json::json!({ "spec": { "files": { "ignoreRules": rules } } })),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("patch ignoreRules to {rules:?}: {e}"));
+        let _ = backups
+            .create(
+                &PostParams::default(),
+                &cr(snapshot_json(
+                    E2E_NAMESPACE,
+                    snapshot,
+                    cfg,
+                    serde_json::json!({}),
+                )),
+            )
+            .await;
+        wait_phase(&backups, snapshot, "Succeeded")
+            .await
+            .unwrap_or_else(|e| panic!("{snapshot} (ignoreRules {rules:?}) should succeed: {e}"));
+        assert_restored_tree(&client, snapshot, script, why).await;
+    }
 }

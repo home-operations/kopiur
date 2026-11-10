@@ -575,3 +575,97 @@ async fn verification_gated_until_first_successful_snapshot_168() {
         "a verify Job must have fired after the first successful backup unlocked verification"
     );
 }
+
+/// GitHub #646: a quick verify of a snapshot taken from an UNCHANGED source
+/// passes the documented default `successExpr`.
+///
+/// kopia's manifest `stats.fileCount` counts only files it READ during the
+/// snapshot; a second snapshot of an unchanged source is served entirely from
+/// kopia's cache (`fileCount: 0`, `cachedFiles: N`). The quick tier used to
+/// report that raw field as `stats.files`, so `stats.files > 0 &&
+/// stats.errors == 0` failed forever on a perfectly healthy repository — and
+/// the newest manifest of any steady-state source is exactly this shape.
+/// `ignoreIdenticalSnapshots` is off by default, so the second Snapshot below
+/// writes that cache-hit manifest and the verify resolves to it.
+#[tokio::test]
+#[ignore = "requires the e2e harness (mise run //crates/e2e:test): kind + built images + helm install"]
+async fn quick_verify_of_an_unchanged_source_passes_the_default_success_expr_646() {
+    let Some(world) = World::connect().await else {
+        return;
+    };
+    world.ensure(&[Need::Filesystem]).await.expect("fixtures");
+    let client = world.client().clone();
+
+    const REPO: &str = "e2e-vfy-cache-repo";
+    const POLICY: &str = "e2e-vfy-cache-policy";
+    // First snapshot: every file is new, so kopia hashes them all.
+    ensure_seed(&client, REPO, POLICY, "e2e-vfy-cache-seed", "vfycache").await;
+
+    // Second snapshot of the same, untouched source: 100% cache hits.
+    let backups: Api<Snapshot> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    create_idempotent(
+        &backups,
+        &cr(snapshot_json(
+            E2E_NAMESPACE,
+            "e2e-vfy-cache-second",
+            POLICY,
+            serde_json::json!({}),
+        )),
+        "create the second (unchanged-source) Snapshot",
+    )
+    .await;
+    wait_phase(&backups, "e2e-vfy-cache-second", "Succeeded")
+        .await
+        .expect("the second backup of the unchanged source should succeed");
+    // It must have written its OWN manifest — an `Unchanged` (deduped) run
+    // would leave the verify resolving to the seed's fully-hashed manifest and
+    // this test would prove nothing.
+    let seed_id = backups
+        .get("e2e-vfy-cache-seed")
+        .await
+        .expect("read the seed Snapshot")
+        .status
+        .and_then(|s| s.snapshot)
+        .map(|s| s.kopia_snapshot_id);
+    let second_id = backups
+        .get("e2e-vfy-cache-second")
+        .await
+        .expect("read the second Snapshot")
+        .status
+        .and_then(|s| s.snapshot)
+        .map(|s| s.kopia_snapshot_id);
+    assert!(
+        second_id.is_some() && second_id != seed_id,
+        "the second run must write a new manifest (got {second_id:?}, seed {seed_id:?})"
+    );
+
+    let policies: Api<SnapshotPolicy> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let patch = serde_json::json!({
+        "spec": { "verification": {
+            "quick": { "schedule": { "cron": "* * * * *" } },
+            "successExpr": "stats.files > 0 && stats.errors == 0"
+        } }
+    });
+    policies
+        .patch(POLICY, &PatchParams::default(), &Patch::Merge(&patch))
+        .await
+        .expect("patch verification onto the SnapshotPolicy");
+
+    wait_until(
+        "SnapshotPolicy.status.lastVerified is stamped by the default-predicate quick verify",
+        default_timeout(),
+        poll_interval(),
+        || async {
+            let s = status_json(&policies, POLICY).await;
+            Ok(s.get("lastVerified")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(|_| ()))
+        },
+    )
+    .await
+    .expect(
+        "a quick verify of a cache-hit snapshot must pass `stats.files > 0 && stats.errors == 0` \
+         and stamp status.lastVerified (#646)",
+    );
+}

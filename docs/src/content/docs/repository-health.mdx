@@ -215,7 +215,13 @@ Each `expr` is compiled and trial-evaluated **at admission**, on `kubectl apply`
 
 ### Bounding failed Snapshots
 
-GFS retention prunes only **successful** snapshots, so failures, including preflight `Failed`, are bounded separately by `SnapshotSchedule.spec.failedJobsHistoryLimit`. That is the maximum number of `Failed` Snapshots a schedule keeps, newest by completion time, default `10`, with `0` keeping none. The oldest beyond the limit are deleted each reconcile. Manually-created Snapshots, meaning ones not from a schedule, are one-offs and aren't affected.
+GFS retention prunes only **successful** snapshots, so failures, including preflight `Failed`, are bounded separately by `SnapshotSchedule.spec.failedJobsHistoryLimit`. That is the maximum number of `Failed` Snapshots a schedule keeps, newest by completion time, default `10`, with `0` keeping none. The oldest beyond the limit are deleted each reconcile.
+
+Failed **manual** Snapshots, from `kubectl kopiur snapshot now` or applied by hand or GitOps, have no schedule to count them. Their owning `SnapshotPolicy` bounds them instead: it keeps the newest `10` per repository and deletes the older ones, the same flat default a schedule uses when `failedJobsHistoryLimit` is unset.
+
+Two kinds of failed Snapshot are never deleted by either bound. A failed run that still owns a kopia snapshot, because it failed **after** the snapshot was written (an `afterSnapshot` hook, for example), is kept so the restore point is not destroyed. A scheduled run whose `SnapshotSchedule` was deleted under `onScheduleDelete: Retain` has no schedule left to prune it. Delete either by hand once you no longer need it.
+
+Retained failures are history, not an outage. They stay until newer failures displace them, which is why `kubectl kopiur doctor` and the console warn about failures older than `--failure-lookback` without failing.
 
 ## See also
 

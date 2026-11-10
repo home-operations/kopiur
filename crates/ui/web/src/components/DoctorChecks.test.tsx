@@ -88,6 +88,39 @@ describe("DoctorChecks", () => {
     warn.mockRestore();
   });
 
+  it("names each check as `id: title` on one line (#695)", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    await render(<DoctorChecks checks={checks} namespace={undefined} />);
+    const rows = bodyRows(screen.getByRole("table"));
+    const cell = nth(rows, 2).querySelector(".doctor-checks__check");
+    expect(cell).not.toBeNull();
+    // One element, read in one breath: the id, a separator, the title.
+    expect(cell?.textContent).toBe("no-stuck-work: no blocked or stuck work");
+    expect(cell?.firstElementChild).toHaveClass("doctor-checks__id");
+    warn.mockRestore();
+  });
+
+  it("never renders a finding on a passing check, even if text rode along", async () => {
+    // A pass has nothing to say. #695: the console printed a long sentence
+    // under a check the CLI reported `ok`; whatever a server sends with a
+    // Pass, the row must not read as a finding.
+    const chatty: DoctorCheckView[] = [
+      {
+        check: "recent-failures",
+        objects: [],
+        scope: "namespace",
+        title: "no recent failed snapshots/restores",
+        outcome: "Pass",
+        what: "131 failed object(s) retained as history",
+      },
+    ];
+    await render(<DoctorChecks checks={chatty} namespace={undefined} />);
+    const row = nth(bodyRows(screen.getByRole("table")), 0);
+    expect(row).toHaveTextContent("recent-failures: no recent failed snapshots/restores");
+    expect(row).not.toHaveTextContent("retained as history");
+    expect(row.querySelector(".finding")).toBeNull();
+  });
+
   it("says what the server says each check read, including the two that are both", async () => {
     // The scope is `DoctorCheckView.scope`, not a table kept here. The client
     // used to own that table and it was already wrong: `list_repos` lists

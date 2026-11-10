@@ -58,6 +58,11 @@ kopiur-api = { workspace = true, features = ["testutil"] }
 # no test could see while neither could see the other. `startup.rs` now asserts
 # the grant answers the question. Dev-only, so nothing ships this edge.
 xtask = { path = "../xtask" }
+# Test-only, for the same kind of reason: `kubectl kopiur doctor` and the
+# console's Doctor render one shared report, and disagreed anyway (#695) while
+# neither crate's tests could see the other's renderer. `tests/doctor_parity.rs`
+# renders one fixture report through both and asserts the same verdicts.
+kopiur-cli = { path = "../cli" }
 tower = { workspace = true, features = ["util"] }
 # `test-util` is tokio's paused clock. The cache-readiness budget is two minutes;
 # without it the tests that exercise the timeout and recovery branches would have

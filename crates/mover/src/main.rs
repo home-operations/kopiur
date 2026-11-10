@@ -47,6 +47,7 @@ use kopiur_mover::status::{
     snapshot_replicate_no_match_message, snapshot_replicate_ok_body,
     snapshot_replicate_success_message, split_api_version, verify_failed_body, verify_ok_body,
 };
+use kopiur_mover::verify::quick_coverage;
 use kopiur_mover::workspec::{
     self, BootstrapRepositoryOp, BrowseSessionOp, KOPIA_KEEP_MAX, KOPIUR_PIN_NAME, MaintenanceOp,
     MoverWorkSpec, Operation, ReplicateOp, RestoreOp, RestoreSelection, RestoreSelector,
@@ -552,34 +553,36 @@ async fn run_operation(
             let id = &spec.identity;
             let override_source = format!("{}@{}:{}", id.username, id.hostname, id.source_path);
             let identity_scope = format!("{}@{}", id.username, id.hostname);
-            // Apply the resolved kopia `policy set` knobs (compression / never-compress
+            // Apply the resolved kopia policy knobs (compression / never-compress
             // / ignore rules / ignore-cache-dirs / backup-side error handling / upload
             // parallelism / extraArgs) against this snapshot's source identity BEFORE
             // creating the snapshot, so SnapshotPolicy.spec.{compression,files,
             // errorHandling,upload,extraArgs} actually reach kopia (ADR-0005 §13(b)/§13(f),
-            // ADR-0004 §4b). The path-scoped `policy set` is skipped when nothing is
-            // configured, but the identity-scoped one below ALWAYS runs — it also
-            // carries the mandatory `KOPIA_KEEP_MAX` retention pin (see its doc
-            // comment): kopia's `snapshot create` unconditionally applies the
-            // source's OWN retention policy after every create, so an unset
-            // identity policy would otherwise fall back to kopia's defaults
-            // (keep-latest 10, …), silently deleting manifests a Kopiur `Snapshot`
-            // CR still references.
-            let mut user_identity_policy = None;
-            if !op.policy.is_empty() {
-                // kopia rejects `--max-parallel-snapshots` on a path-scoped
-                // policy ("only global, username@hostname or @hostname"), so
-                // that one knob is folded into the identity-scope policy_set
-                // below instead of the path-scoped one (the policy_knobs e2e
-                // regression).
-                let (path_policy, split_identity_policy) =
-                    kopiur_kopia::split_policy_scopes(op.policy.to_kopia());
-                client
-                    .policy_set(&override_source, &path_policy)
-                    .await
-                    .map_err(kopia(KopiaOp::PolicySet))?;
-                user_identity_policy = split_identity_policy;
-            }
+            // ADR-0004 §4b).
+            //
+            // kopia rejects `--max-parallel-snapshots` on a path-scoped policy
+            // ("only global, username@hostname or @hostname"), so that one knob
+            // is folded into the identity-scope policy_set below instead of the
+            // path-scoped one (the policy_knobs e2e regression).
+            let (path_policy, user_identity_policy) =
+                kopiur_kopia::split_policy_scopes(op.policy.to_kopia());
+            // The path scope is REPLACED, every run, even when the spec is
+            // empty: kopia stores the policy and `policy set` only adds to it,
+            // so a rule or knob dropped from the spec would otherwise stay in
+            // force (#681). Kopiur owns this scope outright: it is per source,
+            // and nothing else in Kopiur writes it.
+            client
+                .policy_replace(&override_source, &path_policy)
+                .await
+                .map_err(kopia(KopiaOp::PolicyReplace))?;
+            // The identity-scoped `policy set` ALWAYS runs too: it carries the
+            // mandatory `KOPIA_KEEP_MAX` retention pin (see its doc comment).
+            // kopia's `snapshot create` unconditionally applies the source's OWN
+            // retention policy after every create, so an unset identity policy
+            // would otherwise fall back to kopia's defaults (keep-latest 10, …),
+            // silently deleting manifests a Kopiur `Snapshot` CR still
+            // references. It is written, never replaced: that scope can hold
+            // settings Kopiur does not own.
             client
                 .policy_set(
                     &identity_scope,
@@ -1481,9 +1484,11 @@ async fn run_bootstrap_flow(
 /// create` (M0b, confirmed data-loss bug): kopia's six `--keep-*` retention
 /// fields, ALWAYS pinned to [`KOPIA_KEEP_MAX`], with `user_identity_policy`
 /// (the one knob `split_policy_scopes` moves to the identity scope —
-/// currently only `max_parallel_snapshots`) folded in on top when the
-/// operator configured it. Pulled out of `run_operation` so the mandatory
-/// pin is unit-testable without spawning kopia.
+/// currently only `max_parallel_snapshots`) folded in on top. That knob is
+/// written as `inherit` when the operator did not configure it: this scope is
+/// written but never replaced, so omitting the flag would keep a value an
+/// earlier spec stored there (#681). Pulled out of `run_operation` so the
+/// mandatory pin is unit-testable without spawning kopia.
 fn identity_retention_policy(
     user_identity_policy: Option<kopiur_kopia::PolicyArgs>,
 ) -> kopiur_kopia::PolicyArgs {
@@ -1508,7 +1513,11 @@ fn identity_retention_policy(
         // bug. An opt-in (`files.ignoreIdenticalSnapshots: true`) overrides this
         // from the more specific path scope.
         ignore_identical_snapshots: Some(false),
-        max_parallel_snapshots: user_identity_policy.and_then(|p| p.max_parallel_snapshots),
+        max_parallel_snapshots: Some(
+            user_identity_policy
+                .and_then(|p| p.max_parallel_snapshots)
+                .unwrap_or(kopiur_kopia::PolicyInt::Inherit),
+        ),
         ..Default::default()
     }
 }
@@ -3237,33 +3246,6 @@ fn probe_scratch_writable(path: &str) -> std::io::Result<()> {
     std::fs::remove_file(&probe)
 }
 
-/// **Pure.** The quick tier's `successExpr` environment derived from the newest
-/// snapshot manifest for its identity: `(stats, snapshot id)`.
-///
-/// `kopia snapshot verify` reports no machine-readable file/byte counts of its
-/// own, so a healthy quick verify of a non-empty snapshot satisfies the common
-/// `stats.files > 0` predicate from the manifest instead of always failing on a
-/// hardcoded 0. `errors` is 0 — a passing verify found no integrity errors.
-/// Counts saturate rather than wrap, so an absurd manifest cannot make a
-/// predicate read a small number.
-///
-/// Deliberately takes the manifest that WAS found. "No manifest for this
-/// identity" is not an environment to report, it is a terminal verdict
-/// ([`MoverError::VerifyNoSnapshot`]): `kopia snapshot verify --sources` exits 0
-/// when its filter matches ZERO manifests, so reporting success there stamps
-/// `status.lastVerified` for a source path the repository holds no snapshot for
-/// — the #456 false pass.
-fn quick_coverage(entry: kopiur_kopia::SnapshotListEntry) -> (kopiur_api::VerifyStats, String) {
-    (
-        kopiur_api::VerifyStats {
-            files: i64::try_from(entry.stats.file_count).unwrap_or(i64::MAX),
-            bytes: i64::try_from(entry.stats.total_size).unwrap_or(i64::MAX),
-            errors: 0,
-        },
-        entry.id,
-    )
-}
-
 /// Drive a `Verify` run (ADR-0005 §4): connect, run the quick (`kopia snapshot
 /// verify`) or deep (scratch-restore) tier, evaluate the optional CEL `successExpr`
 /// over the result, and PATCH the `SnapshotPolicy` `.status.lastVerified` on
@@ -4429,37 +4411,6 @@ mod tests {
 
     // --- #456: the quick tier's coverage verdict -----------------------------
 
-    /// A manifest entry with the given counts, for [`quick_coverage`].
-    fn manifest(id: &str, files: u64, bytes: u64) -> kopiur_kopia::SnapshotListEntry {
-        let mut e: kopiur_kopia::SnapshotListEntry = serde_json::from_value(serde_json::json!({
-            "id": id,
-            "source": { "host": "h", "userName": "u", "path": "/pvc/data" },
-            "startTime": "2026-08-01T00:00:00Z",
-            "endTime": "2026-08-01T00:01:00Z",
-        }))
-        .expect("typed manifest entry");
-        e.stats.file_count = files;
-        e.stats.total_size = bytes;
-        e
-    }
-
-    #[test]
-    fn quick_coverage_reports_the_manifest_counts_and_saturates() {
-        let (stats, id) = quick_coverage(manifest("k1", 42, 4096));
-        assert_eq!(id, "k1");
-        assert_eq!(stats.files, 42);
-        assert_eq!(stats.bytes, 4096);
-        assert_eq!(
-            stats.errors, 0,
-            "a passing quick verify found no integrity errors"
-        );
-        // Saturate, never wrap: a wrapped count could make `stats.files > 0`
-        // read false (or a byte budget read small) on an absurd manifest.
-        let (stats, _) = quick_coverage(manifest("k2", u64::MAX, u64::MAX));
-        assert_eq!(stats.files, i64::MAX);
-        assert_eq!(stats.bytes, i64::MAX);
-    }
-
     #[test]
     fn a_quick_verify_that_covered_no_snapshot_is_a_terminal_failure_not_a_pass() {
         // #456's actual defect. `kopia snapshot verify --sources <spec>` exits 0
@@ -4747,12 +4698,15 @@ mod tests {
         // more specific PATH scope (from `files.ignoreIdenticalSnapshots`) may.
         let user = kopiur_kopia::PolicyArgs {
             ignore_identical_snapshots: Some(true),
-            max_parallel_snapshots: Some(4),
+            max_parallel_snapshots: Some(kopiur_kopia::PolicyInt::Set(4)),
             ..Default::default()
         };
         let p = identity_retention_policy(Some(user));
         assert_eq!(p.ignore_identical_snapshots, Some(false));
-        assert_eq!(p.max_parallel_snapshots, Some(4));
+        assert_eq!(
+            p.max_parallel_snapshots,
+            Some(kopiur_kopia::PolicyInt::Set(4))
+        );
     }
 
     #[test]
@@ -4764,7 +4718,13 @@ mod tests {
         assert_eq!(p.keep_weekly, Some(KOPIA_KEEP_MAX));
         assert_eq!(p.keep_monthly, Some(KOPIA_KEEP_MAX));
         assert_eq!(p.keep_annual, Some(KOPIA_KEEP_MAX));
-        assert_eq!(p.max_parallel_snapshots, None);
+        // #681: unset is written as an explicit reset, never omitted. The
+        // identity scope is not replaced, so an omitted flag would keep a
+        // `maxParallelSnapshots` an earlier spec stored there.
+        assert_eq!(
+            p.max_parallel_snapshots,
+            Some(kopiur_kopia::PolicyInt::Inherit)
+        );
     }
 
     #[test]
@@ -4773,13 +4733,16 @@ mod tests {
         // (`split_policy_scopes`) rides alongside the mandatory pin, not
         // instead of it.
         let user = kopiur_kopia::PolicyArgs {
-            max_parallel_snapshots: Some(3),
+            max_parallel_snapshots: Some(kopiur_kopia::PolicyInt::Set(3)),
             ..Default::default()
         };
         let p = identity_retention_policy(Some(user));
         assert_eq!(p.keep_latest, Some(KOPIA_KEEP_MAX));
         assert_eq!(p.keep_annual, Some(KOPIA_KEEP_MAX));
-        assert_eq!(p.max_parallel_snapshots, Some(3));
+        assert_eq!(
+            p.max_parallel_snapshots,
+            Some(kopiur_kopia::PolicyInt::Set(3))
+        );
     }
 
     // --- `kopiur-mover ready` probe mode: the pure marker decision ---

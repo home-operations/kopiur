@@ -338,6 +338,17 @@ extraArgs: [] # escape hatch for kopia flags not modeled above
 | `files.ignoreIdenticalSnapshots` | When `true`, kopia won't create a new snapshot if the source is exactly identical to the last one. |
 | `extraArgs`                      | Pass-through kopia flags for anything not modeled above.                                           |
 
+:::note[Kopiur owns the per-source kopia policy]
+
+kopia stores policies in the repository; it does not read them from the CRD. Before every snapshot the mover rebuilds the kopia policy for that source (`<username>@<hostname>:<sourcePath>`) from these fields. It deletes the stored policy, then writes the current spec. Two things follow:
+
+- Removing an entry or a field takes effect on the **next** snapshot. A rule you drop from `ignoreRules` stops excluding its path. A knob you remove falls back to the value the source inherits from the identity (`<username>@<hostname>`) or global kopia policy, which is kopia's default unless something changed it there.
+- A setting you make on that source with `kopia policy set` outside Kopiur is wiped by the next run. To keep a kopia setting that has no field here, put it in `extraArgs`; Kopiur reapplies `extraArgs` on every run.
+
+Kopiur 0.10.18 and earlier only ever _added_ to the stored policy, so a removed `ignoreRules` entry kept applying. Upgrading fixes this from the first snapshot after the upgrade, with no manual cleanup.
+
+:::
+
 The object **splitter** is not here. It is a repository property fixed at creation and lives on [`Repository.create.splitter`](/repositories/#encryption-and-repository-creation), where it applies repository-wide.
 
 #### `files.ignoreRules` default: OS-artifact excludes
@@ -508,7 +519,7 @@ A policy whose `identityDefaults.usernameExpr`/`hostnameExpr` cannot be evaluate
 
 `successExpr` is a CEL predicate returning a bool over the verify result. The environment is:
 
-- `stats{files,bytes,errors}`, for **both** tiers. `quick` has no machine-readable counts of its own, so the operator fills `stats.files` and `stats.bytes` from the verified snapshot's manifest and reports `errors: 0` on a passing run. That means `stats.files > 0 && stats.errors == 0` works on `quick`, not just `deep`.
+- `stats{files,bytes,errors}`, for **both** tiers. `quick` has no machine-readable counts of its own, so the operator fills `stats.files` and `stats.bytes` from the verified snapshot's manifest and reports `errors: 0` on a passing run. `stats.files` is the number of files the snapshot **holds**, including the ones kopia reused from its cache because they had not changed since the previous snapshot. So a snapshot of a source that did not change at all still reports every file, not `0`. That means `stats.files > 0 && stats.errors == 0` works on `quick`, not just `deep`.
 - `snapshot`, the snapshot metadata, where `snapshot.id` is the verified snapshot's id.
 - `restored{files,checksumMatches}`, the scratch-restore result, **deep only**. It is empty for `quick`, so guard a deep-only reference with `tier`.
 - `tier`, either `"quick"` or `"deep"`, so one predicate can branch per tier, for example `tier == 'deep' ? restored.checksumMatches : stats.files > 0`.

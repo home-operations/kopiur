@@ -5713,3 +5713,62 @@ fn an_uncreatable_legacy_pin_name_is_not_looked_up() {
     assert!(current.len() <= kopiur_api::consts::JOB_NAME_MAX);
     assert_eq!(legacy, None);
 }
+
+/// #695: a VolumeSnapshot still becoming readyToUse INSIDE the staging deadline
+/// is an expected wait, so its Event is `Normal`, reason = the wait's condition
+/// reason — never the `Warning` "missing dependency" it used to be, which
+/// doctor's recent-warnings check then flagged on healthy runs.
+#[test]
+fn an_in_deadline_staging_wait_is_a_normal_event_named_by_its_wait_reason() {
+    for reason in [
+        crate::consts::STAGING_WAITING_REASON,
+        crate::consts::GROUP_STAGING_WAITING_REASON,
+    ] {
+        let event = staging_wait_event(
+            reason,
+            "waiting for VolumeSnapshot `ns/vs` to become readyToUse",
+        );
+        assert_eq!(event.type_, EventType::Normal, "{reason}");
+        assert_eq!(event.reason, reason);
+        assert_ne!(event.reason, crate::consts::MISSING_DEPENDENCY_REASON);
+        assert!(
+            event
+                .note
+                .as_deref()
+                .is_some_and(|n| n.contains("readyToUse"))
+        );
+    }
+}
+
+/// Moving the wait off the error path must not slow it down: it polls on the
+/// same jittered transient cadence `error_policy` used for it.
+#[test]
+fn an_in_deadline_staging_wait_polls_on_the_transient_cadence() {
+    let d = staging_wait_requeue("media", "nightly-1");
+    assert_eq!(
+        d,
+        crate::error::jittered_transient_requeue("Snapshot", Some("media"), "nightly-1")
+    );
+    assert!(d >= crate::error::TRANSIENT_BACKOFF && d < 2 * crate::error::TRANSIENT_BACKOFF);
+}
+
+/// Ratchet for #695: the `StagingOutcome::Waiting` arm of the reconciler must
+/// not return an `Err` — every `Err` goes through `error_policy`, which
+/// publishes a `Warning` Event, and an in-deadline wait is not a failure.
+#[test]
+fn the_staging_wait_arm_never_takes_the_error_path() {
+    let src = include_str!("mod.rs");
+    let start = src
+        .find("io::StagingOutcome::Waiting {")
+        .expect("the reconciler matches StagingOutcome::Waiting");
+    let end = start
+        + src[start..]
+            .find("io::StagingOutcome::Failed {")
+            .expect("the Failed arm follows the Waiting arm");
+    let arm = &src[start..end];
+    assert!(
+        !arm.contains("Err(Error") && !arm.contains("Error::"),
+        "the in-deadline staging wait must requeue with Ok(..), not an Err that \
+         error_policy turns into a Warning Event:\n{arm}"
+    );
+}

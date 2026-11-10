@@ -112,7 +112,16 @@ pub async fn run(cli: Cli) -> Result<ExitCode, CliError> {
         Command::Status(args) => {
             CmdOutput::ok(cmd::status::run(&ctx, args, output, chrono::Utc::now()).await?)
         }
-        Command::Doctor(args) => cmd::doctor::run(&ctx, args, output, chrono::Utc::now()).await?,
+        Command::Doctor(args) => {
+            cmd::doctor::run(
+                &ctx,
+                cli.global.namespace.as_deref(),
+                args,
+                output,
+                chrono::Utc::now(),
+            )
+            .await?
+        }
         Command::Ls(args) => cmd::browse::ls(&ctx, args, output).await?,
         Command::Cat(args) => cmd::browse::cat(&ctx, args).await?,
         Command::Download(args) => cmd::browse::download(&ctx, args).await?,

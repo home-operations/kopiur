@@ -1818,7 +1818,7 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
             // failure — see `StagingOutcome::Failed` for the deadline that is
             // (issue #198).
             // LIVE conditions base — same reason as the `Ready` arm above, and it matters
-            // MORE here: this arm returns `Err`, so the run does not reach the
+            // MORE here: this arm returns early, so the run does not reach the
             // Job-creation patch that would otherwise re-fold a clobbered heal.
             let conditions = staged_conditions(
                 &io::live_conditions(&api, &name, backup).await,
@@ -1830,14 +1830,28 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
             // if_changed: the wait message is deterministic per VolumeSnapshot
             // (fixed deadline), so steady-state reconciles don't churn status.
             let current = serde_json::to_value(&backup.status).ok();
-            io::patch_status_if_changed(
+            let changed = io::patch_status_if_changed(
                 &api,
                 &name,
                 current.as_ref(),
                 serde_json::json!({ "phase": "Pending", "conditions": conditions }),
             )
             .await?;
-            return Err(Error::MissingDependency(msg));
+            // An expected wait inside the staging deadline is NOT an error (#695):
+            // it used to return `Err(MissingDependency)`, so every poll published
+            // a `Warning` "missing dependency" Event for a VolumeSnapshot that was
+            // merely still being cut, and doctor's recent-warnings check flagged
+            // healthy runs. Announce it once as a `Normal` Event (on the condition
+            // transition; the message is deterministic per VolumeSnapshot), poll
+            // on the same cadence the error path used, and leave `Warning` to the
+            // deadline: `StagingOutcome::Failed` below.
+            if changed {
+                let event = staging_wait_event(reason, &msg);
+                if let Err(e) = ctx.recorder.publish(&event, &io::event_ref(backup)).await {
+                    tracing::warn!(error = %e, reason, "failed to publish staging-wait event");
+                }
+            }
+            return Ok(Action::requeue(staging_wait_requeue(&namespace, &name)));
         }
         io::StagingOutcome::Failed { reason, message } => {
             // Staging cannot produce the stage (stack/class missing, source not
@@ -5723,6 +5737,30 @@ fn staged_watchdog_budget(pinned_seconds: Option<i64>) -> Option<std::time::Dura
         Some(s) if s > 0 => Some(std::time::Duration::from_secs(s as u64)),
         _ => Some(crate::consts::DEFAULT_STAGING_TIMEOUT),
     }
+}
+
+/// **Pure.** The Event an in-deadline staging wait publishes: `Normal`,
+/// reason = the wait's own condition reason (`WaitingForVolumeSnapshot`,
+/// `WaitingForStagedPvcBind`, `WaitingForVolumeGroupSnapshot`). A wait the
+/// controller expects to end on its own is a milestone, not a problem; only
+/// missing the staging deadline is (`StagingOutcome::Failed` publishes the
+/// `Warning`). See #695.
+pub(crate) fn staging_wait_event(reason: &str, message: &str) -> Event {
+    Event {
+        type_: EventType::Normal,
+        reason: reason.to_string(),
+        note: Some(message.to_string()),
+        action: "WaitForStage".to_string(),
+        secondary: None,
+    }
+}
+
+/// **Pure.** How soon an in-deadline staging wait polls again: the same
+/// per-object-jittered transient cadence the old `Err(MissingDependency)` path
+/// requeued on, so moving the wait off the error path changed what it SAYS,
+/// not how fast it notices the stage became ready.
+pub(crate) fn staging_wait_requeue(namespace: &str, name: &str) -> Duration {
+    crate::error::jittered_transient_requeue("Snapshot", Some(namespace), name)
 }
 
 /// `error_policy` for the `Snapshot` controller.

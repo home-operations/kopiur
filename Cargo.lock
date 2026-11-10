@@ -1940,6 +1940,7 @@ dependencies = [
  "http-body-util",
  "k8s-openapi",
  "kopiur-api",
+ "kopiur-cli",
  "kopiur-kopia",
  "kopiur-ops",
  "kopiur-telemetry",
