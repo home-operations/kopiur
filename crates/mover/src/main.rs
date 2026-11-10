@@ -24,7 +24,7 @@ use kopiur_api::snapshot::SnapshotInfo;
 use kopiur_api::{LeaseAction, lease_action};
 use kopiur_kopia::{
     ConnectOptions, ConnectSpec, KopiaClient, KopiaError, KopiaErrorClass, MigrateSources,
-    SnapshotMigrateOptions, SnapshotSource, filter_as_of, pick_offset,
+    SnapshotMigrateOptions, SnapshotPathKind, SnapshotSource, filter_as_of, pick_offset,
 };
 use tracing::{error, info, warn};
 
@@ -49,9 +49,9 @@ use kopiur_mover::status::{
 };
 use kopiur_mover::workspec::{
     self, BootstrapRepositoryOp, BrowseSessionOp, KOPIA_KEEP_MAX, KOPIUR_PIN_NAME, MaintenanceOp,
-    MoverWorkSpec, Operation, ReplicateOp, RestoreOp, RestoreSelection, RestoreSelector,
-    SnapshotAnchor, SnapshotDeleteBatchOp, SnapshotPinOp, SnapshotReplicateOp, ThrottleSpec,
-    VerifyOp, VerifyTier, maintenance_restamp_target,
+    MoverWorkSpec, Operation, ReplicateOp, RestoreOp, RestoreScope, RestoreSelection,
+    RestoreSelector, SnapshotAnchor, SnapshotDeleteBatchOp, SnapshotPinOp, SnapshotReplicateOp,
+    ThrottleSpec, VerifyOp, VerifyTier, maintenance_restamp_target, restore_scope,
 };
 #[cfg(test)]
 use kopiur_mover::workspec::{SnapshotDeleteItem, SnapshotDeleteOp};
@@ -724,9 +724,7 @@ async fn run_operation(
                     // restore of a snapshot pinned before this fix points at a deleted
                     // manifest. On a not-found, self-heal by re-resolving the live id
                     // from the snapshot's stable identity (source path + start time).
-                    let restored_id = restore_with_heal(client, op, id)
-                        .await
-                        .map_err(kopia(KopiaOp::SnapshotRestore))?;
+                    let restored_id = restore_snapshot(client, op, id).await?;
                     // Restore's terminal success phase is `Completed`, not `Succeeded`
                     // (the Snapshot phase) — the Restore CRD enum rejects `Succeeded`.
                     Ok(StatusUpdate::completed(&restored_id, chrono::Utc::now()))
@@ -976,6 +974,131 @@ fn anchor_source_filter(anchor: &SnapshotAnchor) -> Option<SnapshotSource> {
     })
 }
 
+/// Restore what `op` selects out of `snapshot_id` into the mounted target —
+/// the whole snapshot root, or only `spec.selection.paths` (#689) — self-healing
+/// a stale id either way. Returns the id actually restored. Exhaustive over
+/// [`RestoreScope`], so a selection can never silently become a whole-root
+/// restore (or the reverse).
+async fn restore_snapshot(
+    client: &KopiaClient,
+    op: &RestoreOp,
+    snapshot_id: &str,
+) -> Result<String> {
+    match restore_scope(op) {
+        RestoreScope::WholeRoot => {
+            restore_with_heal(client, op, snapshot_id)
+                .await
+                .map_err(|source| MoverError::Kopia {
+                    op: KopiaOp::SnapshotRestore,
+                    source,
+                })
+        }
+        RestoreScope::Paths(paths) => restore_selected_paths(client, op, snapshot_id, paths).await,
+    }
+}
+
+/// Partial, in-place restore (#689): restore each selected snapshot-relative
+/// path to the same relative location under the target, touching nothing else.
+///
+/// Every path is PROBED first (`kopia ls <id>/<path>`), so a path absent from
+/// the snapshot fails the run before a single byte is written — a typo in one
+/// path must not leave the live PVC half-restored. The probe also heals a stale
+/// manifest id (kopia rewrites the id on pin): a not-found that is NOT "entry
+/// not found" re-resolves the live id from the anchor and probes again.
+///
+/// A selected FILE is restored into its parent directory, which kopia does not
+/// create, so the mover creates it (owned by the mover's uid). A selected
+/// DIRECTORY restores its whole subtree; with `enableFileDeletion` kopia's
+/// `--delete-extra` prunes only inside that directory.
+async fn restore_selected_paths(
+    client: &KopiaClient,
+    op: &RestoreOp,
+    snapshot_id: &str,
+    paths: &[String],
+) -> Result<String> {
+    let probe_err = |source| MoverError::Kopia {
+        op: KopiaOp::RestorePathProbe,
+        source,
+    };
+    let (snapshot_id, kinds) = match probe_selection(client, snapshot_id, paths).await {
+        Ok(kinds) => (snapshot_id.to_string(), kinds),
+        Err(e) if e.class() == KopiaErrorClass::NotFound => {
+            match resolve_live_id(client, &op.anchor).await {
+                Some(live) if live != snapshot_id => {
+                    warn!(
+                        stale = %snapshot_id,
+                        live = %live,
+                        "restore snapshot id not found (changed by a pin); using the current id",
+                    );
+                    let kinds = probe_selection(client, &live, paths)
+                        .await
+                        .map_err(probe_err)?;
+                    (live, kinds)
+                }
+                _ => return Err(probe_err(e)),
+            }
+        }
+        Err(e) => return Err(probe_err(e)),
+    };
+    let missing = missing_selection_paths(&kinds);
+    if !missing.is_empty() {
+        return Err(MoverError::RestorePathsMissing {
+            snapshot_id,
+            missing,
+        });
+    }
+
+    let opts = op.restore_options();
+    for (path, kind) in &kinds {
+        let target = kopiur_kopia::restore_path_target(&op.target_path, path);
+        if let Some(parent) = std::path::Path::new(&target).parent() {
+            // Blocking is fine: at most a handful of `mkdir`s on the local mount.
+            std::fs::create_dir_all(parent).map_err(|source| MoverError::RestoreTargetDir {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+        }
+        client
+            .snapshot_restore_path(&snapshot_id, path, &op.target_path, &opts)
+            .await
+            .map_err(|source| MoverError::Kopia {
+                op: KopiaOp::SnapshotRestore,
+                source,
+            })?;
+        info!(snapshot = %snapshot_id, path = %path, kind = ?kind, target = %target, "restored selected path");
+    }
+    Ok(snapshot_id)
+}
+
+/// Probe every selected path in `snapshot_id`, in selection order.
+async fn probe_selection(
+    client: &KopiaClient,
+    snapshot_id: &str,
+    paths: &[String],
+) -> std::result::Result<Vec<(String, SnapshotPathKind)>, KopiaError> {
+    let mut kinds = Vec::with_capacity(paths.len());
+    for path in paths {
+        kinds.push((
+            path.clone(),
+            client.snapshot_path_kind(snapshot_id, path).await?,
+        ));
+    }
+    Ok(kinds)
+}
+
+/// The selected paths the probe found absent from the snapshot, in selection
+/// order. Exhaustive over [`SnapshotPathKind`] so a new kind must decide whether
+/// it is restorable.
+fn missing_selection_paths(kinds: &[(String, SnapshotPathKind)]) -> Vec<String> {
+    kinds
+        .iter()
+        .filter_map(|(path, kind)| match kind {
+            SnapshotPathKind::Missing => Some(path.clone()),
+            SnapshotPathKind::Directory | SnapshotPathKind::NonDirectory => None,
+        })
+        .collect()
+}
+
 async fn restore_with_heal(
     client: &KopiaClient,
     op: &RestoreOp,
@@ -1046,13 +1169,7 @@ async fn resolve_and_restore(
             identity = %filter.identity(),
             "reusing the snapshot pinned by a prior attempt; restoring",
         );
-        let restored_id =
-            restore_with_heal(client, op, id)
-                .await
-                .map_err(|source| MoverError::Kopia {
-                    op: KopiaOp::SnapshotRestore,
-                    source,
-                })?;
+        let restored_id = restore_snapshot(client, op, id).await?;
         let identity = prior.identity.unwrap_or_else(|| ResolvedIdentity {
             username: sel.username.clone(),
             hostname: sel.hostname.clone(),
@@ -1122,12 +1239,7 @@ async fn resolve_and_restore(
                     ..Default::default()
                 })
                 .await;
-            let restored_id = restore_with_heal(client, op, &entry.id)
-                .await
-                .map_err(|source| MoverError::Kopia {
-                    op: KopiaOp::SnapshotRestore,
-                    source,
-                })?;
+            let restored_id = restore_snapshot(client, op, &entry.id).await?;
             return Ok(StatusUpdate::completed_resolved(
                 &restored_id,
                 identity,
@@ -4426,6 +4538,41 @@ fn build_client(spec: &MoverWorkSpec, kopia_binary: Option<&str>) -> KopiaClient
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- #689: partial restore selection probe -------------------------------
+
+    #[test]
+    fn missing_selection_paths_keeps_only_absent_paths_in_order() {
+        let kinds = vec![
+            (
+                "docs/report.odt".to_string(),
+                SnapshotPathKind::NonDirectory,
+            ),
+            ("typo/x".to_string(), SnapshotPathKind::Missing),
+            ("music/album".to_string(), SnapshotPathKind::Directory),
+            ("also/gone".to_string(), SnapshotPathKind::Missing),
+        ];
+        assert_eq!(
+            missing_selection_paths(&kinds),
+            vec!["typo/x".to_string(), "also/gone".to_string()]
+        );
+        assert!(missing_selection_paths(&kinds[..1]).is_empty());
+    }
+
+    #[test]
+    fn restore_paths_missing_message_is_actionable_and_terminal() {
+        let err = MoverError::RestorePathsMissing {
+            snapshot_id: "k123".into(),
+            missing: vec!["docs/typo.odt".into()],
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("\"docs/typo.odt\""), "{msg}");
+        assert!(msg.contains("k123"), "{msg}");
+        assert!(msg.contains("Nothing was restored"), "{msg}");
+        assert!(msg.contains("Fix: correct spec.selection.paths"), "{msg}");
+        // A missing path never appears by retrying the same Job.
+        assert!(!err.retry_recommended());
+    }
 
     // --- #456: the quick tier's coverage verdict -----------------------------
 

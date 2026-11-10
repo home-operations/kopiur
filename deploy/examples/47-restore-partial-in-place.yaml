@@ -1,0 +1,51 @@
+# Example 47 — partial, in-place restore: bring back ONE deleted file (and one
+# directory) into a live, shared PVC, without touching anything else on it.
+#
+# The use case (#689): several people work on the same volume; one of them deletes
+# `docs/report.odt`. A full in-place restore would roll everyone else's work back,
+# and restoring to a new PVC means an rsync/pv-migrate and cleanup afterwards.
+# `spec.selection.paths` restores only the paths you name, each to the SAME relative
+# location in the target, and leaves every sibling exactly as it is.
+#
+# Maps to `Restore.spec.selection.paths` (crates/api/src/restore.rs, `PathSelection`).
+# The rules, enforced at admission (webhook) and again by the controller:
+#   - relative to the snapshot root, '/'-separated: `docs/report.odt`, not `/docs/...`
+#   - normalized: no `..`, no `.`, no empty segment (`a//b`), no trailing '/'
+#   - 1 to 64 paths, no duplicates, no path inside another selected path
+#   - not allowed with `target.streamExec` (that already selects one file)
+# A selected path that does not exist in the snapshot FAILS the Restore before
+# anything is written, naming the missing path. Browse the snapshot first if you are
+# not sure of the exact name (`kubectl kopiur browse`, or the console).
+#
+# Where the volume is still mounted by the running app, that is fine: for a
+# ReadWriteOnce claim Kopiur schedules the mover on the same node as the pod holding
+# it. (A ReadWriteOncePod claim cannot be co-mounted — scale the app down first.)
+---
+# region restore
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: Restore
+metadata:
+  name: samba-report-odt
+  namespace: samba
+spec:
+  source:
+    # The backup taken while the file still existed.
+    snapshotRef:
+      name: samba-20261105063900-pvc-mp3
+  target:
+    # The LIVE claim the file was deleted from — this is an in-place restore.
+    pvcRef:
+      name: mp3
+  selection:
+    paths:
+      - docs/report.odt # a file: restored to <pvc>/docs/report.odt
+      - music/album # a directory: its whole subtree is restored
+  options:
+    # kopia's default is already to overwrite; said explicitly because this writes
+    # into a volume people are using. Set `false` to keep any copy already there.
+    overwriteFiles: true
+    # Optional. With a selection, deletion is SCOPED to each selected directory:
+    # files under <pvc>/music/album that are not in the snapshot's music/album are
+    # removed; nothing outside the selected paths is ever deleted.
+    # enableFileDeletion: true
+# endregion restore

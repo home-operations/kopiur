@@ -38,6 +38,7 @@ const detail: RestoreDetail = {
     pinnedAt: "2026-09-10T11:59:00Z",
     identity: "kopiur@media:/data",
   },
+  selectedPaths: [],
   target: { pvc: "data", pvcPrime: null },
   conditions: [
     {
@@ -89,6 +90,24 @@ describe("Restore drawer", () => {
     expect(region).toHaveTextContent("k123");
     expect(region).toHaveTextContent("kopiur@media:/data");
     expect(region).toHaveTextContent("Resolved once at creation");
+  });
+
+  it("says it restores the whole snapshot when no paths are selected", async () => {
+    mockApi({ [PATH]: jsonResponse(detail) });
+    mountApp(OPEN);
+    expect(
+      within(await openTab("Source")).getByRole("region", { name: "What it reads" }),
+    ).toHaveTextContent("the whole snapshot");
+  });
+
+  it("lists a partial restore's selected paths", async () => {
+    mockApi({
+      [PATH]: jsonResponse({ ...detail, selectedPaths: ["docs/report.odt", "music/album"] }),
+    });
+    mountApp(OPEN);
+    expect(
+      within(await openTab("Source")).getByRole("region", { name: "What it reads" }),
+    ).toHaveTextContent("docs/report.odt, music/album");
   });
 
   it("explains that NoSnapshot is a successful restore of nothing", async () => {

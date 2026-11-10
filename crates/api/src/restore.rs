@@ -52,6 +52,12 @@ pub struct RestoreSpec {
     /// kopia restore behavior (file deletion, permission/atomicity handling).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub options: Option<RestoreOptions>,
+    /// Restore only some paths out of the snapshot instead of its whole root —
+    /// a partial restore (e.g. bring back one deleted file into a live, shared
+    /// PVC). Absent restores everything. Not allowed with `target.streamExec`,
+    /// which already selects exactly one file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection: Option<PathSelection>,
     /// What to do when the referenced snapshot doesn't exist yet, and how long to wait.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy: Option<RestorePolicy>,
@@ -312,6 +318,33 @@ pub struct RestoreOptions {
     /// (kopia default `false`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skip_existing: Option<bool>,
+}
+
+/// Which paths of the snapshot to restore (a partial restore).
+///
+/// Each path is relative to the snapshot root and is written to the SAME
+/// relative location under the target: `docs/report.odt` restores to
+/// `<target>/docs/report.odt`, and `music/album` restores that whole directory
+/// tree to `<target>/music/album`. Nothing outside the selected paths is
+/// read or written — sibling files in the target are left exactly as they are.
+///
+/// Every path must exist in the snapshot: a path that does not fails the whole
+/// `Restore` before ANY data is written, naming the missing path(s).
+///
+/// Combined with `options.enableFileDeletion: true`, deletion is scoped to each
+/// selected DIRECTORY: files under `<target>/<path>` that are absent from the
+/// snapshot's `<path>` are deleted; nothing outside a selected path is ever
+/// deleted. A selected file is simply overwritten.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PathSelection {
+    /// Snapshot-root-relative paths to restore (files or directories), e.g.
+    /// `docs/report.odt` or `music/album`. Relative, `/`-separated, normalized:
+    /// no leading `/`, no `.` or `..` segments, no empty segments (`a//b`), no
+    /// trailing `/`. At most 64 paths, no duplicates, and no path inside another
+    /// selected path (selecting `docs` already restores `docs/report.odt`).
+    #[schemars(length(min = 1, max = 64), inner(length(min = 1, max = 4096)))]
+    pub paths: Vec<String>,
 }
 
 /// How the restore reacts to a missing snapshot and how long it waits.
@@ -926,6 +959,69 @@ policy:
     }
 
     #[test]
+    fn restore_selection_paths_parse_the_cluster_way_and_round_trip() {
+        // #689 partial in-place restore: `spec.selection.paths` is a sub-object
+        // (not a leaf on `options`) so future selection knobs slot in beside it.
+        let yaml = r#"
+source:
+  snapshotRef: { name: samba-20261105063900-pvc-mp3 }
+target:
+  pvcRef: { name: mp3 }
+selection:
+  paths:
+    - docs/report.odt
+    - music/album
+"#;
+        let spec: RestoreSpec = from_yaml(yaml);
+        assert_eq!(
+            spec.selection,
+            Some(PathSelection {
+                paths: vec!["docs/report.odt".into(), "music/album".into()],
+            })
+        );
+        let json = serde_json::to_value(&spec).expect("serialize");
+        assert_eq!(
+            json["selection"]["paths"],
+            serde_json::json!(["docs/report.odt", "music/album"])
+        );
+        let reparsed: RestoreSpec = serde_json::from_value(json).expect("reparse");
+        assert_eq!(spec, reparsed);
+
+        // Absent selection stays absent on the wire (whole-root restore, unchanged).
+        let whole: RestoreSpec =
+            from_yaml("source: { snapshotRef: { name: s } }\ntarget: { pvcRef: { name: p } }\n");
+        assert_eq!(whole.selection, None);
+        assert!(
+            serde_json::to_value(&whole)
+                .unwrap()
+                .get("selection")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn restore_selection_paths_are_bounded_in_the_crd_schema() {
+        // The API server enforces the count/length bounds even with the webhook
+        // disabled; they mirror `validate::MAX_SELECTION_PATHS`/`_BYTES`.
+        let json = serde_json::to_value(Restore::crd()).expect("serialize CRD");
+        let selection = &json["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"]
+            ["properties"]["selection"];
+        let paths = &selection["properties"]["paths"];
+        assert_eq!(paths["type"], "array", "got {paths}");
+        assert_eq!(paths["minItems"], 1);
+        assert_eq!(
+            paths["maxItems"],
+            crate::validate::MAX_SELECTION_PATHS as u64
+        );
+        assert_eq!(paths["items"]["minLength"], 1);
+        assert_eq!(
+            paths["items"]["maxLength"],
+            crate::validate::MAX_SELECTION_PATH_BYTES as u64
+        );
+        assert_eq!(selection["required"], serde_json::json!(["paths"]));
+    }
+
+    #[test]
     fn restore_pvc_access_modes_render_a_closed_enum_in_the_crd_schema() {
         // The Vec<String> → Vec<PvcAccessMode> migration must surface in the CRD:
         // items are a closed string enum (apiserver rejects typos on new writes),
@@ -1110,6 +1206,7 @@ policy: { onMissingSnapshot: Continue }
             }),
             target: RestoreTarget::Populator(PopulatorTarget {}),
             options: None,
+            selection: None,
             policy: None,
             credential_projection: None,
             mover: Some(MoverSpec {

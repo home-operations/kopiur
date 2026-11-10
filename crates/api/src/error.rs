@@ -167,6 +167,25 @@ pub enum ValidationError {
         reason: String,
     },
 
+    /// A `Restore` `spec.selection.paths` entry is not a usable snapshot-relative
+    /// path (absolute, `..`/`.`/empty segment, duplicate, nested inside another
+    /// selected path, …). Rejected at admission because the mover joins each path
+    /// onto the target mount: a path that could escape it, or that names the same
+    /// tree twice, must never reach a restore.
+    #[error(
+        "invalid restore selection path spec.selection.paths[{index}] = {path:?}: {reason}. \
+         Paths are relative to the snapshot root and '/'-separated, e.g. \"docs/report.odt\" \
+         or \"music/album\""
+    )]
+    RestoreSelectionPathInvalid {
+        /// Zero-based index of the offending entry in `spec.selection.paths`.
+        index: usize,
+        /// The offending value, verbatim.
+        path: String,
+        /// What is wrong and how to fix it.
+        reason: String,
+    },
+
     /// A `Repository`/`ClusterRepository` `identityDefaults` CEL expression
     /// (`hostnameExpr` / `usernameExpr`) failed to **compile** (a syntax error, or
     /// it exceeds the length budget). Surfaced at admission so a bad expression

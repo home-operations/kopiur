@@ -6,6 +6,7 @@ import { Code } from "@astrojs/starlight/components";
 import { region } from "@utils/region";
 import examples37RestoreRecordedIdentity from "@repo/deploy/examples/37-restore-recorded-identity.yaml?raw";
 import examples44MultiPvcDeployOrRestore from "@repo/deploy/examples/44-multi-pvc-deploy-or-restore.yaml?raw";
+import examples47RestorePartialInPlace from "@repo/deploy/examples/47-restore-partial-in-place.yaml?raw";
 import examplesPrivilegedMoverNamespace from "@repo/deploy/examples/privileged-mover-namespace.yaml?raw";
 
 A `Restore` reads a snapshot back into a PersistentVolumeClaim (PVC). It answers three questions. Where to read from (`source`), where to write to (`target`), and how to write (`options` and `policy`). It also gives you the same mover settings a backup has: the UID/GID the mover runs as, the kopia cache, and a retry and deadline policy for the Job. Those are covered in [Mover, cache & failure policy](#mover-cache--failure-policy) below.
@@ -16,6 +17,7 @@ A `Restore` reads a snapshot back into a PersistentVolumeClaim (PVC). It answers
 spec:
   source: { <one of three>: ... } # FROM: which snapshot
   target: { <one of four>: ... } # TO: pvc | pvcRef | populator | streamExec  (REQUIRED)
+  selection: { paths: [...] } # WHAT: only these paths (optional; default: everything)
   options: { ... } # HOW kopia writes (file deletion, permissions)
   policy: { ... } # what to do if the snapshot is missing
 ```
@@ -273,6 +275,43 @@ To actually restore into that claim, delete the **PVC**, keeping its `dataSource
 
 :::
 
+## Restore only some files — `selection`
+
+By default a restore writes the **whole** snapshot. To bring back just one file or a few directories, list them under `spec.selection.paths`. Each path is relative to the snapshot root and is restored to the **same relative location** in the target. Everything else in the target is left exactly as it is.
+
+The typical case is a shared volume: someone deleted `docs/report.odt` while other people kept working on the same PVC. A full in-place restore would roll back their work, and restoring to a new PVC means copying the file across by hand afterwards. A partial restore straight into the live PVC does neither:
+
+<Code
+  code={region(examples47RestorePartialInPlace, "restore")}
+  lang="yaml"
+  title="deploy/examples/47-restore-partial-in-place.yaml"
+/>
+
+With that `Restore`, `docs/report.odt` comes back to `<pvc>/docs/report.odt` and the whole `music/album` directory to `<pvc>/music/album`. `docs/other.txt`, files created since the backup and everything outside the two paths are not read, reverted or deleted. Kopiur creates a missing parent directory for a selected file. The mover can run while the app still has the volume mounted: a `ReadWriteOnce` claim gets the mover scheduled onto the same node as the pod holding it (see [`pvcRef`](#pvcref--write-into-an-existing-pvc) above).
+
+From the CLI, `--path` does the same and can be repeated:
+
+```console
+kubectl kopiur restore --from-snapshot samba-20261105063900-pvc-mp3 --to-pvc mp3 \
+  --path docs/report.odt --path music/album --overwrite-files true --wait
+```
+
+The web console's Restore form has the same field, one path per line, and a restore's detail view lists the paths it selected.
+
+:::caution[What a path may look like (webhook-enforced)]
+
+Paths are relative to the snapshot root and `/`-separated: `docs/report.odt`, not `/docs/report.odt`. They must be normalized, with no `..`, no `.` and no empty segment (`a//b`), and no trailing `/`. You can list 1 to 64 paths, with no duplicates and no path inside another selected path (selecting `docs` already restores `docs/report.odt`). `selection` is not allowed with a `streamExec` target, which already picks exactly one file.
+
+:::
+
+:::note[A path that is not in the snapshot fails the restore — before anything is written]
+
+Kopiur checks every selected path against the snapshot first. If one does not exist, the `Restore` goes to `Failed` and `status.failure.message` names the missing path(s), and **nothing** was written to the target. Use [`kubectl kopiur browse`](/cli/browse/) or the console's snapshot browser to check the exact name, or pick a snapshot taken while the file still existed.
+
+:::
+
+`options` apply to each selected path exactly as they would to the whole snapshot. `overwriteFiles: false` keeps a copy that is already there. `enableFileDeletion: true` is **scoped to each selected directory**: it deletes files under `<pvc>/music/album` that are not in the snapshot's `music/album`, and never touches anything outside a selected path. For a selected file it changes nothing.
+
 ## How to write — `options` and `policy`
 
 ```yaml
@@ -504,6 +543,7 @@ The full `Restore` surface, with the examples that exercise each field. `source`
 | `target.pvcRef`                                                             | Restore into an **existing** PVC (`{ name }`).                                                                                                                        | In-place restore (scale the app down first). ([15](/examples/#example-15--in-place-mirror-restore))                                                                                                                      |
 | `target.populator`                                                          | Explicit passive volume-populator source (`populator: {}`).                                                                                                           | GitOps deploy-or-restore via a PVC `dataSourceRef`. ([05](/examples/#example-05--deploy-or-restore-gitops))                                                                                                              |
 | `target.streamExec`                                                         | Pipe ONE virtual file into a command's stdin in a running Pod (`{ fileName, workloadExec }`). Writes no PVC.                                                          | Replaying a logical dump (`psql` < `pg_dumpall`). ([stream sources](/stream-sources/))                                                                                                                                   |
+| `selection.paths`                                                           | Restore only these snapshot-relative paths (files or directories), each to the same place in the target; siblings are untouched. Absent ⇒ the whole snapshot.         | Bring back one deleted file into a live, shared PVC. ([47](#restore-only-some-files--selection))                                                                                                                         |
 | `options.enableFileDeletion`                                                | Delete target files not in the snapshot (exact **mirror**); wired to kopia's `--delete-extra`. Default `false` (additive).                                            | A faithful in-place restore. Destructive, so use it deliberately. ([15](/examples/#example-15--in-place-mirror-restore))                                                                                                 |
 | `options.ignorePermissionErrors`                                            | Complete and _report_ permission problems vs. fail hard. Default `true`.                                                                                              | `false` to fail-closed when exact permissions matter.                                                                                                                                                                    |
 | `options.writeFilesAtomically`                                              | Write via a temp file + rename. Default `true`.                                                                                                                       | Rarely changed.                                                                                                                                                                                                          |

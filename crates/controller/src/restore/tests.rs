@@ -2345,8 +2345,45 @@ fn restore_flags_enable_file_deletion_regression() {
         ignore_errors: flags.ignore_errors,
         skip_existing: flags.skip_existing,
         delete_extra: flags.delete_extra,
+        paths: vec![],
     };
     assert_eq!(op.restore_options().delete_extra, Some(true));
+}
+
+#[test]
+fn restore_paths_carries_the_selection_onto_the_work_spec() {
+    // #689: a dropped `spec.selection` would silently turn a one-file restore
+    // into a FULL in-place restore of a live PVC. The controller glue must
+    // carry every path verbatim and in order; absent means whole root.
+    use kopiur_api::restore::PathSelection;
+    use kopiur_mover::workspec::{RestoreScope, restore_scope};
+    assert!(restore_paths(&None).is_empty());
+    let paths = restore_paths(&Some(PathSelection {
+        paths: vec!["docs/report.odt".into(), "music/album".into()],
+    }));
+    assert_eq!(paths, vec!["docs/report.odt", "music/album"]);
+
+    let op = RestoreOp {
+        stdout: None,
+        source: RestoreSelection::Snapshot("s".into()),
+        target_path: "/data".into(),
+        anchor: Default::default(),
+        ignore_permission_errors: None,
+        write_files_atomically: None,
+        parallel: None,
+        write_sparse_files: None,
+        skip_owners: None,
+        skip_permissions: None,
+        skip_times: None,
+        overwrite_files: None,
+        overwrite_directories: None,
+        overwrite_symlinks: None,
+        ignore_errors: None,
+        skip_existing: None,
+        delete_extra: false,
+        paths: paths.clone(),
+    };
+    assert_eq!(restore_scope(&op), RestoreScope::Paths(&paths));
 }
 
 // --- §3.6 CR-catalog search: select_recorded_source ---------------------------
