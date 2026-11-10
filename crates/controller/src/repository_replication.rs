@@ -121,16 +121,7 @@ async fn reconcile_inner(repl: &RepositoryReplication, ctx: &Context) -> Result<
     if repl.spec.suspend {
         return suspended(&api, repl, &namespace, &name).await;
     }
-    // #689: resumed — replace a stale `phase: Suspended` the suspended arm
-    // left behind (nothing else rewrites it before the next run ENDS).
-    if let Some(fix) = resumed_phase(
-        repl.spec.suspend,
-        repl.status.as_ref().and_then(|s| s.phase.as_ref())
-            == Some(&RepositoryReplicationPhase::Suspended),
-        observed.has_active,
-    ) {
-        io::patch_status(&api, &name, serde_json::json!({ "phase": fix.label() })).await?;
-    }
+    heal_resumed_phase(&api, repl, &name, observed.has_active).await?;
 
     let source_ref = &repl.spec.source_ref;
     // Launch-side (mirror Job inputs) — store-backed point read (#382 M2).
@@ -170,6 +161,39 @@ async fn reconcile_inner(repl: &RepositoryReplication, ctx: &Context) -> Result<
         ctx, repl, &api, &job_api, &namespace, &name, &repo, observed,
     )
     .await
+}
+
+/// **Pure.** Whether `phase` is the `Suspended` stamp. Exhaustive so a new
+/// phase variant must decide whether it, too, can be left stale by a resume.
+fn phase_is_suspended(phase: Option<&RepositoryReplicationPhase>) -> bool {
+    match phase {
+        Some(RepositoryReplicationPhase::Suspended) => true,
+        Some(
+            RepositoryReplicationPhase::Pending
+            | RepositoryReplicationPhase::Replicating
+            | RepositoryReplicationPhase::Succeeded
+            | RepositoryReplicationPhase::Failed
+            | RepositoryReplicationPhase::Unknown(_),
+        )
+        | None => false,
+    }
+}
+
+/// #689: on a resumed (non-suspended) replication, replace the stale
+/// `phase: Suspended` the suspended arm left behind — nothing else rewrites it
+/// before the next run ENDS, so the CR and the console kept saying
+/// "Suspended". See [`resumed_phase`].
+async fn heal_resumed_phase(
+    api: &Api<RepositoryReplication>,
+    repl: &RepositoryReplication,
+    name: &str,
+    has_active_job: bool,
+) -> Result<()> {
+    let phase = repl.status.as_ref().and_then(|s| s.phase.as_ref());
+    if let Some(fix) = resumed_phase(repl.spec.suspend, phase_is_suspended(phase), has_active_job) {
+        io::patch_status(api, name, serde_json::json!({ "phase": fix.label() })).await?;
+    }
+    Ok(())
 }
 
 /// The `spec.suspend` arm: record any pending run request (so it is VISIBLE

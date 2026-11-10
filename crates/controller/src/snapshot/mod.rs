@@ -4400,6 +4400,30 @@ fn batch_identity(members: &[PendingMember]) -> kopiur_mover::workspec::Resolved
     }
 }
 
+/// #689: whether a pin/unpin mover must wait because its repository is
+/// suspended (a suspended repository runs no new mover work). Only
+/// `Suspended` holds: a not-Ready repository keeps the pre-#689 behavior (the
+/// pin Job's own retry covers a transient outage). The pin converges on its
+/// own once the repository is unsuspended.
+async fn pin_held_by_suspended_repository(
+    ctx: &Context,
+    repo_ref: &kopiur_api::common::RepositoryRef,
+    namespace: &str,
+    name: &str,
+) -> Result<bool> {
+    match io::repository_availability_cached(ctx, repo_ref, namespace).await? {
+        io::RepositoryAvailability::Suspended => {
+            tracing::info!(
+                backup = %name,
+                repository = %repo_ref.name,
+                "holding pin/unpin: repository is suspended (spec.suspend)"
+            );
+            Ok(true)
+        }
+        io::RepositoryAvailability::Available | io::RepositoryAvailability::NotReady => Ok(false),
+    }
+}
+
 /// Reconcile kopia's snapshot-pin state with `Snapshot.spec.pin` (ADR-0005 §13(c)),
 /// after the snapshot exists. Issues a `SnapshotPin` mover Job only when the desired
 /// (`spec.pin`) and observed (`status.pinned`) state differ (the tested
@@ -4468,20 +4492,8 @@ async fn reconcile_pin(
     // The child's effective repository (pin-aware — a pinned child of a
     // multi-repo policy pins/unpins in ITS repository).
     let repo_ref = &effective_repo;
-    // #689: a suspended repository runs no new mover work, pin/unpin included.
-    // Only `Suspended` holds here: a not-Ready repository keeps today's
-    // behavior (the pin Job's own retry covers a transient outage). The pin
-    // converges on its own once the repository is unsuspended.
-    match io::repository_availability_cached(ctx, repo_ref, namespace).await? {
-        io::RepositoryAvailability::Suspended => {
-            tracing::info!(
-                backup = %name,
-                repository = %repo_ref.name,
-                "holding pin/unpin: repository is suspended (spec.suspend)"
-            );
-            return Ok(Action::requeue(Duration::from_secs(60)));
-        }
-        io::RepositoryAvailability::Available | io::RepositoryAvailability::NotReady => {}
+    if pin_held_by_suspended_repository(ctx, repo_ref, namespace, name).await? {
+        return Ok(Action::requeue(Duration::from_secs(60)));
     }
     let identity = resolve_identity_for(
         &config,

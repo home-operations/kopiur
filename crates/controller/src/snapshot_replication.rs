@@ -152,16 +152,7 @@ async fn reconcile_inner(repl: &SnapshotReplication, ctx: &Context) -> Result<Ac
     if repl.spec.suspend {
         return suspended(&api, repl, &namespace, &name).await;
     }
-    // #689: resumed — replace a stale `phase: Suspended` the suspended arm
-    // left behind (nothing else rewrites it before the next run ENDS).
-    if let Some(fix) = resumed_phase(
-        repl.spec.suspend,
-        repl.status.as_ref().and_then(|s| s.phase.as_ref())
-            == Some(&SnapshotReplicationPhase::Suspended),
-        observed.has_active,
-    ) {
-        io::patch_status(&api, &name, serde_json::json!({ "phase": fix.label() })).await?;
-    }
+    heal_resumed_phase(&api, repl, &name, observed.has_active).await?;
 
     // Both endpoints are real repository CRs — resolve them (backend, encryption,
     // moverDefaults, CA bundles), source first for message determinism.
@@ -175,40 +166,19 @@ async fn reconcile_inner(repl: &SnapshotReplication, ctx: &Context) -> Result<Ac
     // reasons so `kubectl describe` names which end is holding the run.
     // #689: a SUSPENDED endpoint (either end) holds the run under
     // `RepositorySuspended`, naming which repository is suspended.
-    let endpoints = [
-        (
-            &repl.spec.source_ref,
-            (
-                "WaitingForSourceRepository",
-                "source repository is not Ready; deferring replication",
-            ),
-        ),
-        (
-            &repl.spec.destination_ref,
-            (
-                "WaitingForDestinationRepository",
-                "destination repository is not Ready; deferring replication",
-            ),
-        ),
-    ];
-    for (rref, not_ready) in endpoints {
-        let availability = io::repository_availability_cached(ctx, rref, &namespace).await?;
-        if let Some((reason, message)) =
-            replication_repository_hold(availability, not_ready, rref, &namespace)
-        {
-            patch_ready_if_changed(
-                &api,
-                &name,
-                repl,
-                io::ReadyOutcome::Reconciling,
-                reason,
-                &message,
-                None,
-                None,
-            )
-            .await?;
-            return Ok(Action::requeue(REQUEUE_NOT_READY));
-        }
+    if let Some((reason, message)) = endpoint_hold(ctx, repl, &namespace).await? {
+        patch_ready_if_changed(
+            &api,
+            &name,
+            repl,
+            io::ReadyOutcome::Reconciling,
+            reason,
+            &message,
+            None,
+            None,
+        )
+        .await?;
+        return Ok(Action::requeue(REQUEUE_NOT_READY));
     }
 
     // A read-only destination can never take migrated snapshots: stalled until
@@ -256,6 +226,73 @@ async fn reconcile_inner(repl: &SnapshotReplication, ctx: &Context) -> Result<Ac
         ctx, repl, &api, &job_api, &namespace, &name, &source, &dest, &overlap, observed,
     )
     .await
+}
+
+/// The first endpoint (source, then destination) whose repository holds the
+/// run, as the `(reason, message)` to report — `None` when both are available.
+/// DISTINCT not-Ready reasons per end so `kubectl describe` names which end is
+/// holding the run; a suspended end reports `RepositorySuspended` (#689).
+async fn endpoint_hold(
+    ctx: &Context,
+    repl: &SnapshotReplication,
+    namespace: &str,
+) -> Result<Option<(&'static str, String)>> {
+    let endpoints = [
+        (
+            &repl.spec.source_ref,
+            (
+                "WaitingForSourceRepository",
+                "source repository is not Ready; deferring replication",
+            ),
+        ),
+        (
+            &repl.spec.destination_ref,
+            (
+                "WaitingForDestinationRepository",
+                "destination repository is not Ready; deferring replication",
+            ),
+        ),
+    ];
+    for (rref, not_ready) in endpoints {
+        let availability = io::repository_availability_cached(ctx, rref, namespace).await?;
+        if let Some(hold) = replication_repository_hold(availability, not_ready, rref, namespace) {
+            return Ok(Some(hold));
+        }
+    }
+    Ok(None)
+}
+
+/// **Pure.** Whether `phase` is the `Suspended` stamp. Exhaustive so a new
+/// phase variant must decide whether it, too, can be left stale by a resume.
+fn phase_is_suspended(phase: Option<&SnapshotReplicationPhase>) -> bool {
+    match phase {
+        Some(SnapshotReplicationPhase::Suspended) => true,
+        Some(
+            SnapshotReplicationPhase::Pending
+            | SnapshotReplicationPhase::Replicating
+            | SnapshotReplicationPhase::Succeeded
+            | SnapshotReplicationPhase::Failed
+            | SnapshotReplicationPhase::Unknown(_),
+        )
+        | None => false,
+    }
+}
+
+/// #689: on a resumed (non-suspended) replication, replace the stale
+/// `phase: Suspended` the suspended arm left behind — nothing else rewrites it
+/// before the next run ENDS, so the CR and the console kept saying
+/// "Suspended". See [`resumed_phase`].
+async fn heal_resumed_phase(
+    api: &Api<SnapshotReplication>,
+    repl: &SnapshotReplication,
+    name: &str,
+    has_active_job: bool,
+) -> Result<()> {
+    let phase = repl.status.as_ref().and_then(|s| s.phase.as_ref());
+    if let Some(fix) = resumed_phase(repl.spec.suspend, phase_is_suspended(phase), has_active_job) {
+        io::patch_status(api, name, serde_json::json!({ "phase": fix.label() })).await?;
+    }
+    Ok(())
 }
 
 /// The `spec.suspend` arm: record any pending run request (so it is VISIBLE
