@@ -9,9 +9,9 @@
 //!    smaller `capacity` is refused with a Warning Event, never applied.
 //!
 //! Gated by `#[cfg(feature = "e2e")]` + `#[ignore]`; driven by
-//! `mise run //crates/e2e:test`. Skips gracefully without a cluster. Runs in the
-//! `reshape-core` shard, which installs the CSI stack (`csi-hostpath-sc`, which
-//! allows volume expansion).
+//! `mise run //crates/e2e:test`. Skips gracefully without a cluster. Runs in its own
+//! `cache-budgets` shard (`csi: true`), which installs the CSI stack
+//! (`csi-hostpath-sc`, which allows volume expansion).
 
 #![cfg(all(unix, feature = "e2e"))]
 

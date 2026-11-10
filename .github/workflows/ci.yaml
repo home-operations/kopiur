@@ -239,7 +239,15 @@ jobs:
           # the populator-restore handshake (repository_lifecycle) and copyMethod
           # Snapshot/Clone (copy_methods) tests run for real instead of self-skipping.
           - shard: reshape-core
-            bins: "mover_config data_integrity repository_lifecycle tenancy copy_methods cache_budgets"
+            bins: "mover_config data_integrity repository_lifecycle tenancy copy_methods"
+            backends: false
+            csi: true
+          # #613 mover cache budgets: percent budgets reaching kopia, and a
+          # Persistent cache PVC growing with `capacity` (needs an expandable
+          # StorageClass, hence `csi: true` for csi-hostpath-sc). Its own shard so
+          # reshape-core stays well under the job timeout.
+          - shard: cache-budgets
+            bins: "cache_budgets"
             backends: false
             csi: true
           # Hooks (ADR §4.8) + GFS time-bucketed retention + policy knobs. The
