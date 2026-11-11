@@ -178,11 +178,11 @@ pub fn validate_cache_legacy_budgets(
     old: Option<&crate::common::CacheDefaults>,
     field: &str,
 ) -> Option<ValidationError> {
+    // With a capacity on the layer the full admission view applies: the bound on
+    // `*CacheSizeMb`, and a capacity large enough to bound BOTH caches (#707
+    // review). Both tighten pre-existing fields, hence admission-only.
     let cache = cache?;
     if old == Some(cache) || cache.capacity.is_none() {
-        return None;
-    }
-    if cache.content_cache_size_mb.is_none() && cache.metadata_cache_size_mb.is_none() {
         return None;
     }
     crate::common::resolve_cache_budgets(
@@ -192,6 +192,77 @@ pub fn validate_cache_legacy_budgets(
         field,
     )
     .err()
+}
+
+/// The controller owner reference naming a kopiur `Repository`/`ClusterRepository`
+/// — the parent an operator-managed `Maintenance` was projected from. `None` for
+/// anything else. Owner references are user-editable, so this only NAMES the
+/// parent; the webhook must fetch it (and match its uid) before treating the
+/// object as a projection (see [`validate_maintenance_cache_legacy_budgets`]).
+pub fn repository_controller_ref(
+    owner_refs: &[k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference],
+) -> Option<&k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference> {
+    owner_refs.iter().find(|o| {
+        o.controller == Some(true)
+            && o.api_version.starts_with(&format!("{}/", crate::GROUP))
+            && matches!(o.kind.as_str(), "Repository" | "ClusterRepository")
+    })
+}
+
+/// [`validate_cache_legacy_budgets_for`] for a `Maintenance`, skipped for a
+/// VERIFIED projection of a repository.
+///
+/// The operator's managed `Maintenance` copies its repository's
+/// `spec.maintenance.mover`, which was admitted on the repository itself — so a
+/// stored repository whose block predates the bound must still get its
+/// maintenance when it is (re-)enabled. Refusing the operator's CREATE (no old
+/// object to compare against) would leave maintenance silently never starting
+/// (#707 review).
+///
+/// `verified_parent_cache` is `Some(cache)` only when the webhook resolved the
+/// [`repository_controller_ref`] parent, its uid matched, and `cache` is that
+/// repository's own `spec.maintenance.mover.cache`. The exemption applies only when
+/// it EQUALS this object's cache block: owner references are user-editable, so a
+/// user-authored `Maintenance` claiming a repository owner but carrying a cache the
+/// repository does not have is still checked (#714 review).
+pub fn validate_maintenance_cache_legacy_budgets(
+    spec: &MaintenanceSpec,
+    old: Option<&MaintenanceSpec>,
+    verified_parent_cache: Option<Option<&crate::common::CacheDefaults>>,
+) -> Vec<ValidationError> {
+    if verified_parent_cache.is_some_and(|parent| parent == mover_cache(spec.mover.as_ref())) {
+        return Vec::new();
+    }
+    validate_cache_legacy_budgets_for(spec, old)
+}
+
+/// A `SnapshotReplication` connects BOTH repositories, and each keeps its own kopia
+/// cache on the one cache volume, so a sized cache must hold two caches of at
+/// least 1MiB + 1MiB each: 6Mi (#714 review). Admission-only and only when the
+/// block changed, because `capacity` is a pre-existing field.
+pub fn validate_snapshot_replication_cache_minimum(
+    spec: &SnapshotReplicationSpec,
+    old: Option<&SnapshotReplicationSpec>,
+) -> Vec<ValidationError> {
+    const MIN_MIB: i64 = 6;
+    let cache = mover_cache(spec.mover.as_ref());
+    let Some(capacity) = cache.and_then(|c| c.capacity.as_deref()) else {
+        return Vec::new();
+    };
+    if old.is_some_and(|o| mover_cache(o.mover.as_ref()) == cache) {
+        return Vec::new();
+    }
+    match crate::common::quantity_to_mib(capacity) {
+        Some(mib) if mib < MIN_MIB => vec![ValidationError::InvalidFieldValue {
+            field: "spec.mover.cache.capacity".to_string(),
+            reason: format!(
+                "`{capacity}` is too small: a snapshot replication keeps a kopia cache for both \
+                 repositories on this volume, which needs at least {MIN_MIB}Mi. Fix: raise \
+                 `capacity`, or remove it for an unsized emptyDir cache"
+            ),
+        }],
+        _ => Vec::new(),
+    }
 }
 
 /// Every mover cache block a spec carries, with its field path — so the webhook

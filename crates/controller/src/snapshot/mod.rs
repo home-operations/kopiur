@@ -1970,10 +1970,10 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
     // persistent claim that is its live capacity (a pending or refused resize can
     // leave it smaller than the spec), so re-resolve against it here; for per-run
     // volumes this reproduces what `build_backup_run` already computed.
-    let resolved_cache = crate::cache::cache_budgets(
+    let resolved_cache = crate::cache::cache_budgets_for_volume(
         crate::cache::effective_cache(&repo, recipe_mover.as_ref().and_then(|m| m.cache.as_ref()))
             .as_ref(),
-        resolved_volume.capacity.as_deref(),
+        &resolved_volume,
     )?;
     work_spec.cache = crate::cache::tuning_of(&resolved_cache);
     let cache_volume = resolved_volume.volume;
@@ -4318,10 +4318,10 @@ async fn build_batch_job(
     );
     let resolved_volume =
         crate::cache::resolve_snapdel_cache_volume(ctx, job_ns, owner.clone(), &cache_plan).await?;
-    let cache_tuning = crate::cache::cache_tuning(
+    let cache_tuning = crate::cache::tuning_of(&crate::cache::cache_budgets_for_volume(
         effective_cache.as_ref(),
-        resolved_volume.capacity.as_deref(),
-    )?;
+        &resolved_volume,
+    )?);
     let cache_volume = resolved_volume.volume;
     let work_spec = MoverWorkSpec {
         version: 1,
