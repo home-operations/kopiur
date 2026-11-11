@@ -219,30 +219,24 @@ fn fanout_restore_json(
 }
 
 /// Purge one scenario's leftovers so a crashed previous try cannot poison it.
+///
+/// Must run BEFORE [`seed_two_member_backups`] in any scenario whose claims
+/// reuse a source PVC's name: a try that failed with its `Restore` still
+/// standing leaves a claiming PVC behind under that name, and the seed would
+/// adopt it. Each claim goes with EVERY Pod mounting it (see
+/// [`drop_csi_pvc`]), not just the `<claim>-reader` this file names, so a reader
+/// a panicked try left `Pending` cannot hold it `Terminating`.
 async fn clear_restore(client: &kube::Client, restore: &str, claims: &[&str]) {
-    use k8s_openapi::api::core::v1::Pod;
     let restores: Api<Restore> = Api::namespaced(client.clone(), E2E_NAMESPACE);
-    let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), E2E_NAMESPACE);
-    let pods: Api<Pod> = Api::namespaced(client.clone(), E2E_NAMESPACE);
-    for claim in claims {
-        let _ = pods
-            .delete(&format!("{claim}-reader"), &DeleteParams::default())
-            .await;
-        let _ = pvcs.delete(claim, &DeleteParams::default()).await;
-    }
     let _ = restores.delete(restore, &DeleteParams::default()).await;
+    for claim in claims {
+        drop_csi_pvc(client, claim).await;
+    }
     wait_until(
         &format!("leftovers of {restore} are gone"),
         default_timeout(),
         poll_interval(),
-        || async {
-            let restore_gone = restores.get_opt(restore).await?.is_none();
-            let mut claims_gone = true;
-            for claim in claims {
-                claims_gone &= pvcs.get_opt(claim).await?.is_none();
-            }
-            Ok((restore_gone && claims_gone).then_some(()))
-        },
+        || async { Ok(restores.get_opt(restore).await?.is_none().then_some(())) },
     )
     .await
     .unwrap_or_else(|e| panic!("a previous try's {restore} must clear first: {e}"));
@@ -411,7 +405,14 @@ async fn a_direct_target_derives_its_member_path_and_honors_the_override() {
     wait_phase(&restores, derived, "Completed")
         .await
         .expect("a direct restore against a selector policy must complete");
-    assert_marker(&client, &format!("{derived}-reader"), alpha, alpha_marker).await;
+    assert_marker(
+        &client,
+        &format!("{derived}-reader"),
+        alpha,
+        alpha_marker,
+        Some(derived),
+    )
+    .await;
 
     // (b) With `fromPolicy.sourcePath` pinned to the OTHER member, the same
     //     target comes back holding bravo's bytes — proving the override, not
@@ -444,6 +445,7 @@ async fn a_direct_target_derives_its_member_path_and_honors_the_override() {
         &format!("{overridden}-reader"),
         overridden_pvc,
         bravo_marker,
+        Some(overridden),
     )
     .await;
 
@@ -461,7 +463,21 @@ async fn a_direct_target_derives_its_member_path_and_honors_the_override() {
 }
 
 /// Run a one-shot pod asserting `claim`'s `marker.txt` holds `expect`.
-async fn assert_marker(client: &kube::Client, reader: &str, claim: &str, expect: &str) {
+///
+/// `restore` names the `Restore` that fills `claim` (when one does), so a reader
+/// that never runs fails with the populator's own account of the claim — its
+/// `status.claims` record, every PVC, the populate Jobs and their pods' logs,
+/// and the namespace's Warning Events — instead of the bare "did not finish;
+/// logs: <empty>" a never-scheduled pod produces. That bare line is all the
+/// CI failures of this file ever recorded: the shard timed out before its
+/// cluster-level diagnostics dump could run.
+async fn assert_marker(
+    client: &kube::Client,
+    reader: &str,
+    claim: &str,
+    expect: &str,
+    restore: Option<&str>,
+) {
     use k8s_openapi::api::core::v1::Pod;
     use kopiur_e2e::{builders, wait};
     let pods: Api<Pod> = Api::namespaced(client.clone(), E2E_NAMESPACE);
@@ -478,10 +494,183 @@ async fn assert_marker(client: &kube::Client, reader: &str, claim: &str, expect:
     )
     .await
     .expect("create reader pod");
-    wait::pod_succeeded(client, E2E_NAMESPACE, reader)
-        .await
-        .unwrap_or_else(|e| panic!("{claim} must hold marker {expect:?}: {e}"));
+    if let Err(e) = wait::pod_succeeded(client, E2E_NAMESPACE, reader).await {
+        let diagnostics = claim_diagnostics(client, reader, claim, restore).await;
+        // Delete the reader before panicking: a non-terminal pod mounting
+        // `claim` pins it `Terminating` (pvc-protection), which is exactly the
+        // leftover that used to poison every nextest retry of this file.
+        let _ = pods.delete(reader, &DeleteParams::default()).await;
+        panic!("{claim} must hold marker {expect:?}: {e}\n{diagnostics}");
+    }
     let _ = pods.delete(reader, &DeleteParams::default()).await;
+}
+
+/// Everything that explains why `claim` never reached a running reader: the
+/// reader's status, the `Restore`'s record of the claim, every PVC in the
+/// namespace (the claim, its `prime-<uid>`, and anything a previous scenario
+/// left in the way), the populate Jobs with their pods' status and logs, and
+/// the namespace's Warning Events.
+///
+/// Best-effort — a read that fails is reported in place, never fatal — because
+/// it only ever runs on the way to a panic.
+async fn claim_diagnostics(
+    client: &kube::Client,
+    reader: &str,
+    claim: &str,
+    restore: Option<&str>,
+) -> String {
+    use k8s_openapi::api::core::v1::Pod;
+    use std::fmt::Write as _;
+
+    let pods: Api<Pod> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let mut out = String::from("==== populator claim diagnostics ====\n");
+    match pods.get_opt(reader).await {
+        Ok(Some(p)) => {
+            let _ = writeln!(out, "-- reader pod {reader}: {:#}", pod_summary(&p));
+        }
+        other => {
+            let _ = writeln!(out, "-- reader pod {reader}: {other:?}");
+        }
+    }
+    if let Some(restore) = restore {
+        let restores: Api<Restore> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+        let status = status_json(&restores, restore).await;
+        let _ = writeln!(
+            out,
+            "-- Restore {restore}: phase={} conditions={:#}\n   claims={:#}",
+            status["phase"], status["conditions"], status["claims"]
+        );
+    }
+    write_pvc_diagnostics(client, &mut out).await;
+    let _ = writeln!(
+        out,
+        "-- Pods mounting {claim}: {:?}",
+        pods.list(&kube::api::ListParams::default())
+            .await
+            .map(|l| kopiur_e2e::pvc::pods_mounting_claim(&l.items, claim))
+    );
+    if let Some(restore) = restore {
+        write_job_diagnostics(client, restore, &mut out).await;
+    }
+    write_warning_events(client, &mut out).await;
+    out
+}
+
+/// A pod's scheduling/run state, compact enough to read in a panic message.
+fn pod_summary(p: &k8s_openapi::api::core::v1::Pod) -> serde_json::Value {
+    serde_json::json!({
+        "name": p.metadata.name,
+        "phase": p.status.as_ref().and_then(|s| s.phase.clone()),
+        "node": p.spec.as_ref().and_then(|s| s.node_name.clone()),
+        "conditions": p.status.as_ref().map(|s| s.conditions.clone()),
+        "containers": p.status.as_ref().map(|s| s.container_statuses.clone()),
+    })
+}
+
+/// One line per PVC: phase, bound volume, deletion state, finalizers,
+/// annotations (the `selected-node` / prime bookkeeping) and `dataSourceRef`.
+async fn write_pvc_diagnostics(client: &kube::Client, out: &mut String) {
+    use std::fmt::Write as _;
+    let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    match pvcs.list(&kube::api::ListParams::default()).await {
+        Ok(list) => {
+            for p in list.items {
+                let _ = writeln!(
+                    out,
+                    "-- PVC {}: phase={:?} volume={:?} deleting={} finalizers={:?} \
+                     annotations={:?} dataSourceRef={:?}",
+                    p.metadata.name.as_deref().unwrap_or_default(),
+                    p.status.as_ref().and_then(|s| s.phase.clone()),
+                    p.spec.as_ref().and_then(|s| s.volume_name.clone()),
+                    p.metadata.deletion_timestamp.is_some(),
+                    p.metadata.finalizers,
+                    p.metadata.annotations,
+                    p.spec.as_ref().and_then(|s| s.data_source_ref.clone()),
+                );
+            }
+        }
+        Err(e) => {
+            let _ = writeln!(out, "-- PVC list failed: {e}");
+        }
+    }
+}
+
+/// The Jobs named after `restore` (its per-claim populate movers) with each
+/// pod's status and log tail — where an in-Job resolution or restore failure
+/// shows up.
+async fn write_job_diagnostics(client: &kube::Client, restore: &str, out: &mut String) {
+    use k8s_openapi::api::batch::v1::Job;
+    use k8s_openapi::api::core::v1::Pod;
+    use kube::api::ListParams;
+    use std::fmt::Write as _;
+    let jobs: Api<Job> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let pods: Api<Pod> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let list = match jobs.list(&ListParams::default()).await {
+        Ok(list) => list.items,
+        Err(e) => {
+            let _ = writeln!(out, "-- Job list failed: {e}");
+            return;
+        }
+    };
+    for job in list.iter().filter(|j| {
+        j.metadata
+            .name
+            .as_deref()
+            .is_some_and(|n| n.starts_with(restore))
+    }) {
+        let name = job.metadata.name.clone().unwrap_or_default();
+        let _ = writeln!(
+            out,
+            "-- Job {name}: conditions={:#}",
+            serde_json::json!(job.status.as_ref().map(|s| s.conditions.clone()))
+        );
+        let selector = format!("job-name={name}");
+        let Ok(job_pods) = pods.list(&ListParams::default().labels(&selector)).await else {
+            continue;
+        };
+        for p in job_pods.items {
+            let pod_name = p.metadata.name.clone().unwrap_or_default();
+            let _ = writeln!(out, "   pod: {:#}", pod_summary(&p));
+            let logs = kopiur_e2e::wait::pod_logs(client, E2E_NAMESPACE, &pod_name)
+                .await
+                .unwrap_or_else(|e| format!("<logs unavailable: {e}>"));
+            let lines: Vec<&str> = logs.lines().collect();
+            let tail = &lines[lines.len().saturating_sub(60)..];
+            let _ = writeln!(out, "   logs (tail):\n{}", tail.join("\n"));
+        }
+    }
+}
+
+/// The namespace's last 40 Warning Events, oldest first.
+async fn write_warning_events(client: &kube::Client, out: &mut String) {
+    use k8s_openapi::api::core::v1::Event;
+    use std::fmt::Write as _;
+    let events: Api<Event> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    match events.list(&kube::api::ListParams::default()).await {
+        Ok(list) => {
+            let mut warnings: Vec<_> = list
+                .items
+                .into_iter()
+                .filter(|e| e.type_.as_deref() == Some("Warning"))
+                .collect();
+            warnings.sort_by(|a, b| a.last_timestamp.cmp(&b.last_timestamp));
+            let _ = writeln!(out, "-- Warning Events (last 40):");
+            for e in &warnings[warnings.len().saturating_sub(40)..] {
+                let _ = writeln!(
+                    out,
+                    "   {} {}/{} x{}: {}",
+                    e.reason.as_deref().unwrap_or_default(),
+                    e.involved_object.kind.as_deref().unwrap_or_default(),
+                    e.involved_object.name.as_deref().unwrap_or_default(),
+                    e.count.unwrap_or(1),
+                    e.message.as_deref().unwrap_or_default(),
+                );
+            }
+        }
+        Err(e) => {
+            let _ = writeln!(out, "-- Event list failed: {e}");
+        }
+    }
 }
 
 /// **Test 3 — fail closed.** A policy whose two selector sources disagree on
@@ -619,8 +808,6 @@ async fn a_failed_claim_stalls_the_restore_without_stopping_its_siblings() {
     if !csi_class_present_or_skip(&client, CSI_STORAGE_CLASS).await {
         return;
     }
-    seed_two_member_backups(&client).await;
-
     let restores: Api<Restore> = Api::namespaced(client.clone(), E2E_NAMESPACE);
     let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), E2E_NAMESPACE);
     let (alpha, alpha_marker) = SOURCES[0];
@@ -629,7 +816,11 @@ async fn a_failed_claim_stalls_the_restore_without_stopping_its_siblings() {
     // the bad one is named after a member that was never backed up.
     let good = alpha;
     let bad = "e2e-popfan-missing";
+    // Clear a previous try FIRST: `good` is the source PVC's own name, so a
+    // standing leftover Restore + claiming PVC would otherwise be what the seed
+    // below tries to delete and re-create.
     clear_restore(&client, restore, &[good, bad]).await;
+    seed_two_member_backups(&client).await;
 
     restores
         .create(
@@ -662,7 +853,14 @@ async fn a_failed_claim_stalls_the_restore_without_stopping_its_siblings() {
 
     // The GOOD sibling binds and carries its own data even though its sibling
     // is doomed — the regression guard for the guard relaxation.
-    assert_marker(&client, &format!("{good}-reader"), good, alpha_marker).await;
+    assert_marker(
+        &client,
+        &format!("{good}-reader"),
+        good,
+        alpha_marker,
+        Some(restore),
+    )
+    .await;
 
     wait_until(
         "the bad claim reaches Failed while its sibling is Populated",

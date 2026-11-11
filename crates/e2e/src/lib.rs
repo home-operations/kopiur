@@ -9,6 +9,7 @@ pub mod apply;
 pub mod builders;
 pub mod cli;
 pub mod consts;
+pub mod pvc;
 pub mod slow_mover;
 pub mod ui;
 pub mod wait;
