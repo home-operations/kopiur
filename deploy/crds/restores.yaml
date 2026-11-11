@@ -1422,6 +1422,18 @@ spec:
                     nullable: true
                     type: string
                 type: object
+              waitPausedAt:
+                description: |-
+                  When the `policy.waitTimeout` window was PAUSED (RFC3339) because the
+                  repository was suspended (`spec.suspend: true`) while this restore — or
+                  one of its populator claims — was still waiting to launch. Set on the
+                  first suspended pass that finds an open window; on the first pass after
+                  the repository is resumed, every still-waiting anchor
+                  (`waitStartedAt`, and each unlaunched claim's `waitStartedAt`) is moved
+                  forward by the paused interval and this field is cleared, so time spent
+                  suspended never consumes the window. Absent when nothing is paused.
+                nullable: true
+                type: string
               waitStartedAt:
                 description: |-
                   When the `policy.waitTimeout` window OPENED (RFC3339) — the first reconcile on which

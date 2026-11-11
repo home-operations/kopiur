@@ -149,6 +149,44 @@ pub async fn resolve_repository_ref_cached(
     }
 }
 
+/// Whether new work may be dispatched against a repository right now — the ONE
+/// answer every launch-side consumer (Snapshot, Restore, Maintenance,
+/// SnapshotPolicy retention/verification, RepositoryReplication,
+/// SnapshotReplication, repository seeding) matches on before it creates a
+/// mover Job (#689).
+///
+/// An enum, not a `bool`, so a suspended repository can never be silently
+/// folded into "Ready" — the #689 bug: `suspend` leaves `status.phase`
+/// untouched, so a phase-only gate kept launching backups against a suspended
+/// `ClusterRepository`. Every caller matches it exhaustively and surfaces
+/// [`RepositoryAvailability::Suspended`] with its own `RepositorySuspended`
+/// reason ([`crate::consts::REPOSITORY_SUSPENDED_REASON`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepositoryAvailability {
+    /// Not suspended and accepting this kind of work: dispatch.
+    Available,
+    /// Not suspended, but not (yet) usable — still bootstrapping, unreachable,
+    /// degraded, or failed. Wait for the repository's own reconcile.
+    NotReady,
+    /// `spec.suspend: true` on the `Repository`/`ClusterRepository`: a
+    /// declarative pause of ALL new work against the repository. It wins over
+    /// any phase. Held work resumes on its own once the repository is
+    /// unsuspended.
+    Suspended,
+}
+
+impl RepositoryAvailability {
+    /// **Pure.** The single decision: `suspend` first (a suspended repository
+    /// is paused whatever its phase says), then the caller's readiness verdict.
+    pub fn decide(suspend: bool, accepts_work: bool) -> Self {
+        match (suspend, accepts_work) {
+            (true, _) => Self::Suspended,
+            (false, true) => Self::Available,
+            (false, false) => Self::NotReady,
+        }
+    }
+}
+
 /// **Pure.** The controller-side `ClusterRepository` tenancy decision for a
 /// consumer in `consumer_ns`: `None` = permitted, `Some(message)` = refused with
 /// an actionable what/why/fix message.
@@ -277,21 +315,34 @@ pub fn unresolved_repository_report(err: &Error, role: &str) -> Option<(&'static
     }
 }
 
-/// Store-backed variant of [`super::repository_ready`] for the launch-side
-/// readiness gates (#382 M2). Accepted staleness bound: a consumer reconcile
-/// triggered by its own Repository watch can read a stale not-Ready phase from
-/// the Repository controller's reflector — that heals at each gate's existing
-/// short requeue backstop (15s for Snapshot/Restore/SnapshotPolicy, the
-/// not-ready requeue for Maintenance/replication), so readiness is never
-/// wedged, only (rarely) delayed by one requeue.
+/// The user-facing message for work held by a suspended repository. One
+/// wording for every consumer so `kubectl describe` reads the same everywhere:
+/// what (the repository is suspended), why (a pause, not a fault), and the fix
+/// (unsuspend; the held work resumes on its own).
+pub fn repository_suspended_message(repo_ref: &RepositoryRef, default_ns: &str) -> String {
+    let key = kopiur_api::common::repo_key(repo_ref, default_ns);
+    format!(
+        "{key} is suspended (spec.suspend: true); this work waits and resumes \
+         automatically once it is unsuspended. Fix: set spec.suspend: false on {key}"
+    )
+}
+
+/// Store-backed launch-side availability gate (#382 M2, #689): `Available`
+/// iff the repository is NOT suspended and its `status.phase == Ready`.
+/// Accepted staleness bound: a consumer reconcile triggered by its own
+/// Repository watch can read a stale phase/suspend from the Repository
+/// controller's reflector — that heals at each gate's existing short requeue
+/// backstop (15s for Snapshot/Restore/SnapshotPolicy, the not-ready requeue
+/// for Maintenance/replication), so availability is never wedged, only
+/// (rarely) delayed by one requeue.
 ///
 /// **Must NOT be used by deletion/finalizer/breaker paths** (audit C7) — those
 /// keep the live [`super::repository_ready`]/[`super::resolve_repository_ref`].
-pub async fn repository_ready_cached(
+pub async fn repository_availability_cached(
     ctx: &Context,
     repo_ref: &RepositoryRef,
     default_ns: &str,
-) -> Result<bool> {
+) -> Result<RepositoryAvailability> {
     let ready = kopiur_api::RepositoryPhase::Ready;
     match repo_lookup(repo_ref, default_ns) {
         RepoLookup::Namespaced { namespace, name } => {
@@ -300,33 +351,42 @@ pub async fn repository_ready_cached(
                 .ok_or_else(|| {
                     Error::MissingDependency(format!("Repository {namespace}/{name}"))
                 })?;
-            Ok(repo.status.as_ref().and_then(|s| s.phase.as_ref()) == Some(&ready))
+            Ok(RepositoryAvailability::decide(
+                repo.spec.suspend,
+                repo.status.as_ref().and_then(|s| s.phase.as_ref()) == Some(&ready),
+            ))
         }
         RepoLookup::Cluster { name } => {
             let repo = fetch_cluster_repository(ctx, &name)
                 .await?
                 .ok_or_else(|| Error::MissingDependency(format!("ClusterRepository {name}")))?;
-            Ok(repo.status.as_ref().and_then(|s| s.phase.as_ref()) == Some(&ready))
+            Ok(RepositoryAvailability::decide(
+                repo.spec.suspend,
+                repo.status.as_ref().and_then(|s| s.phase.as_ref()) == Some(&ready),
+            ))
         }
     }
 }
 
-/// Store-backed MAINTENANCE gate (issue #413): whether the target repository
-/// accepts maintenance now, per [`crate::health::maintenance_may_proceed`] —
-/// keyed on bootstrapped-before + degradation cause, NOT strictly
-/// `phase == Ready` like [`repository_ready_cached`]. Maintenance is the one
-/// consumer deliberately EXEMPT from the #345 breaker's `Ready`-only gate,
-/// because for an index-blob-bloated repository maintenance is the cure and
-/// withholding it is a deadlock.
+/// Store-backed MAINTENANCE gate (issue #413, #689): whether the target
+/// repository accepts maintenance now. Suspension wins — a suspended
+/// repository runs no maintenance, including an externally-authored
+/// `Maintenance` CR (which the repository's own suspend branch cannot reach).
+/// Otherwise per [`crate::health::maintenance_may_proceed`] — keyed on
+/// bootstrapped-before + degradation cause, NOT strictly `phase == Ready` like
+/// [`repository_availability_cached`]. Maintenance is the one consumer
+/// deliberately EXEMPT from the #345 breaker's `Ready`-only gate, because for
+/// an index-blob-bloated repository maintenance is the cure and withholding it
+/// is a deadlock.
 ///
 /// The Maintenance G7 gate is the sole consumer, and it is a launch-side gate
 /// (#382 M2 charter), so no live twin exists. Same staleness bound and same
-/// `MissingDependency` shape as [`repository_ready_cached`].
+/// `MissingDependency` shape as [`repository_availability_cached`].
 pub async fn repository_maintainable_cached(
     ctx: &Context,
     repo_ref: &RepositoryRef,
     default_ns: &str,
-) -> Result<bool> {
+) -> Result<RepositoryAvailability> {
     match repo_lookup(repo_ref, default_ns) {
         RepoLookup::Namespaced { namespace, name } => {
             let repo = fetch_repository(ctx, &namespace, &name)
@@ -335,10 +395,13 @@ pub async fn repository_maintainable_cached(
                     Error::MissingDependency(format!("Repository {namespace}/{name}"))
                 })?;
             let status = repo.status.as_ref();
-            Ok(crate::health::maintenance_may_proceed(
-                status.and_then(|s| s.phase.as_ref()),
-                status.and_then(|s| s.unique_id.as_deref()),
-                status.map(|s| s.conditions.as_slice()).unwrap_or(&[]),
+            Ok(RepositoryAvailability::decide(
+                repo.spec.suspend,
+                crate::health::maintenance_may_proceed(
+                    status.and_then(|s| s.phase.as_ref()),
+                    status.and_then(|s| s.unique_id.as_deref()),
+                    status.map(|s| s.conditions.as_slice()).unwrap_or(&[]),
+                ),
             ))
         }
         RepoLookup::Cluster { name } => {
@@ -346,10 +409,13 @@ pub async fn repository_maintainable_cached(
                 .await?
                 .ok_or_else(|| Error::MissingDependency(format!("ClusterRepository {name}")))?;
             let status = repo.status.as_ref();
-            Ok(crate::health::maintenance_may_proceed(
-                status.and_then(|s| s.phase.as_ref()),
-                status.and_then(|s| s.unique_id.as_deref()),
-                status.map(|s| s.conditions.as_slice()).unwrap_or(&[]),
+            Ok(RepositoryAvailability::decide(
+                repo.spec.suspend,
+                crate::health::maintenance_may_proceed(
+                    status.and_then(|s| s.phase.as_ref()),
+                    status.and_then(|s| s.unique_id.as_deref()),
+                    status.map(|s| s.conditions.as_slice()).unwrap_or(&[]),
+                ),
             ))
         }
     }
@@ -754,10 +820,78 @@ mod tests {
         assert_eq!(log.lock().unwrap().len(), 1, "unset store must read live");
     }
 
-    // --- repository_ready_cached over the kernel ----------------------------
+    // --- repository_availability_cached over the kernel ---------------------
+
+    /// A `Repository` fixture with a phase and an explicit `spec.suspend`.
+    fn repository_suspended(ns: &str, name: &str, phase: Option<&str>) -> Repository {
+        let mut v = repository_json(ns, name, phase);
+        v["spec"]["suspend"] = serde_json::json!(true);
+        serde_json::from_value(v).expect("valid Repository fixture")
+    }
+
+    fn cluster_repository(name: &str, phase: Option<&str>, suspend: bool) -> ClusterRepository {
+        let mut v = serde_json::json!({
+            "apiVersion": kopiur_api::consts::API_VERSION,
+            "kind": "ClusterRepository",
+            "metadata": { "name": name, "uid": format!("uid-crepo-{name}") },
+            "spec": {
+                "backend": { "filesystem": { "path": "/repo" } },
+                "encryption": { "passwordSecretRef": { "name": "pw", "namespace": "kopiur-system" } },
+                "allowedNamespaces": { "all": true },
+            },
+        });
+        if let Some(p) = phase {
+            v["status"] = serde_json::json!({ "phase": p });
+        }
+        if suspend {
+            v["spec"]["suspend"] = serde_json::json!(true);
+        }
+        serde_json::from_value(v).expect("valid ClusterRepository fixture")
+    }
+
+    fn prime_crepo_store(ctx: &Context, objs: Vec<ClusterRepository>, synced: bool) {
+        let (store, mut writer) = kube::runtime::reflector::store::<ClusterRepository>();
+        for o in objs {
+            writer.apply_watcher_event(&watcher::Event::Apply(o));
+        }
+        std::mem::forget(writer);
+        ctx.crepo_store.set(store).ok();
+        ctx.crepo_synced.store(synced, Ordering::Release);
+    }
+
+    #[test]
+    fn suspend_wins_over_every_readiness_verdict() {
+        use RepositoryAvailability as A;
+        // #689: `suspend` leaves `status.phase` untouched, so a suspended
+        // repository can still read `Ready` — it must still be Suspended.
+        assert_eq!(A::decide(true, true), A::Suspended);
+        assert_eq!(A::decide(true, false), A::Suspended);
+        assert_eq!(A::decide(false, true), A::Available);
+        assert_eq!(A::decide(false, false), A::NotReady);
+    }
+
+    #[test]
+    fn the_suspended_message_names_the_repository_kind_and_the_fix() {
+        let ns = RepositoryRef {
+            kind: kopiur_api::common::RepositoryKind::Repository,
+            name: "nas".into(),
+            namespace: None,
+        };
+        let msg = repository_suspended_message(&ns, "apps");
+        assert!(msg.contains("Repository/apps/nas"), "{msg}");
+        assert!(msg.contains("spec.suspend: false"), "{msg}");
+        assert!(msg.contains("resumes"), "{msg}");
+        let cluster = RepositoryRef {
+            kind: kopiur_api::common::RepositoryKind::ClusterRepository,
+            name: "shared".into(),
+            namespace: None,
+        };
+        let msg = repository_suspended_message(&cluster, "apps");
+        assert!(msg.contains("ClusterRepository/shared"), "{msg}");
+    }
 
     #[tokio::test]
-    async fn repository_ready_cached_reads_phase_from_the_store() {
+    async fn repository_availability_cached_reads_phase_and_suspend_from_the_store() {
         let log = Arc::new(Mutex::new(Vec::new()));
         let client = logging_client(log.clone(), StatusCode::NOT_FOUND, not_found_body());
         let ctx = Context::test_context(client);
@@ -767,6 +901,9 @@ mod tests {
                 repository("team-a", "ready", Some("Ready")),
                 repository("team-a", "cold", Some("Initializing")),
                 repository("team-a", "bare", None),
+                // #689: Ready phase, but suspended — the exact reported shape.
+                repository_suspended("team-a", "paused", Some("Ready")),
+                repository_suspended("team-a", "paused-cold", Some("Initializing")),
             ],
             true,
         );
@@ -776,34 +913,77 @@ mod tests {
             name: name.into(),
             namespace: None,
         };
-        assert!(
-            repository_ready_cached(&ctx, &rref("ready"), "team-a")
-                .await
-                .unwrap()
+        let avail = |name: &str| {
+            let ctx = &ctx;
+            let rref = rref(name);
+            async move {
+                repository_availability_cached(ctx, &rref, "team-a")
+                    .await
+                    .unwrap()
+            }
+        };
+        assert_eq!(avail("ready").await, RepositoryAvailability::Available);
+        assert_eq!(avail("cold").await, RepositoryAvailability::NotReady);
+        assert_eq!(avail("bare").await, RepositoryAvailability::NotReady);
+        assert_eq!(avail("paused").await, RepositoryAvailability::Suspended);
+        assert_eq!(
+            avail("paused-cold").await,
+            RepositoryAvailability::Suspended
         );
-        assert!(
-            !repository_ready_cached(&ctx, &rref("cold"), "team-a")
-                .await
-                .unwrap()
-        );
-        assert!(
-            !repository_ready_cached(&ctx, &rref("bare"), "team-a")
-                .await
-                .unwrap()
-        );
-        assert!(
-            log.lock().unwrap().is_empty(),
-            "all three served from cache"
-        );
+        assert!(log.lock().unwrap().is_empty(), "all served from cache");
         // Absent repository: live-confirmed MissingDependency, same shape as
         // the live `repository_ready`.
-        let err = repository_ready_cached(&ctx, &rref("gone"), "team-a")
+        let err = repository_availability_cached(&ctx, &rref("gone"), "team-a")
             .await
             .unwrap_err();
         assert!(
             matches!(err, Error::MissingDependency(ref m) if m.contains("Repository team-a/gone")),
             "got {err:?}"
         );
+    }
+
+    /// #689 was reported against a `ClusterRepository`: the cluster arm must
+    /// honor `suspend` exactly like the namespaced arm.
+    #[tokio::test]
+    async fn repository_availability_cached_honors_cluster_repository_suspend() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let client = logging_client(log.clone(), StatusCode::NOT_FOUND, not_found_body());
+        let ctx = Context::test_context(client);
+        prime_crepo_store(
+            &ctx,
+            vec![
+                cluster_repository("shared", Some("Ready"), false),
+                cluster_repository("paused", Some("Ready"), true),
+                cluster_repository("cold", Some("Initializing"), false),
+            ],
+            true,
+        );
+        let rref = |name: &str| RepositoryRef {
+            kind: kopiur_api::common::RepositoryKind::ClusterRepository,
+            name: name.into(),
+            namespace: None,
+        };
+        for (name, want) in [
+            ("shared", RepositoryAvailability::Available),
+            ("paused", RepositoryAvailability::Suspended),
+            ("cold", RepositoryAvailability::NotReady),
+        ] {
+            assert_eq!(
+                repository_availability_cached(&ctx, &rref(name), "team-a")
+                    .await
+                    .unwrap(),
+                want,
+                "{name}"
+            );
+            assert_eq!(
+                repository_maintainable_cached(&ctx, &rref(name), "team-a")
+                    .await
+                    .unwrap(),
+                want,
+                "maintenance gate, {name}"
+            );
+        }
+        assert!(log.lock().unwrap().is_empty(), "all served from cache");
     }
 
     // --- repository_maintainable_cached: the #413 maintenance gate ----------
@@ -879,6 +1059,7 @@ mod tests {
                 repository_maintainable_cached(ctx, &rref, "team-a")
                     .await
                     .unwrap()
+                    == RepositoryAvailability::Available
             }
         };
         assert!(maintainable("ready").await);
@@ -1145,5 +1326,134 @@ mod tests {
         let api: Api<Snapshot> = Api::namespaced(ctx.client.clone(), "team-a");
 
         assert!(confirm_row_live(&api, "alive").await.unwrap());
+    }
+
+    // --- #689 ratchet: every mover dispatcher honors repository suspend ------
+
+    /// The production half of a source file: inline `mod tests { … }` blocks
+    /// are cut off so a test calling the gate cannot satisfy the ratchet.
+    fn production(src: &str) -> &str {
+        src.split("#[cfg(test)]\nmod tests {").next().unwrap_or(src)
+    }
+
+    /// Modules that launch mover work against a repository and MUST consult the
+    /// shared availability gate (so a suspended `Repository` OR
+    /// `ClusterRepository` holds them). Paths are relative to `src/`.
+    const GATED_DISPATCHERS: &[&str] = &[
+        // Backups (first launch) and pin/unpin.
+        "snapshot/mod.rs",
+        // Restores (first launch).
+        "restore/mod.rs",
+        // Maintenance, owned and externally authored alike.
+        "maintenance/mod.rs",
+        // Retention prunes + verification (`verification::verify_step` is only
+        // ever driven over this module's ready subset).
+        "snapshot_policy.rs",
+        // `sync-to` runs (source repository).
+        "repository_replication.rs",
+        // `snapshot migrate` runs (source AND destination repositories).
+        "snapshot_replication.rs",
+        // Seeding a repository FROM another repository.
+        "repo_seed.rs",
+    ];
+
+    /// Modules that build mover Jobs but are deliberately NOT behind the
+    /// availability gate, each with the reason. Adding a file here is a design
+    /// decision that must be defended in review.
+    const EXEMPT_JOB_BUILDERS: &[(&str, &str)] = &[
+        (
+            "repository.rs",
+            "the Repository itself: its own `spec.suspend` branch returns before bootstrap",
+        ),
+        (
+            "cluster_repository.rs",
+            "the ClusterRepository itself: its own `spec.suspend` branch returns before bootstrap",
+        ),
+        (
+            "verification.rs",
+            "verify Jobs are spawned only from snapshot_policy's ready (non-suspended) subset",
+        ),
+    ];
+
+    fn src_dir() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
+    }
+
+    fn rel_rust_files(dir: &std::path::Path, base: &std::path::Path, out: &mut Vec<String>) {
+        for entry in std::fs::read_dir(dir).expect("read src dir") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                rel_rust_files(&path, base, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                let rel = path.strip_prefix(base).expect("under src");
+                out.push(rel.to_string_lossy().replace('\\', "/"));
+            }
+        }
+    }
+
+    #[test]
+    fn every_gated_dispatcher_consults_the_repository_availability_gate() {
+        for rel in GATED_DISPATCHERS {
+            let src = std::fs::read_to_string(src_dir().join(rel)).expect("read dispatcher");
+            let prod = production(&src);
+            assert!(
+                prod.contains("repository_availability_cached(")
+                    || prod.contains("repository_maintainable_cached("),
+                "{rel}: launches mover work but never consults the shared repository \
+                 availability gate, so a suspended Repository/ClusterRepository would not \
+                 hold it (#689). Match on io::repository_availability_cached (or \
+                 repository_maintainable_cached for maintenance)."
+            );
+        }
+        // The repositories' own suspend branches stay in place.
+        for rel in ["repository.rs", "cluster_repository.rs"] {
+            let src = std::fs::read_to_string(src_dir().join(rel)).expect("read repo reconciler");
+            assert!(
+                production(&src).contains("if repo.spec.suspend {"),
+                "{rel}: lost its own spec.suspend branch"
+            );
+        }
+    }
+
+    /// The ratchet half: a NEW module that builds a mover Job fails this test
+    /// until it is classified as gated (and actually gated) or exempt (with a
+    /// reason), so the #689 class of bug — a dispatcher that ignores repository
+    /// suspend — cannot be reintroduced silently.
+    #[test]
+    fn every_mover_job_builder_is_classified_gated_or_exempt() {
+        let base = src_dir();
+        let mut files = Vec::new();
+        rel_rust_files(&base, &base, &mut files);
+        files.sort();
+        let mut unclassified = Vec::new();
+        for rel in &files {
+            if rel.ends_with("tests.rs") || rel == "jobs.rs" {
+                continue;
+            }
+            let src = std::fs::read_to_string(base.join(rel)).expect("read source");
+            if !production(&src).contains("jobs::build_job(") {
+                continue;
+            }
+            let gated = GATED_DISPATCHERS.contains(&rel.as_str());
+            let exempt = EXEMPT_JOB_BUILDERS.iter().any(|(f, _)| f == rel);
+            if !gated && !exempt {
+                unclassified.push(rel.clone());
+            }
+        }
+        assert!(
+            unclassified.is_empty(),
+            "these modules build mover Jobs but are neither in GATED_DISPATCHERS nor \
+             EXEMPT_JOB_BUILDERS: {unclassified:?}. Gate them on \
+             io::repository_availability_cached (a suspended repository must hold them, \
+             #689) and list them, or exempt them with a reason."
+        );
+        // And the lists themselves stay honest: every entry names a real file.
+        for rel in GATED_DISPATCHERS
+            .iter()
+            .copied()
+            .chain(EXEMPT_JOB_BUILDERS.iter().map(|(f, _)| *f))
+        {
+            assert!(files.iter().any(|f| f == rel), "stale ratchet entry: {rel}");
+        }
     }
 }

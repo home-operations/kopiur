@@ -529,6 +529,16 @@ pub struct RestoreStatus {
     /// which case there is no window to anchor).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wait_started_at: Option<String>,
+    /// When the `policy.waitTimeout` window was PAUSED (RFC3339) because the
+    /// repository was suspended (`spec.suspend: true`) while this restore — or
+    /// one of its populator claims — was still waiting to launch. Set on the
+    /// first suspended pass that finds an open window; on the first pass after
+    /// the repository is resumed, every still-waiting anchor
+    /// (`waitStartedAt`, and each unlaunched claim's `waitStartedAt`) is moved
+    /// forward by the paused interval and this field is cleared, so time spent
+    /// suspended never consumes the window. Absent when nothing is paused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_paused_at: Option<String>,
     /// Bytes/files restored so far, patched periodically by the mover.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub progress: Option<RestoreProgress>,

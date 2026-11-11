@@ -176,6 +176,12 @@ pub fn repository_health(
 
 /// **Pure.** The colour of a replication edge, given its projected phase and
 /// whether the user suspended it.
+///
+/// `spec.suspend` is the ONLY source of "suspended" (#689): a `phase:
+/// Suspended` while the spec is NOT suspended is a stale stamp from before
+/// the resume (the controller rewrites it, but a row read in between, or an
+/// older operator, still carries it), so it reads as pending, never as
+/// suspended.
 fn replication_edge_health(
     phase: Option<&kopiur_ui_model::views::ReplicationPhaseView>,
     suspended: bool,
@@ -188,7 +194,7 @@ fn replication_edge_health(
         Some(P::Succeeded) => Health::Healthy,
         Some(P::Replicating) | Some(P::Pending) => Health::Pending,
         Some(P::Failed) => Health::Failed,
-        Some(P::Suspended) => Health::Suspended,
+        Some(P::Suspended) => Health::Pending,
         Some(P::Unknown { .. }) => Health::Unknown,
         None => Health::Unknown,
     }
@@ -1283,6 +1289,46 @@ spec:
         for (json, expected) in cases {
             let backend: Backend = serde_json::from_str(json).expect(json);
             assert_eq!(backend_location(&backend), expected, "for {json}");
+        }
+    }
+
+    /// #689 finding 2: the UI showed a running replication as "Suspended"
+    /// because a stale `phase: Suspended` outlived `suspend: false`. Every
+    /// phase x suspend combination is pinned: `spec.suspend` is the only
+    /// source of "suspended".
+    #[test]
+    fn replication_edge_health_takes_suspension_from_the_spec_only() {
+        use kopiur_ui_model::views::ReplicationPhaseView as P;
+        let phases = [
+            None,
+            Some(P::Pending),
+            Some(P::Replicating),
+            Some(P::Succeeded),
+            Some(P::Failed),
+            Some(P::Suspended),
+            Some(P::Unknown {
+                raw: "Weird".into(),
+            }),
+        ];
+        for phase in &phases {
+            assert_eq!(
+                replication_edge_health(phase.as_ref(), true),
+                Health::Suspended,
+                "suspend: true wins over {phase:?}"
+            );
+            let resumed = replication_edge_health(phase.as_ref(), false);
+            assert_ne!(
+                resumed,
+                Health::Suspended,
+                "suspend: false must never read as suspended ({phase:?})"
+            );
+            let want = match phase {
+                Some(P::Succeeded) => Health::Healthy,
+                Some(P::Pending | P::Replicating | P::Suspended) => Health::Pending,
+                Some(P::Failed) => Health::Failed,
+                Some(P::Unknown { .. }) | None => Health::Unknown,
+            };
+            assert_eq!(resumed, want, "{phase:?}");
         }
     }
 }

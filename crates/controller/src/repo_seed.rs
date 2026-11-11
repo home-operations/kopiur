@@ -926,10 +926,23 @@ async fn arm_migrate_seed(
         }
         Err(e) => return Err(e),
     };
-    if !io::repository_ready_cached(ctx, rref, sctx.source_default_ns).await? {
-        return Ok(SeedArming::Park(SeedPark::source_not_usable(
-            waiting_for_seed_source_message(source_description, "it is not Ready"),
-        )));
+    // #689: a SUSPENDED source repository is not usable either — suspend
+    // pauses all work against it, seeding reads included.
+    match io::repository_availability_cached(ctx, rref, sctx.source_default_ns).await? {
+        io::RepositoryAvailability::Available => {}
+        io::RepositoryAvailability::NotReady => {
+            return Ok(SeedArming::Park(SeedPark::source_not_usable(
+                waiting_for_seed_source_message(source_description, "it is not Ready"),
+            )));
+        }
+        io::RepositoryAvailability::Suspended => {
+            return Ok(SeedArming::Park(SeedPark::source_not_usable(
+                waiting_for_seed_source_message(
+                    source_description,
+                    "it is suspended (spec.suspend: true); unsuspend it to seed from it",
+                ),
+            )));
+        }
     }
     // The one bare-path arm admission cannot see: it would have to read the
     // SOURCE CR to know its backend shape.

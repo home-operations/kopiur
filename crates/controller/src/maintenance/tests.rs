@@ -751,3 +751,185 @@ fn maintenance_op_threads_owner_and_aliases_from_ownership() {
             .is_empty()
     );
 }
+
+#[test]
+fn a_suspended_repository_of_either_kind_holds_maintenance() {
+    use crate::io::RepositoryAvailability as A;
+    for kind in [
+        RepositoryKind::Repository,
+        RepositoryKind::ClusterRepository,
+    ] {
+        let rref = RepositoryRef {
+            kind,
+            name: "nas".into(),
+            namespace: None,
+        };
+        assert_eq!(maintenance_hold(A::Available, &rref, "apps"), None);
+        let (reason, _) = maintenance_hold(A::NotReady, &rref, "apps").expect("held");
+        assert_eq!(reason, crate::consts::WAITING_FOR_REPOSITORY_REASON);
+        let (reason, msg) = maintenance_hold(A::Suspended, &rref, "apps").expect("held");
+        assert_eq!(reason, crate::consts::REPOSITORY_SUSPENDED_REASON);
+        assert!(msg.contains("spec.suspend: false"), "{msg}");
+    }
+}
+
+/// A mock apiserver for the held-observation tests: answers a GET of any Job
+/// in `succeeded` as a Complete Job, any other GET as 404, and records every
+/// status PATCH body (answering with the Maintenance itself).
+fn held_client(
+    succeeded: Vec<String>,
+    patches: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    maint: serde_json::Value,
+) -> kube::Client {
+    use http::{Request, Response, StatusCode};
+    use kube::client::Body;
+    let svc = tower::service_fn(move |req: Request<Body>| {
+        let succeeded = succeeded.clone();
+        let patches = patches.clone();
+        let maint = maint.clone();
+        async move {
+            let method = req.method().to_string();
+            let path = req.uri().path().to_string();
+            let bytes = http_body_util::BodyExt::collect(req.into_body())
+                .await
+                .expect("body")
+                .to_bytes();
+            let not_found = serde_json::json!({
+                "kind": "Status", "apiVersion": "v1", "status": "Failure",
+                "reason": "NotFound", "code": 404, "message": "not found",
+            });
+            let (status, body) = match method.as_str() {
+                "GET" if path.contains("/jobs/") => {
+                    let job = path.rsplit('/').next().unwrap_or_default().to_string();
+                    if succeeded.contains(&job) {
+                        (
+                            StatusCode::OK,
+                            serde_json::json!({
+                                "apiVersion": "batch/v1", "kind": "Job",
+                                "metadata": { "name": job, "namespace": "apps" },
+                                "status": { "conditions": [
+                                    { "type": "Complete", "status": "True" }
+                                ] },
+                            }),
+                        )
+                    } else {
+                        (StatusCode::NOT_FOUND, not_found)
+                    }
+                }
+                "PATCH" => {
+                    patches
+                        .lock()
+                        .expect("log")
+                        .push(serde_json::from_slice(&bytes).expect("json patch body"));
+                    (StatusCode::OK, maint)
+                }
+                _ => (StatusCode::NOT_FOUND, not_found),
+            };
+            Ok::<_, std::convert::Infallible>(
+                Response::builder()
+                    .status(status)
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string().into_bytes()))
+                    .expect("response"),
+            )
+        }
+    });
+    kube::Client::new(svc, "apps")
+}
+
+/// PR #706 review (Greptile P2): the repository hold returned BEFORE the
+/// due slot's Job was observed. A Job already running when the repository
+/// was suspended (or went not-Ready) finishes on its own — and when it
+/// YIELDED the lease it advances no `lastRunAt`, so only the controller's
+/// `lastHandledAt` records the slot. Held, that record was never written;
+/// once the Job's TTL reaped it, the unsuspend re-ran the same slot. The
+/// hold must observe and record settled Jobs before it parks.
+#[tokio::test]
+async fn a_held_maintenance_still_records_a_slot_whose_job_finished() {
+    let now = Utc::now();
+    let earlier = (now - chrono::Duration::hours(3)).to_rfc3339();
+    let status = MaintenanceStatus {
+        quick: Some(handled_at(&earlier)),
+        full: Some(run_at(&(now - chrono::Duration::hours(1)).to_rfc3339())),
+        ..Default::default()
+    };
+    // Quick hourly → its slot is due; full yearly → not due.
+    let mut m = maint_with("0 * * * *", "0 0 1 1 *", Some(status));
+    m.metadata.namespace = Some("apps".into());
+    let (mode, slot) = due_mode(&m, now, None).expect("the quick slot is due");
+    let job = maintenance_job_name("nas-primary", mode, slot);
+
+    let patches = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let client = held_client(
+        vec![job],
+        patches.clone(),
+        serde_json::to_value(&m).expect("maint json"),
+    );
+    let api: Api<Maintenance> = Api::namespaced(client.clone(), "apps");
+    let job_api: Api<Job> = Api::namespaced(client, "apps");
+    observe_settled_runs(&api, &job_api, "nas-primary", &m, None, now)
+        .await
+        .expect("observe");
+
+    let patches = patches.lock().expect("log").clone();
+    assert!(
+        patches
+            .iter()
+            .any(|p| p["status"]["quick"]["lastHandledAt"].is_string()),
+        "the finished slot must be recorded while held: {patches:?}"
+    );
+}
+
+/// The manual-run half of the same defect: a manual Job that finished while
+/// held must be answered `Succeeded`, not left `Running` until its TTL reaps
+/// it and the unsuspend reports `ManualRunOutcomeLost` for a run that worked.
+#[tokio::test]
+async fn a_held_maintenance_still_answers_a_manual_run_whose_job_finished() {
+    let now = Utc::now();
+    let requested = "2026-06-11T12:00:00Z";
+    let recent = (now - chrono::Duration::minutes(5)).to_rfc3339();
+    let status = MaintenanceStatus {
+        quick: Some(run_at(&recent)),
+        full: Some(run_at(&recent)),
+        manual_run: Some(kopiur_api::ManualRunStatus {
+            requested_at: Some(requested.into()),
+            mode: Some(kopiur_api::ManualRunMode::Quick),
+            phase: Some(kopiur_api::ManualRunPhase::Running),
+            completed_at: None,
+        }),
+        ..Default::default()
+    };
+    let mut m = maint_with("0 0 1 1 *", "0 0 1 1 *", Some(status));
+    m.metadata.namespace = Some("apps".into());
+    m.metadata.annotations = Some(
+        [(
+            crate::consts::RUN_REQUESTED_ANNOTATION.to_string(),
+            requested.to_string(),
+        )]
+        .into(),
+    );
+    let at = DateTime::parse_from_rfc3339(requested)
+        .unwrap()
+        .with_timezone(&Utc);
+    let job = manual_job_name("nas-primary", kopiur_api::ManualRunMode::Quick, at);
+
+    let patches = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let client = held_client(
+        vec![job],
+        patches.clone(),
+        serde_json::to_value(&m).expect("maint json"),
+    );
+    let api: Api<Maintenance> = Api::namespaced(client.clone(), "apps");
+    let job_api: Api<Job> = Api::namespaced(client, "apps");
+    observe_settled_runs(&api, &job_api, "nas-primary", &m, None, now)
+        .await
+        .expect("observe");
+
+    let patches = patches.lock().expect("log").clone();
+    assert!(
+        patches
+            .iter()
+            .any(|p| p["status"]["manualRun"]["phase"] == "Succeeded"),
+        "the finished manual run must be answered while held: {patches:?}"
+    );
+}

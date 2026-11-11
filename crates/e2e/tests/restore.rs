@@ -1706,10 +1706,13 @@ async fn restore_wait_window_opens_when_the_repository_becomes_ready() {
         .await
         .expect("the Restore must park Ready=False behind a not-Ready repository");
     let parked = status_json(&restores, WA_RESTORE).await;
+    // #689: a suspended repository holds the restore under its OWN reason —
+    // `RepositorySuspended`, not the not-Ready fault reason — and, like a
+    // not-Ready park, it must not open the wait window.
     assert_eq!(
         condition_reason(&parked, "Ready"),
-        "RepositoryNotReady",
-        "the parked Restore's Ready reason must be RepositoryNotReady: {parked}"
+        "RepositorySuspended",
+        "the parked Restore's Ready reason must be RepositorySuspended: {parked}"
     );
     assert!(
         parked.get("waitStartedAt").is_none(),

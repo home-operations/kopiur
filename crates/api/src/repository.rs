@@ -115,7 +115,7 @@ pub struct RepositorySpec {
     #[serde(default = "default_repository_mode")]
     #[schemars(default = "default_repository_mode")]
     pub mode: RepositoryMode,
-    /// Pause this repository: skip connect/bootstrap and maintenance projection.
+    /// Pause ALL new work against this repository (backups, restores, maintenance, replication, seeding, verification); held work resumes once unsuspended.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub suspend: bool,
     /// Repository health thresholds (tunes the index-blob-count warning).

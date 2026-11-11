@@ -1007,19 +1007,18 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
     // A store-backed point read (#382 M2) — independent of preflight, so it's
     // evaluated FIRST and the repository-not-ready reason is always surfaced
     // before any preflight machinery. A stale not-Ready hit heals at this
-    // gate's own 15s requeue below (see `io::repository_ready_cached`).
-    if !io::repository_ready_cached(ctx, repo_ref, &namespace).await? {
+    // gate's own 15s requeue below (see `io::repository_availability_cached`).
+    // #689: a SUSPENDED repository holds the launch too (its phase can still
+    // read `Ready`), parked under its own `RepositorySuspended` reason; the
+    // same requeue resumes the backup once the repository is unsuspended.
+    let availability = io::repository_availability_cached(ctx, repo_ref, &namespace).await?;
+    if let Some((reason, message)) = repository_launch_hold(availability, repo_ref, &namespace) {
         let current = serde_json::to_value(&backup.status).ok();
         io::patch_status_if_changed(
             &api,
             &name,
             current.as_ref(),
-            snapshot_ready_status(
-                backup,
-                SnapshotPhase::Pending,
-                crate::consts::REPOSITORY_NOT_READY_REASON,
-                &repository_not_ready_message(&repo_ref.name),
-            ),
+            snapshot_ready_status(backup, SnapshotPhase::Pending, reason, &message),
         )
         .await?;
         return Ok(Action::requeue(Duration::from_secs(15)));
@@ -4431,6 +4430,30 @@ fn batch_identity(members: &[PendingMember]) -> kopiur_mover::workspec::Resolved
     }
 }
 
+/// #689: whether a pin/unpin mover must wait because its repository is
+/// suspended (a suspended repository runs no new mover work). Only
+/// `Suspended` holds: a not-Ready repository keeps the pre-#689 behavior (the
+/// pin Job's own retry covers a transient outage). The pin converges on its
+/// own once the repository is unsuspended.
+async fn pin_held_by_suspended_repository(
+    ctx: &Context,
+    repo_ref: &kopiur_api::common::RepositoryRef,
+    namespace: &str,
+    name: &str,
+) -> Result<bool> {
+    match io::repository_availability_cached(ctx, repo_ref, namespace).await? {
+        io::RepositoryAvailability::Suspended => {
+            tracing::info!(
+                backup = %name,
+                repository = %repo_ref.name,
+                "holding pin/unpin: repository is suspended (spec.suspend)"
+            );
+            Ok(true)
+        }
+        io::RepositoryAvailability::Available | io::RepositoryAvailability::NotReady => Ok(false),
+    }
+}
+
 /// Reconcile kopia's snapshot-pin state with `Snapshot.spec.pin` (ADR-0005 §13(c)),
 /// after the snapshot exists. Issues a `SnapshotPin` mover Job only when the desired
 /// (`spec.pin`) and observed (`status.pinned`) state differ (the tested
@@ -4499,6 +4522,9 @@ async fn reconcile_pin(
     // The child's effective repository (pin-aware — a pinned child of a
     // multi-repo policy pins/unpins in ITS repository).
     let repo_ref = &effective_repo;
+    if pin_held_by_suspended_repository(ctx, repo_ref, namespace, name).await? {
+        return Ok(Action::requeue(Duration::from_secs(60)));
+    }
     let identity = resolve_identity_for(
         &config,
         namespace,

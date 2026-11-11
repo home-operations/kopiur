@@ -13,7 +13,7 @@ import { humanBytes, humanDuration, relativeTime } from "../util/format";
 import { admitsText } from "./admits";
 import { type Lamp, healthLamp, loudLamp } from "./health";
 import { parseRef } from "./kind";
-import { replicationHealth, replicationPhaseLabel } from "./replication";
+import { replicationHealth, replicationStateLabel } from "./replication";
 import { restorePhaseLamp } from "./restore";
 import { snapshotPhaseLamp } from "./snapshot";
 import type { Stat } from "./StatStrip";
@@ -220,7 +220,7 @@ export function cardFacts(card: CardRow, now: Date): CardFacts {
         namespace: r.namespace,
         lamp: {
           ...healthLamp(replicationHealth(r.phase, r.suspended)),
-          word: replicationPhaseLabel(r.phase),
+          word: replicationStateLabel(r.phase, r.suspended),
         },
         meta: `every blob → ${r.destinationBackend ?? "backend"} · ${r.cron}`,
         stats: [
@@ -243,7 +243,7 @@ export function cardFacts(card: CardRow, now: Date): CardFacts {
         namespace: r.namespace,
         lamp: {
           ...healthLamp(replicationHealth(r.phase, r.suspended)),
-          word: replicationPhaseLabel(r.phase),
+          word: replicationStateLabel(r.phase, r.suspended),
         },
         meta: `${refName(r.source)} → ${refName(r.destination)} · ${r.cron}`,
         stats: [

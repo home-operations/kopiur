@@ -99,7 +99,7 @@ An object annotated while the webhook was down degrades gracefully instead of st
 
 ### `phase`
 
-The lifecycle phase: `Pending` (admitted, not yet run), `Replicating` (a mover Job is in flight), `Succeeded` (the last run completed), `Failed` (the last run failed; see conditions), or `Suspended`.
+The lifecycle phase: `Pending` (admitted, not yet run), `Replicating` (a mover Job is in flight), `Succeeded` (the last run completed), `Failed` (the last run failed; see conditions), or `Suspended` (paused through `spec.suspend`). When you set `suspend: false` again, the next reconcile replaces `Suspended` with `Replicating` if a run is already in flight, or `Pending` otherwise. A replication also waits, with reason `RepositorySuspended`, while its source or destination repository is suspended.
 
 ### `manualRun`
 

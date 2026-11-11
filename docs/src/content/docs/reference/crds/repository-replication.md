@@ -74,7 +74,7 @@ An object annotated while the webhook was down degrades gracefully instead of st
 
 ### `phase`
 
-The lifecycle phase: `Pending` (admitted, not yet run, which is the default), `Replicating` (a mover Job is in flight), `Succeeded` (the last run completed and it is idle until the next slot), `Failed` (the last run failed; see conditions), or `Suspended` (paused through `spec.suspend`).
+The lifecycle phase: `Pending` (admitted, not yet run, which is the default), `Replicating` (a mover Job is in flight), `Succeeded` (the last run completed and it is idle until the next slot), `Failed` (the last run failed; see conditions), or `Suspended` (paused through `spec.suspend`). When you set `suspend: false` again, the next reconcile replaces `Suspended` with `Replicating` if a run is already in flight, or `Pending` otherwise, so a resumed replication never keeps reporting itself as paused. The web console takes "Suspended" from `spec.suspend` alone for the same reason.
 
 ### `manualRun`
 

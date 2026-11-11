@@ -55,8 +55,8 @@ use crate::pool::slot_gate_is_false;
 use crate::replication_run::{
     ReplicationPoolGate, RunObservation, RunRequest, RunStall, heal_replication_slot_condition,
     idle_report, manual_replication_job_name, manual_run_request, manual_run_status,
-    observe_and_count_runs, recorded_running, replication_pool_gate, run_job_annotations,
-    suspended_manual_run, suspended_report,
+    observe_and_count_runs, recorded_running, replication_pool_gate, replication_repository_hold,
+    resumed_phase, run_job_annotations, suspended_manual_run, suspended_report,
 };
 use crate::snapshot::{backend_to_repository_connect, job_terminal_state};
 use crate::snapshot_schedule::{next_fire, parse_go_duration};
@@ -150,8 +150,10 @@ async fn reconcile_inner(repl: &SnapshotReplication, ctx: &Context) -> Result<Ac
 
     // A suspended replication is skipped (surface phase + Ready=Reconciling).
     if repl.spec.suspend {
+        observe_held_manual_run(&api, &job_api, repl, &namespace, &name).await?;
         return suspended(&api, repl, &namespace, &name).await;
     }
+    heal_resumed_phase(&api, repl, &name, observed.has_active).await?;
 
     // Both endpoints are real repository CRs — resolve them (backend, encryption,
     // moverDefaults, CA bundles), source first for message determinism.
@@ -171,32 +173,21 @@ async fn reconcile_inner(repl: &SnapshotReplication, ctx: &Context) -> Result<Ac
     // Gate on BOTH repositories being Ready — an object-store repo must be
     // bootstrapped before `kopia snapshot migrate` can reach it. DISTINCT
     // reasons so `kubectl describe` names which end is holding the run.
-    if !io::repository_ready_cached(ctx, &repl.spec.source_ref, &namespace).await? {
+    // #689: a SUSPENDED endpoint (either end) holds the run under
+    // `RepositorySuspended`, naming which repository is suspended.
+    if let Some((reason, message)) = endpoint_hold(ctx, repl, &namespace).await? {
         patch_ready_if_changed(
             &api,
             &name,
             repl,
             io::ReadyOutcome::Reconciling,
-            "WaitingForSourceRepository",
-            "source repository is not Ready; deferring replication",
+            reason,
+            &message,
             None,
             None,
         )
         .await?;
-        return Ok(Action::requeue(REQUEUE_NOT_READY));
-    }
-    if !io::repository_ready_cached(ctx, &repl.spec.destination_ref, &namespace).await? {
-        patch_ready_if_changed(
-            &api,
-            &name,
-            repl,
-            io::ReadyOutcome::Reconciling,
-            "WaitingForDestinationRepository",
-            "destination repository is not Ready; deferring replication",
-            None,
-            None,
-        )
-        .await?;
+        observe_held_manual_run(&api, &job_api, repl, &namespace, &name).await?;
         return Ok(Action::requeue(REQUEUE_NOT_READY));
     }
 
@@ -243,6 +234,103 @@ async fn reconcile_inner(repl: &SnapshotReplication, ctx: &Context) -> Result<Ac
 
     drive_schedule(
         ctx, repl, &api, &job_api, &namespace, &name, &source, &dest, &overlap, observed,
+    )
+    .await
+}
+
+/// The first endpoint (source, then destination) whose repository holds the
+/// run, as the `(reason, message)` to report — `None` when both are available.
+/// DISTINCT not-Ready reasons per end so `kubectl describe` names which end is
+/// holding the run; a suspended end reports `RepositorySuspended` (#689).
+async fn endpoint_hold(
+    ctx: &Context,
+    repl: &SnapshotReplication,
+    namespace: &str,
+) -> Result<Option<(&'static str, String)>> {
+    let endpoints = [
+        (
+            &repl.spec.source_ref,
+            (
+                "WaitingForSourceRepository",
+                "source repository is not Ready; deferring replication",
+            ),
+        ),
+        (
+            &repl.spec.destination_ref,
+            (
+                "WaitingForDestinationRepository",
+                "destination repository is not Ready; deferring replication",
+            ),
+        ),
+    ];
+    for (rref, not_ready) in endpoints {
+        let availability = io::repository_availability_cached(ctx, rref, namespace).await?;
+        if let Some(hold) = replication_repository_hold(availability, not_ready, rref, namespace) {
+            return Ok(Some(hold));
+        }
+    }
+    Ok(None)
+}
+
+/// **Pure.** Whether `phase` is the `Suspended` stamp. Exhaustive so a new
+/// phase variant must decide whether it, too, can be left stale by a resume.
+fn phase_is_suspended(phase: Option<&SnapshotReplicationPhase>) -> bool {
+    match phase {
+        Some(SnapshotReplicationPhase::Suspended) => true,
+        Some(
+            SnapshotReplicationPhase::Pending
+            | SnapshotReplicationPhase::Replicating
+            | SnapshotReplicationPhase::Succeeded
+            | SnapshotReplicationPhase::Failed
+            | SnapshotReplicationPhase::Unknown(_),
+        )
+        | None => false,
+    }
+}
+
+/// #689: on a resumed (non-suspended) replication, replace the stale
+/// `phase: Suspended` the suspended arm left behind — nothing else rewrites it
+/// before the next run ENDS, so the CR and the console kept saying
+/// "Suspended". See [`resumed_phase`]. The rewrite is a compare-and-swap on
+/// the stored phase (PR #706 review) — see
+/// [`crate::replication_run::heal_stale_suspended_phase`].
+async fn heal_resumed_phase(
+    api: &Api<SnapshotReplication>,
+    repl: &SnapshotReplication,
+    name: &str,
+    has_active_job: bool,
+) -> Result<()> {
+    let phase = repl.status.as_ref().and_then(|s| s.phase.as_ref());
+    if let Some(fix) = resumed_phase(repl.spec.suspend, phase_is_suspended(phase), has_active_job) {
+        crate::replication_run::heal_stale_suspended_phase(api, name, fix).await?;
+    }
+    Ok(())
+}
+
+/// The held paths (the CR's own `spec.suspend`, a held repository) return
+/// before [`handle_manual_run`]; record a manual Job that settled meanwhile so
+/// a long hold never reads as `ManualRunOutcomeLost` (PR #706 review). See
+/// [`crate::replication_run::observe_settled_manual_run`].
+async fn observe_held_manual_run(
+    api: &Api<SnapshotReplication>,
+    job_api: &Api<Job>,
+    repl: &SnapshotReplication,
+    namespace: &str,
+    name: &str,
+) -> Result<()> {
+    let current = repl
+        .status
+        .as_ref()
+        .and_then(|s| serde_json::to_value(s).ok());
+    crate::replication_run::observe_settled_manual_run(
+        api,
+        job_api,
+        KIND,
+        namespace,
+        name,
+        repl.metadata.annotations.as_ref(),
+        repl.status.as_ref().and_then(|s| s.manual_run.as_ref()),
+        current.as_ref(),
     )
     .await
 }

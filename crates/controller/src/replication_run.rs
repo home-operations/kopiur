@@ -341,6 +341,159 @@ pub fn suspended_report(pending_request: bool) -> (&'static str, &'static str) {
     }
 }
 
+/// The phase a replication that was suspended and is now RESUMED should show
+/// in place of its stale `Suspended` (#689 finding 2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResumedPhase {
+    /// A run Job is in flight.
+    Replicating,
+    /// Waiting for its next slot (or a gate) — no Job yet.
+    Pending,
+}
+
+impl ResumedPhase {
+    /// The wire label — identical for both replication kinds' phase enums.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Replicating => "Replicating",
+            Self::Pending => "Pending",
+        }
+    }
+}
+
+/// **Pure.** The `status.phase` rewrite a resumed replication owes, if any.
+///
+/// The suspended arm stamps `phase: Suspended`, but nothing on the resumed
+/// path wrote a phase until the mover stamped `Succeeded`/`Failed` at the END
+/// of the next run — so after `suspend: false` the CR (and every UI surface
+/// reading it) kept saying `Suspended` through a whole schedule interval and
+/// the run itself (#689). Only a phase that is `Suspended` while the spec is
+/// NOT suspended is rewritten; every other phase is left to its owner.
+pub fn resumed_phase(
+    spec_suspended: bool,
+    phase_is_suspended: bool,
+    has_active_job: bool,
+) -> Option<ResumedPhase> {
+    match (spec_suspended, phase_is_suspended, has_active_job) {
+        // Still suspended, or the phase is not the stale one: nothing to fix.
+        (true, _, _) | (false, false, _) => None,
+        (false, true, true) => Some(ResumedPhase::Replicating),
+        (false, true, false) => Some(ResumedPhase::Pending),
+    }
+}
+
+/// Rewrite a stale `phase: Suspended` to `fix` — but ONLY if the stored phase
+/// is still `Suspended` at write time. Returns whether the rewrite landed.
+///
+/// A compare-and-swap, not a merge patch (PR #706 review): the caller decided
+/// on the heal from the reconcile's copy of the object, and a run Job that was
+/// in flight across the resume can stamp `Succeeded`/`Failed` between that
+/// read and this write. An unconditional write replaced the mover's result
+/// with `Pending`/`Replicating`, and neither the successful-Job branch nor the
+/// idle branch restores a terminal phase, so the CR misreported until another
+/// run ended. The JSON-patch `test` op makes the apiserver refuse the write
+/// (422) when the phase moved on; that loss is the correct outcome, not an
+/// error — the newer phase belongs to its writer.
+pub async fn heal_stale_suspended_phase<K>(
+    api: &Api<K>,
+    name: &str,
+    fix: ResumedPhase,
+) -> Result<bool>
+where
+    K: kube::Resource + serde::de::DeserializeOwned + Clone + std::fmt::Debug,
+{
+    let ops: json_patch::Patch = serde_json::from_value(serde_json::json!([
+        { "op": "test", "path": "/status/phase", "value": "Suspended" },
+        { "op": "replace", "path": "/status/phase", "value": fix.label() },
+    ]))?;
+    let pp = PatchParams {
+        field_manager: Some(crate::io::FIELD_MANAGER.to_string()),
+        ..PatchParams::default()
+    };
+    match api.patch_status(name, &pp, &Patch::Json::<()>(ops)).await {
+        Ok(_) => Ok(true),
+        // The `test` op failed: the phase is no longer `Suspended`.
+        Err(kube::Error::Api(ae)) if ae.code == 422 => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Observe-only bookkeeping for a HELD replication (its repository suspended
+/// or not Ready, or the CR itself `spec.suspend`): when the pending request is
+/// recorded `Running` and its manual Job has since settled, answer
+/// `status.manualRun` `Succeeded`/`Failed`. Launches nothing, writes no
+/// `Ready` condition.
+///
+/// The held paths return before the kind's `handle_manual_run`, so without
+/// this a Job that finished during a hold longer than its TTL left the request
+/// `Running`, and the resumed reconcile reported `ManualRunOutcomeLost` for a
+/// run that worked (PR #706 review). A Job that is still running, or already
+/// gone, is left to the resumed path. `current_status` is the CR's `.status`
+/// as JSON, so a repeat observation is a no-op write.
+#[allow(clippy::too_many_arguments)]
+pub async fn observe_settled_manual_run<K>(
+    api: &Api<K>,
+    job_api: &Api<Job>,
+    kind: ReplicationKind,
+    namespace: &str,
+    name: &str,
+    annotations: Option<&BTreeMap<String, String>>,
+    manual: Option<&ReplicationManualRunStatus>,
+    current_status: Option<&serde_json::Value>,
+) -> Result<()>
+where
+    K: kube::Resource + serde::de::DeserializeOwned + Clone + std::fmt::Debug,
+{
+    // A malformed request is surfaced by the unheld path; nothing to observe.
+    let Ok(Some(request)) = manual_run_request(kind, annotations, manual, namespace, name) else {
+        return Ok(());
+    };
+    if !recorded_running(manual, &request) {
+        return Ok(());
+    }
+    let job_name = manual_replication_job_name(kind, name, request.at);
+    let Some(job) = job_api.get_opt(&job_name).await? else {
+        return Ok(());
+    };
+    let phase = match job_terminal_state(&job) {
+        Some(true) => ReplicationManualRunPhase::Succeeded,
+        Some(false) => ReplicationManualRunPhase::Failed,
+        None => return Ok(()),
+    };
+    crate::io::patch_status_if_changed(
+        api,
+        name,
+        current_status,
+        serde_json::json!({ "manualRun": manual_run_status(&request, phase, Utc::now()) }),
+    )
+    .await?;
+    Ok(())
+}
+
+/// **Pure.** What holds a replication run behind ONE endpoint repository's
+/// availability (#689). Shared by both replication kinds: `None` = that
+/// endpoint is usable; `Some((reason, message))` = report `Ready=Reconciling`
+/// with that reason and wait. `not_ready` is the caller's existing
+/// endpoint-specific `(reason, message)` for a not-Ready repository (so
+/// `kubectl describe` keeps naming which end holds the run); a SUSPENDED
+/// endpoint always reports `RepositorySuspended`. Exhaustive over
+/// [`crate::io::RepositoryAvailability`].
+pub fn replication_repository_hold(
+    availability: crate::io::RepositoryAvailability,
+    not_ready: (&'static str, &'static str),
+    repo_ref: &kopiur_api::common::RepositoryRef,
+    namespace: &str,
+) -> Option<(&'static str, String)> {
+    match availability {
+        crate::io::RepositoryAvailability::Available => None,
+        crate::io::RepositoryAvailability::NotReady => Some((not_ready.0, not_ready.1.to_string())),
+        crate::io::RepositoryAvailability::Suspended => Some((
+            crate::consts::REPOSITORY_SUSPENDED_REASON,
+            crate::io::repository_suspended_message(repo_ref, namespace),
+        )),
+    }
+}
+
 // --- the source repository's mover-Job pool gate ------------------------------
 
 /// The pool gate's verdict for one replication reconcile — the replication peer
@@ -1036,5 +1189,332 @@ mod tests {
         assert!(repo.contains(REPLICATION_COMPONENT), "{repo}");
         assert!(repo.ends_with("=offsite"), "{repo}");
         assert!(snap.contains(SNAPSHOT_REPLICATION_COMPONENT), "{snap}");
+    }
+
+    #[test]
+    fn a_suspended_endpoint_of_either_kind_holds_a_replication_run() {
+        use crate::io::RepositoryAvailability as A;
+        use kopiur_api::common::{RepositoryKind, RepositoryRef};
+        let not_ready = (
+            "WaitingForSourceRepository",
+            "source repository is not Ready",
+        );
+        for kind in [
+            RepositoryKind::Repository,
+            RepositoryKind::ClusterRepository,
+        ] {
+            let rref = RepositoryRef {
+                kind,
+                name: "src".into(),
+                namespace: None,
+            };
+            assert_eq!(
+                replication_repository_hold(A::Available, not_ready, &rref, "apps"),
+                None
+            );
+            // Not Ready keeps the caller's endpoint-specific reason.
+            assert_eq!(
+                replication_repository_hold(A::NotReady, not_ready, &rref, "apps"),
+                Some((not_ready.0, not_ready.1.to_string()))
+            );
+            let (reason, msg) =
+                replication_repository_hold(A::Suspended, not_ready, &rref, "apps").expect("held");
+            assert_eq!(reason, crate::consts::REPOSITORY_SUSPENDED_REASON);
+            assert!(
+                msg.contains("src") && msg.contains("spec.suspend: false"),
+                "{msg}"
+            );
+        }
+    }
+
+    /// #689 finding 2: a replication resumed from `suspend: true` kept
+    /// `phase: Suspended` until its next run ENDED. Every combination of the
+    /// three inputs is pinned.
+    #[test]
+    fn a_resumed_replication_replaces_its_stale_suspended_phase() {
+        // Still suspended: the suspended arm owns the phase.
+        for phase_suspended in [true, false] {
+            for active in [true, false] {
+                assert_eq!(resumed_phase(true, phase_suspended, active), None);
+            }
+        }
+        // Resumed, but the phase is not the stale one: left to its owner.
+        assert_eq!(resumed_phase(false, false, true), None);
+        assert_eq!(resumed_phase(false, false, false), None);
+        // Resumed with the stale phase: Replicating while a Job runs, else Pending.
+        assert_eq!(
+            resumed_phase(false, true, true),
+            Some(ResumedPhase::Replicating)
+        );
+        assert_eq!(
+            resumed_phase(false, true, false),
+            Some(ResumedPhase::Pending)
+        );
+        // The labels are the wire values of BOTH kinds' phase enums.
+        use kopiur_api::common::PhaseLabel;
+        assert_eq!(
+            ResumedPhase::Replicating.label(),
+            kopiur_api::RepositoryReplicationPhase::Replicating.label()
+        );
+        assert_eq!(
+            ResumedPhase::Pending.label(),
+            kopiur_api::SnapshotReplicationPhase::Pending.label()
+        );
+    }
+
+    /// A mock apiserver that records every request (method, content-type,
+    /// body) and answers a status PATCH with `patch_code`.
+    fn heal_client(
+        log: std::sync::Arc<std::sync::Mutex<Vec<(String, String, serde_json::Value)>>>,
+        patch_code: u16,
+    ) -> kube::Client {
+        use http::{Request, Response, StatusCode};
+        use kube::client::Body;
+        let svc = tower::service_fn(move |req: Request<Body>| {
+            let log = log.clone();
+            async move {
+                let method = req.method().to_string();
+                let ctype = req
+                    .headers()
+                    .get("content-type")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or_default()
+                    .to_string();
+                let bytes = http_body_util::BodyExt::collect(req.into_body())
+                    .await
+                    .expect("body")
+                    .to_bytes();
+                let body = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+                log.lock().expect("log").push((method, ctype, body));
+                let (status, resp) = if patch_code == 200 {
+                    (
+                        StatusCode::OK,
+                        serde_json::json!({
+                            "apiVersion": "kopiur.home-operations.com/v1alpha1",
+                            "kind": "RepositoryReplication",
+                            "metadata": { "name": "r", "namespace": "ns" },
+                            "spec": {
+                                "sourceRef": { "name": "nas" },
+                                "destination": { "filesystem": { "path": "/x" } },
+                                "schedule": { "cron": "0 * * * *" }
+                            }
+                        }),
+                    )
+                } else {
+                    (
+                        StatusCode::from_u16(patch_code).expect("code"),
+                        serde_json::json!({
+                            "kind": "Status", "apiVersion": "v1", "status": "Failure",
+                            "message": "the server rejected our request: test operation failed",
+                            "reason": "Invalid", "code": patch_code,
+                        }),
+                    )
+                };
+                Ok::<_, std::convert::Infallible>(
+                    Response::builder()
+                        .status(status)
+                        .header("content-type", "application/json")
+                        .body(Body::from(resp.to_string().into_bytes()))
+                        .expect("response"),
+                )
+            }
+        });
+        kube::Client::new(svc, "ns")
+    }
+
+    /// A mock apiserver for the held manual-run tests: a GET of the Job named
+    /// `job` answers with `job_status` (404 when `None`); every PATCH body is
+    /// recorded and answered with a minimal RepositoryReplication.
+    fn manual_client(
+        job: String,
+        job_status: Option<serde_json::Value>,
+        patches: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    ) -> kube::Client {
+        use http::{Request, Response, StatusCode};
+        use kube::client::Body;
+        let svc = tower::service_fn(move |req: Request<Body>| {
+            let job = job.clone();
+            let job_status = job_status.clone();
+            let patches = patches.clone();
+            async move {
+                let method = req.method().to_string();
+                let path = req.uri().path().to_string();
+                let bytes = http_body_util::BodyExt::collect(req.into_body())
+                    .await
+                    .expect("body")
+                    .to_bytes();
+                let not_found = serde_json::json!({
+                    "kind": "Status", "apiVersion": "v1", "status": "Failure",
+                    "reason": "NotFound", "code": 404, "message": "not found",
+                });
+                let (status, body) = match method.as_str() {
+                    "GET" if path.ends_with(&format!("/jobs/{job}")) => match &job_status {
+                        Some(st) => (
+                            StatusCode::OK,
+                            serde_json::json!({
+                                "apiVersion": "batch/v1", "kind": "Job",
+                                "metadata": { "name": job, "namespace": "ns" },
+                                "status": st,
+                            }),
+                        ),
+                        None => (StatusCode::NOT_FOUND, not_found),
+                    },
+                    "PATCH" => {
+                        patches
+                            .lock()
+                            .expect("log")
+                            .push(serde_json::from_slice(&bytes).expect("patch body"));
+                        (
+                            StatusCode::OK,
+                            serde_json::json!({
+                                "apiVersion": "kopiur.home-operations.com/v1alpha1",
+                                "kind": "RepositoryReplication",
+                                "metadata": { "name": "r", "namespace": "ns" },
+                                "spec": {
+                                    "sourceRef": { "name": "nas" },
+                                    "destination": { "filesystem": { "path": "/x" } },
+                                    "schedule": { "cron": "0 * * * *" }
+                                }
+                            }),
+                        )
+                    }
+                    _ => (StatusCode::NOT_FOUND, not_found),
+                };
+                Ok::<_, std::convert::Infallible>(
+                    Response::builder()
+                        .status(status)
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string().into_bytes()))
+                        .expect("response"),
+                )
+            }
+        });
+        kube::Client::new(svc, "ns")
+    }
+
+    /// PR #706 review (Greptile P2): a held replication (its source repository
+    /// suspended or not Ready, or the CR itself `spec.suspend`) returned before
+    /// `handle_manual_run`, so a manual Job that FINISHED during the hold left
+    /// `status.manualRun` at `Running`. Once its TTL reaped it, the resumed
+    /// reconcile reported `ManualRunOutcomeLost` for a copy that succeeded.
+    /// The held paths must record a settled manual Job's outcome.
+    #[tokio::test]
+    async fn a_held_replication_still_answers_a_manual_run_whose_job_finished() {
+        let raw = "2026-06-11T12:00:00Z";
+        let at = chrono::DateTime::parse_from_rfc3339(raw)
+            .unwrap()
+            .with_timezone(&Utc);
+        let job = manual_replication_job_name(ReplicationKind::Repository, "r", at);
+        let annotations: BTreeMap<String, String> =
+            [(RUN_REQUESTED_ANNOTATION.to_string(), raw.to_string())].into();
+        let running = ReplicationManualRunStatus {
+            requested_at: Some(raw.into()),
+            phase: Some(ReplicationManualRunPhase::Running),
+            completed_at: None,
+        };
+        let complete = serde_json::json!({ "conditions": [
+            { "type": "Complete", "status": "True" }
+        ] });
+        let failed = serde_json::json!({ "conditions": [
+            { "type": "Failed", "status": "True" }
+        ] });
+
+        for (job_status, want) in [
+            (Some(complete), Some("Succeeded")),
+            (Some(failed), Some("Failed")),
+            // Still running, or gone: nothing to record while held (the
+            // resumed path owns the lost-outcome verdict).
+            (Some(serde_json::json!({ "active": 1 })), None),
+            (None, None),
+        ] {
+            let patches = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let client = manual_client(job.clone(), job_status, patches.clone());
+            let api: Api<kopiur_api::RepositoryReplication> = Api::namespaced(client.clone(), "ns");
+            let job_api: Api<Job> = Api::namespaced(client, "ns");
+            observe_settled_manual_run(
+                &api,
+                &job_api,
+                ReplicationKind::Repository,
+                "ns",
+                "r",
+                Some(&annotations),
+                Some(&running),
+                None,
+            )
+            .await
+            .expect("observe");
+            let patches = patches.lock().expect("log").clone();
+            match want {
+                Some(phase) => assert!(
+                    patches
+                        .iter()
+                        .any(|p| p["status"]["manualRun"]["phase"] == phase),
+                    "want manualRun {phase}: {patches:?}"
+                ),
+                None => assert!(patches.is_empty(), "no write expected: {patches:?}"),
+            }
+        }
+
+        // A request that is not recorded `Running` launched nothing to observe.
+        let patches = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let client = manual_client(job, None, patches.clone());
+        let api: Api<kopiur_api::RepositoryReplication> = Api::namespaced(client.clone(), "ns");
+        let job_api: Api<Job> = Api::namespaced(client, "ns");
+        observe_settled_manual_run(
+            &api,
+            &job_api,
+            ReplicationKind::Repository,
+            "ns",
+            "r",
+            Some(&annotations),
+            None,
+            None,
+        )
+        .await
+        .expect("observe");
+        assert!(patches.lock().expect("log").is_empty());
+    }
+
+    /// PR #706 review (Greptile P2): the resume heal read `phase: Suspended`
+    /// from the reconcile's (cached) copy, then merge-patched `Pending`/
+    /// `Replicating` UNCONDITIONALLY — so a mover that wrote `Succeeded`
+    /// between that read and the write had its result overwritten, and nothing
+    /// restored it until another run finished. The heal must be a
+    /// compare-and-swap on the stored phase still being `Suspended`.
+    #[tokio::test]
+    async fn the_resume_heal_only_rewrites_a_phase_that_is_still_suspended() {
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let api: Api<kopiur_api::RepositoryReplication> =
+            Api::namespaced(heal_client(log.clone(), 200), "ns");
+        let healed = heal_stale_suspended_phase(&api, "r", ResumedPhase::Pending)
+            .await
+            .expect("heal");
+        assert!(healed);
+        let recorded = log.lock().expect("log").clone();
+        assert_eq!(recorded.len(), 1, "exactly one write: {recorded:?}");
+        let (method, ctype, body) = &recorded[0];
+        assert_eq!(method, "PATCH");
+        assert_eq!(
+            ctype, "application/json-patch+json",
+            "a merge patch cannot be conditional on the stored phase"
+        );
+        assert_eq!(
+            body,
+            &serde_json::json!([
+                { "op": "test", "path": "/status/phase", "value": "Suspended" },
+                { "op": "replace", "path": "/status/phase", "value": "Pending" },
+            ])
+        );
+
+        // The mover won the race: the stored phase is no longer `Suspended`,
+        // so the test op fails (422) — that is the CAS losing, not an error,
+        // and the mover's phase stands.
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let api: Api<kopiur_api::RepositoryReplication> =
+            Api::namespaced(heal_client(log.clone(), 422), "ns");
+        let healed = heal_stale_suspended_phase(&api, "r", ResumedPhase::Replicating)
+            .await
+            .expect("a lost compare-and-swap is not a reconcile error");
+        assert!(!healed);
     }
 }

@@ -162,6 +162,30 @@ export function replicationPhaseLabel(phase: ReplicationPhaseView | null | undef
 }
 
 /**
+ * The state WORD for a replication — what every surface (table, card,
+ * activity, drawer) prints next to {@link replicationHealth}'s lamp, so the
+ * two can never disagree.
+ *
+ * `spec.suspend` decides "Suspended" (#689): a suspended spec says
+ * "Suspended" whatever the phase, and a stale `phase: "suspended"` on a
+ * resumed spec says "Resuming" — the controller rewrites that phase on its
+ * next pass, but a row read in between (or from an older operator) must not
+ * tell the reader a running replication is paused.
+ */
+export function replicationStateLabel(
+  phase: ReplicationPhaseView | null | undefined,
+  suspended: boolean,
+): string {
+  if (suspended) {
+    return "Suspended";
+  }
+  if (phase === "suspended") {
+    return "Resuming";
+  }
+  return replicationPhaseLabel(phase);
+}
+
+/**
  * The lamp for a replication.
  *
  * Unlike a repository, a replication row carries no `Health` — the backend
@@ -170,6 +194,10 @@ export function replicationPhaseLabel(phase: ReplicationPhaseView | null | undef
  * an edge in the topology and a row here cannot disagree about the same
  * object: suspension first, a phase this bundle cannot interpret is unknown,
  * and no absence ever reads as healthy.
+ *
+ * `spec.suspend` (`suspended`) is the ONLY source of "suspended" (#689): a
+ * `phase: "suspended"` on a replication whose spec is NOT suspended is a stale
+ * stamp left from before the resume, so it reads as pending.
  */
 export function replicationHealth(
   phase: ReplicationPhaseView | null | undefined,
@@ -191,7 +219,8 @@ export function replicationHealth(
       case "failed":
         return "failed";
       case "suspended":
-        return "suspended";
+        // Stale: the spec says resumed (checked above), so it is waiting to run.
+        return "pending";
       default:
         unknownVariant(phase, "ReplicationPhaseView");
         return "unknown";

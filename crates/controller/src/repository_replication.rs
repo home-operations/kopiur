@@ -39,8 +39,8 @@ use crate::pool::slot_gate_is_false;
 use crate::replication_run::{
     ReplicationPoolGate, RunObservation, RunRequest, RunStall, heal_replication_slot_condition,
     idle_report, manual_replication_job_name, manual_run_request, manual_run_status,
-    observe_and_count_runs, recorded_running, replication_pool_gate, run_job_annotations,
-    suspended_manual_run, suspended_report,
+    observe_and_count_runs, recorded_running, replication_pool_gate, replication_repository_hold,
+    resumed_phase, run_job_annotations, suspended_manual_run, suspended_report,
 };
 use crate::snapshot::{backend_to_repository_connect, job_terminal_state};
 use crate::snapshot_schedule::{next_fire, parse_go_duration};
@@ -119,8 +119,10 @@ async fn reconcile_inner(repl: &RepositoryReplication, ctx: &Context) -> Result<
 
     // §14(e): a suspended replication is skipped (surface phase + Ready=Reconciling).
     if repl.spec.suspend {
+        observe_held_manual_run(&api, &job_api, repl, &namespace, &name).await?;
         return suspended(&api, repl, &namespace, &name).await;
     }
+    heal_resumed_phase(&api, repl, &name, observed.has_active).await?;
 
     let source_ref = &repl.spec.source_ref;
     // Tenancy (#677) first: admission defers the allowedNamespaces gate when the
@@ -137,22 +139,97 @@ async fn reconcile_inner(repl: &RepositoryReplication, ctx: &Context) -> Result<
     // pauses replication (fanning `sync-to` Jobs at a degraded backend is
     // doomed work), whereas maintenance is exempt because it is the cure for
     // a Degraded-because-slow repository.
-    if !io::repository_ready_cached(ctx, source_ref, &namespace).await? {
+    // #689: a SUSPENDED source repository holds the run under its own
+    // `RepositorySuspended` reason.
+    let availability = io::repository_availability_cached(ctx, source_ref, &namespace).await?;
+    if let Some((reason, message)) = replication_repository_hold(
+        availability,
+        (
+            crate::consts::WAITING_FOR_REPOSITORY_REASON,
+            "source repository is not Ready; deferring replication",
+        ),
+        source_ref,
+        &namespace,
+    ) {
         patch_ready_if_changed(
             &api,
             &name,
             repl,
             io::ReadyOutcome::Reconciling,
-            crate::consts::WAITING_FOR_REPOSITORY_REASON,
-            "source repository is not Ready; deferring replication",
+            reason,
+            &message,
             None,
         )
         .await?;
+        observe_held_manual_run(&api, &job_api, repl, &namespace, &name).await?;
         return Ok(Action::requeue(REQUEUE_NOT_READY));
     }
 
     drive_schedule(
         ctx, repl, &api, &job_api, &namespace, &name, &repo, observed,
+    )
+    .await
+}
+
+/// **Pure.** Whether `phase` is the `Suspended` stamp. Exhaustive so a new
+/// phase variant must decide whether it, too, can be left stale by a resume.
+fn phase_is_suspended(phase: Option<&RepositoryReplicationPhase>) -> bool {
+    match phase {
+        Some(RepositoryReplicationPhase::Suspended) => true,
+        Some(
+            RepositoryReplicationPhase::Pending
+            | RepositoryReplicationPhase::Replicating
+            | RepositoryReplicationPhase::Succeeded
+            | RepositoryReplicationPhase::Failed
+            | RepositoryReplicationPhase::Unknown(_),
+        )
+        | None => false,
+    }
+}
+
+/// #689: on a resumed (non-suspended) replication, replace the stale
+/// `phase: Suspended` the suspended arm left behind — nothing else rewrites it
+/// before the next run ENDS, so the CR and the console kept saying
+/// "Suspended". See [`resumed_phase`]. The rewrite is a compare-and-swap on
+/// the stored phase (PR #706 review) — see
+/// [`crate::replication_run::heal_stale_suspended_phase`].
+async fn heal_resumed_phase(
+    api: &Api<RepositoryReplication>,
+    repl: &RepositoryReplication,
+    name: &str,
+    has_active_job: bool,
+) -> Result<()> {
+    let phase = repl.status.as_ref().and_then(|s| s.phase.as_ref());
+    if let Some(fix) = resumed_phase(repl.spec.suspend, phase_is_suspended(phase), has_active_job) {
+        crate::replication_run::heal_stale_suspended_phase(api, name, fix).await?;
+    }
+    Ok(())
+}
+
+/// The held paths (the CR's own `spec.suspend`, a held repository) return
+/// before [`handle_manual_run`]; record a manual Job that settled meanwhile so
+/// a long hold never reads as `ManualRunOutcomeLost` (PR #706 review). See
+/// [`crate::replication_run::observe_settled_manual_run`].
+async fn observe_held_manual_run(
+    api: &Api<RepositoryReplication>,
+    job_api: &Api<Job>,
+    repl: &RepositoryReplication,
+    namespace: &str,
+    name: &str,
+) -> Result<()> {
+    let current = repl
+        .status
+        .as_ref()
+        .and_then(|s| serde_json::to_value(s).ok());
+    crate::replication_run::observe_settled_manual_run(
+        api,
+        job_api,
+        KIND,
+        namespace,
+        name,
+        repl.metadata.annotations.as_ref(),
+        repl.status.as_ref().and_then(|s| s.manual_run.as_ref()),
+        current.as_ref(),
     )
     .await
 }

@@ -87,7 +87,7 @@ Access mode: `ReadWrite`, the default, or `ReadOnly`. A `ReadOnly` repository se
 
 ### `suspend`
 
-Pause this repository from the manifest, default `false`. A suspended repository skips connect, bootstrap and maintenance projection, and reports the state in a condition.
+Pause this repository from the manifest, default `false`. A suspended repository skips connect, bootstrap and maintenance projection, and every new piece of work against it (backups, restores, maintenance, replication, seeding, verification, pin) waits with reason `RepositorySuspended` until you set it back to `false`. Running Jobs finish and `Snapshot` deletions still proceed. See [Repositories → `suspend`](/repositories/#suspend--pause-a-repository).
 
 ### `health`
 

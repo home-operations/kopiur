@@ -11,7 +11,7 @@ import {
   lastRunSummary,
   replicationHealth,
   replicationLag,
-  replicationPhaseLabel,
+  replicationStateLabel,
 } from "./replication";
 import { NotReported } from "./NotReported";
 import { KindChip, KindName } from "./KindMark";
@@ -120,7 +120,7 @@ function replicationCell(
       return (
         <HealthBadge
           health={replicationHealth(row.phase, row.suspended)}
-          label={row.suspended ? "Suspended" : replicationPhaseLabel(row.phase)}
+          label={replicationStateLabel(row.phase, row.suspended)}
         />
       );
     case "copies":
