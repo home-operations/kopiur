@@ -182,7 +182,9 @@ fn phase_is_suspended(phase: Option<&RepositoryReplicationPhase>) -> bool {
 /// #689: on a resumed (non-suspended) replication, replace the stale
 /// `phase: Suspended` the suspended arm left behind — nothing else rewrites it
 /// before the next run ENDS, so the CR and the console kept saying
-/// "Suspended". See [`resumed_phase`].
+/// "Suspended". See [`resumed_phase`]. The rewrite is a compare-and-swap on
+/// the stored phase (PR #706 review) — see
+/// [`crate::replication_run::heal_stale_suspended_phase`].
 async fn heal_resumed_phase(
     api: &Api<RepositoryReplication>,
     repl: &RepositoryReplication,
@@ -191,7 +193,7 @@ async fn heal_resumed_phase(
 ) -> Result<()> {
     let phase = repl.status.as_ref().and_then(|s| s.phase.as_ref());
     if let Some(fix) = resumed_phase(repl.spec.suspend, phase_is_suspended(phase), has_active_job) {
-        io::patch_status(api, name, serde_json::json!({ "phase": fix.label() })).await?;
+        crate::replication_run::heal_stale_suspended_phase(api, name, fix).await?;
     }
     Ok(())
 }

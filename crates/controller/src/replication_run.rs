@@ -382,6 +382,42 @@ pub fn resumed_phase(
     }
 }
 
+/// Rewrite a stale `phase: Suspended` to `fix` — but ONLY if the stored phase
+/// is still `Suspended` at write time. Returns whether the rewrite landed.
+///
+/// A compare-and-swap, not a merge patch (PR #706 review): the caller decided
+/// on the heal from the reconcile's copy of the object, and a run Job that was
+/// in flight across the resume can stamp `Succeeded`/`Failed` between that
+/// read and this write. An unconditional write replaced the mover's result
+/// with `Pending`/`Replicating`, and neither the successful-Job branch nor the
+/// idle branch restores a terminal phase, so the CR misreported until another
+/// run ended. The JSON-patch `test` op makes the apiserver refuse the write
+/// (422) when the phase moved on; that loss is the correct outcome, not an
+/// error — the newer phase belongs to its writer.
+pub async fn heal_stale_suspended_phase<K>(
+    api: &Api<K>,
+    name: &str,
+    fix: ResumedPhase,
+) -> Result<bool>
+where
+    K: kube::Resource + serde::de::DeserializeOwned + Clone + std::fmt::Debug,
+{
+    let ops: json_patch::Patch = serde_json::from_value(serde_json::json!([
+        { "op": "test", "path": "/status/phase", "value": "Suspended" },
+        { "op": "replace", "path": "/status/phase", "value": fix.label() },
+    ]))?;
+    let pp = PatchParams {
+        field_manager: Some(crate::io::FIELD_MANAGER.to_string()),
+        ..PatchParams::default()
+    };
+    match api.patch_status(name, &pp, &Patch::Json::<()>(ops)).await {
+        Ok(_) => Ok(true),
+        // The `test` op failed: the phase is no longer `Suspended`.
+        Err(kube::Error::Api(ae)) if ae.code == 422 => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+
 /// **Pure.** What holds a replication run behind ONE endpoint repository's
 /// availability (#689). Shared by both replication kinds: `None` = that
 /// endpoint is usable; `Some((reason, message))` = report `Ready=Reconciling`
@@ -1172,5 +1208,108 @@ mod tests {
             ResumedPhase::Pending.label(),
             kopiur_api::SnapshotReplicationPhase::Pending.label()
         );
+    }
+
+    /// A mock apiserver that records every request (method, content-type,
+    /// body) and answers a status PATCH with `patch_code`.
+    fn heal_client(
+        log: std::sync::Arc<std::sync::Mutex<Vec<(String, String, serde_json::Value)>>>,
+        patch_code: u16,
+    ) -> kube::Client {
+        use http::{Request, Response, StatusCode};
+        use kube::client::Body;
+        let svc = tower::service_fn(move |req: Request<Body>| {
+            let log = log.clone();
+            async move {
+                let method = req.method().to_string();
+                let ctype = req
+                    .headers()
+                    .get("content-type")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or_default()
+                    .to_string();
+                let bytes = http_body_util::BodyExt::collect(req.into_body())
+                    .await
+                    .expect("body")
+                    .to_bytes();
+                let body = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+                log.lock().expect("log").push((method, ctype, body));
+                let (status, resp) = if patch_code == 200 {
+                    (
+                        StatusCode::OK,
+                        serde_json::json!({
+                            "apiVersion": "kopiur.home-operations.com/v1alpha1",
+                            "kind": "RepositoryReplication",
+                            "metadata": { "name": "r", "namespace": "ns" },
+                            "spec": {
+                                "sourceRef": { "name": "nas" },
+                                "destination": { "filesystem": { "path": "/x" } },
+                                "schedule": { "cron": "0 * * * *" }
+                            }
+                        }),
+                    )
+                } else {
+                    (
+                        StatusCode::from_u16(patch_code).expect("code"),
+                        serde_json::json!({
+                            "kind": "Status", "apiVersion": "v1", "status": "Failure",
+                            "message": "the server rejected our request: test operation failed",
+                            "reason": "Invalid", "code": patch_code,
+                        }),
+                    )
+                };
+                Ok::<_, std::convert::Infallible>(
+                    Response::builder()
+                        .status(status)
+                        .header("content-type", "application/json")
+                        .body(Body::from(resp.to_string().into_bytes()))
+                        .expect("response"),
+                )
+            }
+        });
+        kube::Client::new(svc, "ns")
+    }
+
+    /// PR #706 review (Greptile P2): the resume heal read `phase: Suspended`
+    /// from the reconcile's (cached) copy, then merge-patched `Pending`/
+    /// `Replicating` UNCONDITIONALLY — so a mover that wrote `Succeeded`
+    /// between that read and the write had its result overwritten, and nothing
+    /// restored it until another run finished. The heal must be a
+    /// compare-and-swap on the stored phase still being `Suspended`.
+    #[tokio::test]
+    async fn the_resume_heal_only_rewrites_a_phase_that_is_still_suspended() {
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let api: Api<kopiur_api::RepositoryReplication> =
+            Api::namespaced(heal_client(log.clone(), 200), "ns");
+        let healed = heal_stale_suspended_phase(&api, "r", ResumedPhase::Pending)
+            .await
+            .expect("heal");
+        assert!(healed);
+        let recorded = log.lock().expect("log").clone();
+        assert_eq!(recorded.len(), 1, "exactly one write: {recorded:?}");
+        let (method, ctype, body) = &recorded[0];
+        assert_eq!(method, "PATCH");
+        assert_eq!(
+            ctype, "application/json-patch+json",
+            "a merge patch cannot be conditional on the stored phase"
+        );
+        assert_eq!(
+            body,
+            &serde_json::json!([
+                { "op": "test", "path": "/status/phase", "value": "Suspended" },
+                { "op": "replace", "path": "/status/phase", "value": "Pending" },
+            ])
+        );
+
+        // The mover won the race: the stored phase is no longer `Suspended`,
+        // so the test op fails (422) — that is the CAS losing, not an error,
+        // and the mover's phase stands.
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let api: Api<kopiur_api::RepositoryReplication> =
+            Api::namespaced(heal_client(log.clone(), 422), "ns");
+        let healed = heal_stale_suspended_phase(&api, "r", ResumedPhase::Replicating)
+            .await
+            .expect("a lost compare-and-swap is not a reconcile error");
+        assert!(!healed);
     }
 }
