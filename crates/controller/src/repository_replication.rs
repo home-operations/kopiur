@@ -119,6 +119,7 @@ async fn reconcile_inner(repl: &RepositoryReplication, ctx: &Context) -> Result<
 
     // §14(e): a suspended replication is skipped (surface phase + Ready=Reconciling).
     if repl.spec.suspend {
+        observe_held_manual_run(&api, &job_api, repl, &namespace, &name).await?;
         return suspended(&api, repl, &namespace, &name).await;
     }
     heal_resumed_phase(&api, repl, &name, observed.has_active).await?;
@@ -154,6 +155,7 @@ async fn reconcile_inner(repl: &RepositoryReplication, ctx: &Context) -> Result<
             None,
         )
         .await?;
+        observe_held_manual_run(&api, &job_api, repl, &namespace, &name).await?;
         return Ok(Action::requeue(REQUEUE_NOT_READY));
     }
 
@@ -196,6 +198,34 @@ async fn heal_resumed_phase(
         crate::replication_run::heal_stale_suspended_phase(api, name, fix).await?;
     }
     Ok(())
+}
+
+/// The held paths (the CR's own `spec.suspend`, a held repository) return
+/// before [`handle_manual_run`]; record a manual Job that settled meanwhile so
+/// a long hold never reads as `ManualRunOutcomeLost` (PR #706 review). See
+/// [`crate::replication_run::observe_settled_manual_run`].
+async fn observe_held_manual_run(
+    api: &Api<RepositoryReplication>,
+    job_api: &Api<Job>,
+    repl: &RepositoryReplication,
+    namespace: &str,
+    name: &str,
+) -> Result<()> {
+    let current = repl
+        .status
+        .as_ref()
+        .and_then(|s| serde_json::to_value(s).ok());
+    crate::replication_run::observe_settled_manual_run(
+        api,
+        job_api,
+        KIND,
+        namespace,
+        name,
+        repl.metadata.annotations.as_ref(),
+        repl.status.as_ref().and_then(|s| s.manual_run.as_ref()),
+        current.as_ref(),
+    )
+    .await
 }
 
 /// The `spec.suspend` arm: record any pending run request (so it is VISIBLE

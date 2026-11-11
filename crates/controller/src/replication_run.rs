@@ -418,6 +418,58 @@ where
     }
 }
 
+/// Observe-only bookkeeping for a HELD replication (its repository suspended
+/// or not Ready, or the CR itself `spec.suspend`): when the pending request is
+/// recorded `Running` and its manual Job has since settled, answer
+/// `status.manualRun` `Succeeded`/`Failed`. Launches nothing, writes no
+/// `Ready` condition.
+///
+/// The held paths return before the kind's `handle_manual_run`, so without
+/// this a Job that finished during a hold longer than its TTL left the request
+/// `Running`, and the resumed reconcile reported `ManualRunOutcomeLost` for a
+/// run that worked (PR #706 review). A Job that is still running, or already
+/// gone, is left to the resumed path. `current_status` is the CR's `.status`
+/// as JSON, so a repeat observation is a no-op write.
+#[allow(clippy::too_many_arguments)]
+pub async fn observe_settled_manual_run<K>(
+    api: &Api<K>,
+    job_api: &Api<Job>,
+    kind: ReplicationKind,
+    namespace: &str,
+    name: &str,
+    annotations: Option<&BTreeMap<String, String>>,
+    manual: Option<&ReplicationManualRunStatus>,
+    current_status: Option<&serde_json::Value>,
+) -> Result<()>
+where
+    K: kube::Resource + serde::de::DeserializeOwned + Clone + std::fmt::Debug,
+{
+    // A malformed request is surfaced by the unheld path; nothing to observe.
+    let Ok(Some(request)) = manual_run_request(kind, annotations, manual, namespace, name) else {
+        return Ok(());
+    };
+    if !recorded_running(manual, &request) {
+        return Ok(());
+    }
+    let job_name = manual_replication_job_name(kind, name, request.at);
+    let Some(job) = job_api.get_opt(&job_name).await? else {
+        return Ok(());
+    };
+    let phase = match job_terminal_state(&job) {
+        Some(true) => ReplicationManualRunPhase::Succeeded,
+        Some(false) => ReplicationManualRunPhase::Failed,
+        None => return Ok(()),
+    };
+    crate::io::patch_status_if_changed(
+        api,
+        name,
+        current_status,
+        serde_json::json!({ "manualRun": manual_run_status(&request, phase, Utc::now()) }),
+    )
+    .await?;
+    Ok(())
+}
+
 /// **Pure.** What holds a replication run behind ONE endpoint repository's
 /// availability (#689). Shared by both replication kinds: `None` = that
 /// endpoint is usable; `Some((reason, message))` = report `Ready=Reconciling`
@@ -1268,6 +1320,159 @@ mod tests {
             }
         });
         kube::Client::new(svc, "ns")
+    }
+
+    /// A mock apiserver for the held manual-run tests: a GET of the Job named
+    /// `job` answers with `job_status` (404 when `None`); every PATCH body is
+    /// recorded and answered with a minimal RepositoryReplication.
+    fn manual_client(
+        job: String,
+        job_status: Option<serde_json::Value>,
+        patches: std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    ) -> kube::Client {
+        use http::{Request, Response, StatusCode};
+        use kube::client::Body;
+        let svc = tower::service_fn(move |req: Request<Body>| {
+            let job = job.clone();
+            let job_status = job_status.clone();
+            let patches = patches.clone();
+            async move {
+                let method = req.method().to_string();
+                let path = req.uri().path().to_string();
+                let bytes = http_body_util::BodyExt::collect(req.into_body())
+                    .await
+                    .expect("body")
+                    .to_bytes();
+                let not_found = serde_json::json!({
+                    "kind": "Status", "apiVersion": "v1", "status": "Failure",
+                    "reason": "NotFound", "code": 404, "message": "not found",
+                });
+                let (status, body) = match method.as_str() {
+                    "GET" if path.ends_with(&format!("/jobs/{job}")) => match &job_status {
+                        Some(st) => (
+                            StatusCode::OK,
+                            serde_json::json!({
+                                "apiVersion": "batch/v1", "kind": "Job",
+                                "metadata": { "name": job, "namespace": "ns" },
+                                "status": st,
+                            }),
+                        ),
+                        None => (StatusCode::NOT_FOUND, not_found),
+                    },
+                    "PATCH" => {
+                        patches
+                            .lock()
+                            .expect("log")
+                            .push(serde_json::from_slice(&bytes).expect("patch body"));
+                        (
+                            StatusCode::OK,
+                            serde_json::json!({
+                                "apiVersion": "kopiur.home-operations.com/v1alpha1",
+                                "kind": "RepositoryReplication",
+                                "metadata": { "name": "r", "namespace": "ns" },
+                                "spec": {
+                                    "sourceRef": { "name": "nas" },
+                                    "destination": { "filesystem": { "path": "/x" } },
+                                    "schedule": { "cron": "0 * * * *" }
+                                }
+                            }),
+                        )
+                    }
+                    _ => (StatusCode::NOT_FOUND, not_found),
+                };
+                Ok::<_, std::convert::Infallible>(
+                    Response::builder()
+                        .status(status)
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string().into_bytes()))
+                        .expect("response"),
+                )
+            }
+        });
+        kube::Client::new(svc, "ns")
+    }
+
+    /// PR #706 review (Greptile P2): a held replication (its source repository
+    /// suspended or not Ready, or the CR itself `spec.suspend`) returned before
+    /// `handle_manual_run`, so a manual Job that FINISHED during the hold left
+    /// `status.manualRun` at `Running`. Once its TTL reaped it, the resumed
+    /// reconcile reported `ManualRunOutcomeLost` for a copy that succeeded.
+    /// The held paths must record a settled manual Job's outcome.
+    #[tokio::test]
+    async fn a_held_replication_still_answers_a_manual_run_whose_job_finished() {
+        let raw = "2026-06-11T12:00:00Z";
+        let at = chrono::DateTime::parse_from_rfc3339(raw)
+            .unwrap()
+            .with_timezone(&Utc);
+        let job = manual_replication_job_name(ReplicationKind::Repository, "r", at);
+        let annotations: BTreeMap<String, String> =
+            [(RUN_REQUESTED_ANNOTATION.to_string(), raw.to_string())].into();
+        let running = ReplicationManualRunStatus {
+            requested_at: Some(raw.into()),
+            phase: Some(ReplicationManualRunPhase::Running),
+            completed_at: None,
+        };
+        let complete = serde_json::json!({ "conditions": [
+            { "type": "Complete", "status": "True" }
+        ] });
+        let failed = serde_json::json!({ "conditions": [
+            { "type": "Failed", "status": "True" }
+        ] });
+
+        for (job_status, want) in [
+            (Some(complete), Some("Succeeded")),
+            (Some(failed), Some("Failed")),
+            // Still running, or gone: nothing to record while held (the
+            // resumed path owns the lost-outcome verdict).
+            (Some(serde_json::json!({ "active": 1 })), None),
+            (None, None),
+        ] {
+            let patches = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let client = manual_client(job.clone(), job_status, patches.clone());
+            let api: Api<kopiur_api::RepositoryReplication> = Api::namespaced(client.clone(), "ns");
+            let job_api: Api<Job> = Api::namespaced(client, "ns");
+            observe_settled_manual_run(
+                &api,
+                &job_api,
+                ReplicationKind::Repository,
+                "ns",
+                "r",
+                Some(&annotations),
+                Some(&running),
+                None,
+            )
+            .await
+            .expect("observe");
+            let patches = patches.lock().expect("log").clone();
+            match want {
+                Some(phase) => assert!(
+                    patches
+                        .iter()
+                        .any(|p| p["status"]["manualRun"]["phase"] == phase),
+                    "want manualRun {phase}: {patches:?}"
+                ),
+                None => assert!(patches.is_empty(), "no write expected: {patches:?}"),
+            }
+        }
+
+        // A request that is not recorded `Running` launched nothing to observe.
+        let patches = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let client = manual_client(job, None, patches.clone());
+        let api: Api<kopiur_api::RepositoryReplication> = Api::namespaced(client.clone(), "ns");
+        let job_api: Api<Job> = Api::namespaced(client, "ns");
+        observe_settled_manual_run(
+            &api,
+            &job_api,
+            ReplicationKind::Repository,
+            "ns",
+            "r",
+            Some(&annotations),
+            None,
+            None,
+        )
+        .await
+        .expect("observe");
+        assert!(patches.lock().expect("log").is_empty());
     }
 
     /// PR #706 review (Greptile P2): the resume heal read `phase: Suspended`
