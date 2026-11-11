@@ -70,7 +70,7 @@ describe("RestoreDialog", () => {
     await user.type(screen.getByLabelText("Claim name"), "data");
     await user.type(
       screen.getByLabelText(/Only these paths/),
-      "docs/report.odt{Enter}{Enter}  music/album  {Enter}",
+      "docs/report.odt{Enter}{Enter}   {Enter}music/album{Enter}",
     );
     await user.click(screen.getByRole("radio", { name: /Overwrite them/ }));
     await user.click(screen.getByRole("button", { name: "Create the restore" }));
@@ -82,6 +82,20 @@ describe("RestoreDialog", () => {
       paths: ["docs/report.odt", "music/album"],
     };
     expect(sentBody(RESTORE)).toEqual(expected);
+  });
+
+  it("sends a path verbatim, spaces and all, so it selects exactly that file", async () => {
+    // `docs/report ` and `docs/report` are different files; trimming would
+    // quietly restore the wrong one (#704 review).
+    mockApi({ [RESTORE]: jsonResponse(receipt) });
+    renderWithClient(<RestoreDialog namespace="media" />);
+    const user = await open();
+    await user.type(screen.getByLabelText("Snapshot name"), "nightly-1");
+    await user.type(screen.getByLabelText("Claim name"), "data");
+    await user.type(screen.getByLabelText(/Only these paths/), "docs/report {Enter} lead.txt");
+    await user.click(screen.getByRole("radio", { name: /Leave existing files alone/ }));
+    await user.click(screen.getByRole("button", { name: "Create the restore" }));
+    expect((sentBody(RESTORE) as RestoreBody).paths).toEqual(["docs/report ", " lead.txt"]);
   });
 
   it("builds a fromPolicy source into a claim it creates, with the step-back and the instant", async () => {

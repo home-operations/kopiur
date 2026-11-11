@@ -121,13 +121,89 @@ pub struct ResolvedCacheVolume {
     /// ephemeral volume's `capacity`, or a persistent claim's EFFECTIVE capacity
     /// (see [`crate::io::EnsuredCachePvc::capacity`]).
     pub capacity: Option<String>,
+    /// The capacity the config asks for — what admission validated the budgets
+    /// against. Equal to `capacity` for per-run volumes; a persistent claim can be
+    /// smaller while a resize is pending or after a refused expansion.
+    pub configured: Option<String>,
 }
 
 impl ResolvedCacheVolume {
     fn per_run(volume: CacheVolume) -> Self {
         let capacity = configured_capacity(&volume).map(str::to_string);
-        Self { volume, capacity }
+        Self {
+            volume,
+            configured: capacity.clone(),
+            capacity,
+        }
     }
+}
+
+/// The budgets for a resolved cache volume (#707 review): resolved against the
+/// CONFIGURED capacity — the one admission validated, so an admitted edit can
+/// never fail here just because the claim has not grown yet — then scaled down
+/// to the capacity actually mounted ([`kopiur_api::common::fit_cache_budgets`]).
+/// Failing here instead would block the very mover pod whose mount finishes a
+/// `FileSystemResizePending` expansion, forever.
+pub fn cache_budgets_for_volume(
+    effective: Option<&CacheDefaults>,
+    volume: &ResolvedCacheVolume,
+) -> Result<ResolvedCache> {
+    let r = cache_budgets(effective, volume.configured.as_deref())?;
+    Ok(match volume.capacity.as_deref() {
+        Some(mounted) => kopiur_api::common::fit_cache_budgets(&r, mounted),
+        None => r,
+    })
+}
+
+/// The cache volume and kopia budgets for a replication mover (#707 review).
+///
+/// Like verification ([`verify_cache_volume`]), a replication run always gets a
+/// per-run volume — `mode: Persistent` is coerced to a fresh ephemeral one,
+/// because a replication Job must not attach a `ReadWriteOnce` cache claim that
+/// another run may hold. `kopia_caches` is how many repository connections keep a
+/// kopia cache on that one volume: 1 for a `RepositoryReplication` (connect the
+/// source, `sync-to` the destination's blob storage), 2 for a
+/// `SnapshotReplication` (source AND destination connected), so the budgets are
+/// split and every cache together still fits.
+pub fn replication_cache(
+    effective: Option<&CacheDefaults>,
+    kopia_caches: std::num::NonZeroU32,
+) -> Result<(CacheVolume, CacheTuning)> {
+    let ways = i64::from(kopia_caches.get());
+    // Each connection needs room for 1MiB + 1MiB under the 90% ceiling (3Mi), or one
+    // of its caches would run at kopia's unbounded default (#714 review). Admission
+    // refuses a smaller shared capacity on a new or edited block; a STORED one is not
+    // refused here (that would stop a working replication on upgrade) — its per-run
+    // volume is raised to the minimum instead.
+    let min_mib = 3 * ways;
+    let raised;
+    let effective = match effective {
+        Some(c)
+            if ways > 1
+                && c.capacity
+                    .as_deref()
+                    .and_then(kopiur_api::common::quantity_to_mib)
+                    .is_some_and(|mib| mib < min_mib) =>
+        {
+            raised = CacheDefaults {
+                capacity: Some(format!("{min_mib}Mi")),
+                ..c.clone()
+            };
+            Some(&raised)
+        }
+        other => other,
+    };
+    let volume = verify_cache_volume(effective);
+    let configured = configured_capacity(&volume);
+    let r = cache_budgets(effective, configured)?;
+    let share_mib = configured
+        .and_then(kopiur_api::common::quantity_to_mib)
+        .map(|mib| mib / ways);
+    let r = match share_mib {
+        Some(share) if ways > 1 => kopiur_api::common::fit_cache_budgets(&r, &format!("{share}Mi")),
+        _ => r,
+    };
+    Ok((volume, tuning_of(&r)))
 }
 
 /// Surface what [`crate::io::ensure_cache_pvc`] did about a cache PVC's size (#613)
@@ -275,6 +351,7 @@ pub async fn resolve_cache_volume(
                     claim_name: ensured.claim_name,
                 },
                 capacity: Some(ensured.capacity),
+                configured: Some(capacity),
             })
         }
         CacheVolumeMode::Ephemeral => Ok(ResolvedCacheVolume::per_run(CacheVolume::Ephemeral {
@@ -426,6 +503,7 @@ pub async fn resolve_snapdel_cache_volume(
                     claim_name: ensured.claim_name,
                 },
                 capacity: Some(ensured.capacity),
+                configured: Some(capacity.clone()),
             })
         }
     }
@@ -803,5 +881,134 @@ mod tests {
         }
         assert!(refused.note.contains("allowVolumeExpansion"));
         assert!(shrink.note.contains("cannot shrink"));
+    }
+
+    // --- #707 review follow-ups --------------------------------------------------
+
+    /// Greptile on #707: a Persistent cache grown 1Gi→2Gi with
+    /// `contentCacheSize: { size: 1Gi }` passes admission, but while the claim still
+    /// reports 1Gi (the filesystem only finishes growing when a pod mounts it —
+    /// `FileSystemResizePending`) resolving against 1Gi failed, BEFORE the mover Job
+    /// that would finish the resize was created. Every retry hit the same check.
+    /// Budgets now resolve against the configured capacity and shrink to fit.
+    #[test]
+    fn a_pending_resize_never_blocks_the_run_budgets_shrink_to_fit() {
+        let eff = CacheDefaults {
+            capacity: Some("2Gi".into()),
+            mode: Some(CacheVolumeMode::Persistent),
+            content_cache_size: Some(kopiur_api::common::CacheSize::Size("1Gi".into())),
+            ..Default::default()
+        };
+        // What the old code did: resolve against the claim's current size.
+        assert!(cache_budgets(Some(&eff), Some("1Gi")).is_err());
+        let volume = ResolvedCacheVolume {
+            volume: CacheVolume::Pvc {
+                claim_name: "c".into(),
+            },
+            capacity: Some("1Gi".into()),
+            configured: Some("2Gi".into()),
+        };
+        let r = cache_budgets_for_volume(Some(&eff), &volume).expect("the run must proceed");
+        assert_eq!(r.content_cache_size_mb, Some(512));
+        assert_eq!(r.metadata_cache_size_mb, Some(153));
+        assert_eq!(r.capacity.as_deref(), Some("1Gi"));
+        // Once the claim catches up, the full budgets apply.
+        let caught_up = ResolvedCacheVolume {
+            capacity: Some("2Gi".into()),
+            ..volume
+        };
+        let r = cache_budgets_for_volume(Some(&eff), &caught_up).unwrap();
+        assert_eq!(r.content_cache_size_mb, Some(1024));
+    }
+
+    /// Greptile on #707: both replication kinds accepted `mover.cache` but their Jobs
+    /// used an unsized emptyDir and kopia's default budgets. A RepositoryReplication
+    /// now gets the resolved per-run cache volume (Persistent coerced to a fresh
+    /// ephemeral volume, as for verification — a replication run must not share a
+    /// ReadWriteOnce claim) and budgets sized to it.
+    #[test]
+    fn repository_replication_gets_the_resolved_cache() {
+        let eff = CacheDefaults {
+            capacity: Some("2Gi".into()),
+            storage_class_name: Some("fast".into()),
+            mode: Some(CacheVolumeMode::Persistent),
+            ..Default::default()
+        };
+        let (volume, tuning) = replication_cache(Some(&eff), std::num::NonZeroU32::MIN).unwrap();
+        assert_eq!(
+            volume,
+            CacheVolume::Ephemeral {
+                capacity: "2Gi".into(),
+                storage_class: Some("fast".into()),
+            }
+        );
+        assert_eq!(tuning.content_cache_size_mb, Some(1228));
+        assert_eq!(tuning.metadata_cache_size_mb, Some(307));
+        // No cache config → emptyDir + kopia defaults, exactly as before.
+        let (volume, tuning) = replication_cache(None, std::num::NonZeroU32::MIN).unwrap();
+        assert_eq!(volume, CacheVolume::EmptyDir);
+        assert!(tuning.is_unset());
+    }
+
+    /// A SnapshotReplication connects BOTH repositories, each with its own kopia
+    /// cache on the one cache volume, so each gets half: the two together still fit.
+    #[test]
+    fn snapshot_replication_splits_the_volume_between_its_two_caches() {
+        let eff = CacheDefaults {
+            capacity: Some("2Gi".into()),
+            ..Default::default()
+        };
+        let (_, tuning) =
+            replication_cache(Some(&eff), std::num::NonZeroU32::new(2).unwrap()).unwrap();
+        assert_eq!(tuning.content_cache_size_mb, Some(614));
+        assert_eq!(tuning.metadata_cache_size_mb, Some(153));
+        let both = 2 * (614 + 153);
+        assert!(
+            both * 100 <= 2048 * 90,
+            "two caches must fit the volume: {both}"
+        );
+    }
+
+    /// Greptile on #714: with `capacity: 3Mi` a SnapshotReplication split the
+    /// volume into 1MiB shares, but each of its two caches kept 1MiB + 1MiB — 4MiB
+    /// of budgets on a 3MiB volume. Every cache on a shared volume now fits.
+    ///
+    /// A follow-up review pointed out that refusing such a run would stop a STORED
+    /// replication (admission only refuses new or edited blocks), so instead the
+    /// per-run volume is raised to the minimum that holds every cache (6Mi for two).
+    #[test]
+    fn shared_cache_volumes_fit_every_cache_and_tiny_ones_are_raised() {
+        let two = std::num::NonZeroU32::new(2).unwrap();
+        for small in ["3Mi", "5Mi"] {
+            let tiny = CacheDefaults {
+                capacity: Some(small.into()),
+                storage_class_name: Some("fast".into()),
+                ..Default::default()
+            };
+            let (volume, t) = replication_cache(Some(&tiny), two)
+                .expect("a stored replication with a tiny cache must still run");
+            assert_eq!(
+                volume,
+                CacheVolume::Ephemeral {
+                    capacity: "6Mi".into(),
+                    storage_class: Some("fast".into()),
+                },
+                "{small}: the per-run volume is raised to the two-cache minimum"
+            );
+            let all = 2 * (t.content_cache_size_mb.unwrap() + t.metadata_cache_size_mb.unwrap());
+            assert!(
+                all * 100 <= 6 * 90,
+                "{small}: two caches total {all}MiB on 6Mi"
+            );
+        }
+        for cap in [6, 7, 10, 33, 100, 1000] {
+            let eff = CacheDefaults {
+                capacity: Some(format!("{cap}Mi")),
+                ..Default::default()
+            };
+            let (_, t) = replication_cache(Some(&eff), two).unwrap();
+            let all = 2 * (t.content_cache_size_mb.unwrap() + t.metadata_cache_size_mb.unwrap());
+            assert!(all * 100 <= cap * 90, "{cap}Mi: two caches total {all}MiB");
+        }
     }
 }

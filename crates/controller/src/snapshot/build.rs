@@ -261,7 +261,7 @@ pub(super) fn work_spec_uses_stream(spec: &kopiur_mover::workspec::MoverWorkSpec
         // A `streamExec` restore target execs into a workload pod exactly as a
         // `stream` source does — read off `RestoreOutput` so the RBAC minted and
         // the Job's actual behavior come from the same resolver.
-        Operation::Restore(op) => matches!(
+        Operation::Restore(op) | Operation::PartialRestore(op) => matches!(
             kopiur_mover::workspec::restore_output(op),
             RestoreOutput::Stream(_)
         ),

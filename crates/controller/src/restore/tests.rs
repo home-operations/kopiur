@@ -2395,6 +2395,15 @@ fn restore_paths_carries_the_selection_onto_the_work_spec() {
         paths: paths.clone(),
     };
     assert_eq!(restore_scope(&op), RestoreScope::Paths(&paths));
+    // ...and it is dispatched on the variant an older mover REJECTS, never on
+    // `restore`, which a pre-#689 mover would run as a full restore (#704 review).
+    let operation = kopiur_mover::workspec::restore_operation(op);
+    assert_eq!(operation.kind_str(), "PartialRestore");
+    let wire = serde_json::to_value(&operation).unwrap();
+    assert_eq!(
+        wire["partialRestore"]["paths"],
+        serde_json::json!(["docs/report.odt", "music/album"])
+    );
 }
 
 // --- §3.6 CR-catalog search: select_recorded_source ---------------------------
