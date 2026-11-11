@@ -3104,3 +3104,94 @@ fn restore_op_paths_round_trip_and_resolve_the_scope() {
         RestoreScope::Paths(&["docs/report.odt".to_string(), "music/album".to_string()])
     );
 }
+
+/// A minimal restore op for the #704-review tests.
+fn bare_restore_op(paths: &[&str]) -> RestoreOp {
+    serde_json::from_value(serde_json::json!({
+        "source": { "snapshot": "k1" },
+        "targetPath": "/data",
+        "paths": paths,
+    }))
+    .unwrap()
+}
+
+#[test]
+fn a_partial_restore_rides_its_own_operation_variant() {
+    // #704 review: an older mover (pinned image) ignores unknown FIELDS, so a
+    // partial restore carried as `restore` + `paths` would silently become a
+    // FULL in-place restore there. It must travel under a distinct variant key.
+    let partial = restore_operation(bare_restore_op(&["docs/report.odt"]));
+    assert_eq!(partial.kind_str(), "PartialRestore");
+    let wire = serde_json::to_value(&partial).unwrap();
+    assert!(wire.get("partialRestore").is_some(), "{wire}");
+    assert!(wire.get("restore").is_none(), "{wire}");
+
+    // A whole-root restore keeps the old key, so every mover still runs it.
+    let whole = restore_operation(bare_restore_op(&[]));
+    assert_eq!(whole.kind_str(), "Restore");
+    assert!(
+        serde_json::to_value(&whole)
+            .unwrap()
+            .get("restore")
+            .is_some()
+    );
+}
+
+#[test]
+fn a_mover_that_predates_partial_restore_fails_closed_on_one() {
+    // What a pre-#689 mover's `Operation` looks like on the wire: externally
+    // tagged, camelCase, no `partialRestore` variant, no `deny_unknown_fields`.
+    // (Modelled locally because the old binary is not linkable here.)
+    #[derive(Debug, serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    #[allow(dead_code)]
+    enum LegacyOperation {
+        Snapshot(serde_json::Value),
+        Restore(serde_json::Value),
+    }
+    let partial = serde_json::to_value(restore_operation(bare_restore_op(&["a/b"]))).unwrap();
+    let err = serde_json::from_value::<LegacyOperation>(partial).unwrap_err();
+    assert!(err.to_string().contains("unknown variant"), "{err}");
+    // ...whereas the whole-root restore it has always understood still parses.
+    let whole = serde_json::to_value(restore_operation(bare_restore_op(&[]))).unwrap();
+    assert!(serde_json::from_value::<LegacyOperation>(whole).is_ok());
+
+    // And THIS mover fails closed on an operation newer than itself, too: an
+    // unknown variant is a parse error, never a silently-defaulted run.
+    let spec_with = |operation: serde_json::Value| {
+        serde_json::json!({
+            "version": 3,
+            "operation": operation,
+            "identity": { "username": "u", "hostname": "h", "sourcePath": "/p" },
+            "repository": { "filesystem": { "path": "/repo" } },
+            "targetRef": { "apiVersion": "v", "kind": "Restore", "name": "n", "namespace": "ns" },
+        })
+    };
+    // Control: the same spec with an operation this mover knows parses fine...
+    let known = serde_json::to_value(restore_operation(bare_restore_op(&["a"]))).unwrap();
+    assert!(serde_json::from_value::<MoverWorkSpec>(spec_with(known)).is_ok());
+    // ...so the failure below is the unknown operation, and nothing else.
+    let err = serde_json::from_value::<MoverWorkSpec>(spec_with(
+        serde_json::json!({ "someFutureOp": { "paths": ["a"] } }),
+    ))
+    .unwrap_err();
+    assert!(err.to_string().contains("unknown variant"), "{err}");
+}
+
+#[test]
+fn a_partial_restore_without_paths_or_into_a_stream_is_rejected() {
+    // Defensive: a `partialRestore` that would restore everything (no paths),
+    // or that targets a stream, is a malformed work spec, not a whole-root run.
+    assert_eq!(partial_restore_problem(&bare_restore_op(&["a"])), None);
+    assert!(partial_restore_problem(&bare_restore_op(&[])).is_some());
+    let mut streamed = bare_restore_op(&["a"]);
+    streamed.stdout = Some(StreamExecSpec {
+        namespace: "ns".into(),
+        pod_selector: "app=pg".into(),
+        container: None,
+        command: vec!["psql".into()],
+        file_name: "a".into(),
+        timeout_seconds: 60,
+    });
+    assert!(partial_restore_problem(&streamed).is_some());
+}

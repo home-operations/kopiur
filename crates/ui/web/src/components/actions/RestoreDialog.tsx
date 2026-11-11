@@ -431,12 +431,16 @@ export function RestoreDialog({ namespace, snapshot, open, onOpenChange }: Resto
   );
 }
 
-/** The non-blank lines of the paths box, trimmed — `spec.selection.paths`. */
+/** The non-blank lines of the paths box, unchanged — `spec.selection.paths`. */
 function splitPaths(lines: string): string[] {
+  // Each non-blank line VERBATIM: a leading or trailing space is part of a
+  // filename (`docs/report ` is not `docs/report`), so trimming would select a
+  // different file. Only a pasted CRLF's `\r` is dropped, and whitespace-only
+  // lines are skipped.
   return lines
     .split("\n")
-    .map((line) => line.trim())
-    .filter((line) => line.length > 0);
+    .map((line) => line.replace(/\r$/, ""))
+    .filter((line) => line.trim().length > 0);
 }
 
 /** Every free-text field the source and target variants need. */
