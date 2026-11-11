@@ -160,14 +160,19 @@ async fn reconcile_inner(maint: &Maintenance, ctx: &Context) -> Result<Action> {
     // `Maintenance` CR the repository projected before it was suspended, and
     // an externally-authored one, neither of which the repository's own
     // suspend branch can reach.
+    let now = Utc::now();
+    let job_api: Api<Job> = Api::namespaced(ctx.client.clone(), &namespace);
+
     let availability = io::repository_maintainable_cached(ctx, repo_ref, &namespace).await?;
     if let Some((reason, message)) = maintenance_hold(availability, repo_ref, &namespace) {
+        // The hold stops NEW work only. A Job launched before it keeps running
+        // and settles on its own; record that outcome before parking, or a
+        // yielded slot (no `lastRunAt`) re-fires after the unsuspend and a
+        // finished manual run reads as lost once its TTL reaps it (#706 review).
+        observe_settled_runs(&api, &job_api, &name, maint, repo_defaults, now).await?;
         patch_condition_if_changed(&api, &name, maint, "False", reason, &message).await?;
         return Ok(Action::requeue(REQUEUE_NOT_READY));
     }
-
-    let now = Utc::now();
-    let job_api: Api<Job> = Api::namespaced(ctx.client.clone(), &namespace);
 
     // The repository accepts maintenance and we got this far: mark Maintenance
     // Ready (ADR-0005 §2) so `kubectl wait --for=condition=Ready` works.
@@ -292,6 +297,86 @@ async fn reconcile_inner(maint: &Maintenance, ctx: &Context) -> Result<Action> {
             Ok(Action::requeue(REQUEUE_RUNNING))
         }
     }
+}
+
+/// Observe-only bookkeeping for a Maintenance HELD behind its repository
+/// (suspended or not maintainable): record the outcome of any Job that was
+/// launched before the hold and has since settled, and launch nothing.
+///
+/// - The due cron slot's Job `Succeeded` ⇒ `status.<mode>.lastHandledAt`, the
+///   same durable marker the unheld path writes ([`record_handled_slot`]). A
+///   Job that yielded the lease advances no `lastRunAt`, so without this the
+///   slot re-fires after the unsuspend once the Job's TTL has reaped it.
+/// - The in-flight manual run's Job is terminal ⇒ answer `status.manualRun`
+///   `Succeeded`/`Failed`. Left `Running`, a TTL reap during a long hold makes
+///   the resumed reconcile report `ManualRunOutcomeLost` for a run that ran.
+///
+/// A FAILED cron Job is deliberately not acted on here: the unheld path's
+/// response is a bounded re-spawn, which a hold must not do.
+async fn observe_settled_runs(
+    api: &Api<Maintenance>,
+    job_api: &Api<Job>,
+    name: &str,
+    maint: &Maintenance,
+    repo_defaults: Option<&ScheduleDefaults>,
+    now: DateTime<Utc>,
+) -> Result<()> {
+    if let Some((mode, slot)) = due_mode(maint, now, repo_defaults)
+        && let Some(job) = job_api
+            .get_opt(&maintenance_job_name(name, mode, slot))
+            .await?
+        && job_terminal_state(&job) == Some(true)
+    {
+        record_handled_slot(api, name, maint, mode, slot, now).await?;
+    }
+
+    // A malformed request is surfaced by the unheld path; nothing to observe.
+    let Ok(Some((requested, mode))) = manual_run_request(maint) else {
+        return Ok(());
+    };
+    let Some(annotation_value) = maint
+        .metadata
+        .annotations
+        .as_ref()
+        .and_then(|a| a.get(crate::consts::RUN_REQUESTED_ANNOTATION))
+        .cloned()
+    else {
+        return Ok(());
+    };
+    let in_flight = maint
+        .status
+        .as_ref()
+        .and_then(|st| st.manual_run.as_ref())
+        .is_some_and(|m| {
+            m.requested_at.as_deref() == Some(annotation_value.as_str())
+                && m.mode == Some(mode)
+                && m.phase.as_ref() == Some(&kopiur_api::ManualRunPhase::Running)
+        });
+    if !in_flight {
+        return Ok(());
+    }
+    let Some(job) = job_api
+        .get_opt(&manual_job_name(name, mode, requested))
+        .await?
+    else {
+        return Ok(());
+    };
+    let phase = match job_terminal_state(&job) {
+        Some(true) => kopiur_api::ManualRunPhase::Succeeded,
+        Some(false) => kopiur_api::ManualRunPhase::Failed,
+        None => return Ok(()),
+    };
+    patch_manual_run(
+        api,
+        name,
+        kopiur_api::ManualRunStatus {
+            requested_at: Some(annotation_value),
+            mode: Some(mode),
+            phase: Some(phase),
+            completed_at: Some(now.to_rfc3339()),
+        },
+    )
+    .await
 }
 
 /// Best-effort nudge asking this Maintenance's repository to re-verify its
