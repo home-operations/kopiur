@@ -878,7 +878,8 @@ pub(super) const CONNECT_COMMON: &[FlagSpec] = &[
     owned(
         "readonly",
         B,
-        "set for read-only connections (browse sessions, replication sources) only",
+        "set for read-only connections only (restores, browse sessions, replication \
+         sources, read-only bootstraps), which must never write to the repository",
     ),
     unmodeled(
         "description",

@@ -4041,3 +4041,68 @@ fn the_fanout_status_body_preserves_a_healed_inherit_hold() {
         "pinning the defect: a stale base erases the heal from the fan-out body"
     );
 }
+
+// --- the restore repository volume and the mover's connect mode agree ---
+
+/// The `E2E (populator-fanout)` flake, as a pure rule. The restore mover mounted a
+/// filesystem repository READ-ONLY and connected kopia READ-WRITE; kopia then
+/// auto-compacted the manifest set on load (16+ contents), the compaction write hit the
+/// read-only mount, and the restore failed with `read-only file system`
+/// (`MoverJobFailed`). The mount here and the mover's connect both come from
+/// `Operation::repository_access`, so this pins the pairing from the controller side,
+/// for BOTH restore operations `restore_operation` can produce: a read-only mount is
+/// only ever emitted alongside a `--readonly` connect.
+#[test]
+fn a_restore_mounts_a_filesystem_repository_exactly_as_the_mover_connects_to_it() {
+    use kopiur_api::backend::{Backend, FilesystemBackend, PvcVolume, RepoVolume};
+    let backend = Backend::Filesystem(FilesystemBackend {
+        path: "/repo".into(),
+        volume: Some(RepoVolume::Pvc(PvcVolume {
+            name: "nas-repo".into(),
+        })),
+    });
+    let restore_op = |paths: Vec<String>| RestoreOp {
+        source: RestoreSelection::Snapshot("k1".into()),
+        stdout: None,
+        target_path: "/restore".into(),
+        anchor: Default::default(),
+        ignore_permission_errors: None,
+        write_files_atomically: None,
+        parallel: None,
+        write_sparse_files: None,
+        skip_owners: None,
+        skip_permissions: None,
+        skip_times: None,
+        overwrite_files: None,
+        overwrite_directories: None,
+        overwrite_symlinks: None,
+        ignore_errors: None,
+        skip_existing: None,
+        delete_extra: false,
+        paths,
+    };
+    for operation in [
+        kopiur_mover::workspec::restore_operation(restore_op(vec![])),
+        kopiur_mover::workspec::restore_operation(restore_op(vec!["docs".into()])),
+    ] {
+        let kind = operation.kind_str();
+        let mount = restore_repo_volume(&operation, &backend)
+            .expect("a PVC-backed filesystem repo is mounted");
+        assert_eq!(mount.mount_path, "/repo");
+        assert!(
+            operation.repository_access().connects_read_only(),
+            "a {kind} only reads the repository, so the mover connects --readonly"
+        );
+        assert!(
+            mount.read_only,
+            "a {kind} mounts the repository read-only (it never writes it)"
+        );
+        assert_eq!(
+            mount.read_only,
+            operation.repository_access().connects_read_only(),
+            "{kind}: the repository volume's readOnly must match the mover's connect mode — \
+             a read-only mount under a read-write connect fails reads once kopia \
+             auto-compacts manifests"
+        );
+    }
+}
