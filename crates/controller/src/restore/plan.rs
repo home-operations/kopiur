@@ -620,8 +620,10 @@ pub(super) fn restore_with_conditions(restore: &Restore, conditions: Vec<Conditi
 pub(super) enum CarriedRestore<'a> {
     /// Nothing was cleared: the reconcile's own `Restore`, borrowed.
     Unchanged(&'a Restore),
-    /// The gate cleared a stale gate condition: this copy mirrors the status
-    /// patch it just made, and is what every later writer must rebuild from.
+    /// The gate already wrote status this pass — it cleared a stale gate
+    /// condition, or paused/resumed the `waitTimeout` window
+    /// ([`wait_pause_patch`]): this copy mirrors that patch, and is what every
+    /// later writer must rebuild from.
     Cleared(Box<Restore>),
 }
 
@@ -635,25 +637,26 @@ impl CarriedRestore<'_> {
     }
 }
 
-/// The [`CarriedRestore`] for this pass, given what
-/// [`cleared_referent_conditions`] produced: the original borrowed when nothing
-/// was cleared (the overwhelmingly common path — no clone), an owned copy
-/// carrying the cleared conditions when something was. Pure and TOTAL.
-///
-/// The single construction site for the readiness gate's proceed payload, so the
-/// "cleared but continued from the stale copy" combination — the one that starts
-/// the alternating-write loop described on [`restore_with_conditions`] — has no
-/// place to be written. Both arms are unit-asserted.
-pub(super) fn carried_after_clear<'a>(
-    restore: &'a Restore,
-    cleared: Option<&[Condition]>,
-) -> CarriedRestore<'a> {
-    match cleared {
-        None => CarriedRestore::Unchanged(restore),
-        Some(conditions) => CarriedRestore::Cleared(Box::new(restore_with_conditions(
-            restore,
-            conditions.to_vec(),
-        ))),
+impl<'a> CarriedRestore<'a> {
+    /// This carrier with the conditions [`cleared_referent_conditions`]
+    /// produced substituted — itself unchanged (borrowed stays borrowed: the
+    /// overwhelmingly common path pays no clone) when nothing was cleared, an
+    /// owned copy carrying them when something was. Pure and TOTAL.
+    ///
+    /// The single construction site for the readiness gate's proceed payload,
+    /// so the "cleared but continued from the stale copy" combination — the one
+    /// that starts the alternating-write loop described on
+    /// [`restore_with_conditions`] — has no place to be written. Composes with
+    /// a carrier that is ALREADY owned (the wait-pause bookkeeping wrote
+    /// first), so neither write is dropped. Both arms are unit-asserted.
+    pub(super) fn with_conditions(self, cleared: Option<&[Condition]>) -> CarriedRestore<'a> {
+        match cleared {
+            None => self,
+            Some(conditions) => CarriedRestore::Cleared(Box::new(restore_with_conditions(
+                self.get(),
+                conditions.to_vec(),
+            ))),
+        }
     }
 }
 
@@ -681,6 +684,147 @@ pub(super) fn effective_wait_anchor(restore: &Restore, created_epoch: i64) -> i6
         .and_then(|s| s.wait_started_at.as_deref())
         .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
         .map_or(created_epoch, |at| created_epoch.max(at.timestamp()))
+}
+
+/// Whether a claim record still waits on its FIRST mover launch — the set a
+/// suspended repository holds per claim (PR #706 review). Pure + exhaustive
+/// over [`RestoreClaimPhase`].
+///
+/// The Restore-level gate ([`restore_awaiting_launch`]) cannot see a sibling
+/// claim: once any claim launched, the populator's aggregate phase is
+/// `Restoring`/`Completed` and the gate is skipped, so this per-claim answer is
+/// what keeps a NEW claimant from launching against a paused repository. A
+/// claim with a Job (in flight or done) is never held — existing work runs to
+/// terminal — and neither is a claim past its mover: the deploy-or-restore
+/// empty prime and the volume handover touch no repository.
+pub(super) fn claim_awaiting_launch(prev: Option<&RestoreClaimStatus>) -> bool {
+    let Some(prev) = prev else {
+        return true;
+    };
+    if prev.job.is_some() {
+        return false;
+    }
+    match prev.phase.as_ref() {
+        None | Some(RestoreClaimPhase::Pending) => true,
+        Some(
+            RestoreClaimPhase::Populating
+            | RestoreClaimPhase::Rebinding
+            | RestoreClaimPhase::Populated
+            | RestoreClaimPhase::AlreadyBound
+            | RestoreClaimPhase::Failed,
+        ) => false,
+        // Never re-gate a phase this build cannot place: a newer operator may
+        // already be past the launch.
+        Some(RestoreClaimPhase::Unknown(_)) => false,
+    }
+}
+
+/// The parked reason + message for ONE populator claim held because its
+/// repository is suspended (PR #706 review). Pure.
+pub(super) fn claim_suspension_hold(
+    rref: &kopiur_api::common::RepositoryRef,
+    base_ns: &str,
+    claim: &str,
+) -> (ClaimReason, String) {
+    (
+        ClaimReason::RepositorySuspended,
+        format!(
+            "populator: claiming PVC `{claim}` waits to start: {}",
+            crate::io::repository_suspended_message(rref, base_ns)
+        ),
+    )
+}
+
+/// Whether `status` holds a `waitTimeout` window a suspension would spend: the
+/// Restore-level anchor, or an unlaunched, unsettled claim's anchor.
+fn has_pausable_window(status: &kopiur_api::RestoreStatus) -> bool {
+    status.wait_started_at.is_some()
+        || status
+            .claims
+            .values()
+            .any(|c| c.wait_started_at.is_some() && claim_awaiting_launch(Some(c)))
+}
+
+/// `anchor` moved forward by `by_secs`, as RFC3339 — `None` when the stored
+/// anchor does not parse (it is then left for its reader to fall back on).
+fn shifted_anchor(anchor: &str, by_secs: i64) -> Option<String> {
+    let at = chrono::DateTime::parse_from_rfc3339(anchor).ok()?;
+    Some((at + chrono::Duration::seconds(by_secs)).to_rfc3339())
+}
+
+/// **Pure.** The status merge patch that keeps a repository SUSPENSION from
+/// spending an open `waitTimeout` window (PR #706 review), or `None` when there
+/// is nothing to write.
+///
+/// The window is an absolute deadline anchored at `waitStartedAt`, and the
+/// repository gate parks a waiting restore while its repository is suspended —
+/// so without this a pause longer than the remaining window made the first
+/// pass after the unsuspend apply `onMissingSnapshot` at once (for `fromPolicy`,
+/// `Continue`: an empty volume). Two transitions:
+///
+/// - `suspended`, an open window, no pause recorded ⇒ stamp `waitPausedAt: now`.
+///   Written once; every later suspended pass returns `None` (byte-stable).
+/// - not `suspended`, a pause recorded ⇒ move the Restore-level anchor and
+///   every unlaunched claim's anchor forward by `now - waitPausedAt`, and clear
+///   the stamp. A claim whose Job already launched keeps the deadline it was
+///   dispatched with; a settled claim is untouched.
+///
+/// Only a VERIFIED suspension pauses: the caller passes `suspended` only for an
+/// `Available`/`Suspended` answer, so a not-Ready repository keeps the
+/// pre-existing semantics.
+pub(super) fn wait_pause_patch(
+    status: Option<&kopiur_api::RestoreStatus>,
+    suspended: bool,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<serde_json::Value> {
+    let status = status?;
+    match (suspended, status.wait_paused_at.as_deref()) {
+        (true, None) => has_pausable_window(status)
+            .then(|| serde_json::json!({ "waitPausedAt": now.to_rfc3339() })),
+        (true, Some(_)) | (false, None) => None,
+        (false, Some(paused)) => {
+            let mut patch = serde_json::json!({ "waitPausedAt": null });
+            let Ok(paused) = chrono::DateTime::parse_from_rfc3339(paused) else {
+                return Some(patch);
+            };
+            let by = (now.timestamp() - paused.timestamp()).max(0);
+            if let Some(top) = status
+                .wait_started_at
+                .as_deref()
+                .and_then(|a| shifted_anchor(a, by))
+            {
+                patch["waitStartedAt"] = serde_json::Value::String(top);
+            }
+            let claims: serde_json::Map<String, serde_json::Value> = status
+                .claims
+                .iter()
+                .filter(|(_, c)| claim_awaiting_launch(Some(c)))
+                .filter_map(|(name, c)| {
+                    let moved = shifted_anchor(c.wait_started_at.as_deref()?, by)?;
+                    Some((name.clone(), serde_json::json!({ "waitStartedAt": moved })))
+                })
+                .collect();
+            if !claims.is_empty() {
+                patch["claims"] = serde_json::Value::Object(claims);
+            }
+            Some(patch)
+        }
+    }
+}
+
+/// `restore` with a status merge `patch` applied — the in-memory mirror of a
+/// status write this pass already made, so the rest of the pass (and the
+/// fan-out's per-claim records, which carry `prev` fields forward) builds on
+/// what the server now holds. Pure. A patch the typed status cannot hold leaves
+/// the copy unchanged.
+pub(super) fn restore_with_status_patch(restore: &Restore, patch: &serde_json::Value) -> Restore {
+    let mut carried = restore.clone();
+    let current = serde_json::to_value(&carried.status).unwrap_or(serde_json::Value::Null);
+    let merged = io::apply_merge_patch(&current, patch);
+    if let Ok(status) = serde_json::from_value(merged) {
+        carried.status = Some(status);
+    }
+    carried
 }
 
 /// Where a Restore's `waitTimeout` window stands on this pass — the return of

@@ -326,7 +326,7 @@ fn a_cleared_referent_condition_survives_a_downstream_gate_park() {
     let cleared = cleared_referent_conditions(&parked).expect("a stale park clears");
     // Built through the one construction site the gate uses, so this exercises
     // the real seam rather than a re-implementation of it.
-    let carrier = carried_after_clear(&parked, Some(&cleared));
+    let carrier = CarriedRestore::Unchanged(&parked).with_conditions(Some(&cleared));
     assert!(
         matches!(carrier, CarriedRestore::Cleared(_)),
         "a cleared pass must carry an OWNED copy, never the stale borrow"
@@ -372,10 +372,8 @@ fn a_cleared_referent_condition_survives_a_downstream_gate_park() {
     // Both arms of the construction site: nothing cleared ⇒ the original is
     // BORROWED (the common path pays no clone and changes nothing).
     let untouched = restore_with_condition("Resolved", "True");
-    let same = carried_after_clear(
-        &untouched,
-        cleared_referent_conditions(&untouched).as_deref(),
-    );
+    let same = CarriedRestore::Unchanged(&untouched)
+        .with_conditions(cleared_referent_conditions(&untouched).as_deref());
     assert!(
         matches!(same, CarriedRestore::Unchanged(_)),
         "the common path must borrow: no clone, no allocation, nothing changed"
@@ -4062,4 +4060,216 @@ fn a_suspended_repository_of_either_kind_holds_a_restore_launch() {
             Some(ClaimReason::RepositorySuspended)
         );
     }
+}
+
+fn at(ts: &str) -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::parse_from_rfc3339(ts)
+        .expect("rfc3339")
+        .with_timezone(&chrono::Utc)
+}
+
+fn pause_claim(
+    phase: kopiur_api::RestoreClaimPhase,
+    job: Option<&str>,
+    anchor: Option<&str>,
+) -> kopiur_api::RestoreClaimStatus {
+    kopiur_api::RestoreClaimStatus {
+        uid: Some("u".into()),
+        phase: Some(phase),
+        job: job.map(Into::into),
+        wait_started_at: anchor.map(Into::into),
+        ..Default::default()
+    }
+}
+
+/// PR #706 review (Greptile P1): suspending the repository parked a waiting
+/// restore but left its `waitStartedAt` where it was, and the window is an
+/// ABSOLUTE deadline — so a pause longer than the remaining window made the
+/// first pass after the unsuspend apply `onMissingSnapshot` at once (for
+/// `fromPolicy`, `Continue`: an EMPTY volume). The paused interval is now
+/// excluded: stamp the pause once, and on resume move every still-waiting
+/// anchor forward by exactly the time spent suspended.
+#[test]
+fn a_suspension_does_not_spend_an_open_wait_window() {
+    use kopiur_api::RestoreClaimPhase as P;
+    let opened = "2026-01-01T00:00:00Z";
+    let mut status = kopiur_api::RestoreStatus {
+        wait_started_at: Some(opened.into()),
+        ..Default::default()
+    };
+    status.claims.insert(
+        "waiting".into(),
+        pause_claim(P::Pending, None, Some(opened)),
+    );
+    status.claims.insert(
+        "launched".into(),
+        pause_claim(P::Populating, Some("job"), Some(opened)),
+    );
+    status.claims.insert(
+        "done".into(),
+        pause_claim(P::Populated, Some("job"), Some(opened)),
+    );
+
+    // 10 minutes into a 30-minute window, the repository is suspended: the
+    // pause is stamped ONCE …
+    let suspended_at = at("2026-01-01T00:10:00Z");
+    let stamp = wait_pause_patch(Some(&status), true, suspended_at).expect("stamped");
+    assert_eq!(
+        stamp,
+        serde_json::json!({ "waitPausedAt": suspended_at.to_rfc3339() })
+    );
+    status.wait_paused_at = Some(suspended_at.to_rfc3339());
+    // … and every later suspended pass is byte-stable (no write, no watch event).
+    assert_eq!(
+        wait_pause_patch(Some(&status), true, at("2026-01-03T00:00:00Z")),
+        None
+    );
+
+    // Resumed two DAYS later — far past the 30-minute deadline.
+    let resumed_at = at("2026-01-03T00:10:00Z");
+    let resume = wait_pause_patch(Some(&status), false, resumed_at).expect("resumed");
+    let shifted = "2026-01-03T00:00:00+00:00";
+    assert_eq!(resume["waitPausedAt"], serde_json::Value::Null);
+    assert_eq!(resume["waitStartedAt"], shifted);
+    assert_eq!(resume["claims"]["waiting"]["waitStartedAt"], shifted);
+    // A claim whose Job already launched keeps the deadline it was dispatched
+    // with; a settled claim is never touched.
+    assert!(resume["claims"].get("launched").is_none(), "{resume}");
+    assert!(resume["claims"].get("done").is_none(), "{resume}");
+
+    // The point of it: the window has exactly the 20 minutes it had left.
+    let window = Some("30m");
+    let remaining_at_suspend =
+        wait_remaining_secs(at(opened).timestamp(), window, suspended_at.timestamp());
+    let remaining_at_resume =
+        wait_remaining_secs(at(shifted).timestamp(), window, resumed_at.timestamp());
+    assert_eq!(remaining_at_suspend, Some(20 * 60));
+    assert_eq!(remaining_at_resume, remaining_at_suspend);
+    // Pinning the defect: the unshifted anchor would read the window as spent.
+    assert_eq!(
+        wait_remaining_secs(at(opened).timestamp(), window, resumed_at.timestamp()),
+        None
+    );
+}
+
+/// Nothing to pause or resume ⇒ no write: a restore with no open window is
+/// never stamped, and an unsuspended restore with no pause is left alone.
+#[test]
+fn the_wait_pause_writes_nothing_when_there_is_nothing_to_pause() {
+    let now = at("2026-01-01T00:00:00Z");
+    assert_eq!(wait_pause_patch(None, true, now), None);
+    assert_eq!(
+        wait_pause_patch(Some(&kopiur_api::RestoreStatus::default()), true, now),
+        None
+    );
+    let open = kopiur_api::RestoreStatus {
+        wait_started_at: Some("2025-12-31T23:00:00Z".into()),
+        ..Default::default()
+    };
+    assert_eq!(wait_pause_patch(Some(&open), false, now), None);
+    // A pause stamp with no anchor left to move is still cleared.
+    let stale = kopiur_api::RestoreStatus {
+        wait_paused_at: Some("2025-12-31T23:30:00Z".into()),
+        ..Default::default()
+    };
+    assert_eq!(
+        wait_pause_patch(Some(&stale), false, now),
+        Some(serde_json::json!({ "waitPausedAt": null }))
+    );
+}
+
+/// The carried copy mirrors the pause write, so the fan-out's per-claim
+/// records (built from the carried `prev`) write the SHIFTED anchors back,
+/// never the reconcile-start ones.
+#[test]
+fn the_carried_restore_holds_the_shifted_anchors() {
+    use kopiur_api::RestoreClaimPhase as P;
+    let mut restore = restore_with_anchor(None);
+    let mut status = kopiur_api::RestoreStatus {
+        wait_paused_at: Some("2026-01-01T00:10:00Z".into()),
+        ..Default::default()
+    };
+    status.claims.insert(
+        "waiting".into(),
+        pause_claim(P::Pending, None, Some("2026-01-01T00:00:00Z")),
+    );
+    restore.status = Some(status);
+    let patch = wait_pause_patch(restore.status.as_ref(), false, at("2026-01-01T01:10:00Z"))
+        .expect("resume");
+    let carried = restore_with_status_patch(&restore, &patch);
+    let st = carried.status.expect("status");
+    assert_eq!(st.wait_paused_at, None);
+    assert_eq!(
+        st.claims["waiting"].wait_started_at.as_deref(),
+        Some("2026-01-01T01:00:00+00:00")
+    );
+}
+
+/// PR #706 review (Greptile P1): the repository gate only holds a restore that
+/// has not launched (`Pending`/`Resolving`). A populator whose first claim
+/// started is `Restoring`/`Completed`, so a NEW sibling claim reached its mover
+/// with no suspension check at all and launched against a suspended
+/// repository. Each claim's FIRST launch is now held while suspended; a claim
+/// whose Job already exists, or that is handing its volume over, runs on.
+#[test]
+fn a_suspended_repository_holds_each_unlaunched_populator_claim() {
+    use kopiur_api::RestoreClaimPhase as P;
+    // A brand-new claimant, and one still waiting (for a snapshot, a
+    // scheduling hint, …) without a Job: both are held.
+    assert!(claim_awaiting_launch(None));
+    assert!(claim_awaiting_launch(Some(&pause_claim(
+        P::Pending,
+        None,
+        None
+    ))));
+    // A Job exists: the in-flight work is never re-gated.
+    assert!(!claim_awaiting_launch(Some(&pause_claim(
+        P::Pending,
+        Some("job"),
+        None
+    ))));
+    assert!(!claim_awaiting_launch(Some(&pause_claim(
+        P::Populating,
+        Some("job"),
+        None
+    ))));
+    // Past the mover: the deploy-or-restore empty prime and the volume
+    // handover touch no repository, so they run on.
+    assert!(!claim_awaiting_launch(Some(&pause_claim(
+        P::Populating,
+        None,
+        None
+    ))));
+    assert!(!claim_awaiting_launch(Some(&pause_claim(
+        P::Rebinding,
+        None,
+        None
+    ))));
+    // Settled phases and a phase this build cannot place are never re-gated.
+    for settled in [
+        P::Populated,
+        P::AlreadyBound,
+        P::Failed,
+        P::Unknown("X".into()),
+    ] {
+        assert!(!claim_awaiting_launch(Some(&pause_claim(
+            settled, None, None
+        ))));
+    }
+
+    // The parked record names the suspension (never the not-Ready wording),
+    // keeps the claim's window state as it was — a fresh claim gets no anchor,
+    // so its window opens only once it can proceed — and round-trips through
+    // the claim vocabulary.
+    let rref = kopiur_api::common::RepositoryRef {
+        kind: kopiur_api::common::RepositoryKind::Repository,
+        name: "nas".into(),
+        namespace: None,
+    };
+    let (reason, message) = claim_suspension_hold(&rref, "apps", "data-0");
+    assert_eq!(reason, ClaimReason::RepositorySuspended);
+    assert!(
+        message.contains("data-0") && message.contains("spec.suspend: false"),
+        "{message}"
+    );
 }

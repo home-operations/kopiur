@@ -245,9 +245,11 @@ async fn reconcile_inner(restore: &Restore, ctx: &Context) -> Result<Action> {
     // reconcile-start copy would re-write the `False` just cleared and alternate
     // the two writes on every requeue, forever. See `restore_with_conditions`.
     let gated;
+    let suspended_repository;
     let restore = match gate_on_repository_readiness(ctx, restore, &api, &namespace, &name).await? {
-        RepositoryGate::Proceed(carried) => {
+        RepositoryGate::Proceed(carried, suspended) => {
             gated = carried;
+            suspended_repository = suspended;
             gated.get()
         }
         RepositoryGate::Held(action) | RepositoryGate::Undetermined(action) => {
@@ -273,7 +275,16 @@ async fn reconcile_inner(restore: &Restore, ctx: &Context) -> Result<Action> {
             // (`claim_wait_window`) and the Restore-level `waitStartedAt` is the
             // DirectTarget's — stamping it here made later siblings measure
             // their window from the first claimant's anchor.
-            drive_populator_fanout(ctx, restore, &api, &namespace, &name, claimants).await
+            drive_populator_fanout(
+                ctx,
+                restore,
+                &api,
+                &namespace,
+                &name,
+                claimants,
+                suspended_repository,
+            )
+            .await
         }
         PopulatorState::DirectTarget => {
             drive_direct_target(ctx, restore, &api, &namespace, &name).await
@@ -983,6 +994,18 @@ struct PassCache {
     /// The `fromPolicy` referents, resolved lazily on the first claim that
     /// actually needs to resolve a source.
     from_policy: Option<std::sync::Arc<FromPolicyReferents>>,
+    /// Set when the repository gate VERIFIED the repository is suspended
+    /// (PR #706 review): every claim still awaiting its first launch
+    /// ([`claim_awaiting_launch`]) parks instead of launching.
+    suspended_repository: Option<Box<SuspendedRepository>>,
+}
+
+/// The suspended repository a populator pass holds its unlaunched claims
+/// behind — what [`claim_suspension_hold`] names in each parked record.
+#[derive(Debug)]
+struct SuspendedRepository {
+    rref: RepositoryRef,
+    base_ns: String,
 }
 
 impl PassCache {
@@ -1270,6 +1293,7 @@ async fn drive_populator_fanout(
     namespace: &str,
     name: &str,
     claimants: Claimants,
+    suspended_repository: Option<Box<SuspendedRepository>>,
 ) -> Result<Action> {
     let prev: std::collections::BTreeMap<String, kopiur_api::RestoreClaimStatus> = restore
         .status
@@ -1323,7 +1347,10 @@ async fn drive_populator_fanout(
         our_rebound_pvs(ctx, namespace).await?
     };
 
-    let mut cache = PassCache::default();
+    let mut cache = PassCache {
+        suspended_repository,
+        ..PassCache::default()
+    };
     let mut next: std::collections::BTreeMap<String, kopiur_api::RestoreClaimStatus> =
         std::collections::BTreeMap::new();
     let mut events: Vec<(String, ClaimEvent)> = Vec::new();
@@ -1957,6 +1984,26 @@ async fn claim_populate(
     cc: &ClaimContext<'_>,
     cache: &mut PassCache,
 ) -> Result<ClaimOutcome> {
+    // PR #706 review: a suspended repository holds each claim's FIRST launch.
+    // The Restore-level gate cannot — once any sibling launched, the aggregate
+    // phase is past it — so without this a new claimant reached its mover
+    // against a paused repository. Parked BEFORE resolution and before any
+    // window anchor is stamped: a fresh claim's window opens only once it can
+    // proceed, and an open one is paused by `wait_pause_patch`. A claim whose
+    // Job exists, or that is past its mover, runs on.
+    if let Some(suspended) = cache.suspended_repository.as_deref()
+        && claim_awaiting_launch(cc.prev)
+    {
+        let (reason, message) =
+            claim_suspension_hold(&suspended.rref, &suspended.base_ns, &cc.consumer_name);
+        return Ok(ClaimOutcome {
+            record: cc.record(RestoreClaimPhase::Pending, reason, message),
+            requeue: 15,
+            event: None,
+            after_patch: None,
+        });
+    }
+
     let mut resolved_pin = cc.prev.and_then(|p| p.resolved.clone());
     let mut source_path = cc.prev.and_then(|p| p.source_path.clone());
     let wait_started_at = cc
@@ -4935,7 +4982,11 @@ enum RepositoryGate<'a> {
     /// the sibling variants are one `Action` each. `CarriedRestore` boxes only
     /// its owned arm, so this stays pointer-sized AND the borrowed path keeps
     /// costing nothing.
-    Proceed(CarriedRestore<'a>),
+    ///
+    /// The second field is set only for a LAUNCHED populator whose repository
+    /// is verified suspended (PR #706 review): the fan-out then holds every
+    /// claim still awaiting its first launch.
+    Proceed(CarriedRestore<'a>, Option<Box<SuspendedRepository>>),
     /// VERIFIED not ready: the repository object exists and its phase is not
     /// `Ready` (the backend is unreachable). Park + requeue.
     Held(Action),
@@ -4965,8 +5016,11 @@ enum RepositoryGate<'a> {
 ///   window is both opened and evaluated only against a Ready repository. Once open
 ///   it is an ABSOLUTE deadline anchored at `status.waitStartedAt` (see
 ///   `resolve_snapshot` — spec'd so the in-Job wait is stable across pod retries), so
-///   a repository outage can never fail a restore — or fake a `Continue` empty-volume
-///   outcome — by silently burning the window while the backend is down.
+///   a repository outage BEFORE the window opens can never fail a restore — or fake
+///   a `Continue` empty-volume outcome — by silently burning the window while the
+///   backend is down. A deliberate SUSPENSION after it opened is excluded too
+///   (PR #706 review): [`settle_wait_pause`] stamps `status.waitPausedAt` and, on
+///   resume, moves every still-waiting anchor forward by the paused interval.
 ///
 /// **Tri-state (issue #393).** "Ready", "not Ready" and "cannot tell" are three
 /// answers, and the gate used to give two: every cannot-tell shape fell through
@@ -4993,6 +5047,14 @@ enum RepositoryGate<'a> {
 /// crash window: a Job created moments before the controller died — before the
 /// `Restoring` patch landed — is re-gated as `Pending`/`Resolving`; harmless, the
 /// Job runs to terminal on its own and is observed once the gate opens.)
+///
+/// **A launched populator is the exception (PR #706 review).** Its aggregate
+/// phase leaves `Pending` as soon as ANY claim launches, yet every NEW claimant
+/// launches its own mover afterwards. So for a populator the gate still reads the
+/// repository's availability past launch: it never parks the Restore, but a
+/// verified suspension is handed to the fan-out ([`RepositoryGate::Proceed`]),
+/// which holds each claim still awaiting its first launch
+/// ([`claim_awaiting_launch`]) while in-flight claims run on.
 async fn gate_on_repository_readiness<'a>(
     ctx: &Context,
     restore: &'a Restore,
@@ -5000,14 +5062,24 @@ async fn gate_on_repository_readiness<'a>(
     namespace: &str,
     name: &str,
 ) -> Result<RepositoryGate<'a>> {
-    if !restore_awaiting_launch(restore.status.as_ref().and_then(|s| s.phase.as_ref())) {
-        return proceed_past_gate(restore, api, name).await;
+    let awaiting = restore_awaiting_launch(restore.status.as_ref().and_then(|s| s.phase.as_ref()));
+    // A launched DIRECT restore's live Job is tracked to terminal and never
+    // re-gated. A launched POPULATOR still reads its repository's availability
+    // (PR #706 review): its NEW claims each launch their own mover, and a
+    // suspension must hold those — and pause any claim's open wait window.
+    if !awaiting && !targets_populator(&restore.spec.target) {
+        return proceed_past_gate(CarriedRestore::Unchanged(restore), api, name, None).await;
     }
     let (rref, base_ns) = match restore_repository_ref(ctx, restore, namespace).await? {
         RepoRefLookup::Derived(rref, base_ns) => (rref, base_ns),
         // Both cannot-determine shapes that must NOT park — see the fn doc.
         RepoRefLookup::SnapshotRowMissing | RepoRefLookup::NotDerivable => {
-            return proceed_past_gate(restore, api, name).await;
+            return proceed_past_gate(CarriedRestore::Unchanged(restore), api, name, None).await;
+        }
+        // A launched populator is never re-parked on a missing referent: its
+        // claims' own resolution reports that, per claim.
+        RepoRefLookup::ReferentMissing { .. } if !awaiting => {
+            return proceed_past_gate(CarriedRestore::Unchanged(restore), api, name, None).await;
         }
         RepoRefLookup::ReferentMissing {
             kind,
@@ -5026,10 +5098,42 @@ async fn gate_on_repository_readiness<'a>(
             .await;
         }
     };
-    let availability = io::repository_availability_cached(ctx, &rref, &base_ns).await;
-    match availability.map(|a| repository_restore_hold(a, &rref, &base_ns)) {
-        Ok(None) => proceed_past_gate(restore, api, name).await,
-        Ok(Some((reason, message))) => {
+    let availability = match io::repository_availability_cached(ctx, &rref, &base_ns).await {
+        Ok(availability) => availability,
+        // A launched populator with a vanished repository object: nothing to
+        // hold here — its in-flight claims are tracked as before.
+        Err(Error::MissingDependency(_)) if !awaiting => {
+            return proceed_past_gate(CarriedRestore::Unchanged(restore), api, name, None).await;
+        }
+        // The repository OBJECT is missing (not merely unreachable): the readiness
+        // check answered nothing, so this is UNDETERMINED, not "proceed". Pre-#393
+        // it fell through here and the wait window opened against an unverified
+        // repository (#393).
+        Err(Error::MissingDependency(_)) => {
+            return park_on_missing_referent(
+                ctx,
+                restore,
+                api,
+                name,
+                io::repo_kind_str(rref.kind),
+                repository_referent_namespace(&rref, &base_ns),
+                &rref.name,
+            )
+            .await;
+        }
+        Err(e) => return Err(e),
+    };
+    // Pause/resume the `waitTimeout` window(s) on a VERIFIED suspension
+    // transition (PR #706 review) — before any park or proceed builds on it.
+    let carried = settle_wait_pause(restore, api, name, availability).await?;
+    if !awaiting {
+        let suspended = suspended_repository(availability, rref, base_ns);
+        return proceed_past_gate(carried, api, name, suspended).await;
+    }
+    match repository_restore_hold(availability, &rref, &base_ns) {
+        None => proceed_past_gate(carried, api, name, None).await,
+        Some((reason, message)) => {
+            let restore = carried.get();
             // patch-if-changed for byte-stability: the parked status is identical
             // across the 15s requeues, so a re-park is a server-side no-op — no
             // watch event, no self-trigger (the reconcile hot-loop rule).
@@ -5056,23 +5160,61 @@ async fn gate_on_repository_readiness<'a>(
                 std::time::Duration::from_secs(15),
             )))
         }
-        // The repository OBJECT is missing (not merely unreachable): the readiness
-        // check answered nothing, so this is UNDETERMINED, not "proceed". Pre-#393
-        // it fell through here and the wait window opened against an unverified
-        // repository (#393).
-        Err(Error::MissingDependency(_)) => {
-            park_on_missing_referent(
-                ctx,
-                restore,
-                api,
-                name,
-                io::repo_kind_str(rref.kind),
-                repository_referent_namespace(&rref, &base_ns),
-                &rref.name,
-            )
-            .await
+    }
+}
+
+/// Whether a restore fills volumes through the populator handshake — the one
+/// target whose claims launch movers AFTER the Restore-level gate. Exhaustive
+/// over [`RestoreTarget`].
+fn targets_populator(target: &RestoreTarget) -> bool {
+    match target {
+        RestoreTarget::Populator(_) => true,
+        RestoreTarget::Pvc(_) | RestoreTarget::PvcRef(_) | RestoreTarget::StreamExec(_) => false,
+    }
+}
+
+/// The suspended repository a launched populator's pass holds its unlaunched
+/// claims behind, or `None` when the repository is not suspended. Exhaustive
+/// over [`io::RepositoryAvailability`]: a not-Ready repository keeps the
+/// pre-existing per-claim behavior (the claim's own resolution waits on it).
+fn suspended_repository(
+    availability: io::RepositoryAvailability,
+    rref: RepositoryRef,
+    base_ns: String,
+) -> Option<Box<SuspendedRepository>> {
+    match availability {
+        io::RepositoryAvailability::Suspended => {
+            Some(Box::new(SuspendedRepository { rref, base_ns }))
         }
-        Err(e) => Err(e),
+        io::RepositoryAvailability::Available | io::RepositoryAvailability::NotReady => None,
+    }
+}
+
+/// Apply [`wait_pause_patch`] for this pass's VERIFIED availability and return
+/// the `Restore` the pass continues with — the original when nothing was
+/// written, a copy mirroring the write when something was (so the downstream
+/// parks and the fan-out's per-claim records build on the shifted anchors, not
+/// the reconcile-start ones). A not-Ready repository neither pauses nor
+/// resumes: only a suspension is a deliberate pause.
+async fn settle_wait_pause<'a>(
+    restore: &'a Restore,
+    api: &Api<Restore>,
+    name: &str,
+    availability: io::RepositoryAvailability,
+) -> Result<CarriedRestore<'a>> {
+    let suspended = match availability {
+        io::RepositoryAvailability::Available => false,
+        io::RepositoryAvailability::Suspended => true,
+        io::RepositoryAvailability::NotReady => return Ok(CarriedRestore::Unchanged(restore)),
+    };
+    match wait_pause_patch(restore.status.as_ref(), suspended, chrono::Utc::now()) {
+        None => Ok(CarriedRestore::Unchanged(restore)),
+        Some(patch) => {
+            io::patch_status(api, name, patch.clone()).await?;
+            Ok(CarriedRestore::Cleared(Box::new(
+                restore_with_status_patch(restore, &patch),
+            )))
+        }
     }
 }
 
@@ -5106,20 +5248,21 @@ fn repository_referent_namespace<'a>(rref: &'a RepositoryRef, base_ns: &'a str) 
 /// the `False` this just cleared — see [`restore_with_conditions`] for the write
 /// loop that prevents. Nothing was cleared ⇒ the original is borrowed, no clone.
 async fn proceed_past_gate<'a>(
-    restore: &'a Restore,
+    carried: CarriedRestore<'a>,
     api: &Api<Restore>,
     name: &str,
+    suspended: Option<Box<SuspendedRepository>>,
 ) -> Result<RepositoryGate<'a>> {
-    let cleared = cleared_referent_conditions(restore);
+    let cleared = cleared_referent_conditions(carried.get());
     if let Some(conditions) = &cleared {
         io::patch_status(api, name, serde_json::json!({ "conditions": conditions })).await?;
     }
     // One construction site, pure and total: a cleared pass CANNOT continue from
     // the stale object, because that combination is unwritable here.
-    Ok(RepositoryGate::Proceed(carried_after_clear(
-        restore,
-        cleared.as_deref(),
-    )))
+    Ok(RepositoryGate::Proceed(
+        carried.with_conditions(cleared.as_deref()),
+        suspended,
+    ))
 }
 
 /// Park a restore whose repository referent does not exist (issue #393):
