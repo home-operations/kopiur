@@ -5412,6 +5412,34 @@ mod tests {
             );
         }
 
+        /// The writers must stay writers. A snapshot, a (batch) delete and a pin
+        /// all write manifests, so the generic arm must connect them read-write.
+        /// On a `--readonly` connection kopia refuses the write, and a
+        /// `Snapshot` would hang on its cleanup finalizer forever. This drives
+        /// each one's REAL access, `Operation::repository_access`, through the
+        /// funnel and reads the argv kopia receives.
+        #[tokio::test]
+        async fn writer_operations_connect_read_write_through_the_generic_arm() {
+            let anchor = serde_json::json!({ "sourcePath": "/pvc/db" });
+            for wire in [
+                serde_json::json!({ "snapshot": { "sourcePath": "/data" } }),
+                serde_json::json!({ "snapshotDelete": { "snapshotId": "k1", "anchor": anchor } }),
+                serde_json::json!({ "snapshotDeleteBatch": { "items": [
+                    { "snapshotId": "k1", "anchor": anchor }
+                ] } }),
+                serde_json::json!({ "snapshotPin": { "snapshotId": "k1", "pin": true, "anchor": anchor } }),
+            ] {
+                let op: Operation = serde_json::from_value(wire).expect("fixture decodes");
+                let argv = connect_argv(op.repository_access()).await;
+                assert!(
+                    argv.starts_with("repository connect filesystem")
+                        && !argv.contains("--readonly"),
+                    "{} must connect read-write; got: {argv}",
+                    op.kind_str()
+                );
+            }
+        }
+
         /// This file, for the source-level ratchet below. `include_str!` is
         /// relative to this file, so it is exactly the module being compiled.
         const MAIN_RS: &str = include_str!("main.rs");
