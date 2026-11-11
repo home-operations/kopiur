@@ -537,7 +537,10 @@ async fn create_session_job(
             source,
             mount_path: filesystem_repo_path(&target.repo.backend)
                 .expect("a backend with a repo volume has a repo path"),
-            read_only: true,
+            // Derived from the access the mover connects with (see
+            // `RepositoryAccess`), so the two cannot drift.
+            read_only: kopiur_mover::workspec::BrowseSessionOp::REPOSITORY_ACCESS
+                .mounts_read_only(),
         });
 
     // Workload identity: the session pod must run as the backend's federated

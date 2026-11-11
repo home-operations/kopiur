@@ -2397,6 +2397,15 @@ fn restore_paths_carries_the_selection_onto_the_work_spec() {
         paths: paths.clone(),
     };
     assert_eq!(restore_scope(&op), RestoreScope::Paths(&paths));
+    // ...and it is dispatched on the variant an older mover REJECTS, never on
+    // `restore`, which a pre-#689 mover would run as a full restore (#704 review).
+    let operation = kopiur_mover::workspec::restore_operation(op);
+    assert_eq!(operation.kind_str(), "PartialRestore");
+    let wire = serde_json::to_value(&operation).unwrap();
+    assert_eq!(
+        wire["partialRestore"]["paths"],
+        serde_json::json!(["docs/report.odt", "music/album"])
+    );
 }
 
 // --- §3.6 CR-catalog search: select_recorded_source ---------------------------
@@ -4040,8 +4049,9 @@ fn the_fanout_status_body_preserves_a_healed_inherit_hold() {
 /// auto-compacted the manifest set on load (16+ contents), the compaction write hit the
 /// read-only mount, and the restore failed with `read-only file system`
 /// (`MoverJobFailed`). The mount here and the mover's connect both come from
-/// `RestoreOp::REPOSITORY_ACCESS`, so this pins the pairing from the controller side:
-/// a read-only mount is only ever emitted alongside a `--readonly` connect.
+/// `Operation::repository_access`, so this pins the pairing from the controller side,
+/// for BOTH restore operations `restore_operation` can produce: a read-only mount is
+/// only ever emitted alongside a `--readonly` connect.
 #[test]
 fn a_restore_mounts_a_filesystem_repository_exactly_as_the_mover_connects_to_it() {
     use kopiur_api::backend::{Backend, FilesystemBackend, PvcVolume, RepoVolume};
@@ -4051,16 +4061,48 @@ fn a_restore_mounts_a_filesystem_repository_exactly_as_the_mover_connects_to_it(
             name: "nas-repo".into(),
         })),
     });
-    let mount = restore_repo_volume(&backend).expect("a PVC-backed filesystem repo is mounted");
-    assert_eq!(mount.mount_path, "/repo");
-    assert!(
-        RestoreOp::REPOSITORY_ACCESS.connects_read_only(),
-        "a restore only reads the repository, so the mover connects --readonly"
-    );
-    assert_eq!(
-        mount.read_only,
-        RestoreOp::REPOSITORY_ACCESS.connects_read_only(),
-        "the repository volume's readOnly must match the mover's connect mode: a read-only \
-         mount under a read-write connect fails reads once kopia auto-compacts manifests"
-    );
+    let restore_op = |paths: Vec<String>| RestoreOp {
+        source: RestoreSelection::Snapshot("k1".into()),
+        stdout: None,
+        target_path: "/restore".into(),
+        anchor: Default::default(),
+        ignore_permission_errors: None,
+        write_files_atomically: None,
+        parallel: None,
+        write_sparse_files: None,
+        skip_owners: None,
+        skip_permissions: None,
+        skip_times: None,
+        overwrite_files: None,
+        overwrite_directories: None,
+        overwrite_symlinks: None,
+        ignore_errors: None,
+        skip_existing: None,
+        delete_extra: false,
+        paths,
+    };
+    for operation in [
+        kopiur_mover::workspec::restore_operation(restore_op(vec![])),
+        kopiur_mover::workspec::restore_operation(restore_op(vec!["docs".into()])),
+    ] {
+        let kind = operation.kind_str();
+        let mount = restore_repo_volume(&operation, &backend)
+            .expect("a PVC-backed filesystem repo is mounted");
+        assert_eq!(mount.mount_path, "/repo");
+        assert!(
+            operation.repository_access().connects_read_only(),
+            "a {kind} only reads the repository, so the mover connects --readonly"
+        );
+        assert!(
+            mount.read_only,
+            "a {kind} mounts the repository read-only (it never writes it)"
+        );
+        assert_eq!(
+            mount.read_only,
+            operation.repository_access().connects_read_only(),
+            "{kind}: the repository volume's readOnly must match the mover's connect mode — \
+             a read-only mount under a read-write connect fails reads once kopia \
+             auto-compacts manifests"
+        );
+    }
 }

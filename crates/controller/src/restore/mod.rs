@@ -25,8 +25,8 @@ use kopiur_api::{
     RestoreTarget, validate,
 };
 use kopiur_mover::workspec::{
-    MoverOptions, MoverWorkSpec, Operation, RepositoryConnect, ResolvedIdentity as MoverIdentity,
-    RestoreOp, RestoreSelection, RestoreSelector, SnapshotAnchor, TargetRef,
+    MoverOptions, MoverWorkSpec, RepositoryConnect, ResolvedIdentity as MoverIdentity, RestoreOp,
+    RestoreSelection, RestoreSelector, SnapshotAnchor, TargetRef,
 };
 
 use crate::config;
@@ -3710,7 +3710,10 @@ async fn run_restore_mover(
     };
     let mut work_spec = MoverWorkSpec {
         version: 2,
-        operation: Operation::Restore(RestoreOp {
+        // `restore_operation` puts a path selection on `Operation::PartialRestore`
+        // (#704 review): an older pinned mover rejects that variant instead of
+        // ignoring `paths` and restoring the WHOLE snapshot over a live volume.
+        operation: kopiur_mover::workspec::restore_operation(RestoreOp {
             // A stream destination replaces the filesystem write entirely: the
             // mover reads ONE virtual file out of the snapshot and pipes it into a
             // command's stdin, so `target_path` below is inert for it.
@@ -3769,7 +3772,7 @@ async fn run_restore_mover(
         // Repo throttle applies to restore too (§13(e)).
         throttle: io::throttle_spec(repo.mover_defaults.as_ref()),
     };
-    let repo_volume = restore_repo_volume(&repo.backend);
+    let repo_volume = restore_repo_volume(&work_spec.operation, &repo.backend);
     // Resolve the cache VOLUME; a persistent cache PVC is owned by this Restore.
     let resolved_volume = crate::cache::resolve_cache_volume(
         ctx,
@@ -3779,10 +3782,10 @@ async fn run_restore_mover(
         effective_cache.as_ref(),
     )
     .await?;
-    work_spec.cache = crate::cache::cache_tuning(
+    work_spec.cache = crate::cache::tuning_of(&crate::cache::cache_budgets_for_volume(
         effective_cache.as_ref(),
-        resolved_volume.capacity.as_deref(),
-    )?;
+        &resolved_volume,
+    )?);
     let cache_volume = resolved_volume.volume;
     // RWO Multi-Attach avoidance for the restore DESTINATION PVC: when restoring into
     // an existing ReadWriteOnce PVC held by a running app pod, pin the restore mover to
@@ -5264,19 +5267,21 @@ fn restore_connect(repo: &ResolvedRepository) -> Result<RepositoryConnect> {
 /// A filesystem repository's volume, as the restore mover mounts it (`None` for an
 /// object store, which mounts nothing). Pure.
 ///
-/// Its `readOnly` comes from [`RestoreOp::REPOSITORY_ACCESS`] — the SAME value the
-/// mover picks its kopia connect mode from — so the mount and the connect cannot
-/// drift apart. They did once: a read-only mount under a read-write connect, which
-/// fails every read as soon as kopia auto-compacts the repository's manifests on load
-/// (the `E2E (populator-fanout)` flake; see
+/// Its `readOnly` comes from `operation`'s [`kopiur_mover::workspec::Operation::repository_access`] — the
+/// SAME value the mover picks its kopia connect mode from, for the operation this
+/// Job actually runs (a full `restore` or a `partialRestore`) — so the mount and
+/// the connect cannot drift apart. They did once: a read-only mount under a
+/// read-write connect, which fails every read as soon as kopia auto-compacts the
+/// repository's manifests on load (the `E2E (populator-fanout)` flake; see
 /// [`kopiur_mover::workspec::RepositoryAccess`]).
 pub(super) fn restore_repo_volume(
+    operation: &kopiur_mover::workspec::Operation,
     backend: &kopiur_api::backend::Backend,
 ) -> Option<VolumeMountSpec> {
     io::filesystem_repo_mount_source(backend).map(|source| VolumeMountSpec {
         source,
         mount_path: io::filesystem_repo_path(backend).unwrap_or_default(),
-        read_only: RestoreOp::REPOSITORY_ACCESS.mounts_read_only(),
+        read_only: operation.repository_access().mounts_read_only(),
     })
 }
 

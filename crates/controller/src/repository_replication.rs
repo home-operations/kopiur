@@ -641,7 +641,8 @@ async fn spawn_replication_job(
         ctx.operator_namespace.as_deref(),
     )
     .await?;
-    let work_spec = build_replication_work_spec(repl, repo, namespace, cr_name, dest_ca_bundle_pem);
+    let work_spec =
+        build_replication_work_spec(repl, repo, namespace, cr_name, dest_ca_bundle_pem)?;
 
     let mut labels = BTreeMap::new();
     labels.insert(
@@ -813,7 +814,12 @@ async fn spawn_replication_job(
         passthrough_env: ctx.mover_env_passthrough.clone(),
         extra_env: Vec::new(),
         annotations,
-        cache_volume: Default::default(),
+        // #707 review: the resolved per-run cache volume (see `replication_cache`).
+        cache_volume: crate::cache::replication_cache(
+            resolved_mover.cache.as_ref(),
+            std::num::NonZeroU32::MIN,
+        )?
+        .0,
         scratch_volume: None,
         readiness_exec: None,
     };
@@ -831,9 +837,20 @@ pub fn build_replication_work_spec(
     namespace: &str,
     cr_name: &str,
     dest_ca_bundle_pem: Option<String>,
-) -> MoverWorkSpec {
+) -> Result<MoverWorkSpec> {
     let sync = repl.spec.sync.unwrap_or_default();
-    MoverWorkSpec {
+    // #707 review: honor `mover.cache` (over the source repository's
+    // `moverDefaults.cache`). One kopia cache: the source is connected, the
+    // destination is written through its blob storage by `sync-to`.
+    let (_, cache) = crate::cache::replication_cache(
+        crate::cache::effective_cache(
+            repo,
+            repl.spec.mover.as_ref().and_then(|m| m.cache.as_ref()),
+        )
+        .as_ref(),
+        std::num::NonZeroU32::MIN,
+    )?;
+    Ok(MoverWorkSpec {
         version: 1,
         operation: Operation::Replicate(ReplicateOp {
             destination: backend_to_repository_connect(&repl.spec.destination, dest_ca_bundle_pem),
@@ -862,9 +879,9 @@ pub fn build_replication_work_spec(
         },
         hook_plan: Default::default(),
         options: MoverOptions::default(),
-        cache: Default::default(),
+        cache,
         throttle: io::throttle_spec(repo.mover_defaults.as_ref()),
-    }
+    })
 }
 
 /// The replication slot due now (cron + jitter strictly after the last run), or
@@ -1288,11 +1305,32 @@ mod tests {
         assert!(replication_job_name(long, slot).len() <= 52);
     }
 
+    /// Greptile on #707: `mover.cache` was accepted on a RepositoryReplication but
+    /// the work spec always carried `cache: Default::default()` — kopia ran at its
+    /// own defaults whatever the user set. The resolved budgets now reach the mover.
+    #[test]
+    fn work_spec_carries_the_resolved_cache_budgets() {
+        let mut r = repl_with("0 5 * * *", None);
+        r.spec.mover = Some(
+            serde_json::from_value(serde_json::json!({
+                "cache": { "capacity": "2Gi", "contentCacheSize": { "percent": 50 } }
+            }))
+            .unwrap(),
+        );
+        let ws = build_replication_work_spec(&r, &sample_repo(), "ns", "offsite", None).unwrap();
+        assert_eq!(ws.cache.content_cache_size_mb, Some(1024));
+        assert_eq!(ws.cache.metadata_cache_size_mb, Some(307));
+        // Unset → kopia defaults, exactly as before.
+        let bare = repl_with("0 5 * * *", None);
+        let ws = build_replication_work_spec(&bare, &sample_repo(), "ns", "offsite", None).unwrap();
+        assert!(ws.cache.is_unset());
+    }
+
     #[test]
     fn work_spec_maps_source_and_destination() {
         let r = repl_with("0 5 * * *", None);
         let repo = sample_repo();
-        let ws = build_replication_work_spec(&r, &repo, "ns", "offsite", None);
+        let ws = build_replication_work_spec(&r, &repo, "ns", "offsite", None).unwrap();
         // Operation is Replicate with the S3 destination; source is the filesystem repo.
         match &ws.operation {
             Operation::Replicate(op) => {
@@ -1330,7 +1368,7 @@ mod tests {
             max_upload_speed_bytes_per_second: Some(3_000_000),
         });
         let repo = sample_repo();
-        let ws = build_replication_work_spec(&r, &repo, "ns", "offsite", None);
+        let ws = build_replication_work_spec(&r, &repo, "ns", "offsite", None).unwrap();
         match &ws.operation {
             Operation::Replicate(op) => {
                 assert_eq!(op.parallel, Some(6));

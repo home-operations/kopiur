@@ -284,3 +284,72 @@ fn storage_class_expansion_needs_an_explicit_true() {
     assert!(!storage_class_allows_expansion(&sc(Some(false))));
     assert!(!storage_class_allows_expansion(&sc(None)));
 }
+
+/// Greptile on #707: when a sibling run wins the create race (409), the claim
+/// that now exists may be SMALLER than this run's requested capacity (the policy's
+/// capacity changed between the two runs). Reporting the requested capacity sized
+/// this run's budgets against a disk it does not have; the winner is re-read and
+/// its effective capacity is used instead.
+#[tokio::test]
+async fn a_lost_create_race_reports_the_winning_claims_capacity() {
+    let gets = Arc::new(Mutex::new(0u32));
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let svc = {
+        let (gets, log) = (gets.clone(), log.clone());
+        tower::service_fn(move |req: Request<Body>| {
+            let (gets, log) = (gets.clone(), log.clone());
+            async move {
+                let method = req.method().as_str().to_string();
+                log.lock().unwrap().push(method.clone());
+                let (status, json) = match method.as_str() {
+                    // First GET: absent (so this run tries to create). Later GETs:
+                    // the sibling's winning claim, 64Mi.
+                    "GET" => {
+                        let mut n = gets.lock().unwrap();
+                        *n += 1;
+                        if *n == 1 {
+                            (StatusCode::NOT_FOUND, status_body(404))
+                        } else {
+                            (StatusCode::OK, pvc_json("64Mi", Some("64Mi")))
+                        }
+                    }
+                    "POST" => (
+                        StatusCode::CONFLICT,
+                        serde_json::json!({
+                            "kind": "Status", "apiVersion": "v1", "status": "Failure",
+                            "message": "already exists", "reason": "AlreadyExists", "code": 409,
+                        }),
+                    ),
+                    _ => (StatusCode::NOT_FOUND, status_body(404)),
+                };
+                Ok::<_, std::convert::Infallible>(
+                    Response::builder()
+                        .status(status)
+                        .header("content-type", "application/json")
+                        .body(Body::from(serde_json::to_vec(&json).unwrap()))
+                        .unwrap(),
+                )
+            }
+        })
+    };
+    let client = Client::new(svc, "ns");
+    let out = ensure_cache_pvc(
+        &client,
+        "ns",
+        "kopiur-cache-pg",
+        Default::default(),
+        "128Mi",
+        Some("fast"),
+    )
+    .await
+    .expect("a lost create race is not an error");
+    assert_eq!(
+        out.capacity, "64Mi",
+        "budgets must fit the winning claim, not this run's request"
+    );
+    assert_eq!(out.claim_name, "kopiur-cache-pg");
+    assert!(
+        log.lock().unwrap().iter().filter(|m| *m == "GET").count() >= 2,
+        "the winner must be re-read"
+    );
+}

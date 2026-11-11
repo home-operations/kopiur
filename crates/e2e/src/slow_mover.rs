@@ -130,6 +130,8 @@ pub enum MoverOp {
     Snapshot,
     /// `Operation::Restore`.
     Restore,
+    /// `Operation::PartialRestore` — a restore of selected paths (#689).
+    PartialRestore,
     /// `Operation::SnapshotDelete`.
     SnapshotDelete,
     /// `Operation::SnapshotDeleteBatch` — the per-repository batch delete.
@@ -157,6 +159,7 @@ impl MoverOp {
         match self {
             MoverOp::Snapshot => "snapshot",
             MoverOp::Restore => "restore",
+            MoverOp::PartialRestore => "partialRestore",
             MoverOp::SnapshotDelete => "snapshotDelete",
             MoverOp::SnapshotDeleteBatch => "snapshotDeleteBatch",
             MoverOp::BootstrapRepository => "bootstrapRepository",
@@ -603,6 +606,7 @@ mod tests {
         let all = [
             MoverOp::Snapshot,
             MoverOp::Restore,
+            MoverOp::PartialRestore,
             MoverOp::SnapshotDelete,
             MoverOp::SnapshotDeleteBatch,
             MoverOp::BootstrapRepository,

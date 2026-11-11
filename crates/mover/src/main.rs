@@ -283,18 +283,20 @@ async fn run(cli: &MoverCli) -> Result<()> {
             // `apply_repository_throttle` is a no-op for them today — that is a
             // controller-side gap, deliberately out of scope for this change.
             //
-            // The access mode is decided HERE, per variant, for the same reason:
-            // a restore reads through a read-only filesystem mount, and a
-            // read-write connect over it fails once kopia auto-compacts the
+            // The connect MODE is not decided here: it is
+            // `Operation::repository_access`, exhaustive over every variant and
+            // the same value the controller mounts a filesystem repository by.
+            // A restore (full or partial) reads through a read-only mount, and
+            // a read-write connect over it fails once kopia auto-compacts the
             // manifest set on load (see `RepositoryAccess`).
-            Operation::Restore(_) => {
-                run_generic_flow(&client, &spec, &connect, RestoreOp::REPOSITORY_ACCESS).await
-            }
             Operation::Snapshot(_)
+            | Operation::Restore(_)
+            | Operation::PartialRestore(_)
             | Operation::SnapshotDelete(_)
             | Operation::SnapshotDeleteBatch(_)
             | Operation::SnapshotPin(_) => {
-                run_generic_flow(&client, &spec, &connect, RepositoryAccess::ReadWrite).await
+                let access = spec.operation.repository_access();
+                run_generic_flow(&client, &spec, &connect, access).await
             }
         },
     };
@@ -312,7 +314,8 @@ async fn run(cli: &MoverCli) -> Result<()> {
 }
 
 /// The shared lifecycle of the operations without a flow of their own
-/// (snapshot, restore, delete, batch delete, pin): connect with `access` and
+/// (snapshot, restore, partial restore, delete, batch delete, pin): connect
+/// with `access` (`Operation::repository_access`) and
 /// apply the repository throttle as one step, then run with periodic progress
 /// PATCHes and report the terminal outcome.
 async fn run_generic_flow(
@@ -737,35 +740,15 @@ async fn run_operation(
             }
             Ok(StatusUpdate::succeeded_backup(&result, chrono::Utc::now()))
         }
-        Operation::Restore(op) => {
-            // Where the bytes GO is decided first: a stream restore never touches a
-            // filesystem, so it does not share the mounted-target machinery below.
-            if let kopiur_mover::workspec::RestoreOutput::Stream(consumer) =
-                kopiur_mover::workspec::restore_output(op)
-            {
-                return restore_stream(client, op, consumer).await;
-            }
-            // Exactly one source kind (externally tagged): a controller-resolved id,
-            // or an in-Job selector to resolve here. Exhaustive — a new variant
-            // can't compile until handled.
-            match &op.source {
-                RestoreSelection::Snapshot(id) => {
-                    // The recorded id can be STALE — kopia rewrites a snapshot's
-                    // manifest id on pin (`UpdateSnapshot`), so a snapshotRef/identity
-                    // restore of a snapshot pinned before this fix points at a deleted
-                    // manifest. On a not-found, self-heal by re-resolving the live id
-                    // from the snapshot's stable identity (source path + start time).
-                    let restored_id = restore_snapshot(client, op, id).await?;
-                    // Restore's terminal success phase is `Completed`, not `Succeeded`
-                    // (the Snapshot phase) — the Restore CRD enum rejects `Succeeded`.
-                    Ok(StatusUpdate::completed(&restored_id, chrono::Utc::now()))
-                }
-                // Object-store `fromPolicy`/`identity`-without-id: the controller
-                // can't list the backend in-process, so resolve "latest" (offset/asOf)
-                // here, where the mover reaches every backend.
-                RestoreSelection::Resolve(sel) => {
-                    resolve_and_restore(client, op, sel, reporter).await
-                }
+        Operation::Restore(op) => run_restore(client, op, reporter).await,
+        // #689: the selection rides its own variant so an older mover fails
+        // closed on it (see `Operation::PartialRestore`). A malformed one — no
+        // paths, or a stream target — must fail here too, never degrade into a
+        // whole-root restore of a live volume.
+        Operation::PartialRestore(op) => {
+            match kopiur_mover::workspec::partial_restore_problem(op) {
+                Some(reason) => Err(MoverError::PartialRestoreInvalid { reason }),
+                None => run_restore(client, op, reporter).await,
             }
         }
         Operation::SnapshotDelete(op) => {
@@ -842,6 +825,43 @@ async fn run_operation(
                 "SnapshotReplicate is handled by run_snapshot_replicate_flow, not execute()"
             )
         }
+    }
+}
+
+/// Run a filesystem or stream restore — shared by [`Operation::Restore`] and
+/// [`Operation::PartialRestore`]; how much of the snapshot is restored is read
+/// off the op by `restore_snapshot` (`RestoreScope`).
+async fn run_restore(
+    client: &KopiaClient,
+    op: &RestoreOp,
+    reporter: &StatusReporter,
+) -> Result<StatusUpdate> {
+    // Where the bytes GO is decided first: a stream restore never touches a
+    // filesystem, so it does not share the mounted-target machinery below.
+    if let kopiur_mover::workspec::RestoreOutput::Stream(consumer) =
+        kopiur_mover::workspec::restore_output(op)
+    {
+        return restore_stream(client, op, consumer).await;
+    }
+    // Exactly one source kind (externally tagged): a controller-resolved id,
+    // or an in-Job selector to resolve here. Exhaustive — a new variant
+    // can't compile until handled.
+    match &op.source {
+        RestoreSelection::Snapshot(id) => {
+            // The recorded id can be STALE — kopia rewrites a snapshot's
+            // manifest id on pin (`UpdateSnapshot`), so a snapshotRef/identity
+            // restore of a snapshot pinned before this fix points at a deleted
+            // manifest. On a not-found, self-heal by re-resolving the live id
+            // from the snapshot's stable identity (source path + start time).
+            let restored_id = restore_snapshot(client, op, id).await?;
+            // Restore's terminal success phase is `Completed`, not `Succeeded`
+            // (the Snapshot phase) — the Restore CRD enum rejects `Succeeded`.
+            Ok(StatusUpdate::completed(&restored_id, chrono::Utc::now()))
+        }
+        // Object-store `fromPolicy`/`identity`-without-id: the controller
+        // can't list the backend in-process, so resolve "latest" (offset/asOf)
+        // here, where the mover reaches every backend.
+        RestoreSelection::Resolve(sel) => resolve_and_restore(client, op, sel, reporter).await,
     }
 }
 
@@ -1786,9 +1806,10 @@ impl BootstrapConnectFailure {
     }
 }
 
-/// Connect for bootstrap, honoring [`BootstrapRepositoryOp::read_only`]
-/// (M6): a `mode: ReadOnly` repository's bootstrap connects with `--readonly`
-/// (`repository_connect_readonly`) instead of the normal read-write connect —
+/// Connect for bootstrap with `access` — [`BootstrapRepositoryOp::repository_access`],
+/// i.e. [`BootstrapRepositoryOp::read_only`] (M6): a `mode: ReadOnly`
+/// repository's bootstrap connects with `--readonly` instead of the normal
+/// read-write connect —
 /// bootstrap is a connect/scan probe, and a read-write connect from a
 /// ReadOnly consumer repo was exactly what let it clobber the primary's
 /// maintenance owner. The other flows state their own mode to
@@ -1806,15 +1827,17 @@ async fn bootstrap_connect(
     client: &KopiaClient,
     spec: &ConnectSpec,
     cache: kopiur_kopia::CacheTuning,
-    read_only: bool,
+    access: RepositoryAccess,
     throttle: &ThrottleSpec,
 ) -> std::result::Result<(), BootstrapConnectFailure> {
-    let connected = if read_only {
-        client.repository_connect_readonly(spec, cache).await
-    } else {
-        client.repository_connect(spec, cache).await
+    let options = ConnectOptions {
+        readonly: access.connects_read_only(),
+        persist_credentials: false,
     };
-    connected.map_err(BootstrapConnectFailure::Connect)?;
+    client
+        .repository_connect_with(spec, cache, options)
+        .await
+        .map_err(BootstrapConnectFailure::Connect)?;
     apply_repository_throttle(client, throttle)
         .await
         .map_err(BootstrapConnectFailure::Throttle)
@@ -1954,7 +1977,7 @@ async fn seed_connect_source(
             &source,
             spec.cache,
             ConnectOptions {
-                readonly: true,
+                readonly: workspec::SeedOpSpec::SOURCE_ACCESS.connects_read_only(),
                 persist_credentials: true,
             },
         )
@@ -2569,7 +2592,15 @@ async fn bootstrap_create_arm(
     {
         return Err(Box::new(BootstrapResult::failed(&ce)));
     }
-    if let Err(ce) = bootstrap_connect(client, connect_spec, cache, op.read_only, throttle).await {
+    if let Err(ce) = bootstrap_connect(
+        client,
+        connect_spec,
+        cache,
+        op.repository_access(),
+        throttle,
+    )
+    .await
+    {
         return Err(Box::new(ce.into_result()));
     }
     stamp_owner_on_new_repository(client, op.maintenance_owner.as_ref()).await;
@@ -2627,8 +2658,14 @@ async fn bootstrap_seed_arm(
         workspec::SeedModeSpec::Blob => false,
         workspec::SeedModeSpec::Migrate => !local_initialized,
     };
-    if let Err(ce) =
-        bootstrap_connect(client, connect_spec, cache, op.read_only, &spec.throttle).await
+    if let Err(ce) = bootstrap_connect(
+        client,
+        connect_spec,
+        cache,
+        op.repository_access(),
+        &spec.throttle,
+    )
+    .await
     {
         return Err(Box::new(ce.into_result()));
     }
@@ -2674,7 +2711,15 @@ async fn bootstrap_connect_probe(
     // THROTTLE failure ends the bootstrap here — the connection is open but
     // uncapped, and nothing about the backend has been learned that would
     // justify creating or seeding a repository over it.
-    let err = match bootstrap_connect(client, connect_spec, cache, op.read_only, throttle).await {
+    let err = match bootstrap_connect(
+        client,
+        connect_spec,
+        cache,
+        op.repository_access(),
+        throttle,
+    )
+    .await
+    {
         Ok(()) => None,
         Err(BootstrapConnectFailure::Connect(e)) => Some(e),
         Err(e @ BootstrapConnectFailure::Throttle(_)) => return Err(Box::new(e.into_result())),
@@ -4026,7 +4071,7 @@ async fn srepl_connect_source(
             source_connect,
             spec.cache,
             ConnectOptions {
-                readonly: true,
+                readonly: SnapshotReplicateOp::SOURCE_ACCESS.connects_read_only(),
                 persist_credentials: true,
             },
         )
@@ -4491,8 +4536,12 @@ async fn run_browse_session_flow(
         session = %spec.target_ref.name,
         "starting browse session (read-only connect)"
     );
+    let options = ConnectOptions {
+        readonly: BrowseSessionOp::REPOSITORY_ACCESS.connects_read_only(),
+        persist_credentials: false,
+    };
     if let Err(e) = client
-        .repository_connect_readonly(connect, spec.cache)
+        .repository_connect_with(connect, spec.cache, options)
         .await
     {
         // Mirrors the maintenance connect-failure logging (class + message) so
@@ -4737,6 +4786,31 @@ mod tests {
         assert!(
             msg.contains("symbolic link") && msg.contains("Fix:"),
             "{msg}"
+        );
+    }
+
+    /// The exact #704 review case: the live PVC holds `docs -> archive` (a
+    /// RELATIVE link to a sibling) and `docs/sub/report.odt` is selected. The
+    /// guard must refuse it in both passes and must NOT create `archive/sub`
+    /// through the link — the `create_dir_all` it replaced did exactly that.
+    #[cfg(unix)]
+    #[test]
+    fn check_selected_target_refuses_a_relative_symlinked_parent_without_mkdir_through_it() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let r = root.path();
+        std::fs::create_dir(r.join("archive")).unwrap();
+        symlink("archive", r.join("docs")).unwrap();
+        for prep in [TargetPrep::CheckOnly, TargetPrep::CreateParents] {
+            let err = check_selected_target(r, "docs/sub/report.odt", prep).unwrap_err();
+            match err {
+                MoverError::RestoreTargetSymlink { path } => assert_eq!(path, r.join("docs")),
+                other => panic!("{prep:?}: expected RestoreTargetSymlink, got {other:?}"),
+            }
+        }
+        assert!(
+            !r.join("archive/sub").exists(),
+            "nothing may be created through the symlinked parent"
         );
     }
 
@@ -5350,7 +5424,7 @@ mod tests {
             ("connect_and_throttle", "the funnel (1 call)"),
             (
                 "bootstrap_connect",
-                "the bootstrap funnel (2 calls: rw + readonly)",
+                "the bootstrap funnel (1 call; mode from RepositoryAccess)",
             ),
             (
                 "main_serve",
@@ -5378,7 +5452,7 @@ mod tests {
         ];
 
         /// Total direct calls the sanctioned list above accounts for.
-        const SANCTIONED_DIRECT_CONNECT_CALLS: usize = 9;
+        const SANCTIONED_DIRECT_CONNECT_CALLS: usize = 8;
 
         /// **The #374 ratchet.** A mover flow must obtain its connection from
         /// [`connect_and_throttle`] or [`bootstrap_connect`], so that "connects

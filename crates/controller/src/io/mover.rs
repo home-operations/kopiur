@@ -1532,7 +1532,20 @@ pub async fn ensure_cache_pvc(
         return match api.create(&PostParams::default(), &pvc).await {
             Ok(_) => Ok(fresh(CachePvcResize::Unchanged)),
             // A concurrent reconcile won the create race: the PVC is there, reuse it.
-            Err(kube::Error::Api(e)) if e.code == 409 => Ok(fresh(CachePvcResize::Unchanged)),
+            // The winner may have been created at a different (smaller) capacity —
+            // the policy's capacity can change between two sibling runs — so re-read
+            // it and size the budgets to what it actually holds (#707 review).
+            Err(kube::Error::Api(e)) if e.code == 409 => {
+                let capacity = api.get_opt(name).await?.map_or_else(
+                    || capacity.to_string(),
+                    |w| effective_cache_capacity(capacity, &w),
+                );
+                Ok(EnsuredCachePvc {
+                    claim_name: name.to_string(),
+                    capacity,
+                    resize: CachePvcResize::Unchanged,
+                })
+            }
             Err(e) => Err(Error::Kube(e)),
         };
     };

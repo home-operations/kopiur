@@ -3104,3 +3104,240 @@ fn restore_op_paths_round_trip_and_resolve_the_scope() {
         RestoreScope::Paths(&["docs/report.odt".to_string(), "music/album".to_string()])
     );
 }
+
+/// A minimal restore op for the #704-review tests.
+fn bare_restore_op(paths: &[&str]) -> RestoreOp {
+    serde_json::from_value(serde_json::json!({
+        "source": { "snapshot": "k1" },
+        "targetPath": "/data",
+        "paths": paths,
+    }))
+    .unwrap()
+}
+
+#[test]
+fn a_partial_restore_rides_its_own_operation_variant() {
+    // #704 review: an older mover (pinned image) ignores unknown FIELDS, so a
+    // partial restore carried as `restore` + `paths` would silently become a
+    // FULL in-place restore there. It must travel under a distinct variant key.
+    let partial = restore_operation(bare_restore_op(&["docs/report.odt"]));
+    assert_eq!(partial.kind_str(), "PartialRestore");
+    let wire = serde_json::to_value(&partial).unwrap();
+    assert!(wire.get("partialRestore").is_some(), "{wire}");
+    assert!(wire.get("restore").is_none(), "{wire}");
+
+    // A whole-root restore keeps the old key, so every mover still runs it.
+    let whole = restore_operation(bare_restore_op(&[]));
+    assert_eq!(whole.kind_str(), "Restore");
+    assert!(
+        serde_json::to_value(&whole)
+            .unwrap()
+            .get("restore")
+            .is_some()
+    );
+}
+
+#[test]
+fn a_mover_that_predates_partial_restore_fails_closed_on_one() {
+    // What a pre-#689 mover's `Operation` looks like on the wire: externally
+    // tagged, camelCase, no `partialRestore` variant, no `deny_unknown_fields`.
+    // (Modelled locally because the old binary is not linkable here.)
+    #[derive(Debug, serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    #[allow(dead_code)]
+    enum LegacyOperation {
+        Snapshot(serde_json::Value),
+        Restore(serde_json::Value),
+    }
+    let partial = serde_json::to_value(restore_operation(bare_restore_op(&["a/b"]))).unwrap();
+    let err = serde_json::from_value::<LegacyOperation>(partial).unwrap_err();
+    assert!(err.to_string().contains("unknown variant"), "{err}");
+    // ...whereas the whole-root restore it has always understood still parses.
+    let whole = serde_json::to_value(restore_operation(bare_restore_op(&[]))).unwrap();
+    assert!(serde_json::from_value::<LegacyOperation>(whole).is_ok());
+
+    // And THIS mover fails closed on an operation newer than itself, too: an
+    // unknown variant is a parse error, never a silently-defaulted run.
+    let spec_with = |operation: serde_json::Value| {
+        serde_json::json!({
+            "version": 3,
+            "operation": operation,
+            "identity": { "username": "u", "hostname": "h", "sourcePath": "/p" },
+            "repository": { "filesystem": { "path": "/repo" } },
+            "targetRef": { "apiVersion": "v", "kind": "Restore", "name": "n", "namespace": "ns" },
+        })
+    };
+    // Control: the same spec with an operation this mover knows parses fine...
+    let known = serde_json::to_value(restore_operation(bare_restore_op(&["a"]))).unwrap();
+    assert!(serde_json::from_value::<MoverWorkSpec>(spec_with(known)).is_ok());
+    // ...so the failure below is the unknown operation, and nothing else.
+    let err = serde_json::from_value::<MoverWorkSpec>(spec_with(
+        serde_json::json!({ "someFutureOp": { "paths": ["a"] } }),
+    ))
+    .unwrap_err();
+    assert!(err.to_string().contains("unknown variant"), "{err}");
+}
+
+#[test]
+fn a_partial_restore_without_paths_or_into_a_stream_is_rejected() {
+    // Defensive: a `partialRestore` that would restore everything (no paths),
+    // or that targets a stream, is a malformed work spec, not a whole-root run.
+    assert_eq!(partial_restore_problem(&bare_restore_op(&["a"])), None);
+    assert!(partial_restore_problem(&bare_restore_op(&[])).is_some());
+    let mut streamed = bare_restore_op(&["a"]);
+    streamed.stdout = Some(StreamExecSpec {
+        namespace: "ns".into(),
+        pod_selector: "app=pg".into(),
+        container: None,
+        command: vec!["psql".into()],
+        file_name: "a".into(),
+        timeout_seconds: 60,
+    });
+    assert!(partial_restore_problem(&streamed).is_some());
+}
+
+// --- Operation::repository_access: one answer per operation, every operation ---
+
+/// One minimal instance of EVERY [`Operation`] variant, decoded from the wire
+/// shape (`{ "<variant>": { ... } }`), paired with the access the operation must
+/// connect with. A bootstrap appears twice — its access follows `readOnly`.
+///
+/// The `kind_str` coverage check in the test below is what makes this list
+/// exhaustive in practice: a new variant that is not added here fails it.
+fn every_operation_with_its_access() -> Vec<(Operation, RepositoryAccess)> {
+    let anchor = serde_json::json!({ "sourcePath": "/pvc/db" });
+    let fs = serde_json::json!({ "filesystem": { "path": "/repo" } });
+    let restore = serde_json::json!({
+        "source": { "snapshot": "k1" },
+        "targetPath": "/restore",
+        "anchor": anchor,
+    });
+    let mut partial = restore.clone();
+    partial["paths"] = serde_json::json!(["docs"]);
+    let bootstrap = |read_only: bool| {
+        serde_json::json!({ "bootstrapRepository": {
+            "autoCreate": false,
+            "scanCatalog": false,
+            "readOnly": read_only,
+        } })
+    };
+    let fixtures = [
+        (
+            serde_json::json!({ "snapshot": { "sourcePath": "/data" } }),
+            RepositoryAccess::ReadWrite,
+        ),
+        (
+            serde_json::json!({ "restore": restore }),
+            RepositoryAccess::ReadOnly,
+        ),
+        (
+            serde_json::json!({ "partialRestore": partial }),
+            RepositoryAccess::ReadOnly,
+        ),
+        (
+            serde_json::json!({ "snapshotDelete": { "snapshotId": "k1", "anchor": anchor } }),
+            RepositoryAccess::ReadWrite,
+        ),
+        (
+            serde_json::json!({ "snapshotDeleteBatch": { "items": [] } }),
+            RepositoryAccess::ReadWrite,
+        ),
+        (bootstrap(false), RepositoryAccess::ReadWrite),
+        (bootstrap(true), RepositoryAccess::ReadOnly),
+        (
+            serde_json::json!({ "maintenance": {
+                "mode": "quick", "owner": "kopiur/ns/repo", "takeoverPolicy": "Never",
+            } }),
+            RepositoryAccess::ReadWrite,
+        ),
+        (
+            serde_json::json!({ "snapshotPin": { "snapshotId": "k1", "pin": true, "anchor": anchor } }),
+            RepositoryAccess::ReadWrite,
+        ),
+        (
+            serde_json::json!({ "verify": { "tier": { "quick": {} } } }),
+            RepositoryAccess::ReadWrite,
+        ),
+        (
+            serde_json::json!({ "replicate": { "destination": fs } }),
+            RepositoryAccess::ReadWrite,
+        ),
+        (
+            serde_json::json!({ "browseSession": {} }),
+            RepositoryAccess::ReadOnly,
+        ),
+        (
+            serde_json::to_value(Operation::SnapshotReplicate(sample_snapshot_replicate_op()))
+                .expect("serialize snapshotReplicate"),
+            RepositoryAccess::ReadOnly,
+        ),
+    ];
+    fixtures
+        .into_iter()
+        .map(|(wire, access)| {
+            let op: Operation = serde_json::from_value(wire.clone())
+                .unwrap_or_else(|e| panic!("fixture {wire} must decode as an Operation: {e}"));
+            (op, access)
+        })
+        .collect()
+}
+
+/// The populator-fanout flake was a restore connecting read-write through a
+/// read-only repository mount. `Operation::repository_access` is now THE answer
+/// for every operation — the mover connects by it and the controller derives
+/// every read-only mount from it — and this pins the whole matrix, so changing
+/// one operation's mode, or adding an operation, is a deliberate edit here.
+#[test]
+fn every_operation_connects_with_its_declared_repository_access() {
+    let all = every_operation_with_its_access();
+    let covered: std::collections::BTreeSet<&str> =
+        all.iter().map(|(op, _)| op.kind_str()).collect();
+    assert_eq!(
+        covered,
+        [
+            "BootstrapRepository",
+            "BrowseSession",
+            "Maintenance",
+            "PartialRestore",
+            "Replicate",
+            "Restore",
+            "Snapshot",
+            "SnapshotDelete",
+            "SnapshotDeleteBatch",
+            "SnapshotPin",
+            "SnapshotReplicate",
+            "Verify",
+        ]
+        .into_iter()
+        .collect(),
+        "every Operation variant needs a fixture here (and a decision in \
+         `Operation::repository_access`)"
+    );
+    for (op, want) in &all {
+        assert_eq!(
+            op.repository_access(),
+            *want,
+            "{} must connect {want:?}",
+            op.kind_str()
+        );
+        // The pairing the bug broke: a read-only mount only ever under a
+        // read-only connect.
+        assert!(
+            !op.repository_access().mounts_read_only()
+                || op.repository_access().connects_read_only(),
+            "{}: a read-only mount under a read-write connect",
+            op.kind_str()
+        );
+    }
+    // The reader flows are exactly the ones that may mount read-only.
+    assert_eq!(RestoreOp::REPOSITORY_ACCESS, RepositoryAccess::ReadOnly);
+    assert_eq!(
+        SnapshotReplicateOp::SOURCE_ACCESS,
+        RepositoryAccess::ReadOnly
+    );
+    assert_eq!(
+        BrowseSessionOp::REPOSITORY_ACCESS,
+        RepositoryAccess::ReadOnly
+    );
+    assert_eq!(SeedOpSpec::SOURCE_ACCESS, RepositoryAccess::ReadOnly);
+}

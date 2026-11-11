@@ -1116,7 +1116,7 @@ async fn spawn_snapshot_replication_job(
             kopiur_api::ValidationError::ReplicationMountPathCollision { path }.to_string(),
         ));
     }
-    let work_spec = build_snapshot_replication_work_spec(repl, source, dest, namespace, cr_name);
+    let work_spec = build_snapshot_replication_work_spec(repl, source, dest, namespace, cr_name)?;
 
     let mut labels = BTreeMap::new();
     labels.insert(
@@ -1165,7 +1165,11 @@ async fn spawn_snapshot_replication_job(
         io::filesystem_repo_mount_source(&source.backend).map(|mount_source| VolumeMountSpec {
             source: mount_source,
             mount_path: io::filesystem_repo_path(&source.backend).unwrap_or_default(),
-            read_only: true,
+            // Derived from the access the mover CONNECTS the source with, never
+            // a literal: a read-only mount under a read-write connect fails reads
+            // once kopia auto-compacts manifests (see `RepositoryAccess`).
+            read_only: kopiur_mover::workspec::SnapshotReplicateOp::SOURCE_ACCESS
+                .mounts_read_only(),
         });
     // A filesystem DESTINATION needs its volume mounted read-write — `kopia
     // snapshot migrate` writes the copies into it. Carried in the
@@ -1234,7 +1238,12 @@ async fn spawn_snapshot_replication_job(
         passthrough_env: ctx.mover_env_passthrough.clone(),
         extra_env,
         annotations,
-        cache_volume: Default::default(),
+        // #707 review: the resolved per-run cache volume (see `replication_cache`).
+        cache_volume: crate::cache::replication_cache(
+            resolved_mover.cache.as_ref(),
+            SNAPSHOT_REPLICATION_KOPIA_CACHES,
+        )?
+        .0,
         scratch_volume: None,
         readiness_exec: None,
     };
@@ -1384,7 +1393,7 @@ pub fn build_snapshot_replication_work_spec(
     dest: &ResolvedRepository,
     namespace: &str,
     cr_name: &str,
-) -> MoverWorkSpec {
+) -> Result<MoverWorkSpec> {
     let selection = repl.spec.selection.as_ref();
     let (include, exclude) = selection_matchers(repl);
     let migrate = repl.spec.migrate.clone().unwrap_or_default();
@@ -1401,7 +1410,18 @@ pub fn build_snapshot_replication_work_spec(
         dest.mover_defaults.as_ref(),
         migrate_throttle.and_then(|t| t.destination.as_ref()),
     );
-    MoverWorkSpec {
+    // #707 review: honor `mover.cache` (over the source repository's
+    // `moverDefaults.cache`). TWO kopia caches share the volume — source and
+    // destination are both connected — so each gets half.
+    let (_, cache) = crate::cache::replication_cache(
+        crate::cache::effective_cache(
+            source,
+            repl.spec.mover.as_ref().and_then(|m| m.cache.as_ref()),
+        )
+        .as_ref(),
+        SNAPSHOT_REPLICATION_KOPIA_CACHES,
+    )?;
+    Ok(MoverWorkSpec {
         version: 1,
         operation: Operation::SnapshotReplicate(SnapshotReplicateOp {
             destination: backend_to_repository_connect(&dest.backend, dest.ca_bundle_pem.clone()),
@@ -1441,10 +1461,16 @@ pub fn build_snapshot_replication_work_spec(
         },
         hook_plan: Default::default(),
         options: MoverOptions::default(),
-        cache: Default::default(),
+        cache,
         throttle: source_throttle,
-    }
+    })
 }
+
+/// A snapshot-replication mover connects BOTH repositories, each keeping its own
+/// kopia cache on the one cache volume (`srepl-source-cache` / `srepl-dest-xdg`),
+/// so the cache budgets are split between them.
+const SNAPSHOT_REPLICATION_KOPIA_CACHES: std::num::NonZeroU32 =
+    std::num::NonZeroU32::new(2).unwrap();
 
 /// CRD [`IdentityMatcher`] → wire [`IdentityMatcherSpec`] (a field-for-field
 /// mirror; the wire type exists so the mover contract can't drift with CRD
@@ -1971,6 +1997,29 @@ mod tests {
 
     // --- work-spec field map ------------------------------------------------
 
+    /// Greptile on #707: `mover.cache` was accepted on a SnapshotReplication but the
+    /// work spec always carried `cache: Default::default()`. The resolved budgets
+    /// now reach the mover — halved, because its source AND destination kopia caches
+    /// share the one cache volume.
+    #[test]
+    fn work_spec_carries_cache_budgets_split_between_both_repositories() {
+        let mut r = srepl_with("0 6 * * *", None);
+        r.spec.mover = Some(
+            serde_json::from_value(serde_json::json!({ "cache": { "capacity": "2Gi" } })).unwrap(),
+        );
+        let ws = build_snapshot_replication_work_spec(
+            &r,
+            &sample_source(),
+            &sample_dest(),
+            "ns",
+            "offsite",
+        )
+        .unwrap();
+        // 60% / 15% of 2Gi = 1228 / 307, halved per cache.
+        assert_eq!(ws.cache.content_cache_size_mb, Some(614));
+        assert_eq!(ws.cache.metadata_cache_size_mb, Some(153));
+    }
+
     #[test]
     fn work_spec_maps_source_destination_and_identity_sentinel() {
         let r = srepl_with("0 6 * * *", None);
@@ -1980,7 +2029,8 @@ mod tests {
             &sample_dest(),
             "ns",
             "offsite",
-        );
+        )
+        .unwrap();
         match &ws.operation {
             Operation::SnapshotReplicate(op) => {
                 assert_eq!(op.destination.kind_str(), "S3");
@@ -2074,7 +2124,7 @@ mod tests {
             }),
             ..Default::default()
         });
-        let ws = build_snapshot_replication_work_spec(&r, &source, &dest, "ns", "offsite");
+        let ws = build_snapshot_replication_work_spec(&r, &source, &dest, "ns", "offsite").unwrap();
         match &ws.operation {
             Operation::SnapshotReplicate(op) => {
                 assert_eq!(op.include.len(), 1);

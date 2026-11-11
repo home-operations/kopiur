@@ -215,15 +215,39 @@ impl Ctx<'_> {
         Ok(())
     }
 
-    /// A budget's default share, lowered to the room `other` leaves under the ceiling.
-    /// `None` when that would be under 1MiB (kopia then keeps its own default).
+    /// A budget's default share — at least 1MiB, so a small capacity never rounds a
+    /// cache down to "unset" (kopia's unbounded default) — lowered to the room
+    /// `other` leaves under the ceiling. `None` only when there is no room at all.
     fn default_for(cap: i64, pct: u32, other: Option<Budget>) -> Option<Budget> {
         let room = Self::ceiling(cap) - other.map_or(0, |o| o.mb);
-        let mb = (cap * i64::from(pct) / 100).min(room);
+        let mb = (cap * i64::from(pct) / 100).max(1).min(room);
         (mb >= 1).then_some(Budget {
             mb,
             origin: Origin::Defaulted,
         })
+    }
+
+    /// At admission ([`LegacyBudgets::Enforce`]) a known capacity must bound BOTH
+    /// caches: one left unset runs at kopia's multi-GiB default and can fill a small
+    /// volume. Only a capacity under 3MiB (no room for 1MiB + 1MiB under the 90%
+    /// ceiling) gets here; a stored object with one keeps running (pass-through).
+    fn check_both_bounded(
+        &self,
+        content: Option<Budget>,
+        metadata: Option<Budget>,
+    ) -> Result<(), ValidationError> {
+        if self.legacy == LegacyBudgets::Enforce && (content.is_none() || metadata.is_none()) {
+            return Err(self.invalid(
+                "capacity",
+                format!(
+                    "capacity `{}` is too small to bound both kopia caches (it needs at least \
+                     3Mi), so one would run at kopia's unbounded default. Fix: raise `capacity`, \
+                     or remove it for an unsized emptyDir cache",
+                    self.capacity_str()
+                ),
+            ));
+        }
+        Ok(())
     }
 
     /// The capacity bound on resolved budgets (legacy pass-through values exempt).
@@ -332,6 +356,12 @@ pub fn resolve_cache_budgets(
         "metadataCacheSize",
     )?;
 
+    // A capacity that parses but rounds to 0MiB (e.g. `512Ki`) is a SIZED volume too
+    // small to bound either cache — refuse it at admission rather than treat it as
+    // "no capacity" (#714 review). Stored objects keep running (pass-through).
+    if capacity.and_then(quantity_to_mib) == Some(0) {
+        ctx.check_both_bounded(None, None)?;
+    }
     let Some(cap) = ctx.cap_mib else {
         // No fixed-size volume: nothing to default against or bound by.
         return Ok(ResolvedCache {
@@ -340,13 +370,15 @@ pub fn resolve_cache_budgets(
             metadata_cache_size_mb: metadata.map(|b| b.mb),
         });
     };
-    // Default each unset budget against the OTHER's explicit value; with both unset
-    // the default pair (60% + 15%) already fits under the ceiling.
+    // Default content against metadata's explicit value, then metadata against the
+    // RESOLVED content: the 1MiB floor means two defaults on a tiny volume could
+    // otherwise overshoot the ceiling together.
     let content_r =
         content.or_else(|| Ctx::default_for(cap, DEFAULT_CONTENT_CACHE_PERCENT, metadata));
     let metadata_r =
-        metadata.or_else(|| Ctx::default_for(cap, DEFAULT_METADATA_CACHE_PERCENT, content));
+        metadata.or_else(|| Ctx::default_for(cap, DEFAULT_METADATA_CACHE_PERCENT, content_r));
     ctx.check_bounds(cap, content_r, metadata_r)?;
+    ctx.check_both_bounded(content_r, metadata_r)?;
     Ok(ResolvedCache {
         capacity: capacity.map(str::to_string),
         content_cache_size_mb: content_r.map(|b| b.mb),
@@ -391,5 +423,52 @@ pub fn validate_cache_shape(cfg: &CacheDefaults, field: &str) -> Result<(), Vali
     Ok(())
 }
 
+/// Scale resolved budgets down to fit `available` when it is smaller than the
+/// capacity they were resolved against (#613 review follow-up).
+///
+/// Budgets are always resolved against the CONFIGURED capacity — the one admission
+/// validated — so an edit that passed the webhook can never fail at run time just
+/// because the volume has not caught up. The volume actually mounted can be
+/// smaller: a grown PVC whose filesystem only finishes resizing when a pod mounts
+/// it (`FileSystemResizePending`), a refused expansion, or two caches sharing one
+/// volume (snapshot replication). Each budget is scaled by `available / capacity`
+/// (rounded down, at least 1MiB so neither cache falls back to kopia's unbounded
+/// default), which keeps the pair within 90% of `available`. A volume at least as
+/// large as the resolved capacity, or a result with no capacity, is returned as is.
+pub fn fit_cache_budgets(r: &ResolvedCache, available: &str) -> ResolvedCache {
+    let (Some(resolved), Some(avail)) = (
+        r.capacity.as_deref().and_then(quantity_to_mib),
+        quantity_to_mib(available),
+    ) else {
+        return r.clone();
+    };
+    if avail >= resolved || resolved <= 0 {
+        return r.clone();
+    }
+    let scale = |b: Option<i64>| b.map(|mb| (mb * avail / resolved).max(1));
+    let (mut content, mut metadata) = (
+        scale(r.content_cache_size_mb),
+        scale(r.metadata_cache_size_mb),
+    );
+    // The 1MiB floor can push the pair past the ceiling on a small volume (#714
+    // review): take the excess off the larger budget, never below 1MiB.
+    let ceiling = avail * i64::from(MAX_CACHE_BUDGET_PERCENT) / 100;
+    if let (Some(c), Some(m)) = (content.as_mut(), metadata.as_mut()) {
+        let excess = *c + *m - ceiling;
+        if excess > 0 {
+            let larger = if *c >= *m { c } else { m };
+            *larger = (*larger - excess).max(1);
+        }
+    }
+    ResolvedCache {
+        capacity: Some(available.to_string()),
+        content_cache_size_mb: content,
+        metadata_cache_size_mb: metadata,
+    }
+}
+
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod followup_tests;

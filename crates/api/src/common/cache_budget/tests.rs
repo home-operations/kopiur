@@ -86,12 +86,8 @@ fn defaults_round_down_on_small_capacities() {
         mb(&resolve(&cfg("capacity: 100Mi\n")).unwrap()),
         (Some(60), Some(15))
     );
-    // 5MiB → 3 / 0 → metadata left to kopia rather than 0.
-    assert_eq!(
-        mb(&resolve(&cfg("capacity: 5Mi\n")).unwrap()),
-        (Some(3), None)
-    );
-    // 1MiB → both round to 0 → both left unset; never an error for a stored object.
+    // 1MiB → nothing fits under the ceiling: both left unset at run time, never an
+    // error for a stored object (admission refuses it; see the follow-up tests).
     assert_eq!(mb(&resolve(&cfg("capacity: 1Mi\n")).unwrap()), (None, None));
 }
 
@@ -287,6 +283,11 @@ fn resolved_budgets_never_exceed_capacity_for_any_admissible_input() {
                 assert!(
                     total * 100 <= cap_mib * i64::from(MAX_CACHE_BUDGET_PERCENT),
                     "{cfg:?} resolved to {r:?}: {total}MiB > 90% of {cap_mib}MiB"
+                );
+                // …and neither cache is left at kopia's unbounded default.
+                assert!(
+                    r.content_cache_size_mb.is_some() && r.metadata_cache_size_mb.is_some(),
+                    "{cfg:?} left a cache unbounded: {r:?}"
                 );
                 // The controller's pass-through view of an admissible object is identical.
                 assert_eq!(
