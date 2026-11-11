@@ -646,8 +646,11 @@ async fn spawn_maintenance_job(
         repo,
         maint.spec.mover.as_ref().and_then(|m| m.cache.as_ref()),
     );
-    let cache = crate::cache::cache_tuning(effective_cache.as_ref());
-    let work_spec = MoverWorkSpec {
+    // The budgets need the cache volume's capacity, which is only known once the
+    // volume is resolved below (a persistent claim's LIVE size, #613); they are
+    // filled in there.
+    let cache = kopiur_kopia::CacheTuning::default();
+    let mut work_spec = MoverWorkSpec {
         version: 1,
         operation: Operation::Maintenance(maintenance_op(maint, mode)),
         // Maintenance does not snapshot, so the identity is a stable sentinel
@@ -733,14 +736,19 @@ async fn spawn_maintenance_job(
     let creds_secrets = io::plain_creds(creds.names);
 
     // Resolve the cache VOLUME; a persistent cache PVC is owned by this Maintenance.
-    let cache_volume = crate::cache::resolve_cache_volume(
-        &ctx.client,
+    let resolved_volume = crate::cache::resolve_cache_volume(
+        ctx,
         namespace,
         owner.clone(),
         &format!("kopiur-cache-{cr_name}"),
         effective_cache.as_ref(),
     )
     .await?;
+    work_spec.cache = crate::cache::cache_tuning(
+        effective_cache.as_ref(),
+        resolved_volume.capacity.as_deref(),
+    )?;
+    let cache_volume = resolved_volume.volume;
 
     // Resolve the maintenance mover's effective security context (explicit or inherited)
     // and merge the repository's moverDefaults under it (`hardened ⊂ moverDefaults ⊂

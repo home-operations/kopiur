@@ -459,6 +459,8 @@ pub fn build_adopted_snapshot(
             // deletion path re-projects credentials correctly (never reads the
             // adopted row as "predates the pin").
             credential_projection: Some(crate::snapshot::projection_to_pin(policy)),
+            // No mover ran for an adopted row, so no cache budgets were resolved.
+            cache: None,
         }),
         ..Default::default()
     };

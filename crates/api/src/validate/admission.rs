@@ -161,6 +161,115 @@ pub fn validate_snapshot_replication_admission_extras(
     errs
 }
 
+/// The capacity bound on the ORIGINAL `contentCacheSizeMb`/`metadataCacheSizeMb`
+/// fields (#613): with a `capacity` on the same layer they must fit in it exactly
+/// like `{ size: … }` does — each within the capacity, the pair within 90% of it.
+///
+/// Admission-only, and only when the cache block CHANGED: those fields predate the
+/// bound, so stored objects carrying an oversized budget exist. The shared
+/// validator and the controller hand such values to kopia unchanged
+/// ([`crate::common::LegacyBudgets::PassThrough`]); this refuses the next apply
+/// that edits the cache block while keeping them. Skipping an unchanged block also
+/// keeps the controller's own metadata writes (finalizers, labels) on such an
+/// object from being refused. `old` is the same block in the previous object
+/// (`None` on CREATE).
+pub fn validate_cache_legacy_budgets(
+    cache: Option<&crate::common::CacheDefaults>,
+    old: Option<&crate::common::CacheDefaults>,
+    field: &str,
+) -> Option<ValidationError> {
+    let cache = cache?;
+    if old == Some(cache) || cache.capacity.is_none() {
+        return None;
+    }
+    if cache.content_cache_size_mb.is_none() && cache.metadata_cache_size_mb.is_none() {
+        return None;
+    }
+    crate::common::resolve_cache_budgets(
+        cache,
+        cache.capacity.as_deref(),
+        crate::common::LegacyBudgets::Enforce,
+        field,
+    )
+    .err()
+}
+
+/// Every mover cache block a spec carries, with its field path — so the webhook
+/// can apply [`validate_cache_legacy_budgets`] to any kind uniformly. Order is
+/// stable per kind (the old object's blocks are matched by position).
+pub trait CacheBlocks {
+    /// `(field path, cache block)` for each place this kind configures a mover cache.
+    fn cache_blocks(&self) -> Vec<(&'static str, Option<&crate::common::CacheDefaults>)>;
+}
+
+fn mover_cache(m: Option<&crate::common::MoverSpec>) -> Option<&crate::common::CacheDefaults> {
+    m.and_then(|m| m.cache.as_ref())
+}
+
+macro_rules! mover_cache_blocks {
+    ($($ty:ty),* $(,)?) => {$(
+        impl CacheBlocks for $ty {
+            fn cache_blocks(&self) -> Vec<(&'static str, Option<&crate::common::CacheDefaults>)> {
+                vec![("spec.mover.cache", mover_cache(self.mover.as_ref()))]
+            }
+        }
+    )*};
+}
+mover_cache_blocks!(
+    SnapshotPolicySpec,
+    crate::snapshot::SnapshotSpec,
+    crate::restore::RestoreSpec,
+    MaintenanceSpec,
+    RepositoryReplicationSpec,
+    SnapshotReplicationSpec,
+);
+
+macro_rules! repository_cache_blocks {
+    ($($ty:ty),* $(,)?) => {$(
+        impl CacheBlocks for $ty {
+            fn cache_blocks(&self) -> Vec<(&'static str, Option<&crate::common::CacheDefaults>)> {
+                vec![
+                    (
+                        "spec.moverDefaults.cache",
+                        self.mover_defaults.as_ref().and_then(|m| m.cache.as_ref()),
+                    ),
+                    (
+                        "spec.maintenance.mover.cache",
+                        mover_cache(self.maintenance.as_ref().and_then(|m| m.mover.as_ref())),
+                    ),
+                ]
+            }
+        }
+    )*};
+}
+repository_cache_blocks!(
+    crate::repository::RepositorySpec,
+    crate::cluster_repository::ClusterRepositorySpec,
+);
+
+/// [`validate_cache_legacy_budgets`] over every cache block of `spec`, against the
+/// same blocks of `old` (the previous object on UPDATE, `None` on CREATE).
+pub fn validate_cache_legacy_budgets_for<T: CacheBlocks>(
+    spec: &T,
+    old: Option<&T>,
+) -> Vec<ValidationError> {
+    let old_blocks = old.map(CacheBlocks::cache_blocks);
+    spec.cache_blocks()
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, (field, cache))| {
+            let prev = old_blocks
+                .as_ref()
+                .and_then(|b| b.get(i))
+                .and_then(|(_, c)| *c);
+            validate_cache_legacy_budgets(cache, prev, field)
+        })
+        .collect()
+}
+
+// (`validate_cache_legacy_budgets` above is kind-agnostic: the webhook applies it
+// to every kind's cache block, `Repository`/`ClusterRepository` included.)
+//
 // `Repository`/`ClusterRepository` deliberately have NO entry here. Everything
 // this change adds to them — `scheduleDefaults.jitter` (parse + bounds) and
 // `moverDefaults.podLabels`/`podAnnotations` (reserved keys, via

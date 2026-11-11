@@ -11,7 +11,9 @@
 #   - spec.mover.inheritSecurityContextFrom : { podSelector: LabelSelector, container? }
 #       (combines with securityContext: explicit fields win, inherit fills the rest)
 #   - spec.mover.cache                 : { capacity, storageClassName,
-#                                          metadataCacheSizeMb, contentCacheSizeMb,
+#                                          contentCacheSize / metadataCacheSize:
+#                                            { percent: N } | { size: <quantity> },
+#                                          (or contentCacheSizeMb / metadataCacheSizeMb),
 #                                          mode: Ephemeral|Persistent }
 #   - spec.failurePolicy               : { backoffLimit, activeDeadlineSeconds }
 ---
@@ -69,12 +71,22 @@ spec:
     # Cache: a large restore benefits from a sized cache. `mode: Persistent` keeps a
     # warm cache PVC across runs (ReadWriteOnce — assumes non-overlapping runs);
     # the default `Ephemeral` gives a fresh per-run volume (or emptyDir if unsized).
+    #
+    # region cache
+    # Budgets are a share of `capacity` ({ percent: N }) or a fixed size
+    # ({ size: 2Gi }). Leave them out and kopia gets 60% / 15% of `capacity`.
+    # Content + metadata may claim at most 90% of `capacity`: kopia only trims its
+    # cache back to these limits periodically, so it runs over them in between.
+    # (`contentCacheSizeMb` / `metadataCacheSizeMb` in MiB still work too.)
     cache:
       capacity: 16Gi
       storageClassName: fast-ssd
-      contentCacheSizeMb: 10000 # kopia --content-cache-size-mb
-      metadataCacheSizeMb: 2000 # kopia --metadata-cache-size-mb
+      contentCacheSize: # kopia --content-cache-size-mb (≈ 11468 here)
+        percent: 70
+      metadataCacheSize: # kopia --metadata-cache-size-mb
+        size: 2Gi
       mode: Ephemeral
+    # endregion cache
   # ── Retry / deadline for the restore Job (mirrors Snapshot.spec.failurePolicy) ──
   failurePolicy:
     backoffLimit: 4 # retry the restore Job up to 4 times

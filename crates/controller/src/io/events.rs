@@ -790,6 +790,34 @@ pub(crate) async fn publish_failure(
     }
 }
 
+/// Emit a `Normal` Event on an explicit [`ObjectReference`] — the `Normal`
+/// counterpart to [`publish_warning_event_on_ref`] (e.g. a grown cache PVC reported
+/// on its owner, #613). The reference must omit `resourceVersion`. Best-effort.
+pub async fn publish_normal_event_on_ref(
+    ctx: &Context,
+    regarding: &ObjectReference,
+    reason: &str,
+    action: &str,
+    message: &str,
+) {
+    if let Err(e) = ctx
+        .recorder
+        .publish(
+            &Event {
+                type_: EventType::Normal,
+                reason: reason.to_string(),
+                note: Some(message.to_string()),
+                action: action.to_string(),
+                secondary: None,
+            },
+            regarding,
+        )
+        .await
+    {
+        tracing::warn!(error = %e, reason, "failed to publish Normal event");
+    }
+}
+
 /// Publish a Warning Event on `regarding` with a pre-composed `(reason, action,
 /// note)`. The single low-level publish primitive every backend/bootstrap warning
 /// funnels through. Best-effort: a failed publish is logged, never fatal (a

@@ -415,6 +415,7 @@ pub fn build_copy_snapshot(
             repository: Some(dest_ref),
             sources: Vec::new(),
             credential_projection: None,
+            cache: None,
         }),
         copied_from: Some(CopiedFrom {
             repository: source_repository_ref(source_repo),

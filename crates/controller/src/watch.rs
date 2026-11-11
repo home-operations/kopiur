@@ -1110,6 +1110,7 @@ mod tests {
                 repository: Some(p),
                 sources: vec![],
                 credential_projection: None,
+                cache: None,
             }),
             ..Default::default()
         });

@@ -469,7 +469,7 @@ spec:
     podSecurityContext: # pod SC — notably fsGroup
       fsGroup: 1000 # make fresh restore volumes group-writable, set once here
     resources: { requests: { cpu: 250m, memory: 512Mi } }
-    cache: # kopia cache backing every mover (capacity/class/budgets)
+    cache: # kopia cache backing every mover (capacity/class/budgets; budgets default to 60%/15% of capacity)
       capacity: 10Gi
       storageClassName: fast-ssd
     scratch: # default size/class for the deep-verify scratch (restore-test) PVC
@@ -501,7 +501,7 @@ The `quick` and `deep` verification movers a `SnapshotPolicy` spawns inherit the
 
 :::note[Snapshot-delete Jobs (`snapdel-*`) use `moverDefaults.cache` too]
 
-A batch delete Job opens the repository and loads its index just like a backup, so on a large repository a cold cache means gigabytes of index download per Job. Delete Jobs therefore take the repository's `moverDefaults.cache`: its `contentCacheSizeMb`/`metadataCacheSizeMb` budgets, and a volume chosen like this.
+A batch delete Job opens the repository and loads its index just like a backup, so on a large repository a cold cache means gigabytes of index download per Job. Delete Jobs therefore take the repository's `moverDefaults.cache`: its `contentCacheSize`/`metadataCacheSize` budgets (resolved against the delete Job's own cache volume), and a volume chosen like this.
 
 | `moverDefaults.cache`                                                       | Delete Job cache volume                                                                                                  |
 | --------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
