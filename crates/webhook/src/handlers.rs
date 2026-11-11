@@ -310,6 +310,7 @@ async fn handle_snapshot_policy(
     {
         let name = obj.metadata.name.as_deref().unwrap_or(req.name.as_str());
         let ns = req.namespace.as_deref().unwrap_or_default();
+        let old_meta = req.old_object.as_ref().map(|o| &o.metadata);
         let outcome = crate::identity_fork::check_identity_fork(
             client,
             name,
@@ -319,6 +320,8 @@ async fn handle_snapshot_policy(
             obj.metadata.annotations.as_ref(),
             &old_spec,
             &old_status,
+            old_meta.and_then(|m| m.labels.as_ref()),
+            old_meta.and_then(|m| m.annotations.as_ref()),
         )
         .await;
         if let Some(err) = outcome.error {
@@ -3966,6 +3969,138 @@ mod tests {
             let client = not_found_client();
             let resp = dispatch(&req, Some(&client)).await;
             assert!(!resp.allowed, "a spec-driven fork must still be denied");
+        }
+
+        /// `update_policy_request` with metadata labels on both sides.
+        fn with_labels(
+            mut req: AdmissionRequest<DynamicObject>,
+            old: Value,
+            new: Value,
+        ) -> AdmissionRequest<DynamicObject> {
+            let labels = |v: Value| serde_json::from_value(v).expect("labels decode");
+            if let Some(o) = req.object.as_mut() {
+                o.metadata.labels = Some(labels(new));
+            }
+            if let Some(o) = req.old_object.as_mut() {
+                o.metadata.labels = Some(labels(old));
+            }
+            req
+        }
+
+        fn single_status_with_history() -> Value {
+            json!({
+                "resolved": { "identity": { "username": "pg", "hostname": "east" } },
+                "lastSuccessfulSnapshot": "2026-06-19T00:00:00Z",
+            })
+        }
+
+        /// PR #705 review (P1 "Backup history can split silently"): labels and
+        /// annotations reach a policy's identity ONLY through the repository's
+        /// `identityDefaults` CEL (`hostnameExpr: "labels['site']"`). With the
+        /// repository missing those defaults are unknowable, so a label change on
+        /// a policy with history cannot be shown identity-preserving. Admitting it
+        /// would let the controller silently re-identify the policy once the
+        /// repository exists — so it is denied until the repository exists, or
+        /// acknowledged.
+        #[tokio::test]
+        async fn fork_guard_denies_a_label_change_it_cannot_check_with_the_repository_missing() {
+            let req = with_labels(
+                update_policy_request(
+                    single_repo_policy(),
+                    json!({}),
+                    single_repo_policy(),
+                    single_status_with_history(),
+                ),
+                json!({ "site": "east" }),
+                json!({ "site": "west" }),
+            );
+            let client = not_found_client();
+            let resp = dispatch(&req, Some(&client)).await;
+            assert!(
+                !resp.allowed,
+                "a label change the missing repository's identityDefaults could read must not \
+                 be admitted unchecked"
+            );
+            let msg = &resp.result.message;
+            assert!(msg.contains("ClusterRepository/onsite"), "{msg}");
+            assert!(msg.contains("allow-identity-change"), "{msg}");
+        }
+
+        /// The same edit, acknowledged, is admitted: the ack is the release valve.
+        #[tokio::test]
+        async fn an_acknowledged_label_change_is_admitted_with_the_repository_missing() {
+            let req = with_labels(
+                update_policy_request(
+                    single_repo_policy(),
+                    json!({ "kopiur.home-operations.com/allow-identity-change": "true" }),
+                    single_repo_policy(),
+                    single_status_with_history(),
+                ),
+                json!({ "site": "east" }),
+                json!({ "site": "west" }),
+            );
+            let client = not_found_client();
+            let resp = dispatch(&req, Some(&client)).await;
+            assert!(resp.allowed, "{}", resp.result.message);
+        }
+
+        /// Unchanged labels stay the GitOps steady state: admitted.
+        #[tokio::test]
+        async fn unchanged_labels_are_admitted_with_the_repository_missing() {
+            let req = with_labels(
+                update_policy_request(
+                    single_repo_policy(),
+                    json!({}),
+                    single_repo_policy(),
+                    single_status_with_history(),
+                ),
+                json!({ "site": "east" }),
+                json!({ "site": "east" }),
+            );
+            let client = not_found_client();
+            let resp = dispatch(&req, Some(&client)).await;
+            assert!(resp.allowed, "{}", resp.result.message);
+        }
+
+        /// Removing a literal `spec.identity.hostname` that happened to equal the
+        /// namespace default compares equal with no defaults, yet under the
+        /// missing repository's `hostnameExpr` the identity would change. Also
+        /// uncheckable, also denied.
+        #[tokio::test]
+        async fn removing_an_identity_override_is_denied_with_the_repository_missing() {
+            let mut old = single_repo_policy();
+            old["identity"] = json!({ "hostname": "billing" });
+            let status = json!({
+                "resolved": { "identity": { "username": "pg", "hostname": "billing" } },
+                "lastSuccessfulSnapshot": "2026-06-19T00:00:00Z",
+            });
+            let req = update_policy_request(single_repo_policy(), json!({}), old, status);
+            let client = not_found_client();
+            let resp = dispatch(&req, Some(&client)).await;
+            assert!(!resp.allowed, "{}", resp.result.message);
+        }
+
+        /// The multi-repo arm gets the same protection for a missing member.
+        #[tokio::test]
+        async fn multi_repo_label_change_is_denied_with_missing_members() {
+            let req = with_labels(
+                update_policy_request(
+                    multi_repo_policy(),
+                    json!({}),
+                    multi_repo_policy(),
+                    multi_status("billing"),
+                ),
+                json!({ "site": "east" }),
+                json!({ "site": "west" }),
+            );
+            let client = not_found_client();
+            let resp = dispatch(&req, Some(&client)).await;
+            assert!(!resp.allowed, "{}", resp.result.message);
+            assert!(
+                resp.result.message.contains("ClusterRepository/a"),
+                "{}",
+                resp.result.message
+            );
         }
     }
 }
