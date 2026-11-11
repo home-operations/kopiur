@@ -3772,12 +3772,7 @@ async fn run_restore_mover(
         // Repo throttle applies to restore too (§13(e)).
         throttle: io::throttle_spec(repo.mover_defaults.as_ref()),
     };
-    let repo_volume =
-        io::filesystem_repo_mount_source(&repo.backend).map(|source| VolumeMountSpec {
-            source,
-            mount_path: io::filesystem_repo_path(&repo.backend).unwrap_or_default(),
-            read_only: true,
-        });
+    let repo_volume = restore_repo_volume(&work_spec.operation, &repo.backend);
     // Resolve the cache VOLUME; a persistent cache PVC is owned by this Restore.
     let resolved_volume = crate::cache::resolve_cache_volume(
         ctx,
@@ -5267,6 +5262,27 @@ async fn ensure_wait_anchor(
 /// Map a resolved repository backend to the mover connect spec for a restore.
 fn restore_connect(repo: &ResolvedRepository) -> Result<RepositoryConnect> {
     crate::snapshot::repository_connect_pub(repo)
+}
+
+/// A filesystem repository's volume, as the restore mover mounts it (`None` for an
+/// object store, which mounts nothing). Pure.
+///
+/// Its `readOnly` comes from `operation`'s [`kopiur_mover::workspec::Operation::repository_access`] — the
+/// SAME value the mover picks its kopia connect mode from, for the operation this
+/// Job actually runs (a full `restore` or a `partialRestore`) — so the mount and
+/// the connect cannot drift apart. They did once: a read-only mount under a
+/// read-write connect, which fails every read as soon as kopia auto-compacts the
+/// repository's manifests on load (the `E2E (populator-fanout)` flake; see
+/// [`kopiur_mover::workspec::RepositoryAccess`]).
+pub(super) fn restore_repo_volume(
+    operation: &kopiur_mover::workspec::Operation,
+    backend: &kopiur_api::backend::Backend,
+) -> Option<VolumeMountSpec> {
+    io::filesystem_repo_mount_source(backend).map(|source| VolumeMountSpec {
+        source,
+        mount_path: io::filesystem_repo_path(backend).unwrap_or_default(),
+        read_only: operation.repository_access().mounts_read_only(),
+    })
 }
 
 /// The `Restore` CRD's kopia restore behavior knobs (ADR §4.6, M2 flag sweep),

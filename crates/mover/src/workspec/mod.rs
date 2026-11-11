@@ -680,7 +680,96 @@ pub fn restore_scope(op: &RestoreOp) -> RestoreScope<'_> {
     }
 }
 
+/// How a mover run connects to a repository: read-write, or `kopia repository
+/// connect --readonly`. Every repository a mover opens has one, and a
+/// filesystem repository mounted `readOnly: true` MUST be opened `ReadOnly`.
+///
+/// That pairing is not tidiness. kopia AUTO-COMPACTS the manifest set on every
+/// load once it holds 16 or more manifest contents, and compaction WRITES; the
+/// only client it spares is one opened read-only. A read-write connection over a
+/// read-only volume therefore fails ordinary reads — `snapshot list`, `snapshot
+/// restore` — with `read-only file system` whenever the repository's writers
+/// happen to have left the count at the threshold. That is what made restores
+/// from filesystem repositories fail intermittently with `MoverJobFailed` (the
+/// `E2E (populator-fanout)` flake), pinned against the real binary by
+/// `crates/kopia/tests/integration_readonly_manifest_compaction.rs`.
+///
+/// The other direction is harmless — a writable mount under a `--readonly`
+/// connect (a `mode: ReadOnly` repository's bootstrap) never makes kopia write.
+/// So a read-only mount is derived FROM the access ([`Self::mounts_read_only`])
+/// at every site that mounts read-only, never written as a literal; the
+/// controller's `read_only_repository_mounts_derive_from_an_access` ratchet
+/// enforces that.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepositoryAccess {
+    /// Connect read-write; the repository's volume must be mounted writable.
+    ReadWrite,
+    /// Connect with `kopia repository connect --readonly`; the repository's
+    /// volume may (and, for a flow that only reads, should) be mounted
+    /// `readOnly: true`.
+    ReadOnly,
+}
+
+impl RepositoryAccess {
+    /// Whether the kopia connection is opened `--readonly`.
+    pub fn connects_read_only(self) -> bool {
+        match self {
+            RepositoryAccess::ReadOnly => true,
+            RepositoryAccess::ReadWrite => false,
+        }
+    }
+
+    /// The `readOnly` for the volume of a repository opened with this access,
+    /// at a site whose mount follows its access. Read-only exactly when the
+    /// connect is, so a read-only mount can never sit under a read-write
+    /// connect.
+    pub fn mounts_read_only(self) -> bool {
+        self.connects_read_only()
+    }
+}
+
+impl Operation {
+    /// How this run connects to its work-spec `repository` — THE answer, read by
+    /// the mover's generic connect and by the controller wherever it mounts that
+    /// repository read-only. Exhaustive, no `_`: a new operation cannot compile
+    /// until it says how it opens the repository.
+    ///
+    /// A replication's DESTINATION and a seed's SOURCE are second repositories
+    /// with their own access ([`SnapshotReplicateOp::SOURCE_ACCESS`] covers the
+    /// replication source, which IS the work-spec repository;
+    /// [`SeedOpSpec::SOURCE_ACCESS`] the seed source).
+    pub fn repository_access(&self) -> RepositoryAccess {
+        match self {
+            // Restores only read: `snapshot list`/`restore`/`ls`/`show`.
+            Operation::Restore(_) | Operation::PartialRestore(_) => RestoreOp::REPOSITORY_ACCESS,
+            Operation::BrowseSession(_) => BrowseSessionOp::REPOSITORY_ACCESS,
+            Operation::SnapshotReplicate(_) => SnapshotReplicateOp::SOURCE_ACCESS,
+            Operation::BootstrapRepository(op) => op.repository_access(),
+            // Writers: a snapshot (and its policy writes), deletes, pin rewrites,
+            // maintenance, verify (connects read-write today), and `sync-to`'s
+            // source connect.
+            Operation::Snapshot(_)
+            | Operation::SnapshotDelete(_)
+            | Operation::SnapshotDeleteBatch(_)
+            | Operation::Maintenance(_)
+            | Operation::SnapshotPin(_)
+            | Operation::Verify(_)
+            | Operation::Replicate(_) => RepositoryAccess::ReadWrite,
+        }
+    }
+}
+
 impl RestoreOp {
+    /// How a restore — full ([`Operation::Restore`]) or partial
+    /// ([`Operation::PartialRestore`]), one payload — opens the repository:
+    /// READ-ONLY. A restore only ever reads it (`snapshot list`/`restore`/`ls`/
+    /// `show`; pins go to the Kubernetes API, not to kopia), so the controller
+    /// mounts a filesystem repository read-only and the mover must connect
+    /// `--readonly` to match — or kopia's manifest auto-compaction tries to write
+    /// through the read-only mount and fails the restore (see
+    /// [`RepositoryAccess`]).
+    pub const REPOSITORY_ACCESS: RepositoryAccess = RepositoryAccess::ReadOnly;
+
     /// Translate the carried restore flags into the kopia client's options.
     /// Every field is mapped explicitly (no `..Default::default()` swallowing a
     /// field silently) — this is the regression guard for the M2 gap-sweep bug
@@ -953,6 +1042,17 @@ pub struct BootstrapRepositoryOp {
 }
 
 impl BootstrapRepositoryOp {
+    /// How the bootstrap connects: `--readonly` for a `mode: ReadOnly`
+    /// repository ([`Self::read_only`]), read-write otherwise. Its volume stays
+    /// writable either way — the harmless direction (see [`RepositoryAccess`]).
+    pub fn repository_access(&self) -> RepositoryAccess {
+        if self.read_only {
+            RepositoryAccess::ReadOnly
+        } else {
+            RepositoryAccess::ReadWrite
+        }
+    }
+
     /// The kopia client's [`CreateOptions`](kopiur_kopia::CreateOptions) for the
     /// create-time format knobs carried here.
     pub fn create_options(&self) -> kopiur_kopia::CreateOptions {
@@ -1041,6 +1141,11 @@ pub struct SeedOpSpec {
 }
 
 impl SeedOpSpec {
+    /// How a seed opens its SOURCE repository: read-only. Seeding never writes
+    /// to the source — `sync-to` pushes FROM it and `snapshot migrate` reads it —
+    /// and the controller mounts a filesystem source read-only to match.
+    pub const SOURCE_ACCESS: RepositoryAccess = RepositoryAccess::ReadOnly;
+
     /// Which copy mechanism this op selects. Exhaustive.
     pub fn mode(&self) -> SeedModeSpec {
         self.from.mode()
@@ -1997,6 +2102,14 @@ pub struct SnapshotReplicateOp {
     pub destination_throttle: ThrottleSpec,
 }
 
+impl SnapshotReplicateOp {
+    /// How a snapshot replication opens its SOURCE (the work-spec `repository`):
+    /// read-only — `snapshot migrate --source-config` only reads it — and the
+    /// controller mounts a filesystem source read-only to match. The destination
+    /// is opened read-write under its own kopia config.
+    pub const SOURCE_ACCESS: RepositoryAccess = RepositoryAccess::ReadOnly;
+}
+
 /// A fully-resolved repository CR reference on the wire (kind + name +
 /// namespace + uid). A plain-string mirror of the api crate's `RepositoryRef`
 /// plus the CR uid — never the CRD type itself (wire-mirror rule).
@@ -2192,6 +2305,13 @@ impl Default for BrowseSessionOp {
             ttl_seconds: default_browse_ttl(),
         }
     }
+}
+
+impl BrowseSessionOp {
+    /// How a browse session opens the repository: read-only, always — the
+    /// session is an interactive reader, and the read-only bit persisted in the
+    /// kopia config is what makes it structurally unable to mutate anything.
+    pub const REPOSITORY_ACCESS: RepositoryAccess = RepositoryAccess::ReadOnly;
 }
 
 /// The default browse-session TTL: 900 seconds (15 minutes).

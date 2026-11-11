@@ -183,3 +183,47 @@ pub async fn pod_logs(client: &Client, ns: &str, name: &str) -> Result<String> {
         .await
         .with_context(|| format!("fetch logs for pod {ns}/{name}"))
 }
+
+/// Run a failure-diagnostics collector under a hard `budget`, returning its
+/// report — or, if it overruns, a note that it was cut off.
+///
+/// Diagnostics run on the way to a panic, after the test has already spent its
+/// wait budget, and they make several unbounded apiserver calls (lists, one log
+/// request per pod). Without a cap, one slow call could hold the test until the
+/// CI job's own timeout, losing both the report and the cleanup that follows
+/// it — the exact failure mode that kept the populator-fanout flake evidence-free.
+pub async fn diagnostics_within(
+    budget: std::time::Duration,
+    collect: impl std::future::Future<Output = String>,
+) -> String {
+    tokio::time::timeout(budget, collect)
+        .await
+        .unwrap_or_else(|_| format!("<diagnostics collection timed out after {budget:?}>"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// A failure's diagnostics must never cost the failure itself: collection
+    /// that hangs (a slow apiserver, a log request that never returns) is cut off
+    /// at its budget with a note saying so, and the caller goes on to clean up
+    /// and report.
+    #[tokio::test]
+    async fn diagnostics_that_never_finish_are_cut_off_at_their_budget() {
+        let out =
+            diagnostics_within(Duration::from_millis(20), std::future::pending::<String>()).await;
+        assert!(
+            out.contains("timed out after 20ms"),
+            "a hung collection must be reported as cut off: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn diagnostics_that_finish_in_budget_are_returned_whole() {
+        let out =
+            diagnostics_within(Duration::from_secs(5), async { "all of it".to_string() }).await;
+        assert_eq!(out, "all of it");
+    }
+}

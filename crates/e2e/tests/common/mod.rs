@@ -851,27 +851,20 @@ pub async fn clear_scenario_leftovers(client: &Client, schedule: &str, policy: &
     .unwrap_or_else(|e| panic!("previous try's `{policy}` leftovers must clear: {e}"));
 }
 
-/// Delete a PVC and its seed Pod and WAIT for both to go, so the next
+/// Delete a PVC and EVERY Pod mounting it (its seed Pod, and any reader a
+/// panicked earlier try left behind) and WAIT for all of them to go, so the next
 /// [`csi_pvc_with_data`] starts from nothing rather than adopting a volume whose
 /// labels or contents belong to a previous scenario.
+///
+/// "Every Pod", not "the seed Pod": the `pvc-protection` finalizer holds a PVC
+/// while ANY non-terminal Pod references it, and a reader left `Pending` by a
+/// failed try is exactly such a Pod. Deleting only `<name>-seed` used to wait
+/// out the whole timeout on it, poisoning every nextest retry of
+/// `populator_fanout` before it reached what it was retrying.
 pub async fn drop_csi_pvc(client: &Client, name: &str) {
-    use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Pod};
-    let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), E2E_NAMESPACE);
-    let pods: Api<Pod> = Api::namespaced(client.clone(), E2E_NAMESPACE);
-    let seed = format!("{name}-seed");
-    let _ = pods.delete(&seed, &DeleteParams::default()).await;
-    let _ = pvcs.delete(name, &DeleteParams::default()).await;
-    wait_until(
-        &format!("PVC {name} and its seed pod are gone"),
-        default_timeout(),
-        poll_interval(),
-        || async {
-            let gone = pvcs.get_opt(name).await?.is_none() && pods.get_opt(&seed).await?.is_none();
-            Ok(gone.then_some(()))
-        },
-    )
-    .await
-    .unwrap_or_else(|e| panic!("PVC {name} must be deleted before it is re-seeded: {e}"));
+    kopiur_e2e::pvc::delete_pvc_and_consumers(client, E2E_NAMESPACE, name)
+        .await
+        .unwrap_or_else(|e| panic!("PVC {name} must be deleted before it is re-seeded: {e}"));
 }
 
 /// A populator `Restore` reading `seed` out of `repo` (`target.populator: {}`).
