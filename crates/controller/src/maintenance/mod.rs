@@ -771,10 +771,10 @@ async fn spawn_maintenance_job(
         effective_cache.as_ref(),
     )
     .await?;
-    work_spec.cache = crate::cache::cache_tuning(
+    work_spec.cache = crate::cache::tuning_of(&crate::cache::cache_budgets_for_volume(
         effective_cache.as_ref(),
-        resolved_volume.capacity.as_deref(),
-    )?;
+        &resolved_volume,
+    )?);
     let cache_volume = resolved_volume.volume;
 
     // Resolve the maintenance mover's effective security context (explicit or inherited)

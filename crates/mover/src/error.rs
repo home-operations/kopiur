@@ -351,6 +351,15 @@ pub enum MoverError {
         missing: Vec<String>,
     },
 
+    /// A `partialRestore` work spec is malformed (no paths, or a stream
+    /// target). Raised before anything is written so it can never degrade into
+    /// a whole-root restore of a live volume.
+    #[error("partial restore refused: {reason}")]
+    PartialRestoreInvalid {
+        /// What is wrong with the work spec.
+        reason: &'static str,
+    },
+
     /// A partial restore could not create the parent directory of a selected
     /// FILE inside the target (kopia restores a file only into an existing
     /// directory).
@@ -668,6 +677,7 @@ impl MoverError {
             | MoverError::RestoreNoSnapshot { .. }
             | MoverError::RestoreAsOfInvalid { .. }
             | MoverError::RestorePathsMissing { .. }
+            | MoverError::PartialRestoreInvalid { .. }
             | MoverError::RestoreTargetDir { .. }
             | MoverError::RestoreTargetSymlink { .. }
             | MoverError::ScratchNotWritable { .. }

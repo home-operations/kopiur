@@ -24,6 +24,16 @@ pub enum Operation {
     Snapshot(SnapshotOp),
     /// Restore a snapshot's contents into `target`.
     Restore(RestoreOp),
+    /// Restore ONLY `RestoreOp::paths` out of a snapshot into `target` (#689).
+    ///
+    /// Same payload as [`Operation::Restore`], but a distinct variant on
+    /// purpose: a mover that predates partial restore ignores the unknown
+    /// `paths` FIELD and would silently run a FULL in-place restore over a live
+    /// volume, whereas an unknown VARIANT is a hard work-spec parse error. So a
+    /// controller paired with an older pinned mover image fails closed. Build it
+    /// with [`restore_operation`]; a `partialRestore` without paths is rejected
+    /// by [`partial_restore_problem`].
+    PartialRestore(RestoreOp),
     /// Delete a snapshot from the repository (finalizer path, deletionPolicy:
     /// Delete).
     SnapshotDelete(SnapshotDeleteOp),
@@ -89,6 +99,7 @@ impl Operation {
         match self {
             Operation::Snapshot(_) => "Snapshot",
             Operation::Restore(_) => "Restore",
+            Operation::PartialRestore(_) => "PartialRestore",
             Operation::SnapshotDelete(_) => "SnapshotDelete",
             Operation::SnapshotDeleteBatch(_) => "SnapshotDeleteBatch",
             Operation::BootstrapRepository(_) => "BootstrapRepository",
@@ -629,6 +640,35 @@ pub enum RestoreScope<'a> {
     WholeRoot,
     /// Restore only these snapshot-relative paths (non-empty).
     Paths(&'a [String]),
+}
+
+/// THE constructor for a restore run's operation: [`Operation::PartialRestore`]
+/// when the op selects paths, [`Operation::Restore`] otherwise. Never build the
+/// variant by hand — this is what keeps a partial restore from ever riding the
+/// variant an older mover would execute as a full restore.
+pub fn restore_operation(op: RestoreOp) -> Operation {
+    if op.paths.is_empty() {
+        Operation::Restore(op)
+    } else {
+        Operation::PartialRestore(op)
+    }
+}
+
+/// Why a [`Operation::PartialRestore`] payload is malformed, or `None`. A
+/// partial restore with no paths would restore everything, and one targeting a
+/// stream has no filesystem to place paths in — both must fail, never degrade.
+pub fn partial_restore_problem(op: &RestoreOp) -> Option<&'static str> {
+    match (restore_scope(op), restore_output(op)) {
+        (RestoreScope::WholeRoot, _) => Some(
+            "it carries no paths, so it would restore the whole snapshot. This is a controller \
+             bug; nothing was restored",
+        ),
+        (RestoreScope::Paths(_), RestoreOutput::Stream(_)) => Some(
+            "it targets a stream (streamExec), which cannot take a path selection. This is a \
+             controller bug; nothing was restored",
+        ),
+        (RestoreScope::Paths(_), RestoreOutput::Filesystem) => None,
+    }
 }
 
 /// THE resolver for how much of the snapshot a restore run restores.

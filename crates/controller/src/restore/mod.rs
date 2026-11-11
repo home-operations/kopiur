@@ -25,8 +25,8 @@ use kopiur_api::{
     RestoreTarget, validate,
 };
 use kopiur_mover::workspec::{
-    MoverOptions, MoverWorkSpec, Operation, RepositoryConnect, ResolvedIdentity as MoverIdentity,
-    RestoreOp, RestoreSelection, RestoreSelector, SnapshotAnchor, TargetRef,
+    MoverOptions, MoverWorkSpec, RepositoryConnect, ResolvedIdentity as MoverIdentity, RestoreOp,
+    RestoreSelection, RestoreSelector, SnapshotAnchor, TargetRef,
 };
 
 use crate::config;
@@ -3710,7 +3710,10 @@ async fn run_restore_mover(
     };
     let mut work_spec = MoverWorkSpec {
         version: 2,
-        operation: Operation::Restore(RestoreOp {
+        // `restore_operation` puts a path selection on `Operation::PartialRestore`
+        // (#704 review): an older pinned mover rejects that variant instead of
+        // ignoring `paths` and restoring the WHOLE snapshot over a live volume.
+        operation: kopiur_mover::workspec::restore_operation(RestoreOp {
             // A stream destination replaces the filesystem write entirely: the
             // mover reads ONE virtual file out of the snapshot and pipes it into a
             // command's stdin, so `target_path` below is inert for it.
@@ -3784,10 +3787,10 @@ async fn run_restore_mover(
         effective_cache.as_ref(),
     )
     .await?;
-    work_spec.cache = crate::cache::cache_tuning(
+    work_spec.cache = crate::cache::tuning_of(&crate::cache::cache_budgets_for_volume(
         effective_cache.as_ref(),
-        resolved_volume.capacity.as_deref(),
-    )?;
+        &resolved_volume,
+    )?);
     let cache_volume = resolved_volume.volume;
     // RWO Multi-Attach avoidance for the restore DESTINATION PVC: when restoring into
     // an existing ReadWriteOnce PVC held by a running app pod, pin the restore mover to

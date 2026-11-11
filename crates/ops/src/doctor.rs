@@ -1669,6 +1669,25 @@ struct FailureEntry {
     /// "a green/red verdict must not hinge on it" the row's own comment
     /// forbids. Explained failures are reported, never counted as red.
     explained_by_warn_gate: bool,
+    /// The failed object still owns a kopia snapshot: the run failed AFTER the
+    /// snapshot was written (an `afterSnapshot` hook, for example), so it is a
+    /// real restore point. No history bound ever deletes one, and doctor must
+    /// never advise deleting one blindly: under the default
+    /// `deletionPolicy: Delete`, deleting the CR deletes the backup with it.
+    owns_backup: bool,
+}
+
+/// The patch that drops a failed Snapshot's CR but keeps the kopia snapshot it
+/// owns: `Retain` releases the finalizer without `kopia snapshot delete`.
+fn keep_backup_fix(target: &FindingTarget) -> String {
+    format!(
+        "this failed run still owns a kopia snapshot, so deleting it under the default \
+         `deletionPolicy: Delete` deletes that backup too. To keep the backup and drop only the \
+         row: `kubectl patch snapshot -n {ns} {name} --type merge -p \
+         '{{\"spec\":{{\"deletionPolicy\":\"Retain\"}}}}'`, then delete it",
+        ns = target.namespace.as_deref().unwrap_or_default(),
+        name = target.name,
+    )
 }
 
 /// When a terminal object recorded its failure: [`failing_since`] — the newest
@@ -1802,6 +1821,19 @@ fn retained_history_note(older: &[&&FailureEntry], lookback_label: &str) -> Stri
         .min()
         .map(|t| format!(", oldest {}", t.to_rfc3339()))
         .unwrap_or_default();
+    // Never advise deleting a restore point blindly (Greptile on #703).
+    let owning = older.iter().filter(|e| e.owns_backup).count();
+    let keep_backups = if owning == 0 {
+        String::new()
+    } else {
+        format!(
+            " {owning} of them still own a kopia snapshot (the run failed after the snapshot \
+             was written) and are never pruned automatically; deleting one under the default \
+             `deletionPolicy: Delete` also deletes that backup, so set its \
+             `spec.deletionPolicy: Retain` first to keep the backup and drop only the row (each \
+             one's finding in `-o json` carries the exact command)."
+        )
+    };
     format!(
         "{count} failed object(s) retained as history, none in the last {lookback_label} \
          (by namespace: {by_ns}{oldest}). They are kept on purpose so a past failure can \
@@ -1809,7 +1841,7 @@ fn retained_history_note(older: &[&&FailureEntry], lookback_label: &str) -> Stri
          (default {limit}) failed Snapshots per repository and deletes older ones as newer \
          failures arrive, failed manual Snapshots keep the newest {limit} per SnapshotPolicy, \
          and Restores are never pruned — so a burst of failures stays until newer failures \
-         displace it. To clear them, delete the ones you have diagnosed \
+         displace it.{keep_backups} To clear the rest, delete the ones you have diagnosed \
          (`kubectl delete snapshot -n <namespace> <name>`) or lower failedJobsHistoryLimit; \
          `-o json` names every object",
         count = older.len(),
@@ -1841,6 +1873,7 @@ fn failure_entry(
         at: failed_at(conditions, meta),
         explained_by_warn_gate: warn_gate.is_some(),
         message: warn_gate.or_else(|| failure_message(conditions)),
+        owns_backup: false,
     }
 }
 
@@ -1864,13 +1897,15 @@ fn recent_failures(
     let mut entries = Vec::new();
     for s in &work.snapshots {
         if s.status.as_ref().and_then(|st| st.phase.as_ref()) == Some(&SnapshotPhase::Failed) {
-            entries.push(failure_entry(
+            let mut entry = failure_entry(
                 object_label("snapshot", &s.metadata),
                 FindingTarget::of(FindingKind::Snapshot, &s.metadata),
                 conditions_of(s.status.as_ref().map(|st| &st.conditions)),
                 &s.metadata,
                 GateScope::covers_snapshot,
-            ));
+            );
+            entry.owns_backup = s.status.as_ref().is_some_and(|st| st.snapshot.is_some());
+            entries.push(entry);
         }
     }
     for r in &work.restores {
@@ -1915,6 +1950,9 @@ fn failure_findings(
                     .unwrap_or_else(|| "failed; the operator left no message".to_string()),
             );
             finding.at = e.at;
+            if e.owns_backup {
+                finding.fix = Some(keep_backup_fix(&e.target));
+            }
             finding
         })
         .collect()
@@ -1932,9 +1970,41 @@ async fn check_warnings(ctx: &OpsCtx, now: DateTime<Utc>) -> Outcome {
         Ok(l) => l,
         Err(e) => return warn_for("list", "events.events.k8s.io", &e),
     };
+    let recent = recent_warnings(&listed.items, now);
+    if recent.is_empty() {
+        Outcome::Pass
+    } else {
+        // Warnings are informational here — the specific checks above turn the
+        // actionable ones into Fails; this is the catch-all surface.
+        Outcome::Warn(warnings_note(&recent))
+    }
+}
+
+/// When one Event last happened: the series' last observation, else the
+/// event time, else (core/v1-emitted aggregated events) `lastTimestamp`, else
+/// `creationTimestamp` — which is only the FIRST occurrence. **Pure.**
+fn event_last_seen(e: &Event) -> Option<DateTime<Utc>> {
+    let at = e
+        .series
+        .as_ref()
+        .map(|s| s.last_observed_time.0)
+        .or_else(|| e.event_time.as_ref().map(|t| t.0))
+        .or_else(|| e.deprecated_last_timestamp.as_ref().map(|t| t.0))
+        .or_else(|| e.metadata.creation_timestamp.as_ref().map(|t| t.0));
+    at.and_then(|t| DateTime::from_timestamp(t.as_second(), 0))
+}
+
+/// The Warning Events on kopiur objects seen in the last hour, one line each,
+/// deduplicated, **newest first** — a repeated warning by its latest
+/// occurrence. [`warnings_note`] caps this list, so the order is what decides
+/// which warnings a reader sees: it was alphabetical, and an older warning
+/// whose reason sorted early could push the newest failure out of the cap.
+/// **Pure.**
+fn recent_warnings(events: &[Event], now: DateTime<Utc>) -> Vec<String> {
     let cutoff = now - chrono::Duration::hours(1);
-    let mut recent: Vec<String> = listed
-        .items
+    let mut latest: std::collections::BTreeMap<String, DateTime<Utc>> =
+        std::collections::BTreeMap::new();
+    for (line, at) in events
         .iter()
         .filter(|e| {
             e.regarding
@@ -1943,21 +2013,9 @@ async fn check_warnings(ctx: &OpsCtx, now: DateTime<Utc>) -> Outcome {
                 .map(|v| v.starts_with(kopiur_api::GROUP))
                 .unwrap_or(false)
         })
-        .filter(|e| {
-            let at = e
-                .series
-                .as_ref()
-                .map(|s| s.last_observed_time.0)
-                .or_else(|| e.event_time.as_ref().map(|t| t.0))
-                // core/v1-emitted aggregated events: lastTimestamp tracks
-                // recurrence; creationTimestamp is only the FIRST occurrence.
-                .or_else(|| e.deprecated_last_timestamp.as_ref().map(|t| t.0))
-                .or_else(|| e.metadata.creation_timestamp.as_ref().map(|t| t.0));
-            at.and_then(|t| DateTime::from_timestamp(t.as_second(), 0))
-                .is_some_and(|t| t > cutoff)
-        })
-        .map(|e| {
-            format!(
+        .filter_map(|e| event_last_seen(e).filter(|t| *t > cutoff).map(|at| (e, at)))
+        .map(|(e, at)| {
+            let line = format!(
                 "{} {}/{}: {}",
                 e.reason.clone().unwrap_or_default(),
                 e.regarding
@@ -1969,22 +2027,22 @@ async fn check_warnings(ctx: &OpsCtx, now: DateTime<Utc>) -> Outcome {
                     .and_then(|r| r.name.clone())
                     .unwrap_or_default(),
                 e.note.clone().unwrap_or_default()
-            )
+            );
+            (line, at)
         })
-        .collect();
-    recent.sort();
-    recent.dedup();
-    if recent.is_empty() {
-        Outcome::Pass
-    } else {
-        // Warnings are informational here — the specific checks above turn the
-        // actionable ones into Fails; this is the catch-all surface.
-        Outcome::Warn(warnings_note(&recent))
+    {
+        let seen = latest.entry(line).or_insert(at);
+        *seen = (*seen).max(at);
     }
+    let mut recent: Vec<(String, DateTime<Utc>)> = latest.into_iter().collect();
+    // Newest first; equal times fall back to the text, so the order is stable.
+    recent
+        .sort_by(|(a_line, a_at), (b_line, b_at)| b_at.cmp(a_at).then_with(|| a_line.cmp(b_line)));
+    recent.into_iter().map(|(line, _)| line).collect()
 }
 
-/// The recent-warnings sentence, capped: the five newest-sorted entries in
-/// full and a count of the rest, so a noisy hour cannot bury the report.
+/// The recent-warnings sentence, capped: the first five entries of the
+/// newest-first list [`recent_warnings`] builds, in full, and a count of the rest, so a noisy hour cannot bury the report.
 /// `kubectl get events --field-selector type=Warning -A` lists them all. **Pure.**
 fn warnings_note(recent: &[String]) -> String {
     const SHOWN: usize = 5;
@@ -3418,6 +3476,101 @@ mod tests {
         );
         assert_eq!(objects.len(), 13, "every object is still a finding");
         assert!(objects.iter().all(|o| o.severity == FindingSeverity::Warn));
+    }
+
+    /// A Warning Event on a kopiur Snapshot, last seen `minutes_ago`.
+    fn warning_event(name: &str, reason: &str, minutes_ago: i64) -> Event {
+        serde_json::from_value(serde_json::json!({
+            "metadata": { "name": format!("{name}.{reason}"), "namespace": "media",
+                          "creationTimestamp": ago(minutes_ago) },
+            "eventTime": (now() - chrono::Duration::minutes(minutes_ago))
+                .to_rfc3339_opts(chrono::SecondsFormat::Micros, true),
+            "type": "Warning",
+            "reason": reason,
+            "note": format!("{reason} on {name}"),
+            "regarding": { "apiVersion": kopiur_api::consts::API_VERSION,
+                           "kind": "Snapshot", "namespace": "media", "name": name },
+        }))
+        .expect("event fixture")
+    }
+
+    /// Greptile on #703: the five-entry cap kept warnings in ALPHABETICAL
+    /// order, so with more than five distinct warnings an older `A…` reason
+    /// could hide the newest failure. The cap must keep the newest five, and a
+    /// repeated warning sorts by its LATEST occurrence.
+    #[test]
+    fn the_warnings_cap_keeps_the_newest_not_the_alphabetically_first() {
+        let mut events: Vec<Event> = ["A1", "A2", "A3", "A4", "A5"]
+            .iter()
+            .enumerate()
+            .map(|(i, r)| warning_event("old", r, 50 - i as i64))
+            .collect();
+        // The newest failure has the alphabetically LAST reason.
+        events.push(warning_event("new", "ZNewestFailure", 1));
+        // A repeat of A1, seen just now: its latest occurrence is what counts,
+        // and it is listed once.
+        events.push(warning_event("old", "A1", 0));
+        let lines = recent_warnings(&events, now());
+        assert_eq!(lines.len(), 6, "deduplicated: {lines:?}");
+        assert!(lines[0].starts_with("A1 "), "newest first: {lines:?}");
+        assert!(
+            lines[1].starts_with("ZNewestFailure "),
+            "newest first: {lines:?}"
+        );
+        let note = warnings_note(&lines);
+        assert!(
+            note.contains("ZNewestFailure"),
+            "the newest warning must survive the cap: {note}"
+        );
+        assert!(!note.contains("A2 "), "the oldest falls off: {note}");
+    }
+
+    /// Greptile on #703: a retained failure that still OWNS a kopia snapshot
+    /// (it failed after the snapshot was written, e.g. an `afterSnapshot`
+    /// hook) is a real restore point. The "delete the ones you have diagnosed"
+    /// advice would, under the default `deletionPolicy: Delete`, destroy it.
+    /// The note must say so and give the way to drop only the row.
+    #[test]
+    fn retained_failures_that_own_a_backup_are_never_advised_away() {
+        let mut owning = failed_snapshot("hook-failed", 60 * 24 * 7);
+        owning.status.as_mut().unwrap().snapshot = Some(
+            serde_json::from_value(serde_json::json!({
+                "kopiaSnapshotID": "k123",
+                "identity": { "username": "u", "hostname": "h", "sourcePath": "/d" },
+            }))
+            .expect("snapshot info fixture"),
+        );
+        let plain = failed_snapshot("connect-failed", 60 * 24 * 7);
+        let (outcome, objects) = recent_failures(
+            &work(vec![owning, plain], vec![]),
+            std::time::Duration::from_secs(24 * 3600),
+            now(),
+        );
+        let Outcome::Warn(msg) = &outcome else {
+            panic!("history warns: {outcome:?}");
+        };
+        assert!(
+            msg.contains("1 of them still own a kopia snapshot"),
+            "the note names the backup-owning failures: {msg}"
+        );
+        assert!(
+            msg.contains("deletionPolicy") && msg.contains("Retain"),
+            "the note says how to keep the backup while dropping the row: {msg}"
+        );
+        let owning = objects.iter().find(|o| o.name == "hook-failed").unwrap();
+        assert!(
+            owning
+                .fix
+                .as_deref()
+                .is_some_and(|f| f.contains("\"deletionPolicy\":\"Retain\"")),
+            "the finding carries the exact patch: {:?}",
+            owning.fix
+        );
+        let plain = objects.iter().find(|o| o.name == "connect-failed").unwrap();
+        assert_eq!(
+            plain.fix, None,
+            "a backup-less failure needs no such warning"
+        );
     }
 
     #[test]

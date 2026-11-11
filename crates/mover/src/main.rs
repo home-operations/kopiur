@@ -283,6 +283,7 @@ async fn run(cli: &MoverCli) -> Result<()> {
             // controller-side gap, deliberately out of scope for this change.
             Operation::Snapshot(_)
             | Operation::Restore(_)
+            | Operation::PartialRestore(_)
             | Operation::SnapshotDelete(_)
             | Operation::SnapshotDeleteBatch(_)
             | Operation::SnapshotPin(_) => {
@@ -709,35 +710,15 @@ async fn run_operation(
             }
             Ok(StatusUpdate::succeeded_backup(&result, chrono::Utc::now()))
         }
-        Operation::Restore(op) => {
-            // Where the bytes GO is decided first: a stream restore never touches a
-            // filesystem, so it does not share the mounted-target machinery below.
-            if let kopiur_mover::workspec::RestoreOutput::Stream(consumer) =
-                kopiur_mover::workspec::restore_output(op)
-            {
-                return restore_stream(client, op, consumer).await;
-            }
-            // Exactly one source kind (externally tagged): a controller-resolved id,
-            // or an in-Job selector to resolve here. Exhaustive — a new variant
-            // can't compile until handled.
-            match &op.source {
-                RestoreSelection::Snapshot(id) => {
-                    // The recorded id can be STALE — kopia rewrites a snapshot's
-                    // manifest id on pin (`UpdateSnapshot`), so a snapshotRef/identity
-                    // restore of a snapshot pinned before this fix points at a deleted
-                    // manifest. On a not-found, self-heal by re-resolving the live id
-                    // from the snapshot's stable identity (source path + start time).
-                    let restored_id = restore_snapshot(client, op, id).await?;
-                    // Restore's terminal success phase is `Completed`, not `Succeeded`
-                    // (the Snapshot phase) — the Restore CRD enum rejects `Succeeded`.
-                    Ok(StatusUpdate::completed(&restored_id, chrono::Utc::now()))
-                }
-                // Object-store `fromPolicy`/`identity`-without-id: the controller
-                // can't list the backend in-process, so resolve "latest" (offset/asOf)
-                // here, where the mover reaches every backend.
-                RestoreSelection::Resolve(sel) => {
-                    resolve_and_restore(client, op, sel, reporter).await
-                }
+        Operation::Restore(op) => run_restore(client, op, reporter).await,
+        // #689: the selection rides its own variant so an older mover fails
+        // closed on it (see `Operation::PartialRestore`). A malformed one — no
+        // paths, or a stream target — must fail here too, never degrade into a
+        // whole-root restore of a live volume.
+        Operation::PartialRestore(op) => {
+            match kopiur_mover::workspec::partial_restore_problem(op) {
+                Some(reason) => Err(MoverError::PartialRestoreInvalid { reason }),
+                None => run_restore(client, op, reporter).await,
             }
         }
         Operation::SnapshotDelete(op) => {
@@ -814,6 +795,43 @@ async fn run_operation(
                 "SnapshotReplicate is handled by run_snapshot_replicate_flow, not execute()"
             )
         }
+    }
+}
+
+/// Run a filesystem or stream restore — shared by [`Operation::Restore`] and
+/// [`Operation::PartialRestore`]; how much of the snapshot is restored is read
+/// off the op by `restore_snapshot` (`RestoreScope`).
+async fn run_restore(
+    client: &KopiaClient,
+    op: &RestoreOp,
+    reporter: &StatusReporter,
+) -> Result<StatusUpdate> {
+    // Where the bytes GO is decided first: a stream restore never touches a
+    // filesystem, so it does not share the mounted-target machinery below.
+    if let kopiur_mover::workspec::RestoreOutput::Stream(consumer) =
+        kopiur_mover::workspec::restore_output(op)
+    {
+        return restore_stream(client, op, consumer).await;
+    }
+    // Exactly one source kind (externally tagged): a controller-resolved id,
+    // or an in-Job selector to resolve here. Exhaustive — a new variant
+    // can't compile until handled.
+    match &op.source {
+        RestoreSelection::Snapshot(id) => {
+            // The recorded id can be STALE — kopia rewrites a snapshot's
+            // manifest id on pin (`UpdateSnapshot`), so a snapshotRef/identity
+            // restore of a snapshot pinned before this fix points at a deleted
+            // manifest. On a not-found, self-heal by re-resolving the live id
+            // from the snapshot's stable identity (source path + start time).
+            let restored_id = restore_snapshot(client, op, id).await?;
+            // Restore's terminal success phase is `Completed`, not `Succeeded`
+            // (the Snapshot phase) — the Restore CRD enum rejects `Succeeded`.
+            Ok(StatusUpdate::completed(&restored_id, chrono::Utc::now()))
+        }
+        // Object-store `fromPolicy`/`identity`-without-id: the controller
+        // can't list the backend in-process, so resolve "latest" (offset/asOf)
+        // here, where the mover reaches every backend.
+        RestoreSelection::Resolve(sel) => resolve_and_restore(client, op, sel, reporter).await,
     }
 }
 
@@ -4678,6 +4696,31 @@ mod tests {
         assert!(
             msg.contains("symbolic link") && msg.contains("Fix:"),
             "{msg}"
+        );
+    }
+
+    /// The exact #704 review case: the live PVC holds `docs -> archive` (a
+    /// RELATIVE link to a sibling) and `docs/sub/report.odt` is selected. The
+    /// guard must refuse it in both passes and must NOT create `archive/sub`
+    /// through the link — the `create_dir_all` it replaced did exactly that.
+    #[cfg(unix)]
+    #[test]
+    fn check_selected_target_refuses_a_relative_symlinked_parent_without_mkdir_through_it() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let r = root.path();
+        std::fs::create_dir(r.join("archive")).unwrap();
+        symlink("archive", r.join("docs")).unwrap();
+        for prep in [TargetPrep::CheckOnly, TargetPrep::CreateParents] {
+            let err = check_selected_target(r, "docs/sub/report.odt", prep).unwrap_err();
+            match err {
+                MoverError::RestoreTargetSymlink { path } => assert_eq!(path, r.join("docs")),
+                other => panic!("{prep:?}: expected RestoreTargetSymlink, got {other:?}"),
+            }
+        }
+        assert!(
+            !r.join("archive/sub").exists(),
+            "nothing may be created through the symlinked parent"
         );
     }
 

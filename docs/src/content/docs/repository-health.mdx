@@ -221,6 +221,19 @@ Failed **manual** Snapshots, from `kubectl kopiur snapshot now` or applied by ha
 
 Two kinds of failed Snapshot are never deleted by either bound. A failed run that still owns a kopia snapshot, because it failed **after** the snapshot was written (an `afterSnapshot` hook, for example), is kept so the restore point is not destroyed. A scheduled run whose `SnapshotSchedule` was deleted under `onScheduleDelete: Retain` has no schedule left to prune it. Delete either by hand once you no longer need it.
 
+:::caution[A failed run can still be a backup]
+
+Deleting a failed Snapshot that owns a kopia snapshot, the first kind above, under the default `deletionPolicy: Delete` deletes that backup too, not just the history row. To drop only the row and keep the backup, set `Retain` first:
+
+```console
+$ kubectl patch snapshot -n <namespace> <name> --type merge -p '{"spec":{"deletionPolicy":"Retain"}}'
+$ kubectl delete snapshot -n <namespace> <name>
+```
+
+`kubectl kopiur doctor` counts these separately in its retained-failures warning, and each one's finding in `-o json` carries this command with its name filled in.
+
+:::
+
 Retained failures are history, not an outage. They stay until newer failures displace them, which is why `kubectl kopiur doctor` and the console warn about failures older than `--failure-lookback` without failing.
 
 ## See also
