@@ -135,7 +135,12 @@ function SizeHistory({ detail }: { detail: SnapshotDetailData }) {
       <SnapshotSizeChart
         rows={history.data.items}
         maxSeries={1}
-        focus={{ namespace: row.namespace, name: row.name }}
+        focus={{
+          namespace: row.namespace,
+          name: row.name,
+          policy: row.policy,
+          source: row.identity,
+        }}
       />
     </>
   );

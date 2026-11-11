@@ -88,6 +88,19 @@ function nonEmpty(value: string | null | undefined): string | null {
 }
 
 /**
+ * The (policy, source) a row is filed under, normalized exactly as
+ * {@link sizeSeries} groups it — so a caller holding ONE snapshot can find
+ * that snapshot's series by identity, whether or not the snapshot itself has
+ * a plotted point (a pending/failed run records no size).
+ */
+export function seriesIdentity(
+  policy: string | null | undefined,
+  source: string | null | undefined,
+): { policy: string; source: string | null } {
+  return { policy: nonEmpty(policy) ?? NO_POLICY, source: nonEmpty(source) };
+}
+
+/**
  * The rows grouped into one series per (policy, source), each oldest first.
  *
  * A series whose rows are all unplottable is dropped entirely rather than
@@ -98,8 +111,7 @@ function nonEmpty(value: string | null | undefined): string | null {
 export function sizeSeries(rows: readonly SnapshotRow[]): SizeSeries[] {
   const groups = new Map<string, SizeSeries>();
   for (const row of rows) {
-    const policy = nonEmpty(row.policy) ?? NO_POLICY;
-    const source = nonEmpty(row.identity);
+    const { policy, source } = seriesIdentity(row.policy, row.identity);
     // NUL cannot occur in a policy name or a kopia identity, so the key is
     // unambiguous.
     const key = `${policy}\u0000${source ?? ""}`;

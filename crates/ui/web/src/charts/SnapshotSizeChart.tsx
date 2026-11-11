@@ -10,6 +10,7 @@ import {
   areaPath,
   linePath,
   plotArea,
+  seriesIdentity,
   sizeSeries,
 } from "./series";
 
@@ -68,12 +69,38 @@ export interface SnapshotSizeChartProps {
    * The snapshot this chart is about (a drawer's own): its SOURCE's series is
    * drawn first, and its point is the one the readout shows until the pointer
    * moves, instead of the newest.
+   *
+   * The series is found by the snapshot's own `policy` + `source` (kopia
+   * identity), NOT by looking for its point: a pending or failed run records
+   * no size, and an older run can fall outside the page of history the chart
+   * was handed, so "the series containing this point" may not exist — and a
+   * drawer capped at one chart must then say so, never draw a sibling's.
    */
-  focus?: { namespace: string; name: string } | undefined;
+  focus?: SnapshotFocus | undefined;
+}
+
+/** The snapshot a chart is about: which point, and which (policy, source). */
+export interface SnapshotFocus {
+  namespace: string;
+  name: string;
+  /** `SnapshotRow.policy` of the focused snapshot. */
+  policy: string | null | undefined;
+  /** `SnapshotRow.identity` of the focused snapshot — its source. */
+  source: string | null | undefined;
 }
 
 export function SnapshotSizeChart({ rows, maxSeries = 4, focus }: SnapshotSizeChartProps) {
-  const series = focusFirst(sizeSeries(rows), focus);
+  const selected = focusFirst(sizeSeries(rows), focus);
+  if (selected.kind === "missing") {
+    return (
+      <p className="page__section-note">
+        This snapshot&apos;s source <span className="mono">{selected.source ?? "(unknown)"}</span>{" "}
+        has no recorded size in these runs of <span className="mono">{selected.policy}</span>, so
+        there is no trend to draw for it; only successful runs record a size.
+      </p>
+    );
+  }
+  const { series } = selected;
   if (series.length === 0) {
     return (
       <p className="page__section-note">
@@ -108,20 +135,29 @@ export function SnapshotSizeChart({ rows, maxSeries = 4, focus }: SnapshotSizeCh
   );
 }
 
+/** What the chart draws once the focus is applied. */
+type FocusedSeries =
+  | { kind: "drawn"; series: SizeSeries[] }
+  /** The focused snapshot's source has no plotted point in these rows. */
+  | { kind: "missing"; policy: string; source: string | null };
+
 /**
- * The series the focused snapshot belongs to, moved to the front so a drawer
- * capped at one chart draws the snapshot's OWN source — never a sibling PVC's.
- * Every other series keeps its order.
+ * The series the focused snapshot belongs to — selected by its (policy,
+ * source) identity — moved to the front so a drawer capped at one chart draws
+ * the snapshot's OWN source, never a sibling PVC's. Every other series keeps
+ * its order. When that source has nothing plotted, the answer is `missing`,
+ * never "whatever sorts first".
  */
-function focusFirst(series: SizeSeries[], focus: SnapshotSizeChartProps["focus"]): SizeSeries[] {
-  if (focus === undefined) return series;
-  const index = series.findIndex((s) =>
-    s.points.some((p) => p.name === focus.name && p.namespace === focus.namespace),
-  );
-  if (index <= 0) return series;
+function focusFirst(series: SizeSeries[], focus: SnapshotFocus | undefined): FocusedSeries {
+  if (focus === undefined) return { kind: "drawn", series };
+  const want = seriesIdentity(focus.policy, focus.source);
+  const index = series.findIndex((s) => s.policy === want.policy && s.source === want.source);
   const own = series[index];
-  if (own === undefined) return series;
-  return [own, ...series.slice(0, index), ...series.slice(index + 1)];
+  if (own === undefined) return { kind: "missing", ...want };
+  return {
+    kind: "drawn",
+    series: [own, ...series.slice(0, index), ...series.slice(index + 1)],
+  };
 }
 
 /** The chart's title: the quantity, then whose it is. */

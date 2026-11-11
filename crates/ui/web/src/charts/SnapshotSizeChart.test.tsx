@@ -191,7 +191,12 @@ describe("SnapshotSizeChart", () => {
     });
 
     it("draws the focused snapshot's own source, with only that source's runs", () => {
-      const focus = { namespace: "media", name: "samba-2026-09-08-pvc-home" };
+      const focus = {
+        namespace: "media",
+        name: "samba-2026-09-08-pvc-home",
+        policy: "samba",
+        source: "samba@samba:/pvc/home",
+      };
       const { container } = render(<SnapshotSizeChart rows={multi} maxSeries={1} focus={focus} />);
       expect(screen.getByRole("figure")).toHaveTextContent("samba@samba:/pvc/home");
       // Three runs of ONE volume — not 24 points zig-zagging across eight.
@@ -204,6 +209,49 @@ describe("SnapshotSizeChart", () => {
         "samba-2026-09-09-pvc-home",
       ]);
       expect(screen.getByRole("status")).toHaveTextContent("(this snapshot)");
+    });
+
+    // PR #706 review (Greptile P2): the drawer caps at ONE chart, and the
+    // focused snapshot may have no plotted point of its own — a pending or
+    // failed run records no size, and an older run can sit outside the newest
+    // page of history. Selecting by "the series that contains this point" then
+    // fell back to the alphabetically first source: the drawer of a `home`
+    // snapshot drew `backup`. The series is selected by the snapshot's own
+    // (policy, source), never by its point.
+    it("draws the focused snapshot's source even when that snapshot has no size", () => {
+      const pending = row({
+        name: "samba-2026-09-10-pvc-home",
+        policy: "samba",
+        identity: "samba@samba:/pvc/home",
+        phase: "running",
+        endTime: null,
+        sizeBytes: null,
+      });
+      const focus = {
+        namespace: "media",
+        name: pending.name,
+        policy: "samba",
+        source: "samba@samba:/pvc/home",
+      };
+      render(<SnapshotSizeChart rows={[...multi, pending]} maxSeries={1} focus={focus} />);
+      const figure = screen.getByRole("figure");
+      expect(figure).toHaveTextContent("samba@samba:/pvc/home");
+      expect(figure).not.toHaveTextContent("samba@samba:/pvc/backup");
+      // No point of its own: the readout must not claim to be "this snapshot".
+      expect(screen.getByRole("status")).toHaveTextContent("(latest)");
+    });
+
+    it("says the source is unavailable rather than drawing a sibling's", () => {
+      const focus = {
+        namespace: "media",
+        name: "samba-2026-09-10-pvc-gone",
+        policy: "samba",
+        source: "samba@samba:/pvc/gone",
+      };
+      render(<SnapshotSizeChart rows={multi} maxSeries={1} focus={focus} />);
+      expect(screen.queryByRole("figure")).toBeNull();
+      expect(screen.getByText(/has no recorded size/)).toBeInTheDocument();
+      expect(screen.queryByText(/samba@samba:\/pvc\/backup/)).toBeNull();
     });
 
     it("never says one-of-several for a single-source policy", () => {
