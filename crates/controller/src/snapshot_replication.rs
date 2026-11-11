@@ -158,9 +158,17 @@ async fn reconcile_inner(repl: &SnapshotReplication, ctx: &Context) -> Result<Ac
     // Both endpoints are real repository CRs — resolve them (backend, encryption,
     // moverDefaults, CA bundles), source first for message determinism.
     // Launch-side (migrate Job inputs) — store-backed point reads (#382 M2).
-    let source = io::resolve_repository_ref_cached(ctx, &repl.spec.source_ref, &namespace).await?;
-    let dest =
-        io::resolve_repository_ref_cached(ctx, &repl.spec.destination_ref, &namespace).await?;
+    // Tenancy (#677) on BOTH ends, before any work: admission defers the
+    // allowedNamespaces gate when a ClusterRepository did not exist yet. A
+    // missing/refused end is reported on `Ready` before the error propagates.
+    let resolved = resolve_endpoints(ctx, repl, &namespace).await;
+    let (source, dest) = match resolved {
+        Ok(pair) => pair,
+        Err(e) => {
+            report_unresolved_endpoint(&api, &name, repl, &e).await?;
+            return Err(e);
+        }
+    };
 
     // Gate on BOTH repositories being Ready — an object-store repo must be
     // bootstrapped before `kopia snapshot migrate` can reach it. DISTINCT
@@ -323,6 +331,55 @@ async fn observe_held_manual_run(
         repl.metadata.annotations.as_ref(),
         repl.status.as_ref().and_then(|s| s.manual_run.as_ref()),
         current.as_ref(),
+    )
+    .await
+}
+
+/// Resolve BOTH endpoint repositories for this run, source first for message
+/// determinism: the controller-side tenancy gate ([`io::ensure_consumer_tenancy`],
+/// #677 — admission defers it when a ClusterRepository did not exist yet) and the
+/// store-backed point read (#382 M2) for each.
+async fn resolve_endpoints(
+    ctx: &Context,
+    repl: &SnapshotReplication,
+    namespace: &str,
+) -> Result<(ResolvedRepository, ResolvedRepository)> {
+    let mut out = Vec::with_capacity(2);
+    for rref in [&repl.spec.source_ref, &repl.spec.destination_ref] {
+        io::ensure_consumer_tenancy(ctx, rref, namespace).await?;
+        out.push(io::resolve_repository_ref_cached(ctx, rref, namespace).await?);
+    }
+    let dest = out
+        .pop()
+        .ok_or_else(|| Error::Invariant("no destination resolved".into()))?;
+    let source = out
+        .pop()
+        .ok_or_else(|| Error::Invariant("no source resolved".into()))?;
+    Ok((source, dest))
+}
+
+/// Surface an endpoint that is missing or refused on `Ready` (issue #677), so the
+/// hold is visible on the object rather than only in an Event. Other errors are
+/// left to the error policy.
+async fn report_unresolved_endpoint(
+    api: &Api<SnapshotReplication>,
+    name: &str,
+    repl: &SnapshotReplication,
+    err: &Error,
+) -> Result<()> {
+    let Some((reason, message)) = io::unresolved_repository_report(err, "endpoint repository")
+    else {
+        return Ok(());
+    };
+    patch_ready_if_changed(
+        api,
+        name,
+        repl,
+        io::ReadyOutcome::Reconciling,
+        reason,
+        &message,
+        None,
+        None,
     )
     .await
 }
@@ -1184,6 +1241,23 @@ async fn spawn_snapshot_replication_job(
     slot: DateTime<Utc>,
     trigger: ReplicationRunTrigger,
 ) -> Result<()> {
+    // Defensive re-check of the admission rule: two different refs must not
+    // resolve to one storage target. Admission skips it when either repository
+    // did not exist yet at apply time (#677), so the live pair is checked here.
+    if !kopiur_api::validate::replication_destination_differs(&source.backend, &dest.backend) {
+        let label = |r: &RepositoryRef| match r.namespace.as_deref() {
+            Some(ns) if !ns.is_empty() => format!("{} {ns}/{}", r.kind.kind_str(), r.name),
+            _ => format!("{} {}", r.kind.kind_str(), r.name),
+        };
+        return Err(Error::Validation(
+            kopiur_api::ValidationError::SnapshotReplicationSameStorage {
+                source_ref: label(&repl.spec.source_ref),
+                destination_ref: label(&repl.spec.destination_ref),
+                backend: dest.backend.kind_str().to_string(),
+            }
+            .to_string(),
+        ));
+    }
     // Defensive re-check of the admission rule (one validator, two callers): a
     // same-kind static/workload-identity auth mix would leak the static side's
     // env into the workload-identity side's ambient credential chain.

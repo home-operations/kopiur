@@ -27,6 +27,7 @@ pub mod gates;
 pub mod identity;
 pub mod invariants;
 pub mod jitter;
+pub mod kopia_flags;
 pub mod message;
 pub mod preflight;
 pub mod recorded;

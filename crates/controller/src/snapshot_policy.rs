@@ -905,6 +905,10 @@ async fn reconcile_inner(config: &SnapshotPolicy, ctx: &Context) -> Result<Actio
         // Launch-side resolution (identity/retention/verification inputs) —
         // store-backed point read (#382 M2); the deletion cascade keeps the
         // live resolver.
+        // Tenancy (#677): admission defers the allowedNamespaces gate when the
+        // ClusterRepository did not exist yet, so it is enforced here, before
+        // any work against the repository.
+        io::ensure_consumer_tenancy(ctx, rref, &namespace).await?;
         let repo = io::resolve_repository_ref_cached(ctx, rref, &namespace).await?;
         let resolved =
             resolve_config_identity(config, &namespace, repo.identity_defaults.as_ref())?;
@@ -1239,6 +1243,7 @@ async fn reconcile_inner(config: &SnapshotPolicy, ctx: &Context) -> Result<Actio
         }
         None => conditions,
     };
+    let conditions = kopia_args_conditions(ctx, config, conditions, &existing, generation).await;
     let status = final_status_body(
         config,
         generation,
@@ -1506,6 +1511,78 @@ fn policy_ready_conditions(
             generation,
         )
     }
+}
+
+/// **Pure.** The `UnsupportedKopiaArgs` state for a policy (#708): `Some((true,
+/// message))` when its legacy `spec.extraArgs` carries refused kopia flags,
+/// `Some((false, …))` to clear a condition that is present, `None` when there is
+/// nothing to say (no findings and never flagged) — so a healthy policy's status
+/// never grows the condition.
+fn kopia_args_state(
+    spec: &kopiur_api::SnapshotPolicySpec,
+    existing: &[k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition],
+) -> Option<(bool, String)> {
+    let findings = kopiur_api::validate::legacy_extra_args_findings(spec);
+    if findings.is_empty() {
+        return existing
+            .iter()
+            .any(|c| c.type_ == crate::consts::UNSUPPORTED_KOPIA_ARGS_CONDITION)
+            .then(|| {
+                (
+                    false,
+                    "spec.extraArgs carries no refused kopia flag".to_string(),
+                )
+            });
+    }
+    let detail: Vec<String> = findings.into_iter().map(|f| f.message).collect();
+    Some((
+        true,
+        format!(
+            "spec.extraArgs carries kopia flags Kopiur refuses; backups still pass them \
+             unchanged, but the next edit of spec.extraArgs is refused until they are \
+             removed: {}",
+            detail.join("; ")
+        ),
+    ))
+}
+
+/// Fold [`kopia_args_state`] into the status conditions, with a Warning Event
+/// on the flip to `True` only (a steady state does not re-publish).
+async fn kopia_args_conditions(
+    ctx: &Context,
+    config: &SnapshotPolicy,
+    conditions: Vec<k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition>,
+    existing: &[k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition],
+    generation: Option<i64>,
+) -> Vec<k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition> {
+    let Some((refused, message)) = kopia_args_state(&config.spec, existing) else {
+        return conditions;
+    };
+    let was_refused = existing
+        .iter()
+        .any(|c| c.type_ == crate::consts::UNSUPPORTED_KOPIA_ARGS_CONDITION && c.status == "True");
+    if refused && !was_refused {
+        io::publish_warning_event(
+            ctx,
+            config,
+            crate::consts::UNSUPPORTED_KOPIA_ARGS_REASON,
+            crate::consts::FIX_EXTRA_ARGS_ACTION,
+            &message,
+        )
+        .await;
+    }
+    io::upsert_condition(
+        &conditions,
+        crate::consts::UNSUPPORTED_KOPIA_ARGS_CONDITION,
+        refused,
+        if refused {
+            crate::consts::UNSUPPORTED_KOPIA_ARGS_REASON
+        } else {
+            crate::consts::KOPIA_ARGS_SUPPORTED_REASON
+        },
+        &message,
+        generation,
+    )
 }
 
 /// **Pure-ish** (no IO): the deep-verify scratch no-op state to surface, over
@@ -3662,6 +3739,41 @@ mod tests {
     }
 
     // --- M10: the RepositoriesReady gate conditions ------------------------
+
+    /// #708: a stored policy whose legacy `extraArgs` carries a refused flag keeps
+    /// running and says so; clearing the list clears the condition; a policy that
+    /// was never flagged never grows it.
+    #[test]
+    fn kopia_args_state_flags_refused_legacy_extra_args_and_clears() {
+        let mut spec: kopiur_api::SnapshotPolicySpec = serde_json::from_value(serde_json::json!({
+            "repository": { "kind": "Repository", "name": "r" },
+            "sources": [ { "pvc": { "name": "data" } } ],
+            "extraArgs": ["--keep-latest=3", "--one-file-system=true"]
+        }))
+        .expect("spec");
+        let (refused, msg) = kopia_args_state(&spec, &[]).expect("flagged");
+        assert!(refused);
+        assert!(msg.contains("--keep-latest=3"), "{msg}");
+        assert!(msg.contains("spec.retention"), "{msg}");
+        assert!(!msg.contains("one-file-system"), "{msg}");
+
+        let flagged = io::upsert_condition(
+            &[],
+            crate::consts::UNSUPPORTED_KOPIA_ARGS_CONDITION,
+            true,
+            crate::consts::UNSUPPORTED_KOPIA_ARGS_REASON,
+            &msg,
+            Some(1),
+        );
+        spec.extra_args = vec!["--one-file-system=true".into()];
+        let (refused, _) = kopia_args_state(&spec, &flagged).expect("clears");
+        assert!(!refused);
+        assert_eq!(
+            kopia_args_state(&spec, &[]),
+            None,
+            "never grows when healthy"
+        );
+    }
 
     #[test]
     fn policy_ready_conditions_write_and_clear_the_registered_gate() {

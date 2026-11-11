@@ -12,6 +12,12 @@
 //!    via `AdmissionResponse::with_patch`.
 //! 4. For consumer CRs referencing a `ClusterRepository`, enforce the
 //!    `allowedNamespaces` tenancy gate (fail closed) — see [`crate::tenancy`].
+//!
+//! A reference whose target does not exist YET is always **admitted** (with an
+//! admission warning), never denied: GitOps apply order and `--dry-run=server`
+//! must not be enforced at admission (issue #677). Every referent read goes
+//! through [`crate::referent::fetch`] (ratchet-enforced), and checks that need
+//! the referent are deferred to the controller, which re-enforces tenancy.
 
 use kopiur_api as api;
 
@@ -28,6 +34,7 @@ use api::snapshot_replication::{IdentityMatcher, Pruning, SnapshotReplicationSpe
 use api::snapshot_schedule::SnapshotScheduleSpec;
 
 use crate::error::{AdmissionError, AdmissionResult};
+use crate::referent::{self, Referent, missing_referent_warning};
 use crate::tenancy::{self, TenancyDecision, TenancyDenial};
 use json_patch::{AddOperation, Patch, PatchOperation, jsonptr::PointerBuf};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
@@ -164,9 +171,18 @@ fn ptr(path: &str) -> PointerBuf {
 /// Attach non-blocking admission warnings to an already-allowed response (e.g. the
 /// inline-NFS `fsGroup` footgun). Empty input leaves the response untouched so the
 /// API server doesn't surface a spurious empty warning list.
+///
+/// Exact duplicates are dropped (first occurrence wins): two checks reading the
+/// same absent referent each report it, and the user should see it once.
 fn with_warnings(mut resp: AdmissionResponse, warnings: Vec<String>) -> AdmissionResponse {
-    if !warnings.is_empty() {
-        resp.warnings = Some(warnings);
+    let mut unique: Vec<String> = Vec::with_capacity(warnings.len());
+    for w in warnings {
+        if !unique.contains(&w) {
+            unique.push(w);
+        }
+    }
+    if !unique.is_empty() {
+        resp.warnings = Some(unique);
     }
     resp
 }
@@ -224,9 +240,16 @@ async fn handle_snapshot_policy(
     errs.extend(api::validate::validate_backup_config_admission_extras(
         &spec,
     ));
+    let old_spec = decode_old_spec::<SnapshotPolicySpec>(req);
     errs.extend(api::validate::validate_cache_legacy_budgets_for(
         &spec,
-        decode_old_spec::<SnapshotPolicySpec>(req).as_ref(),
+        old_spec.as_ref(),
+    ));
+    // #708: the legacy `extraArgs` predates the kopia flag table, so it is only
+    // checked when this apply changes it (stored objects keep running).
+    errs.extend(api::validate::validate_legacy_extra_args(
+        &spec,
+        old_spec.as_ref(),
     ));
     if !errs.is_empty() {
         return Err(AdmissionError::Invalid(errs));
@@ -237,12 +260,20 @@ async fn handle_snapshot_policy(
     // is exactly the old one-ref check; the multi-repo shape gets
     // any-denies-fails semantics — one non-permitted ClusterRepository member
     // refuses the whole policy.
+    let mut warnings = Vec::new();
+    let repo_field = if api::is_multi_repo(&spec) {
+        "spec.repositories"
+    } else {
+        "spec.repository"
+    };
     for rref in api::repository_refs(&spec) {
-        if let TenancyDecision::Deny(denial) =
-            tenancy_for(rref, req.namespace.as_deref(), client).await
-        {
-            return Err(denial.into());
-        }
+        apply_tenancy(
+            tenancy_for(rref, req.namespace.as_deref(), client).await,
+            rref,
+            repo_field,
+            DenialPrefix::Bare,
+            &mut warnings,
+        )?;
     }
 
     // Identity-collision detection (ADR-0005 §6): reject a SnapshotPolicy whose
@@ -272,8 +303,6 @@ async fn handle_snapshot_policy(
         }
     }
 
-    let mut warnings = Vec::new();
-
     // Fork-on-edit guard: on UPDATE, reject a change that would re-identify a policy
     // with existing snapshot history (orphaning the old kopia source) unless it is
     // acknowledged with the allow-identity-change annotation. Reads the old object's
@@ -288,6 +317,7 @@ async fn handle_snapshot_policy(
     {
         let name = obj.metadata.name.as_deref().unwrap_or(req.name.as_str());
         let ns = req.namespace.as_deref().unwrap_or_default();
+        let old_meta = req.old_object.as_ref().map(|o| &o.metadata);
         let outcome = crate::identity_fork::check_identity_fork(
             client,
             name,
@@ -297,6 +327,8 @@ async fn handle_snapshot_policy(
             obj.metadata.annotations.as_ref(),
             &old_spec,
             &old_status,
+            old_meta.and_then(|m| m.labels.as_ref()),
+            old_meta.and_then(|m| m.annotations.as_ref()),
         )
         .await;
         if let Some(err) = outcome.error {
@@ -404,7 +436,14 @@ async fn handle_snapshot(
             .or(req.namespace.as_deref())
             .unwrap_or_default();
         let api: Api<kopiur_api::SnapshotPolicy> = Api::namespaced(client.clone(), ns);
-        if let Ok(Some(policy)) = api.get_opt(&policy_ref.name).await {
+        let policy = referent::fetch(&api, &policy_ref.name).await;
+        if policy.is_missing() {
+            warnings.push(missing_referent_warning(
+                "spec.policyRef",
+                &format!("SnapshotPolicy \"{ns}/{}\"", policy_ref.name),
+            ));
+        }
+        if let Referent::Found(policy) = policy {
             // A `pvcSelector` recipe expands to one Snapshot per matched PVC,
             // so a Snapshot against one MUST say which PVC it covers. Refuse at
             // apply time rather than letting it fail at reconcile: the operator
@@ -736,11 +775,15 @@ async fn handle_restore(
         return Err(AdmissionError::Invalid(errs));
     }
 
-    if let Some(repo) = &spec.repository
-        && let TenancyDecision::Deny(denial) =
-            tenancy_for(repo, req.namespace.as_deref(), client).await
-    {
-        return Err(denial.into());
+    let mut warnings: Vec<String> = Vec::new();
+    if let Some(repo) = &spec.repository {
+        apply_tenancy(
+            tenancy_for(repo, req.namespace.as_deref(), client).await,
+            repo,
+            "spec.repository",
+            DenialPrefix::Bare,
+            &mut warnings,
+        )?;
     }
 
     // `fromPolicy` repository selection (#368): decided by the shared
@@ -766,7 +809,14 @@ async fn handle_restore(
             .unwrap_or_default();
         let policy_ns = fp.namespace.as_deref().unwrap_or(restore_ns);
         let policies: Api<kopiur_api::SnapshotPolicy> = Api::namespaced(client.clone(), policy_ns);
-        if let Ok(Some(policy)) = policies.get_opt(&fp.name).await
+        let policy = referent::fetch(&policies, &fp.name).await;
+        if policy.is_missing() {
+            warnings.push(missing_referent_warning(
+                "spec.source.fromPolicy",
+                &format!("SnapshotPolicy \"{policy_ns}/{}\"", fp.name),
+            ));
+        }
+        if let Referent::Found(policy) = policy
             && let Err(e) = api::snapshot_policy::select_restore_repository(
                 &policy.spec,
                 &fp.name,
@@ -788,12 +838,11 @@ async fn handle_restore(
             None
         }
     };
-    let mut warnings: Vec<String> = spec
-        .mover
-        .as_ref()
-        .and_then(|m| m.privileged_mode_warning(api::common::MoverOperation::Restore))
-        .into_iter()
-        .collect();
+    warnings.extend(
+        spec.mover
+            .as_ref()
+            .and_then(|m| m.privileged_mode_warning(api::common::MoverOperation::Restore)),
+    );
     warnings.extend(
         crate::secctx::restore_warnings(
             client,
@@ -854,13 +903,16 @@ async fn handle_maintenance(
         ]));
     }
 
-    if let TenancyDecision::Deny(denial) =
-        tenancy_for(&spec.repository, req.namespace.as_deref(), client).await
-    {
-        return Err(denial.into());
-    }
+    let mut warnings = Vec::new();
+    apply_tenancy(
+        tenancy_for(&spec.repository, req.namespace.as_deref(), client).await,
+        &spec.repository,
+        "spec.repository",
+        DenialPrefix::Bare,
+        &mut warnings,
+    )?;
 
-    Ok(resp)
+    Ok(with_warnings(resp, warnings))
 }
 
 // --- replication run-now annotation -----------------------------------------
@@ -871,13 +923,16 @@ const REPOSITORY_REPLICATION_RUN_COMMAND: &str = "kubectl kopiur replication run
 /// The `SnapshotReplication` counterpart.
 const SNAPSHOT_REPLICATION_RUN_COMMAND: &str = "kubectl kopiur replication run --kind snapshot";
 
-/// Refuse a malformed `run-requested` annotation at admission (issue #380).
-///
 /// The `spec.maintenance.mover.cache` of the repository this `Maintenance` claims
 /// as its controller owner — `Some` only when that repository exists and its uid
 /// matches the owner reference, so a user-written owner reference alone proves
 /// nothing (#714 review). `None` (no exemption, fail closed) without a client, on
 /// any lookup error, or on a uid mismatch.
+///
+/// The owner is read through [`crate::referent::fetch`] like every other
+/// point-read, but with the OPPOSITE polarity to a reference check: only a
+/// verified [`crate::referent::Referent::Found`] grants the exemption; a
+/// `Missing` owner and an `Unreadable` one both deny it.
 async fn verified_parent_maintenance_cache(
     req: &AdmissionRequest<DynamicObject>,
     meta: &ObjectMeta,
@@ -892,16 +947,31 @@ async fn verified_parent_maintenance_cache(
     };
     let (uid, cache) = if owner.kind == "ClusterRepository" {
         let api: Api<api::ClusterRepository> = Api::all(client.clone());
-        let r = api.get_opt(&owner.name).await.ok()??;
+        let r = verified_owner(crate::referent::fetch(&api, &owner.name).await)?;
         (r.metadata.uid, cache_of(r.spec.maintenance))
     } else {
         let api: Api<api::Repository> = Api::namespaced(client.clone(), req.namespace.as_deref()?);
-        let r = api.get_opt(&owner.name).await.ok()??;
+        let r = verified_owner(crate::referent::fetch(&api, &owner.name).await)?;
         (r.metadata.uid, cache_of(r.spec.maintenance))
     };
     (uid.as_deref() == Some(owner.uid.as_str())).then_some(cache)
 }
 
+/// **Pure.** The owner repository for the managed-Maintenance cache exemption,
+/// only when it was verifiably read. Exhaustive so a new [`crate::referent::Referent`]
+/// state cannot silently grant the exemption: NotFound and any read error are
+/// "no exemption" (fail closed), the opposite of a reference check's "admit on
+/// NotFound".
+fn verified_owner<T>(read: crate::referent::Referent<T>) -> Option<T> {
+    use crate::referent::Referent;
+    match read {
+        Referent::Found(owner) => Some(owner),
+        Referent::Missing | Referent::Unreadable(_) => None,
+    }
+}
+
+/// Refuse a malformed `run-requested` annotation at admission (issue #380).
+///
 /// The annotation is user input on both replication kinds exactly as it is on
 /// `Maintenance`, and it flows into a scheduling decision — so a typo'd
 /// timestamp is refused here rather than reaching a reconciler that can only
@@ -946,47 +1016,68 @@ async fn handle_repository_replication(
     refuse_malformed_run_annotation(obj, REPOSITORY_REPLICATION_RUN_COMMAND)?;
 
     // Tenancy: a ClusterRepository sourceRef is gated against allowedNamespaces.
-    if let TenancyDecision::Deny(denial) =
-        tenancy_for(&spec.source_ref, req.namespace.as_deref(), client).await
-    {
-        return Err(denial.into());
-    }
+    // A sourceRef that does not exist yet is admitted with a warning (#677).
+    let mut warnings = Vec::new();
+    apply_tenancy(
+        tenancy_for(&spec.source_ref, req.namespace.as_deref(), client).await,
+        &spec.source_ref,
+        "spec.sourceRef",
+        DenialPrefix::Bare,
+        &mut warnings,
+    )?;
 
     // §13(d): the destination must differ from the source's backend (no self-mirror),
     // and the source/destination auth pair must be safe in one mover pod (a same-kind
     // static/workload-identity mix leaks the static env into the ambient chain).
     // Resolve the source backend via the client and compare. Best-effort — a missing
     // client / unresolvable source skips these checks (the structural validations
-    // above already ran), mirroring how tenancy degrades when inputs are unavailable.
-    if let Some(client) = client
-        && let Some(source_backend) =
-            resolve_source_backend(client, &spec.source_ref, req.namespace.as_deref()).await
-    {
-        if !api::validate::replication_destination_differs(&source_backend, &spec.destination) {
-            return Err(AdmissionError::Invalid(vec![
-                ValidationError::ReplicationDestinationSameAsSource {
-                    backend: spec.destination.kind_str().to_string(),
-                },
-            ]));
-        }
-        if let Some(path) = api::validate::replication_filesystem_mount_collision(
-            &source_backend,
-            &spec.destination,
-        ) {
-            return Err(AdmissionError::Invalid(vec![
-                ValidationError::ReplicationMountPathCollision { path },
-            ]));
-        }
-        if let Err(e) = api::validate::validate_replication_auth(
-            &source_backend,
-            &spec.destination,
-            api::validate::AuthPairKind::Replication,
-        ) {
-            return Err(AdmissionError::Invalid(vec![e]));
+    // above already ran); a source that does not exist yet is admitted with a
+    // warning and the controller/mover re-validate once it does (#677).
+    if let Some(client) = client {
+        let source =
+            resolve_source_backend(client, &spec.source_ref, req.namespace.as_deref()).await;
+        note_missing(
+            &source,
+            "spec.sourceRef",
+            &spec.source_ref,
+            req.namespace.as_deref(),
+            &mut warnings,
+        );
+        if let Referent::Found(source_backend) = source {
+            check_replication_pair(&source_backend, &spec.destination)?;
         }
     }
 
-    Ok(resp)
+    Ok(with_warnings(resp, warnings))
+}
+
+/// The §13(d) source/destination pair rules for a `RepositoryReplication`, once
+/// the source's backend is known: no self-mirror, no shared in-pod filesystem
+/// mount path, and a safe auth pair for one mover pod.
+fn check_replication_pair(
+    source_backend: &api::backend::Backend,
+    destination: &api::backend::Backend,
+) -> Result<(), AdmissionError> {
+    if !api::validate::replication_destination_differs(source_backend, destination) {
+        return Err(AdmissionError::Invalid(vec![
+            ValidationError::ReplicationDestinationSameAsSource {
+                backend: destination.kind_str().to_string(),
+            },
+        ]));
+    }
+    if let Some(path) =
+        api::validate::replication_filesystem_mount_collision(source_backend, destination)
+    {
+        return Err(AdmissionError::Invalid(vec![
+            ValidationError::ReplicationMountPathCollision { path },
+        ]));
+    }
+    api::validate::validate_replication_auth(
+        source_backend,
+        destination,
+        api::validate::AuthPairKind::Replication,
+    )
+    .map_err(|e| AdmissionError::Invalid(vec![e]))
 }
 
 // --- SnapshotReplication ----------------------------------------------------
@@ -1026,19 +1117,20 @@ async fn handle_snapshot_replication(
     // the mover opens the source read-only AND writes the destination, so a
     // ClusterRepository on EITHER side must permit this namespace. The denial
     // names which ref failed — with two ClusterRepository refs a bare repo name
-    // would not say which one to fix.
+    // would not say which one to fix. A ref whose repository does not exist yet
+    // is admitted with a warning (#677).
+    let mut warnings = Vec::new();
     for (field, rref) in [
         ("spec.sourceRef", &spec.source_ref),
         ("spec.destinationRef", &spec.destination_ref),
     ] {
-        if let TenancyDecision::Deny(denial) =
-            tenancy_for(rref, req.namespace.as_deref(), client).await
-        {
-            return Err(AdmissionError::RefTenancy {
-                field,
-                source: denial,
-            });
-        }
+        apply_tenancy(
+            tenancy_for(rref, req.namespace.as_deref(), client).await,
+            rref,
+            field,
+            DenialPrefix::Field,
+            &mut warnings,
+        )?;
     }
 
     // Client-dependent checks are best-effort — no client (unit tests, a webhook
@@ -1047,12 +1139,26 @@ async fn handle_snapshot_replication(
     // controller/mover re-validate at run time), mirroring
     // `handle_repository_replication`'s degrade posture.
     let Some(client) = client else {
-        return Ok(resp);
+        return Ok(with_warnings(resp, warnings));
     };
     let ns = req.namespace.as_deref();
     let source_backend = resolve_source_backend(client, &spec.source_ref, ns).await;
     let dest_backend = resolve_source_backend(client, &spec.destination_ref, ns).await;
-    if let (Some(src), Some(dst)) = (&source_backend, &dest_backend) {
+    note_missing(
+        &source_backend,
+        "spec.sourceRef",
+        &spec.source_ref,
+        ns,
+        &mut warnings,
+    );
+    note_missing(
+        &dest_backend,
+        "spec.destinationRef",
+        &spec.destination_ref,
+        ns,
+        &mut warnings,
+    );
+    if let (Referent::Found(src), Referent::Found(dst)) = (&source_backend, &dest_backend) {
         // §13(d) analogue: two DIFFERENT refs must not resolve to one storage
         // target — the "copy" would read and write a single repository. The pure
         // validator already rejected the literal same-ref case; this is the
@@ -1098,7 +1204,7 @@ async fn handle_snapshot_replication(
     let (include, exclude) = selection_matchers(&spec);
     let overlapping = api::validate::replication_identity_overlap(include, exclude, &identities);
     if overlapping.is_empty() {
-        return Ok(resp);
+        return Ok(with_warnings(resp, warnings));
     }
     // Exhaustive over Pruning so a new mode must decide its overlap rule here.
     let mirror_source = match &spec.pruning {
@@ -1112,15 +1218,13 @@ async fn handle_snapshot_replication(
             },
         ]));
     }
-    Ok(with_warnings(
-        resp,
-        vec![format!(
-            "spec.selection overlaps {} that the destination also writes directly, so \
-             replicated copies will mix with them. If unintended, exclude them via \
-             spec.selection.identities.exclude",
-            api::error::describe_overlapping_identities(&overlapping)
-        )],
-    ))
+    warnings.push(format!(
+        "spec.selection overlaps {} that the destination also writes directly, so \
+         replicated copies will mix with them. If unintended, exclude them via \
+         spec.selection.identities.exclude",
+        api::error::describe_overlapping_identities(&overlapping)
+    ));
+    Ok(with_warnings(resp, warnings))
 }
 
 /// The replication's identity matchers, or empty slices when no selection is
@@ -1147,32 +1251,109 @@ fn repository_ref_label(r: &RepositoryRef) -> String {
 }
 
 /// Resolve a replication source's backend from its `RepositoryRef` (a namespaced
-/// `Repository` or a cluster-scoped `ClusterRepository`). Returns `None` when the
-/// repo can't be fetched (so the differs check is skipped rather than guessed).
+/// `Repository` or a cluster-scoped `ClusterRepository`), through the shared
+/// [`referent::fetch`]: `Missing` admits with a warning (#677) and `Unreadable`
+/// skips the backend checks rather than guessing. A namespaced ref with no
+/// resolvable namespace cannot be read at all and is treated as unreadable-skip.
 async fn resolve_source_backend(
     client: &Client,
     source: &RepositoryRef,
     consumer_namespace: Option<&str>,
-) -> Option<api::backend::Backend> {
-    use kube::Api;
+) -> Referent<api::backend::Backend> {
     match source.kind {
         RepositoryKind::Repository => {
-            let ns = source.namespace.as_deref().or(consumer_namespace)?;
+            let Some(ns) = source.namespace.as_deref().or(consumer_namespace) else {
+                return Referent::Unreadable(kube::Error::Api(
+                    kube::core::Status::failure(
+                        "a namespaced Repository reference with no resolvable namespace",
+                        "BadRequest",
+                    )
+                    .with_code(400)
+                    .boxed(),
+                ));
+            };
             let api: Api<api::Repository> = Api::namespaced(client.clone(), ns);
-            api.get_opt(&source.name)
+            referent::fetch(&api, &source.name)
                 .await
-                .ok()
-                .flatten()
                 .map(|r| r.spec.backend)
         }
         RepositoryKind::ClusterRepository => {
             let api: Api<api::ClusterRepository> = Api::all(client.clone());
-            api.get_opt(&source.name)
+            referent::fetch(&api, &source.name)
                 .await
-                .ok()
-                .flatten()
                 .map(|r| r.spec.backend)
         }
+    }
+}
+
+/// How a tenancy DENIAL is worded: bare (the CR has one repository ref, so the
+/// repository name alone is unambiguous) or prefixed with the spec field (two
+/// refs, or a ref not at `spec.repository`).
+#[derive(Clone, Copy)]
+enum DenialPrefix {
+    /// [`AdmissionError::Tenancy`] — the historical single-ref wording.
+    Bare,
+    /// [`AdmissionError::RefTenancy`] — `"<field>: <denial>"`.
+    Field,
+}
+
+/// Fold one ref's [`TenancyDecision`] into the handler outcome. Exhaustive, so a
+/// new decision cannot be silently treated as allow or deny:
+///
+/// - `Allow` → continue.
+/// - `RepoMissing` → **admit** with a missing-referent warning (issue #677); the
+///   controller enforces the gate once the repository exists.
+/// - `Deny` → the typed denial, worded per [`DenialPrefix`].
+fn apply_tenancy(
+    decision: TenancyDecision,
+    rref: &RepositoryRef,
+    field: &'static str,
+    prefix: DenialPrefix,
+    warnings: &mut Vec<String>,
+) -> Result<(), AdmissionError> {
+    match decision {
+        TenancyDecision::Allow => Ok(()),
+        TenancyDecision::RepoMissing { .. } => {
+            warnings.push(missing_referent_warning(field, &referent_label(rref, None)));
+            Ok(())
+        }
+        TenancyDecision::Deny(denial) => Err(match prefix {
+            DenialPrefix::Bare => denial.into(),
+            DenialPrefix::Field => AdmissionError::RefTenancy {
+                field,
+                source: denial,
+            },
+        }),
+    }
+}
+
+/// Push a missing-referent warning when `referent` is [`Referent::Missing`].
+fn note_missing<T>(
+    referent: &Referent<T>,
+    field: &str,
+    rref: &RepositoryRef,
+    consumer_namespace: Option<&str>,
+    warnings: &mut Vec<String>,
+) {
+    if referent.is_missing() {
+        warnings.push(missing_referent_warning(
+            field,
+            &referent_label(rref, consumer_namespace),
+        ));
+    }
+}
+
+/// `ClusterRepository "offsite"` / `Repository "billing/nas"` — the quoted target
+/// of a missing-referent warning. A namespaced ref shows its effective namespace
+/// when one is known. Kept identical across call sites so [`with_warnings`]'s
+/// de-duplication collapses two checks reporting the same absent repository.
+fn referent_label(rref: &RepositoryRef, consumer_namespace: Option<&str>) -> String {
+    match rref.kind {
+        RepositoryKind::ClusterRepository => format!("ClusterRepository {:?}", rref.name),
+        RepositoryKind::Repository => match rref.namespace.as_deref().or(consumer_namespace) {
+            Some(ns) if !ns.is_empty() => format!("Repository {:?}", format!("{ns}/{}", rref.name)),
+            _ => format!("Repository {:?}", rref.name),
+        },
     }
 }
 
@@ -1342,19 +1523,19 @@ async fn handle_repository(
     // fail-closed `allowedNamespaces` gate as any other consumer ref (mirroring
     // the `SnapshotReplication` gates above). A `Repository` seed source is not
     // gated here, exactly as elsewhere.
-    if let Some(seed) = &spec.seed
-        && let Some(source) = api::seed::seed_repository_ref(seed)
-        && let TenancyDecision::Deny(denial) =
-            tenancy_for(source, req.namespace.as_deref(), client).await
-    {
-        return Err(AdmissionError::RefTenancy {
-            field: "spec.seed.from.repository",
-            source: denial,
-        });
-    }
-
     let mut warnings =
         api::validate::repository_warnings(&spec.backend, spec.mover_defaults.as_ref());
+    if let Some(seed) = &spec.seed
+        && let Some(source) = api::seed::seed_repository_ref(seed)
+    {
+        apply_tenancy(
+            tenancy_for(source, req.namespace.as_deref(), client).await,
+            source,
+            "spec.seed.from.repository",
+            DenialPrefix::Field,
+            &mut warnings,
+        )?;
+    }
 
     // identityDefaults edit guard (silent re-identification): same rule as
     // `handle_cluster_repository` above. The consumer SnapshotPolicy LIST is
@@ -3521,5 +3702,567 @@ mod tests {
         assert!(assessable_sources(&snapshot_pinning(Some(7)), &policy).is_empty());
         // And an empty policy with no pin is simply nothing to assess.
         assert!(assessable_sources(&snapshot_pinning(None), &policy_with_sources(0)).is_empty());
+    }
+
+    // --- issue #677: a referent that does not exist yet is ADMITTED -------------
+
+    /// Tests for the "NotFound ⇒ admit" contract (issue #677): every referent
+    /// lookup the webhook makes must admit a reference whose target is absent
+    /// (GitOps apply order, `--dry-run=server`), while a genuine API failure on
+    /// the fail-closed tenancy gate still denies.
+    mod missing_referents {
+        use super::*;
+
+        /// A `Client` that answers EVERY request with `status` + a Kubernetes
+        /// `Status` body, the way the API server answers a GET of an absent
+        /// object (404) or an RBAC/apiserver fault (403/500).
+        fn status_client(status: u16, reason: &'static str) -> Client {
+            let svc = tower::service_fn(move |req: http::Request<kube::client::Body>| {
+                let body = json!({
+                    "apiVersion": "v1",
+                    "kind": "Status",
+                    "status": "Failure",
+                    "message": format!("{} {reason}", req.uri().path()),
+                    "reason": reason,
+                    "code": status,
+                });
+                async move {
+                    let resp = http::Response::builder()
+                        .status(status)
+                        .header("content-type", "application/json")
+                        .body(kube::client::Body::from(serde_json::to_vec(&body).unwrap()))
+                        .unwrap();
+                    Ok::<_, std::convert::Infallible>(resp)
+                }
+            });
+            Client::new(svc, "test-ns")
+        }
+
+        fn not_found_client() -> Client {
+            status_client(404, "NotFound")
+        }
+
+        /// Assert `req` is admitted with a missing-referent warning naming `field`.
+        async fn assert_admitted_with_missing_warning(
+            req: AdmissionRequest<DynamicObject>,
+            field: &str,
+        ) {
+            let client = not_found_client();
+            let resp = dispatch(&req, Some(&client)).await;
+            assert!(
+                resp.allowed,
+                "a reference to a not-yet-existing object must be ADMITTED (#677), got: {}",
+                resp.result.message
+            );
+            let warnings = resp.warnings.unwrap_or_default();
+            assert!(
+                warnings
+                    .iter()
+                    .any(|w| w.starts_with(&format!("{field}: "))
+                        && w.contains("does not exist yet")),
+                "expected a missing-referent warning for {field}, got {warnings:?}"
+            );
+        }
+
+        fn replication_spec(source_kind: &str) -> Value {
+            json!({
+                "sourceRef": { "kind": source_kind, "name": "onsite" },
+                "destination": { "s3": { "bucket": "offsite", "endpoint": "https://s3.example" } },
+                "schedule": { "cron": "0 4 * * *" },
+            })
+        }
+
+        #[tokio::test]
+        async fn repository_replication_from_a_missing_cluster_repository_is_admitted() {
+            // The exact shape of the reporter's apply (#677).
+            assert_admitted_with_missing_warning(
+                admission_request(
+                    "RepositoryReplication",
+                    replication_spec("ClusterRepository"),
+                ),
+                "spec.sourceRef",
+            )
+            .await;
+        }
+
+        #[tokio::test]
+        async fn repository_replication_from_a_missing_repository_is_admitted() {
+            assert_admitted_with_missing_warning(
+                admission_request("RepositoryReplication", replication_spec("Repository")),
+                "spec.sourceRef",
+            )
+            .await;
+        }
+
+        #[tokio::test]
+        async fn a_cluster_repository_read_failure_still_fails_closed() {
+            // Only a 404 is "missing". A 403/500 is an unreadable tenancy gate,
+            // and the gate keeps failing closed — an RBAC or apiserver fault must
+            // never open the allowedNamespaces boundary.
+            for (code, reason) in [(403, "Forbidden"), (500, "InternalError")] {
+                let client = status_client(code, reason);
+                let resp = dispatch(
+                    &admission_request(
+                        "RepositoryReplication",
+                        replication_spec("ClusterRepository"),
+                    ),
+                    Some(&client),
+                )
+                .await;
+                assert!(!resp.allowed, "{code} must still deny");
+                assert!(
+                    resp.result
+                        .message
+                        .contains("cannot read ClusterRepository"),
+                    "{}",
+                    resp.result.message
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn snapshot_policy_on_a_missing_cluster_repository_is_admitted() {
+            let spec = json!({
+                "repository": { "kind": "ClusterRepository", "name": "onsite" },
+                "sources": [ { "pvc": { "name": "data" } } ],
+            });
+            assert_admitted_with_missing_warning(
+                admission_request("SnapshotPolicy", spec),
+                "spec.repository",
+            )
+            .await;
+        }
+
+        #[tokio::test]
+        async fn multi_repo_snapshot_policy_names_the_missing_member() {
+            let spec = json!({
+                "repositories": [
+                    { "kind": "ClusterRepository", "name": "a" },
+                    { "kind": "ClusterRepository", "name": "b" },
+                ],
+                "sources": [ { "pvc": { "name": "data" } } ],
+            });
+            assert_admitted_with_missing_warning(
+                admission_request("SnapshotPolicy", spec),
+                "spec.repositories",
+            )
+            .await;
+        }
+
+        #[tokio::test]
+        async fn restore_from_a_missing_cluster_repository_is_admitted() {
+            let spec = json!({
+                "source": { "identity": { "username": "app", "hostname": "billing", "sourcePath": "/pvc/data" } },
+                "repository": { "kind": "ClusterRepository", "name": "onsite" },
+                "target": { "pvcRef": { "name": "out" } },
+            });
+            assert_admitted_with_missing_warning(restore_create_request(spec), "spec.repository")
+                .await;
+        }
+
+        #[tokio::test]
+        async fn restore_from_a_missing_policy_is_admitted() {
+            // The fromPolicy referent read was already best-effort; pin it so a
+            // refactor onto the shared helper cannot regress it into a deny.
+            let client = not_found_client();
+            let resp = dispatch(
+                &restore_create_request(from_policy_restore(None)),
+                Some(&client),
+            )
+            .await;
+            assert!(resp.allowed, "{}", resp.result.message);
+        }
+
+        #[tokio::test]
+        async fn maintenance_on_a_missing_cluster_repository_is_admitted() {
+            let spec = json!({
+                "repository": { "kind": "ClusterRepository", "name": "onsite" },
+                "ownership": { "owner": "kopiur/onsite" },
+                "schedule": {
+                    "quick": { "cron": "0 */6 * * *" },
+                    "full": { "cron": "0 3 * * 0" },
+                },
+            });
+            assert_admitted_with_missing_warning(
+                admission_request("Maintenance", spec),
+                "spec.repository",
+            )
+            .await;
+        }
+
+        #[tokio::test]
+        async fn snapshot_replication_with_both_refs_missing_is_admitted_and_names_both() {
+            let spec = || {
+                snapshot_replication_spec(json!({
+                    "sourceRef": { "kind": "ClusterRepository", "name": "onsite" },
+                    "destinationRef": { "kind": "Repository", "name": "offsite" },
+                }))
+            };
+            assert_admitted_with_missing_warning(
+                admission_request("SnapshotReplication", spec()),
+                "spec.sourceRef",
+            )
+            .await;
+            assert_admitted_with_missing_warning(
+                admission_request("SnapshotReplication", spec()),
+                "spec.destinationRef",
+            )
+            .await;
+        }
+
+        #[tokio::test]
+        async fn repository_seeding_from_a_missing_cluster_repository_is_admitted() {
+            let spec = repo_spec_with_seed(json!({
+                "from": { "repository": { "kind": "ClusterRepository", "name": "offsite" } }
+            }));
+            assert_admitted_with_missing_warning(
+                admission_request("Repository", spec),
+                "spec.seed.from.repository",
+            )
+            .await;
+        }
+
+        #[tokio::test]
+        async fn snapshot_with_a_missing_policy_is_admitted() {
+            let client = not_found_client();
+            let req =
+                snapshot_create_request(json!({}), json!({ "policyRef": { "name": "nightly" } }));
+            let resp = dispatch(&req, Some(&client)).await;
+            assert!(resp.allowed, "{}", resp.result.message);
+        }
+
+        fn single_repo_policy() -> Value {
+            json!({
+                "repository": { "kind": "ClusterRepository", "name": "onsite" },
+                "sources": [ { "pvc": { "name": "data" } } ],
+            })
+        }
+
+        fn multi_repo_policy() -> Value {
+            json!({
+                "repositories": [
+                    { "kind": "ClusterRepository", "name": "a" },
+                    { "kind": "ClusterRepository", "name": "b" },
+                ],
+                "sources": [ { "pvc": { "name": "data" } } ],
+            })
+        }
+
+        fn multi_status(hostname: &str) -> Value {
+            json!({
+                "resolved": { "repositories": [
+                    { "repository": { "kind": "ClusterRepository", "name": "a" },
+                      "identity": { "username": "pg", "hostname": hostname } },
+                    { "repository": { "kind": "ClusterRepository", "name": "b" },
+                      "identity": { "username": "pg", "hostname": hostname } },
+                ] },
+                "lastSuccessfulSnapshot": "2026-06-19T00:00:00Z",
+            })
+        }
+
+        /// The fork guard needs the repository's identityDefaults to resolve the
+        /// NEW identity. With the repository missing there is nothing to resolve
+        /// against, so a spec-unchanged re-apply (the GitOps steady state) must
+        /// not be denied just because the pinned identity came from defaults the
+        /// webhook cannot see right now.
+        #[tokio::test]
+        async fn fork_guard_admits_an_unchanged_policy_whose_repository_is_missing() {
+            // Pinned while the repository's identityDefaults.cluster was `east`.
+            let status = json!({
+                "resolved": { "identity": { "username": "pg", "hostname": "billing.east" } },
+                "lastSuccessfulSnapshot": "2026-06-19T00:00:00Z",
+            });
+            let req = update_policy_request(
+                single_repo_policy(),
+                json!({}),
+                single_repo_policy(),
+                status,
+            );
+            let client = not_found_client();
+            let resp = dispatch(&req, Some(&client)).await;
+            assert!(
+                resp.allowed,
+                "an unchanged policy must not fork-deny on a missing repository: {}",
+                resp.result.message
+            );
+        }
+
+        /// ...but a re-identification the SPEC itself causes is still caught
+        /// with the repository missing: it does not depend on the repository's
+        /// defaults, so there is something to compare.
+        #[tokio::test]
+        async fn fork_guard_still_denies_a_spec_driven_fork_with_the_repository_missing() {
+            let mut new = single_repo_policy();
+            new["identity"] = json!({ "hostname": "payments" });
+            let status = json!({
+                "resolved": { "identity": { "username": "pg", "hostname": "billing" } },
+                "lastSuccessfulSnapshot": "2026-06-19T00:00:00Z",
+            });
+            let req = update_policy_request(new, json!({}), single_repo_policy(), status);
+            let client = not_found_client();
+            let resp = dispatch(&req, Some(&client)).await;
+            assert!(!resp.allowed, "a spec-driven fork must still be denied");
+            assert!(
+                resp.result.message.contains("payments"),
+                "{}",
+                resp.result.message
+            );
+        }
+
+        /// Same pair of guarantees for the multi-repo arm: a missing member does
+        /// not fork-deny an unchanged policy...
+        #[tokio::test]
+        async fn multi_repo_fork_guard_admits_an_unchanged_policy_with_missing_members() {
+            let req = update_policy_request(
+                multi_repo_policy(),
+                json!({}),
+                multi_repo_policy(),
+                multi_status("billing.east"),
+            );
+            let client = not_found_client();
+            let resp = dispatch(&req, Some(&client)).await;
+            assert!(resp.allowed, "{}", resp.result.message);
+        }
+
+        /// ...and still denies a spec-driven fork.
+        #[tokio::test]
+        async fn multi_repo_fork_guard_still_denies_a_spec_driven_fork_with_missing_members() {
+            let mut new = multi_repo_policy();
+            new["identity"] = json!({ "hostname": "payments" });
+            let req =
+                update_policy_request(new, json!({}), multi_repo_policy(), multi_status("billing"));
+            let client = not_found_client();
+            let resp = dispatch(&req, Some(&client)).await;
+            assert!(!resp.allowed, "a spec-driven fork must still be denied");
+        }
+
+        /// `update_policy_request` with metadata labels on both sides.
+        fn with_labels(
+            mut req: AdmissionRequest<DynamicObject>,
+            old: Value,
+            new: Value,
+        ) -> AdmissionRequest<DynamicObject> {
+            let labels = |v: Value| serde_json::from_value(v).expect("labels decode");
+            if let Some(o) = req.object.as_mut() {
+                o.metadata.labels = Some(labels(new));
+            }
+            if let Some(o) = req.old_object.as_mut() {
+                o.metadata.labels = Some(labels(old));
+            }
+            req
+        }
+
+        fn single_status_with_history() -> Value {
+            json!({
+                "resolved": { "identity": { "username": "pg", "hostname": "east" } },
+                "lastSuccessfulSnapshot": "2026-06-19T00:00:00Z",
+            })
+        }
+
+        /// PR #705 review (P1 "Backup history can split silently"): labels and
+        /// annotations reach a policy's identity ONLY through the repository's
+        /// `identityDefaults` CEL (`hostnameExpr: "labels['site']"`). With the
+        /// repository missing those defaults are unknowable, so a label change on
+        /// a policy with history cannot be shown identity-preserving. Admitting it
+        /// would let the controller silently re-identify the policy once the
+        /// repository exists — so it is denied until the repository exists, or
+        /// acknowledged.
+        #[tokio::test]
+        async fn fork_guard_denies_a_label_change_it_cannot_check_with_the_repository_missing() {
+            let req = with_labels(
+                update_policy_request(
+                    single_repo_policy(),
+                    json!({}),
+                    single_repo_policy(),
+                    single_status_with_history(),
+                ),
+                json!({ "site": "east" }),
+                json!({ "site": "west" }),
+            );
+            let client = not_found_client();
+            let resp = dispatch(&req, Some(&client)).await;
+            assert!(
+                !resp.allowed,
+                "a label change the missing repository's identityDefaults could read must not \
+                 be admitted unchecked"
+            );
+            let msg = &resp.result.message;
+            assert!(msg.contains("ClusterRepository/onsite"), "{msg}");
+            assert!(msg.contains("allow-identity-change"), "{msg}");
+        }
+
+        /// The same edit, acknowledged, is admitted: the ack is the release valve.
+        #[tokio::test]
+        async fn an_acknowledged_label_change_is_admitted_with_the_repository_missing() {
+            let req = with_labels(
+                update_policy_request(
+                    single_repo_policy(),
+                    json!({ "kopiur.home-operations.com/allow-identity-change": "true" }),
+                    single_repo_policy(),
+                    single_status_with_history(),
+                ),
+                json!({ "site": "east" }),
+                json!({ "site": "west" }),
+            );
+            let client = not_found_client();
+            let resp = dispatch(&req, Some(&client)).await;
+            assert!(resp.allowed, "{}", resp.result.message);
+        }
+
+        /// Unchanged labels stay the GitOps steady state: admitted.
+        #[tokio::test]
+        async fn unchanged_labels_are_admitted_with_the_repository_missing() {
+            let req = with_labels(
+                update_policy_request(
+                    single_repo_policy(),
+                    json!({}),
+                    single_repo_policy(),
+                    single_status_with_history(),
+                ),
+                json!({ "site": "east" }),
+                json!({ "site": "east" }),
+            );
+            let client = not_found_client();
+            let resp = dispatch(&req, Some(&client)).await;
+            assert!(resp.allowed, "{}", resp.result.message);
+        }
+
+        /// Removing a literal `spec.identity.hostname` that happened to equal the
+        /// namespace default compares equal with no defaults, yet under the
+        /// missing repository's `hostnameExpr` the identity would change. Also
+        /// uncheckable, also denied.
+        #[tokio::test]
+        async fn removing_an_identity_override_is_denied_with_the_repository_missing() {
+            let mut old = single_repo_policy();
+            old["identity"] = json!({ "hostname": "billing" });
+            let status = json!({
+                "resolved": { "identity": { "username": "pg", "hostname": "billing" } },
+                "lastSuccessfulSnapshot": "2026-06-19T00:00:00Z",
+            });
+            let req = update_policy_request(single_repo_policy(), json!({}), old, status);
+            let client = not_found_client();
+            let resp = dispatch(&req, Some(&client)).await;
+            assert!(!resp.allowed, "{}", resp.result.message);
+        }
+
+        /// The multi-repo arm gets the same protection for a missing member.
+        #[tokio::test]
+        async fn multi_repo_label_change_is_denied_with_missing_members() {
+            let req = with_labels(
+                update_policy_request(
+                    multi_repo_policy(),
+                    json!({}),
+                    multi_repo_policy(),
+                    multi_status("billing"),
+                ),
+                json!({ "site": "east" }),
+                json!({ "site": "west" }),
+            );
+            let client = not_found_client();
+            let resp = dispatch(&req, Some(&client)).await;
+            assert!(!resp.allowed, "{}", resp.result.message);
+            assert!(
+                resp.result.message.contains("ClusterRepository/a"),
+                "{}",
+                resp.result.message
+            );
+        }
+
+        /// A `Maintenance` CREATE claiming `ClusterRepository/shared` (uid
+        /// `uid-1`) as its controller owner, carrying a cache whose budgets the
+        /// legacy bound refuses unless the owner verifiably vouches for it (#714).
+        fn projected_maintenance_request() -> AdmissionRequest<DynamicObject> {
+            let mut req = admission_request(
+                "Maintenance",
+                json!({
+                    "repository": { "kind": "ClusterRepository", "name": "shared" },
+                    "ownership": { "owner": "kopiur/shared" },
+                    "schedule": {
+                        "quick": { "cron": "0 */6 * * *" },
+                        "full": { "cron": "0 3 * * 0" },
+                    },
+                    "mover": { "cache": { "capacity": "2Gi", "contentCacheSizeMb": 5000 } },
+                }),
+            );
+            let owner = serde_json::from_value(json!([{
+                "apiVersion": "kopiur.home-operations.com/v1alpha1",
+                "kind": "ClusterRepository",
+                "name": "shared",
+                "uid": "uid-1",
+                "controller": true,
+            }]))
+            .expect("owner refs decode");
+            req.object
+                .as_mut()
+                .expect("object")
+                .metadata
+                .owner_references = Some(owner);
+            req
+        }
+
+        /// A `Client` answering every GET with `ClusterRepository/shared` (uid
+        /// `uid-1`) whose `spec.maintenance.mover.cache` matches the request's.
+        fn owner_repo_client() -> Client {
+            let body = json!({
+                "apiVersion": "kopiur.home-operations.com/v1alpha1",
+                "kind": "ClusterRepository",
+                "metadata": { "name": "shared", "uid": "uid-1" },
+                "spec": {
+                    "backend": { "filesystem": { "path": "/repo" } },
+                    "encryption": {
+                        "passwordSecretRef": { "name": "pw", "namespace": "kopiur-system" },
+                    },
+                    "allowedNamespaces": { "all": true },
+                    "maintenance": {
+                        "mover": { "cache": { "capacity": "2Gi", "contentCacheSizeMb": 5000 } },
+                    },
+                },
+            });
+            let svc = tower::service_fn(move |_req: http::Request<kube::client::Body>| {
+                let body = body.clone();
+                async move {
+                    let resp = http::Response::builder()
+                        .status(200)
+                        .header("content-type", "application/json")
+                        .body(kube::client::Body::from(serde_json::to_vec(&body).unwrap()))
+                        .unwrap();
+                    Ok::<_, std::convert::Infallible>(resp)
+                }
+            });
+            Client::new(svc, "test-ns")
+        }
+
+        /// #714's exemption still applies through `referent::fetch` when the
+        /// owner is verifiably Found with a matching uid and cache.
+        #[tokio::test]
+        async fn a_verified_owner_still_exempts_the_projected_maintenance() {
+            let client = owner_repo_client();
+            let resp = dispatch(&projected_maintenance_request(), Some(&client)).await;
+            assert!(resp.allowed, "{}", resp.result.message);
+        }
+
+        /// The exemption has the OPPOSITE polarity to a reference check: an
+        /// owner that does not exist (404) grants nothing, so the legacy bound
+        /// applies and the object is refused.
+        #[tokio::test]
+        async fn a_not_found_owner_grants_no_legacy_cache_exemption() {
+            let client = not_found_client();
+            let resp = dispatch(&projected_maintenance_request(), Some(&client)).await;
+            assert!(
+                !resp.allowed,
+                "a missing owner must not vouch for the cache"
+            );
+        }
+
+        /// ...and neither does an owner that cannot be read (403).
+        #[tokio::test]
+        async fn an_unreadable_owner_grants_no_legacy_cache_exemption() {
+            let client = status_client(403, "Forbidden");
+            let resp = dispatch(&projected_maintenance_request(), Some(&client)).await;
+            assert!(
+                !resp.allowed,
+                "an unreadable owner must not vouch for the cache"
+            );
+        }
     }
 }

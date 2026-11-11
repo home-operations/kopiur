@@ -94,6 +94,33 @@ The **field descriptions come from the Rust doc comments** in `crates/api`, so a
 ``[`X`]`` are stripped to `` `X` `` by the generator), so write them to read
 well in both `cargo doc` and the reference page.
 
+## 4c. kopia flags — every one is classified (`crates/api/src/kopia_flags/`)
+
+Every flag kopia's help lists for a command Kopiur invokes carries a reviewed
+`FlagDisposition` (`Modeled { spec_path }`, `OwnedByKopiur`, `Global`,
+`Rejected { use_instead }`, `Unmodeled`) in `crates/api/src/kopia_flags/table.rs`.
+There is no "unreviewed" variant. The same table drives admission of the
+escape hatches (`spec.kopiaArgs.*`, legacy `spec.extraArgs`).
+
+- **Kopia help snapshots** live in `crates/api/tests/fixtures/kopia-flags/`,
+  written by `cargo xtask gen-kopia-flags` (part of `mise run gen`), which runs the
+  mise-pinned `kopia help <command>`. Each file records the kopia version, so a
+  kopia bump without regeneration fails `mise run gen-check` (CI's Rust Lint job
+  installs the pinned kopia through mise). The hermetic test suite never needs kopia.
+- **Ratchet** (`crates/api/tests/kopia_flag_coverage.rs`): fails when a snapshot
+  flag has no table entry, when an entry names a flag kopia dropped, or when a
+  `Modeled`/`use_instead` path is not in `deploy/crds/`. After a kopia bump:
+  `mise run gen`, then classify whatever the test names.
+- **Round trip** (`crates/mover/tests/kopia_flag_roundtrip.rs`): every `Modeled`
+  row of `snapshot create` and `policy set` needs a sample proving the field puts
+  the flag on the command line and removing it takes it off (absent flag, or the
+  path-scope `policy delete` / identity-scope `inherit`).
+- **Adding a command**: add a `KopiaCommand` variant; the exhaustive
+  `flag_tables` match then demands its table, and `gen-kopia-flags` snapshots it.
+- **Hidden flags** (`.Hidden()` in kopia) never appear in help, even under
+  `--help-full`. The ones Kopiur passes are listed in `HIDDEN_FLAGS_USED`; the
+  real-kopia integration tests are their guard.
+
 ## 5. Status
 
 Always carries `resolved.*` pinned values (ADR §4.2: resolved identity pinned at admission, never re-rendered). `conditions: Vec<Condition>` using the k8s-openapi type. Phase is a closed enum with a `#[default]` of `Pending`.

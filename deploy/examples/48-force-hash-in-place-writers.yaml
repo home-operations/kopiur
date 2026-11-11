@@ -1,0 +1,98 @@
+# Example 48 — Back up a database that rewrites files in place (forceHashPercent)
+#
+# kopia decides whether to read a file by comparing its size and modification
+# time with the previous snapshot. When both match, kopia reuses the previous
+# snapshot's content WITHOUT reading the file. Some databases rewrite fixed-size
+# files in place without moving their mtime, so those files are silently backed
+# up STALE while every other file is current. Confirmed with MariaDB 11.8:
+# InnoDB's redo log `ib_logfile0` and the Aria logs (`aria_log.00000001`,
+# `aria_log_control`). A restore pairs current data pages with an old redo log
+# (kopiur#708).
+#
+# `spec.upload.forceHashPercent: 100` passes `kopia snapshot create
+# --force-hash 100`: every file is re-read and re-hashed on every snapshot. It
+# costs a full READ of the volume per run (fine for a typically small database
+# volume); uploads stay deduplicated, so unchanged data is not re-uploaded.
+# Values below 100 re-read a random share of files, which only bounds how stale
+# a file can get, so use 100 for correctness. Absent = kopia's default, 0.
+#
+# `spec.kopiaArgs.snapshotCreate` is the escape hatch for `snapshot create`
+# flags Kopiur does not model (here: more verbose kopia logs). Admission refuses
+# a flag Kopiur models, owns or forbids — `--force-hash` in it is refused with
+# a pointer to `upload.forceHashPercent`.
+#
+# Field shapes verified against crates/api (externally-tagged backend: the
+# bucket lives under `backend.s3`, NOT `backend: { kind: S3 }`).
+#
+# The `# region …` / `# endregion …` lines are region markers
+# (docs/src/content/docs/backups.mdx pulls the policy on its own). Plain YAML
+# comments — the file stays `kubectl apply -f`-able as-is.
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: db-repo-creds
+  namespace: billing
+type: Opaque
+stringData:
+  AWS_ACCESS_KEY_ID: "REPLACE_ME"
+  AWS_SECRET_ACCESS_KEY: "REPLACE_ME"
+  KOPIA_PASSWORD: "choose-something-long-and-random"
+---
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: Repository
+metadata:
+  name: db-backups
+  namespace: billing
+spec:
+  backend:
+    s3:
+      bucket: backups # REPLACE_ME: your bucket
+      prefix: billing/mariadb/
+      region: us-east-1
+      auth:
+        secretRef:
+          name: db-repo-creds
+  encryption:
+    passwordSecretRef:
+      name: db-repo-creds
+      key: KOPIA_PASSWORD
+  create:
+    enabled: true
+---
+# region policy
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: SnapshotPolicy
+metadata:
+  name: mariadb
+  namespace: billing
+spec:
+  repository:
+    name: db-backups
+  sources:
+    - pvc:
+        name: mariadb-data # the PVC holding /var/lib/mysql
+  retention:
+    keepDaily: 7
+    keepWeekly: 4
+  upload:
+    # Re-read every file on every snapshot, so in-place writers (InnoDB redo
+    # log, Aria logs) are never reused from the previous snapshot unread.
+    forceHashPercent: 100
+  kopiaArgs:
+    # Unmodeled `snapshot create` flags only; checked at admission.
+    snapshotCreate:
+      - --log-level=debug
+# endregion policy
+---
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: SnapshotSchedule
+metadata:
+  name: mariadb-nightly
+  namespace: billing
+spec:
+  policyRef:
+    name: mariadb
+  schedule:
+    cron: "0 2 * * *"
+    jitter: 30m

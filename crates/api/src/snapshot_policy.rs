@@ -94,9 +94,18 @@ pub struct SnapshotPolicySpec {
     /// Paths/patterns kopia should skip while snapshotting.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub files: Option<Files>,
-    /// Escape hatch for kopia flags not yet modeled.
+    /// Escape hatch for `kopia policy set` flags not yet modeled. The original
+    /// spelling of `kopiaArgs.policySet`; set one or the other, not both. A flag
+    /// Kopiur models, owns or forbids is refused at admission (a stored object
+    /// carrying one keeps running and reports an `UnsupportedKopiaArgs` condition).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extra_args: Vec<String>,
+    /// Per-command escape hatch for kopia flags Kopiur does not model yet, appended
+    /// to the named command. Only flags kopia's table marks unmodeled or
+    /// log-only are accepted; anything Kopiur models (use the field), owns or
+    /// forbids is refused at admission with the reason and the field to use.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kopia_args: Option<KopiaArgs>,
     /// Backup-side error handling: let a snapshot complete-with-errors instead of failing outright.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_handling: Option<ErrorHandling>,
@@ -875,6 +884,32 @@ pub struct Upload {
     /// set` knob, but lives here beside its parallelism siblings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit_mb: Option<i64>,
+    /// `snapshot create --force-hash`: re-read and re-hash this percentage of files
+    /// (0–100) even when their size and modification time match the previous
+    /// snapshot. kopia normally reuses the previous snapshot's content for such a
+    /// file without reading it, so a file rewritten in place without its mtime
+    /// moving (MariaDB/InnoDB's `ib_logfile0`, Aria logs) is backed up STALE.
+    /// `100` is the only value that guarantees every file is read; lower values
+    /// pick files at random and only bound how stale one can get. Costs a full
+    /// read of the volume per snapshot (uploads stay deduplicated). Absent:
+    /// kopia's default, 0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(range(max = 100))]
+    pub force_hash_percent: Option<u8>,
+}
+
+/// Per-command extra kopia flags (the escape hatch), checked against Kopiur's
+/// reviewed kopia flag table at admission.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct KopiaArgs {
+    /// Appended to `kopia policy set` for each source's policy. The same list as
+    /// the legacy `spec.extraArgs`; set one of the two.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub policy_set: Vec<String>,
+    /// Appended to `kopia snapshot create` on every backup run.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub snapshot_create: Vec<String>,
 }
 
 /// First-class backup verification proving snapshots are restorable; opt-in, with quick and deep tiers.

@@ -5,6 +5,8 @@
 //!   * `gen-rbac [--check]`  — write `deploy/rbac/*.yaml` (cluster + namespaced)
 //!   * `gen-docs [--check]`  — write `docs/src/content/docs/field-reference.md` from the schemas
 //!   * `gen-ui-types [--check]` — write `crates/ui/web/src/api/types/*.ts`
+//!   * `gen-kopia-flags [--check]` — snapshot kopia's help flags into
+//!     `crates/api/tests/fixtures/kopia-flags/` (needs the pinned kopia on PATH)
 //!   * `gen-all  [--check]`  — all of the above (+ dashboards)
 //!   * `check-wiring`        — fail if a CRD field is read by no consumer crate
 //!   * `check-phases`        — fail if a phase branch is non-exhaustive (#359)
@@ -18,7 +20,7 @@
 
 fn usage() {
     eprintln!(
-        "usage: cargo xtask <gen-crds|gen-rbac|gen-docs|gen-ui-types|gen-all> [--check]\n\
+        "usage: cargo xtask <gen-crds|gen-rbac|gen-docs|gen-ui-types|gen-kopia-flags|gen-all> [--check]\n\
                 cargo xtask check-wiring\n\
                 cargo xtask check-phases\n\
          \n\
@@ -31,7 +33,12 @@ fn usage() {
          \x20          export no longer produces; never touches the SPA's\n\
          \x20          hand-maintained src/api/types.ts barrel, which lives\n\
          \x20          outside that directory.\n\
-         gen-all    run gen-crds, gen-rbac, dashboards, gen-docs, and gen-ui-types\n\
+         gen-kopia-flags\n\
+         \x20          snapshot the flags `kopia help <cmd>` lists for every command\n\
+         \x20          Kopiur invokes into crates/api/tests/fixtures/kopia-flags/\n\
+         \x20          (runs the kopia on PATH, or KOPIA_BIN; use `mise run gen`)\n\
+         gen-all    run gen-crds, gen-rbac, dashboards, gen-docs, gen-ui-types\n\
+         \x20          and gen-kopia-flags\n\
          \n\
          check-wiring\n\
          \x20          fail if a CRD field is defined and schema-generated but read\n\
@@ -67,7 +74,7 @@ fn main() {
     let check = args.iter().skip(1).any(|a| a == "--check");
 
     match cmd {
-        "gen-crds" | "gen-rbac" | "gen-docs" | "gen-ui-types" | "gen-all" => {
+        "gen-crds" | "gen-rbac" | "gen-docs" | "gen-ui-types" | "gen-kopia-flags" | "gen-all" => {
             match xtask::run(cmd, check) {
                 Ok(code) => std::process::exit(code),
                 Err(e) => {

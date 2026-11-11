@@ -5031,6 +5031,9 @@ async fn resolve_recipe_cached(
 
     let repo_ref = kopiur_api::snapshot::effective_repository_ref(backup, &config.spec, cfg_ns)
         .map_err(|e| Error::Validation(e.to_string()))?;
+    // Tenancy (#677): the policy may have been admitted before its
+    // ClusterRepository existed; its namespace is the consumer.
+    io::ensure_consumer_tenancy(ctx, &repo_ref, cfg_ns).await?;
     let repo = io::resolve_repository_ref_cached(ctx, &repo_ref, cfg_ns).await?;
     Ok((config, repo_ref, repo))
 }

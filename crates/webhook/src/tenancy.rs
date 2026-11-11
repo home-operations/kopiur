@@ -1,34 +1,36 @@
 //! Cross-namespace `ClusterRepository` tenancy enforcement (ADR §3.2).
 //!
-//! The validating webhook is the single enforcement point for `allowedNamespaces`
-//! on a `ClusterRepository` — the controller never trusts that the API server
-//! pre-filtered cross-tenant references (ADR §3.2). Consumer CRs (`SnapshotPolicy`,
-//! manual `Snapshot`, `Restore`, `Maintenance`) that reference a `ClusterRepository`
-//! must have their namespace gated here.
+//! The validating webhook is the FIRST enforcement point for `allowedNamespaces`
+//! on a `ClusterRepository`: consumer CRs (`SnapshotPolicy`, `Restore`,
+//! `Maintenance`, both replication kinds, a seeding `Repository`) that reference
+//! a `ClusterRepository` have their namespace gated here. The controller is the
+//! second: it re-evaluates the same gate before it does work against the
+//! repository, which is what lets admission defer the check when the repository
+//! does not exist yet (issue #677).
 //!
 //! ## Pure core + thin IO (mirrors the api-crate pattern)
 //!
-//! The api-crate validator [`api::validate::validate_consumer_against_cluster_repo`]
-//! is **fail-open** for `Selector` gates whose `matchExpressions` it cannot
-//! evaluate, and returns [`api::error::ValidationError::SelectorLabelsUnavailable`]
-//! when namespace labels are absent. That is correct for the api crate (it cannot
-//! fetch a `Namespace`), but a webhook MUST fail **closed**.
-//!
-//! So the tenancy check is split:
-//!
 //! - [`evaluate_tenancy`] — a **pure function** taking the resolved
-//!   `ClusterRepository` spec + the consumer namespace's labels as inputs. It is
-//!   exhaustively unit-tested (no cluster). It hardens the api-crate behavior:
-//!   * `matchExpressions` present → we do NOT treat it as "no constraint"; if we
-//!     cannot prove a match we deny (fail closed).
+//!   `ClusterRepository` spec + the consumer namespace's labels as inputs, a typed
+//!   adapter over the shared fail-closed
+//!   [`api::validate::validate_consumer_against_cluster_repo`]:
+//!   * `matchExpressions` are evaluated; an unknown operator denies.
 //!   * labels unresolvable → deny (fail closed).
 //! - [`resolve_tenancy_inputs`] — the **thin IO caller** that fetches the
 //!   `ClusterRepository` and the consumer `Namespace`'s labels via a
 //!   [`kube::Client`], then calls [`evaluate_tenancy`]. Any fetch failure (client
-//!   absent, repo not found, namespace not found, API error) becomes a deny.
+//!   absent, namespace not found, API error) becomes a deny — EXCEPT a
+//!   `ClusterRepository` that does not exist (yet): that is
+//!   [`TenancyDecision::RepoMissing`], which the handlers ADMIT with a warning
+//!   (issue #677). There is no gate to evaluate until the repository exists, and
+//!   GitOps apply order must not be enforced at admission; the controller
+//!   re-evaluates the same gate (via the shared
+//!   [`api::validate::validate_consumer_against_cluster_repo`]) before it does any
+//!   work against the repository, so admitting here never opens the boundary.
 
 use kopiur_api as api;
 
+use crate::referent::{self, Referent};
 use api::cluster_repository::{AllowedNamespaces, ClusterRepository};
 use k8s_openapi::api::core::v1::Namespace;
 use kube::{Api, Client};
@@ -125,6 +127,13 @@ pub enum TenancyDecision {
     Allow,
     /// The reference is rejected for the given typed reason.
     Deny(TenancyDenial),
+    /// The referenced `ClusterRepository` does not exist (the API server answered
+    /// 404). Admitted with a warning (issue #677): the gate is evaluated by the
+    /// controller once the repository exists.
+    RepoMissing {
+        /// The referenced (absent) `ClusterRepository`.
+        repo_name: String,
+    },
 }
 
 impl TenancyDecision {
@@ -147,90 +156,45 @@ impl TenancyDecision {
 /// `allowedNamespaces` gate; `labels` are the consumer namespace's labels (the
 /// caller resolved them from a `Namespace` get — `None` means "could not resolve").
 ///
-/// Hardening over [`api::validate::validate_consumer_against_cluster_repo`]:
-/// - `Selector` with **no resolvable labels** → deny (the api crate also denies
-///   here via `SelectorLabelsUnavailable`, but we phrase it as a hard deny).
-/// - `Selector` carrying `matchExpressions` is **not** treated as "no constraint":
-///   if every `matchExpressions` term is satisfied by the labels we allow,
-///   otherwise we deny. The api crate documents `matchExpressions` as fail-open;
-///   here we evaluate it and fail closed on any unsatisfied/unknown term.
+/// A thin typed adapter over the shared, fail-closed
+/// [`api::validate::validate_consumer_against_cluster_repo`] — the SAME function
+/// the controller evaluates before doing work for a consumer it could not gate at
+/// admission (issue #677), so the two enforcement points can never disagree.
+/// `Selector` with no resolvable labels denies, every `matchExpressions` term is
+/// evaluated, and an unknown operator denies.
 pub fn evaluate_tenancy(
     consumer_namespace: &str,
     repo_name: &str,
     allowed: &AllowedNamespaces,
     labels: Option<&BTreeMap<String, String>>,
 ) -> TenancyDecision {
-    match allowed {
-        AllowedNamespaces::All(true) => TenancyDecision::Allow,
-        AllowedNamespaces::All(false) => deny_not_allowed(consumer_namespace, repo_name),
-        AllowedNamespaces::List(names) => {
-            if names.iter().any(|n| n == consumer_namespace) {
-                TenancyDecision::Allow
-            } else {
-                deny_not_allowed(consumer_namespace, repo_name)
-            }
+    use api::error::ValidationError;
+    match api::validate::validate_consumer_against_cluster_repo(
+        consumer_namespace,
+        repo_name,
+        allowed,
+        labels,
+    ) {
+        Ok(()) => TenancyDecision::Allow,
+        Err(ValidationError::SelectorLabelsUnavailable { .. }) => {
+            TenancyDecision::Deny(TenancyDenial::SelectorLabelsUnresolved {
+                consumer_namespace: consumer_namespace.to_string(),
+                repo_name: repo_name.to_string(),
+            })
         }
-        AllowedNamespaces::Selector(sel) => {
-            let Some(labels) = labels else {
-                return TenancyDecision::Deny(TenancyDenial::SelectorLabelsUnresolved {
-                    consumer_namespace: consumer_namespace.to_string(),
-                    repo_name: repo_name.to_string(),
-                });
-            };
-            // matchLabels: every (k, v) must be present and equal.
-            let match_labels = sel.match_labels.clone().unwrap_or_default();
-            let labels_ok = match_labels
-                .iter()
-                .all(|(k, v)| labels.get(k).map(|got| got == v).unwrap_or(false));
-            if !labels_ok {
-                return deny_not_allowed(consumer_namespace, repo_name);
-            }
-            // matchExpressions: evaluate each term and fail closed on any miss or
-            // unknown operator. The api crate treats these as "no constraint"; we do
-            // NOT — the webhook is the enforcement point and must not fail open.
-            for expr in sel.match_expressions.clone().unwrap_or_default() {
-                if !expression_satisfied(&expr, labels) {
-                    return deny_not_allowed(consumer_namespace, repo_name);
-                }
-            }
-            TenancyDecision::Allow
-        }
-    }
-}
-
-fn deny_not_allowed(consumer_namespace: &str, repo_name: &str) -> TenancyDecision {
-    TenancyDecision::Deny(TenancyDenial::NotAllowed {
-        consumer_namespace: consumer_namespace.to_string(),
-        repo_name: repo_name.to_string(),
-    })
-}
-
-/// Evaluate a single `matchExpressions` term against a label set, failing closed on
-/// any unknown operator.
-fn expression_satisfied(
-    expr: &k8s_openapi::apimachinery::pkg::apis::meta::v1::LabelSelectorRequirement,
-    labels: &BTreeMap<String, String>,
-) -> bool {
-    let values = expr.values.clone().unwrap_or_default();
-    match expr.operator.as_str() {
-        "In" => labels
-            .get(&expr.key)
-            .map(|got| values.iter().any(|v| v == got))
-            .unwrap_or(false),
-        "NotIn" => labels
-            .get(&expr.key)
-            .map(|got| !values.iter().any(|v| v == got))
-            .unwrap_or(true),
-        "Exists" => labels.contains_key(&expr.key),
-        "DoesNotExist" => !labels.contains_key(&expr.key),
-        // Unknown operator: fail closed.
-        _ => false,
+        // `ConsumerNamespaceNotAllowed` is the only other error the validator
+        // returns; anything else would still be a refusal, so it denies too.
+        Err(_) => TenancyDecision::Deny(TenancyDenial::NotAllowed {
+            consumer_namespace: consumer_namespace.to_string(),
+            repo_name: repo_name.to_string(),
+        }),
     }
 }
 
 /// Thin IO caller: fetch the referenced `ClusterRepository` and the consumer
 /// `Namespace`'s labels, then delegate to [`evaluate_tenancy`]. **Fails closed** on
-/// any error (no client, repo missing, namespace missing, API error).
+/// any error (no client, namespace missing, API error); a repository that does not
+/// exist yet is [`TenancyDecision::RepoMissing`] (admit + warn, issue #677).
 pub async fn resolve_tenancy_inputs(
     client: Option<&Client>,
     consumer_namespace: &str,
@@ -244,9 +208,14 @@ pub async fn resolve_tenancy_inputs(
     };
 
     let crepos: Api<ClusterRepository> = Api::all(client.clone());
-    let crepo = match crepos.get(repo_name).await {
-        Ok(c) => c,
-        Err(e) => {
+    let crepo = match referent::fetch(&crepos, repo_name).await {
+        Referent::Found(c) => c,
+        Referent::Missing => {
+            return TenancyDecision::RepoMissing {
+                repo_name: repo_name.to_string(),
+            };
+        }
+        Referent::Unreadable(e) => {
             return TenancyDecision::Deny(TenancyDenial::RepoUnresolvable {
                 consumer_namespace: consumer_namespace.to_string(),
                 repo_name: repo_name.to_string(),
@@ -261,9 +230,13 @@ pub async fn resolve_tenancy_inputs(
     let labels = match &crepo.spec.allowed_namespaces {
         AllowedNamespaces::Selector(_) => {
             let nss: Api<Namespace> = Api::all(client.clone());
-            match nss.get(consumer_namespace).await {
-                Ok(ns) => Some(ns.metadata.labels.clone().unwrap_or_default()),
-                Err(e) => {
+            match referent::fetch(&nss, consumer_namespace).await {
+                Referent::Found(ns) => Some(ns.metadata.labels.clone().unwrap_or_default()),
+                // The consumer's own namespace cannot really be absent while a CR
+                // is being admitted into it; if it is, the labels are simply
+                // unresolvable and the Selector gate fails closed.
+                Referent::Missing => None,
+                Referent::Unreadable(e) => {
                     return TenancyDecision::Deny(TenancyDenial::NamespaceLabelsUnresolvable {
                         consumer_namespace: consumer_namespace.to_string(),
                         repo_name: repo_name.to_string(),
@@ -348,7 +321,7 @@ mod tests {
                 ));
                 assert!(denial.to_string().contains("denying"));
             }
-            TenancyDecision::Allow => unreachable!(),
+            TenancyDecision::Allow | TenancyDecision::RepoMissing { .. } => unreachable!(),
         }
     }
 
@@ -463,5 +436,48 @@ mod tests {
     async fn resolve_without_client_fails_closed() {
         let d = resolve_tenancy_inputs(None, "ns", "repo").await;
         assert!(!d.is_allow());
+    }
+
+    /// A `Client` answering every request with `code`/`reason` as a Kubernetes
+    /// `Status` body.
+    fn status_client(code: u16, reason: &'static str) -> Client {
+        let svc = tower::service_fn(move |_req: http::Request<kube::client::Body>| async move {
+            let body = serde_json::json!({
+                "apiVersion": "v1", "kind": "Status", "status": "Failure",
+                "message": reason, "reason": reason, "code": code,
+            });
+            Ok::<_, std::convert::Infallible>(
+                http::Response::builder()
+                    .status(code)
+                    .header("content-type", "application/json")
+                    .body(kube::client::Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+        });
+        Client::new(svc, "test-ns")
+    }
+
+    /// Issue #677: a ClusterRepository that does not exist yet is NOT a denial —
+    /// there is no gate to evaluate until it exists, and the controller enforces
+    /// it then.
+    #[tokio::test]
+    async fn a_missing_cluster_repository_is_repo_missing_not_a_denial() {
+        let client = status_client(404, "NotFound");
+        match resolve_tenancy_inputs(Some(&client), "billing", "onsite").await {
+            TenancyDecision::RepoMissing { repo_name } => assert_eq!(repo_name, "onsite"),
+            other => panic!("expected RepoMissing, got {other:?}"),
+        }
+    }
+
+    /// Every OTHER read failure keeps failing closed.
+    #[tokio::test]
+    async fn an_unreadable_cluster_repository_still_denies() {
+        for (code, reason) in [(403, "Forbidden"), (500, "InternalError")] {
+            let client = status_client(code, reason);
+            match resolve_tenancy_inputs(Some(&client), "billing", "onsite").await {
+                TenancyDecision::Deny(TenancyDenial::RepoUnresolvable { .. }) => {}
+                other => panic!("{code}: expected a RepoUnresolvable deny, got {other:?}"),
+            }
+        }
     }
 }

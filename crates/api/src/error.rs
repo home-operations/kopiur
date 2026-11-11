@@ -106,6 +106,17 @@ pub enum ValidationError {
     )]
     RestoreSourceRepositoryRequired,
 
+    /// An escape-hatch kopia arg (`spec.extraArgs`, `spec.kopiaArgs.*`) carries a
+    /// flag Kopiur models, owns or forbids, or a bare positional word. The message
+    /// (from [`crate::kopia_flags::check_extra_args`]) is already what/why/fix.
+    #[error("{field}: {message}")]
+    KopiaArgNotAllowed {
+        /// The list the arg is in (e.g. `spec.kopiaArgs.snapshotCreate`).
+        field: String,
+        /// What is wrong, why, and the field to use instead.
+        message: String,
+    },
+
     /// A `Repository`/`ClusterRepository` spec carried kopia-side (repo-level)
     /// retention policy fields, which conflict with CR-driven GFS retention and
     /// risk double-deletion (ADR §4.4 exclusivity).
@@ -387,6 +398,31 @@ pub enum ValidationError {
         old: String,
         /// The `username@hostname` this edit would resolve to in that repository.
         new: String,
+    },
+
+    /// An UPDATE to a `SnapshotPolicy` with snapshot history changes an input its
+    /// kopia identity could be rendered from — its labels, annotations, or
+    /// `spec.identity` — while a referenced repository does not exist yet (issue
+    /// #677 admits references to absent repositories). Labels and annotations
+    /// only reach the identity through that repository's `identityDefaults` CEL,
+    /// which cannot be read while it is absent, so the edit cannot be shown to
+    /// preserve the identity. Admitting it would let the controller silently
+    /// re-identify the policy once the repository appears; instead it is
+    /// rejected until the repository exists, or acknowledged with the same
+    /// `allow-identity-change` annotation as [`Self::IdentityWouldFork`].
+    #[error(
+        "this edit changes the labels, annotations or spec.identity of a policy that already has \
+         snapshots (identity {old:?}), but repository {repo} does not exist yet, so whether its \
+         identityDefaults would give the policy a new kopia identity — starting a separate \
+         history — cannot be checked. Fix: create repository {repo} first and re-apply this \
+         edit, or add annotation kopiur.home-operations.com/allow-identity-change (any non-empty \
+         value) if a new identity is intended"
+    )]
+    IdentityForkUncheckable {
+        /// Normalized key (`Kind[/namespace]/name`) of the absent repository.
+        repo: String,
+        /// The previously-pinned `username@hostname` in that repository.
+        old: String,
     },
 
     /// An UPDATE to a `Repository`/`ClusterRepository`'s `identityDefaults`

@@ -125,6 +125,93 @@ fn maintenance_hold(
     }
 }
 
+/// **Pure.** Whether `maint` is exactly the `Maintenance` the operator projects
+/// from `repo.spec.maintenance` — the only object exempt from the consumer
+/// tenancy gate, because it is the repository owner's own authorization.
+///
+/// A matching ownerReference alone is NOT enough (PR #705 review): any tenant who
+/// can read the `ClusterRepository` can copy its uid onto a hand-written
+/// `Maintenance`, which would then outlive their removal from
+/// `allowedNamespaces`. So the object must match the projection on every axis a
+/// tenant cannot fake from their own namespace:
+/// - it lives in the repository's resolved placement namespace
+///   (`spec.maintenance.namespace`, else the operator's) — creating objects there
+///   needs the repository owner's RBAC, not a tenant's;
+/// - it carries the name the projection uses (the repository's own name);
+/// - its CONTROLLER ownerReference is this `ClusterRepository` by kind, name and
+///   live uid (a recreated repository never matches);
+/// - the repository currently wants a managed `Maintenance` (enabled, writable);
+/// - it requests no credential projection, which the projection never sets.
+fn is_managed_cluster_maintenance(
+    maint: &Maintenance,
+    repo: &kopiur_api::ClusterRepository,
+    operator_namespace: Option<&str>,
+) -> bool {
+    let repo_name = repo.name_any();
+    let Some(uid) = repo.metadata.uid.as_deref() else {
+        return false;
+    };
+    let wanted =
+        repo.spec.mode.allows_writes() && repo.spec.maintenance.as_ref().is_none_or(|m| m.enabled);
+    let Some(placement) =
+        crate::cluster_repository::cluster_maintenance_placement_in(repo, operator_namespace)
+    else {
+        return false;
+    };
+    let controlled_by_repo = maint.metadata.owner_references.iter().flatten().any(|o| {
+        o.controller == Some(true)
+            && o.kind == "ClusterRepository"
+            && o.name == repo_name
+            && o.uid == uid
+            && o.api_version.starts_with("kopiur.home-operations.com/")
+    });
+    wanted
+        && controlled_by_repo
+        && maint.metadata.namespace.as_deref() == Some(placement.as_str())
+        && maint.metadata.name.as_deref() == Some(repo_name.as_str())
+        && maint.spec.credential_projection.is_none()
+}
+
+/// Whether this `Maintenance` is the managed projection of the very
+/// `ClusterRepository` it targets (see [`is_managed_cluster_maintenance`]). A
+/// namespaced `Repository` ref is never gated, so it needs no answer here. An
+/// absent repository answers `false` and the gate then reports it as a missing
+/// dependency.
+async fn owned_by_repository(
+    maint: &Maintenance,
+    repo_ref: &kopiur_api::common::RepositoryRef,
+    ctx: &Context,
+) -> Result<bool> {
+    use kopiur_api::common::RepositoryKind;
+    match repo_ref.kind {
+        RepositoryKind::Repository => Ok(false),
+        RepositoryKind::ClusterRepository => {
+            let repo = io::fetch_cluster_repository(ctx, &repo_ref.name).await?;
+            Ok(repo.is_some_and(|r| {
+                r.name_any() == repo_ref.name
+                    && is_managed_cluster_maintenance(maint, &r, ctx.operator_namespace.as_deref())
+            }))
+        }
+    }
+}
+
+/// The controller-side tenancy gate for a `Maintenance` (#677): admission defers
+/// the `allowedNamespaces` gate when the `ClusterRepository` did not exist yet, so
+/// it is enforced here before any Job is spawned. A `Maintenance` the
+/// `ClusterRepository` itself owns (its projected `spec.maintenance`) is the
+/// repository owner's own authorization and is not gated.
+async fn ensure_maintenance_tenancy(
+    maint: &Maintenance,
+    repo_ref: &kopiur_api::common::RepositoryRef,
+    ctx: &Context,
+    namespace: &str,
+) -> Result<()> {
+    if owned_by_repository(maint, repo_ref, ctx).await? {
+        return Ok(());
+    }
+    io::ensure_consumer_tenancy(ctx, repo_ref, namespace).await
+}
+
 async fn reconcile_inner(maint: &Maintenance, ctx: &Context) -> Result<Action> {
     let errs = validate::validate_maintenance(&maint.spec);
     if let Some(first) = errs.into_iter().next() {
@@ -138,6 +225,8 @@ async fn reconcile_inner(maint: &Maintenance, ctx: &Context) -> Result<Action> {
     let api: Api<Maintenance> = Api::namespaced(ctx.client.clone(), &namespace);
 
     let repo_ref = &maint.spec.repository;
+    // Tenancy (#677) — see `ensure_maintenance_tenancy`.
+    ensure_maintenance_tenancy(maint, repo_ref, ctx, &namespace).await?;
     // Launch-side (Job spawn inputs) — store-backed point read (#382 M2).
     let repo = io::resolve_repository_ref_cached(ctx, repo_ref, &namespace).await?;
     // GitHub #174 item 3: the last of the cascade levels for BOTH scheduling

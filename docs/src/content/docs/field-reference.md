@@ -2246,11 +2246,12 @@ Externally tagged — set **exactly one** of: `repositories` · `repository`.
 | `defaultDeletionPolicy` | enum: Delete \| Retain \| Orphan | `Delete` | Lifecycle of the underlying kopia snapshot when its `Snapshot` CR is deleted. Produced backups default to `Delete`; discovered snapshots are forced to `Retain`. |
 | `deletion` | [object](#snapshotpolicy-specdeletion) | — | Deletion semantics for the `Snapshot` CRs carrying this recipe's config label. |
 | `errorHandling` | [object](#snapshotpolicy-specerrorhandling) | — | Backup-side error handling: let a snapshot complete-with-errors instead of failing outright. |
-| `extraArgs` | []string | — | Escape hatch for kopia flags not yet modeled. |
+| `extraArgs` | []string | — | Escape hatch for `kopia policy set` flags not yet modeled. The original spelling of `kopiaArgs.policySet`; set one or the other, not both. A flag Kopiur models, owns or forbids is refused at admission (a stored object carrying one keeps running and reports an `UnsupportedKopiaArgs` condition). |
 | `files` | [object](#snapshotpolicy-specfiles) | — | Paths/patterns kopia should skip while snapshotting. |
 | `groupBy` | enum: VolumeGroupSnapshot \| None | `VolumeGroupSnapshot` | Multi-PVC grouping strategy. Defaults to a consistent group snapshot across all PVCs; set `None` *explicitly* to accept independent per-PVC snapshots, because a silent per-PVC fallback would produce inconsistent backups. |
 | `hooks` | [object](#snapshotpolicy-spechooks) | — | Pre/post snapshot hooks that run in the workload, not the mover. |
 | `identity` | [object](#snapshotpolicy-specidentity) | — | Identity overrides — what kopia records as `username@hostname:path`. |
+| `kopiaArgs` | [object](#snapshotpolicy-speckopiaargs) | — | Per-command escape hatch for kopia flags Kopiur does not model yet, appended to the named command. Only flags kopia's table marks unmodeled or log-only are accepted; anything Kopiur models (use the field), owns or forbids is refused at admission with the reason and the field to use. |
 | `mover` | [object](#snapshotpolicy-specmover) | — | Per-recipe mover overrides (resources, cache, security context). |
 | `preflight` | [object](#snapshotpolicy-specpreflight) | — | Named CEL preconditions evaluated before each backup run; opt-in (absent ⇒ no preflight). A failing check holds the `Snapshot` in `Pending` (`PreflightFailed`) and, after `timeout`, fails it. |
 | `repositories` | [][object](#snapshotpolicy-specrepositories) | —<br><sub>minItems 1; maxItems 8</sub> | Multi-repository fan-out: every listed `Repository`/`ClusterRepository` receives its own independent backup of each source — one `Snapshot` CR + one mover Job per (source, repository) pair, so the captures are separate kopia snapshots, not copies of one another. Identity resolves per-repo under that repository's `identityDefaults`. Mutually exclusive with `repository` (exactly one of the two is set) AND with `hooks`: with N concurrent children the first finisher would run the thaw hook while the other N-1 movers still read — use a single-repo policy plus a `SnapshotReplication` when hooks are needed for a second target. |
@@ -2404,6 +2405,13 @@ Externally tagged — set **exactly one** of: `httpRequest` · `runJob` · `work
 | --- | --- | --- | --- |
 | `hostname` | string | — | Override the `hostname` portion of `username@hostname:path`; absent uses the resolved default. |
 | `username` | string | — | Override the `username` portion of `username@hostname:path`; absent uses the resolved default. |
+
+#### SnapshotPolicy `spec.kopiaArgs`
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `policySet` | []string | — | Appended to `kopia policy set` for each source's policy. The same list as the legacy `spec.extraArgs`; set one of the two. |
+| `snapshotCreate` | []string | — | Appended to `kopia snapshot create` on every backup run. |
 
 #### SnapshotPolicy `spec.mover`
 
@@ -2581,6 +2589,7 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc` · `pvcSelector` ·
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
+| `forceHashPercent` | integer | —<br><sub>min 0; max 100</sub> | `snapshot create --force-hash`: re-read and re-hash this percentage of files (0–100) even when their size and modification time match the previous snapshot. kopia normally reuses the previous snapshot's content for such a file without reading it, so a file rewritten in place without its mtime moving (MariaDB/InnoDB's `ib_logfile0`, Aria logs) is backed up STALE. `100` is the only value that guarantees every file is read; lower values pick files at random and only bound how stale one can get. Costs a full read of the volume per snapshot (uploads stay deduplicated). Absent: kopia's default, 0. |
 | `limitMb` | integer | — | `snapshot create --upload-limit-mb`: abort the snapshot once this many MB have been uploaded (kopia default: 0 — unlimited). Named `limitMb` rather than `uploadLimitMb` to avoid the `upload.uploadLimitMb` stutter; like `failFast`, this is a `snapshot create` argv flag, not a `policy set` knob, but lives here beside its parallelism siblings. |
 | `maxParallelFileReads` | integer | — | `--max-parallel-file-reads`: file-read concurrency within a snapshot. |
 | `maxParallelSnapshots` | integer | — | `--max-parallel-snapshots`: how many sources snapshot concurrently. |
@@ -4042,7 +4051,7 @@ Externally tagged — set **exactly one** of: `pvcConsumer` · `snapshot` · `wo
 | `maxUploadSpeedBytesPerSecond` | integer | — | `--max-upload-speed`: cap write throughput to the destination, in bytes/sec (kopia default: unlimited). |
 | `mustExist` | boolean | — | `--[no-]must-exist`: fail the sync instead of initializing the destination's repository-format blob (kopia default `false` — sync-to may create the destination layout on first run). |
 | `parallel` | integer | —<br><sub>min 0</sub> | `--parallel`: number of concurrent blob-copy workers (kopia default `1` — sequential, the root cause of #216's multi-week seed times to R2). |
-| `times` | boolean | — | `--[no-]times`: synchronize blob modification times to the destination, when the destination backend supports it (kopia default `true`). |
+| `times` | boolean | — | `--[no-]times`: synchronize blob modification times to the destination, when the destination backend supports it (kopia default `false`). Object stores (S3, GCS, Azure, B2) cannot set a blob's time, so kopia warns and copies without it. |
 | `update` | boolean | — | `--[no-]update`: update blobs already present at the destination when the source copy is newer (kopia default `true`). |
 
 ### RepositoryReplication `status`

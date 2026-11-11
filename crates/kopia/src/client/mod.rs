@@ -587,6 +587,13 @@ pub struct SnapshotCreateOptions {
     /// `--description`: free-form text recorded on the snapshot manifest
     /// (kopia default: empty).
     pub description: Option<String>,
+    /// `--force-hash`: re-hash this percentage of files even when size and mtime
+    /// match the previous snapshot (kopia default: 0 — reuse them unread). #708.
+    pub force_hash_percent: Option<u8>,
+    /// Verbatim extra `snapshot create` flags (`SnapshotPolicy.spec.kopiaArgs.
+    /// snapshotCreate`, admission-checked against the kopia flag table),
+    /// appended after every flag Kopiur sets.
+    pub extra_args: Vec<String>,
 }
 
 /// Options for `kopia restore` / `kopia snapshot restore`. The tri-state
@@ -2956,7 +2963,40 @@ fn snapshot_create_args(
         args.push("--description".into());
         args.push(desc.clone());
     }
+    if let Some(pct) = opts.force_hash_percent {
+        args.push("--force-hash".into());
+        args.push(pct.to_string());
+    }
+    args.extend(opts.extra_args.iter().cloned());
     args
+}
+
+/// The `kopia snapshot create` argv for a path source with no source override: exactly what [`KopiaClient::snapshot_create_with`] runs for those
+/// inputs. Public so the flag-coverage round-trip tests can assert what a
+/// `SnapshotPolicy` field puts on the command line without spawning kopia.
+pub fn snapshot_create_argv(
+    source_path: &str,
+    tags: &BTreeMap<String, String>,
+    opts: &SnapshotCreateOptions,
+) -> Vec<String> {
+    snapshot_create_args(source_path, None, tags, None, opts)
+}
+
+/// The `kopia policy set` argv [`KopiaClient::policy_set`] runs. Public for the
+/// same round-trip tests as [`snapshot_create_argv`].
+pub fn policy_set_argv(target: &str, policy: &PolicyArgs) -> Vec<String> {
+    policy_set_args(target, policy)
+}
+
+/// The two argvs [`KopiaClient::policy_replace`] runs for `target`: the
+/// `policy delete`, then the `policy set` (`None` when the spec sets no flag).
+/// Public for the same round-trip tests as [`snapshot_create_argv`].
+pub fn policy_replace_argv(
+    target: &str,
+    policy: &PolicyArgs,
+) -> (Vec<String>, Option<Vec<String>>) {
+    let plan = policy_replace_plan(target, policy);
+    (plan.delete, plan.set)
 }
 
 /// Build the args for `kopia snapshot verify` plus options. Pure.

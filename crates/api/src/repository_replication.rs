@@ -89,7 +89,9 @@ pub struct SyncOptions {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub must_exist: Option<bool>,
     /// `--[no-]times`: synchronize blob modification times to the destination,
-    /// when the destination backend supports it (kopia default `true`).
+    /// when the destination backend supports it (kopia default `false`). Object
+    /// stores (S3, GCS, Azure, B2) cannot set a blob's time, so kopia warns and
+    /// copies without it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub times: Option<bool>,
     /// `--[no-]update`: update blobs already present at the destination when the

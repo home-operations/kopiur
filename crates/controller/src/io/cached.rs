@@ -187,6 +187,134 @@ impl RepositoryAvailability {
     }
 }
 
+/// **Pure.** The controller-side `ClusterRepository` tenancy decision for a
+/// consumer in `consumer_ns`: `None` = permitted, `Some(message)` = refused with
+/// an actionable what/why/fix message.
+///
+/// Evaluated by the SAME fail-closed shared validator the admission webhook uses
+/// ([`kopiur_api::validate::validate_consumer_against_cluster_repo`]), so the two
+/// enforcement points cannot disagree. `labels` are the consumer namespace's
+/// labels (`None` = unresolved; a `Selector` gate then refuses).
+pub fn consumer_tenancy_refusal(
+    consumer_ns: &str,
+    repo_name: &str,
+    allowed: &kopiur_api::AllowedNamespaces,
+    labels: Option<&std::collections::BTreeMap<String, String>>,
+) -> Option<String> {
+    kopiur_api::validate::validate_consumer_against_cluster_repo(
+        consumer_ns,
+        repo_name,
+        allowed,
+        labels,
+    )
+    .err()
+    .map(|e| {
+        format!(
+            "{e}. Fix: an administrator adds namespace `{consumer_ns}` to \
+             `spec.allowedNamespaces` of ClusterRepository `{repo_name}` (this object then \
+             reconciles automatically), or point this object at a repository its namespace may \
+             use"
+        )
+    })
+}
+
+/// Enforce a `ClusterRepository`'s `allowedNamespaces` gate for a CONSUMER in
+/// `consumer_ns` before any work is done against the repository (issue #677).
+///
+/// The admission webhook is the first enforcement point, but it ADMITS a consumer
+/// whose `ClusterRepository` does not exist yet (GitOps apply order must not be
+/// enforced at admission), so there was no gate to evaluate then. This is the
+/// second enforcement point that makes admitting safe: a tenant cannot pre-create
+/// a consumer for a repository name and inherit access when an administrator later
+/// creates a `ClusterRepository` that does not allow its namespace. It also means
+/// narrowing `allowedNamespaces` stops new work for consumers it no longer admits.
+///
+/// - A namespaced `Repository` ref is not gated (same as admission).
+/// - Repository absent → [`Error::MissingDependency`] (the caller's usual park).
+/// - Refused → [`Error::BlockedOnGrant`]: the grant is an administrator's edit of
+///   the watched `ClusterRepository`, so the edit re-enqueues this consumer.
+///
+/// Launch-side only — deletion/finalizer paths must NOT call this: tearing down
+/// data a consumer already owns never needs (and must never be blocked by) a
+/// grant it may since have lost.
+pub async fn ensure_consumer_tenancy(
+    ctx: &Context,
+    repo_ref: &RepositoryRef,
+    consumer_ns: &str,
+) -> Result<()> {
+    use kopiur_api::AllowedNamespaces;
+    use kopiur_api::common::RepositoryKind;
+    match repo_ref.kind {
+        RepositoryKind::Repository => Ok(()),
+        RepositoryKind::ClusterRepository => {
+            let name = &repo_ref.name;
+            let repo = fetch_cluster_repository(ctx, name)
+                .await?
+                .ok_or_else(|| Error::MissingDependency(format!("ClusterRepository {name}")))?;
+            // Labels only matter to a Selector gate; never let a Namespace read
+            // block a List/All gate.
+            let labels = match &repo.spec.allowed_namespaces {
+                AllowedNamespaces::Selector(_) => {
+                    let nss: Api<k8s_openapi::api::core::v1::Namespace> =
+                        Api::all(ctx.client.clone());
+                    nss.get_opt(consumer_ns)
+                        .await?
+                        .map(|ns| ns.metadata.labels.unwrap_or_default())
+                }
+                AllowedNamespaces::List(_) | AllowedNamespaces::All(_) => None,
+            };
+            match consumer_tenancy_refusal(
+                consumer_ns,
+                name,
+                &repo.spec.allowed_namespaces,
+                labels.as_ref(),
+            ) {
+                None => Ok(()),
+                Some(message) => Err(Error::BlockedOnGrant(message)),
+            }
+        }
+    }
+}
+
+/// **Pure.** The `Ready` condition `(reason, message)` a consumer should surface
+/// when resolving one of its repository refs failed with `err`, or `None` when the
+/// error is not about the reference itself (a transient API/kopia failure, which
+/// the error policy's Event + requeue already report).
+///
+/// `role` names the ref (`"source repository"`). Issue #677: an object admitted
+/// before its repository exists must SAY so on its status, not only in an Event —
+/// `kubectl get`, Flux health checks and the console all read `Ready`.
+/// Exhaustive over [`Error`] so a new variant must decide.
+pub fn unresolved_repository_report(err: &Error, role: &str) -> Option<(&'static str, String)> {
+    match err {
+        Error::MissingDependency(what) => Some((
+            crate::consts::MISSING_DEPENDENCY_REASON,
+            format!(
+                "{role} {what} does not exist yet; kopiur starts automatically once it is \
+                 created. If the reference is a typo, fix it in the spec"
+            ),
+        )),
+        Error::BlockedOnGrant(why) => Some((crate::consts::BLOCKED_ON_GRANT_REASON, why.clone())),
+        Error::MissingCaBundle(why) => Some((
+            crate::consts::MISSING_CA_BUNDLE_REASON,
+            format!("{role}: {why}"),
+        )),
+        Error::Kube(_)
+        | Error::Kopia(_)
+        | Error::Validation(_)
+        | Error::MissingRecordedIdentity(_)
+        | Error::MissingSourcePvc(_)
+        | Error::InheritSourceMissing(_)
+        | Error::Serialization(_)
+        | Error::BuildJob(_)
+        | Error::InvalidSchedule(_)
+        | Error::Invariant(_)
+        | Error::WebhookSetup(_)
+        | Error::WebhookCert(_)
+        | Error::CatalogExpiryIncomplete { .. } => None,
+    }
+}
+
 /// The user-facing message for work held by a suspended repository. One
 /// wording for every consumer so `kubectl describe` reads the same everywhere:
 /// what (the repository is suspended), why (a pause, not a fault), and the fix
@@ -409,6 +537,77 @@ mod tests {
     use kube::client::Body;
     use kube::runtime::watcher;
     use kube::{Client, ResourceExt};
+
+    // --- issue #677: controller-side tenancy + the unresolved-ref report ----
+
+    #[test]
+    fn consumer_tenancy_refusal_permits_listed_namespaces_and_refuses_others() {
+        use kopiur_api::AllowedNamespaces;
+        let allowed = AllowedNamespaces::List(vec!["billing".into()]);
+        assert_eq!(
+            consumer_tenancy_refusal("billing", "onsite", &allowed, None),
+            None
+        );
+        let msg = consumer_tenancy_refusal("evil", "onsite", &allowed, None)
+            .expect("an unlisted namespace is refused");
+        // what / why / fix: names the namespace, the repository, and the lever.
+        assert!(msg.contains("evil"), "{msg}");
+        assert!(msg.contains("onsite"), "{msg}");
+        assert!(msg.contains("spec.allowedNamespaces"), "{msg}");
+        assert!(
+            consumer_tenancy_refusal("any", "onsite", &AllowedNamespaces::All(true), None)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn consumer_tenancy_refusal_fails_closed_on_selectors() {
+        use k8s_openapi::apimachinery::pkg::apis::meta::v1::{
+            LabelSelector, LabelSelectorRequirement,
+        };
+        use kopiur_api::AllowedNamespaces;
+        let allowed = AllowedNamespaces::Selector(LabelSelector {
+            match_expressions: Some(vec![LabelSelectorRequirement {
+                key: "tier".into(),
+                operator: "In".into(),
+                values: Some(vec!["gold".into()]),
+            }]),
+            ..Default::default()
+        });
+        // Unresolved labels → refused.
+        assert!(consumer_tenancy_refusal("ns", "r", &allowed, None).is_some());
+        let gold = std::collections::BTreeMap::from([("tier".to_string(), "gold".to_string())]);
+        let bronze = std::collections::BTreeMap::from([("tier".to_string(), "bronze".to_string())]);
+        assert!(consumer_tenancy_refusal("ns", "r", &allowed, Some(&gold)).is_none());
+        // matchExpressions are enforced, not treated as "no constraint".
+        assert!(consumer_tenancy_refusal("ns", "r", &allowed, Some(&bronze)).is_some());
+    }
+
+    #[test]
+    fn a_missing_repository_is_reported_as_missing_dependency_on_ready() {
+        let (reason, message) = unresolved_repository_report(
+            &Error::MissingDependency("ClusterRepository onsite".into()),
+            "source repository",
+        )
+        .expect("a missing referent is a status-worthy hold");
+        assert_eq!(reason, crate::consts::MISSING_DEPENDENCY_REASON);
+        assert!(message.contains("ClusterRepository onsite"), "{message}");
+        assert!(message.contains("starts automatically"), "{message}");
+
+        let (reason, _) = unresolved_repository_report(
+            &Error::BlockedOnGrant("not allowed".into()),
+            "source repository",
+        )
+        .expect("a refused grant is a status-worthy hold");
+        assert_eq!(reason, crate::consts::BLOCKED_ON_GRANT_REASON);
+
+        // A transient API failure is the error policy's to report, not a
+        // reference problem.
+        assert!(
+            unresolved_repository_report(&Error::Invariant("x".into()), "source repository")
+                .is_none()
+        );
+    }
 
     // --- read_from_store: the one gating decision, exhaustively -------------
 

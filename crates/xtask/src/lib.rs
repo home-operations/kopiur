@@ -5,6 +5,7 @@ pub mod artifact;
 pub mod crds;
 pub mod dashboards;
 pub mod docs;
+pub mod kopia_flags;
 pub mod paths;
 pub mod phases;
 pub mod rbac;
@@ -47,15 +48,22 @@ pub fn collect(cmd: &str) -> Result<Vec<Artifact>> {
 /// a stale-file sweep the content-keyed [`Artifact`] machinery has no notion of.
 /// It therefore runs beside the artifacts, and `gen-all` takes the worse of the
 /// two exit codes so a TypeScript drift can never be masked by clean YAML.
+///
+/// `gen-kopia-flags` runs beside them for a different reason: it shells out to
+/// the pinned kopia binary, and [`collect`]'s callers include the hermetic test
+/// suite, which must not need one.
 pub fn run(cmd: &str, check: bool) -> Result<i32> {
-    if cmd == "gen-ui-types" {
-        return ui_types::run(check);
+    match cmd {
+        "gen-ui-types" => return ui_types::run(check),
+        "gen-kopia-flags" => return kopia_flags::run(check),
+        _ => {}
     }
     let code = run_artifacts(cmd, check)?;
     if cmd != "gen-all" {
         return Ok(code);
     }
-    Ok(code.max(ui_types::run(check)?))
+    let code = code.max(ui_types::run(check)?);
+    Ok(code.max(kopia_flags::run(check)?))
 }
 
 /// The [`Artifact`]-keyed half of [`run`]: generate in memory, then write or

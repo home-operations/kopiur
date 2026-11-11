@@ -57,6 +57,10 @@ spec:
 
 Because the conditions are standard, dependents gate cleanly. A `SnapshotPolicy` in a tenant namespace will not usefully reconcile until its `Repository` is `Ready`, and you can express that with a Flux `dependsOn`, pointed at the Kustomization that contains the `Repository`, or with an Argo sync-wave.
 
+That gating is optional. Apply order is never enforced at admission: an object that references a `Repository`, `ClusterRepository`, or `SnapshotPolicy` that does not exist yet is **admitted**, with a `Warning:` line naming the missing object, and `kubectl apply --dry-run=server` of a whole bundle succeeds against an empty cluster. The object then waits, reporting `MissingDependency` (on its `Ready` condition for the replication kinds, and as a Warning Event), and proceeds by itself once the referenced object is created. Only a genuine failure to read the referenced object, such as an RBAC or API-server error, still fails a `ClusterRepository` [`allowedNamespaces`](/repositories/#allowednamespaces--who-may-use-it-clusterrepository-only) check closed at admission.
+
+One edit does wait for the repository: changing the labels, annotations or `spec.identity` of a `SnapshotPolicy` that **already has snapshots** while one of its repositories is missing. Those are inputs the repository's [`identityDefaults`](/repositories/#identitydefaults--per-tenant-identity-cel) can render the kopia identity from, and they cannot be read while it is absent, so the edit could silently start a separate snapshot history once the repository appears. It is rejected with an error naming the repository. Create the repository first and re-apply, or add the `kopiur.home-operations.com/allow-identity-change` annotation if a new identity is intended. Re-applying the policy unchanged, or changing anything else, is admitted as usual.
+
 ## Materialized defaults — no diff-thrash
 
 Fields whose default is unconditional now carry a real OpenAPI `default:`, and it is written into the stored object:
