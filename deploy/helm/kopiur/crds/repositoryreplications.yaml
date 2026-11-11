@@ -1151,7 +1151,9 @@ spec:
                   times:
                     description: |-
                       `--[no-]times`: synchronize blob modification times to the destination,
-                      when the destination backend supports it (kopia default `true`).
+                      when the destination backend supports it (kopia default `false`). Object
+                      stores (S3, GCS, Azure, B2) cannot set a blob's time, so kopia warns and
+                      copies without it.
                     nullable: true
                     type: boolean
                   update:

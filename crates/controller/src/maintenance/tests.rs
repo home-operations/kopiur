@@ -1,5 +1,136 @@
 use super::*;
 use crate::snapshot_schedule::{jitter_defaults, tz_defaults};
+
+/// Fixture: a live `ClusterRepository` `shared` (uid `uid-1`), optionally with
+/// `spec.maintenance` overrides.
+fn shared_cluster_repo(maintenance: Option<serde_json::Value>) -> kopiur_api::ClusterRepository {
+    let mut spec = serde_json::json!({
+        "backend": { "filesystem": { "path": "/repo" } },
+        "encryption": {
+            "passwordSecretRef": { "name": "pw", "namespace": "kopiur-system" },
+        },
+        "allowedNamespaces": { "list": ["tenant-a"] },
+    });
+    if let Some(m) = maintenance {
+        spec["maintenance"] = m;
+    }
+    serde_json::from_value(serde_json::json!({
+        "apiVersion": kopiur_api::consts::API_VERSION,
+        "kind": "ClusterRepository",
+        "metadata": { "name": "shared", "uid": "uid-1" },
+        "spec": spec,
+    }))
+    .expect("valid ClusterRepository fixture")
+}
+
+/// The exact object the operator projects for `repo` into `placement`.
+fn projected_for(repo: &kopiur_api::ClusterRepository, placement: &str) -> Maintenance {
+    let owner = crate::io::owner_ref_for(repo, "ClusterRepository").expect("owner ref");
+    crate::io::build_managed_maintenance(
+        RepositoryKind::ClusterRepository,
+        "shared",
+        placement,
+        &repo.spec.maintenance.clone().unwrap_or_default(),
+        owner,
+        None,
+    )
+}
+
+/// Issue #677 / PR #705 review: a ClusterRepository's own projected Maintenance is
+/// exempt from the consumer tenancy gate, and ONLY that object. The genuine
+/// projection (built by the same `build_managed_maintenance` the reconciler
+/// applies) passes; it lives in the operator namespace by default, or in
+/// `spec.maintenance.namespace` when set.
+#[test]
+fn the_genuine_projected_maintenance_is_exempt_from_the_tenancy_gate() {
+    let repo = shared_cluster_repo(None);
+    let m = projected_for(&repo, "kopiur-system");
+    assert!(is_managed_cluster_maintenance(
+        &m,
+        &repo,
+        Some("kopiur-system")
+    ));
+
+    let placed = shared_cluster_repo(Some(serde_json::json!({ "namespace": "maint" })));
+    let m = projected_for(&placed, "maint");
+    assert!(is_managed_cluster_maintenance(
+        &m,
+        &placed,
+        Some("kopiur-system")
+    ));
+}
+
+/// PR #705 review (P1 security): a tenant who can read the ClusterRepository's
+/// uid must not be able to forge the exemption by copying it onto a hand-written
+/// `Maintenance` — otherwise removing their namespace from `allowedNamespaces`
+/// would not stop their maintenance Jobs. Every way the forged object differs
+/// from the real projection must lose the exemption.
+#[test]
+fn a_forged_owner_reference_does_not_exempt_maintenance_from_the_tenancy_gate() {
+    let repo = shared_cluster_repo(None);
+    let genuine = projected_for(&repo, "kopiur-system");
+    let op_ns = Some("kopiur-system");
+    let exempt = |m: &Maintenance, r: &kopiur_api::ClusterRepository, ns: Option<&str>| {
+        is_managed_cluster_maintenance(m, r, ns)
+    };
+
+    // The very object the reviewer described: live uid copied onto a Maintenance
+    // in a tenant namespace.
+    let mut m = genuine.clone();
+    m.metadata.namespace = Some("tenant-a".into());
+    assert!(!exempt(&m, &repo, op_ns), "tenant namespace");
+
+    // Owner ref present but not the controller reference.
+    let mut m = genuine.clone();
+    for o in m.metadata.owner_references.iter_mut().flatten() {
+        o.controller = None;
+    }
+    assert!(!exempt(&m, &repo, op_ns), "non-controller ref");
+
+    // A differently-named object in the placement namespace.
+    let mut m = genuine.clone();
+    m.metadata.name = Some("sneaky".into());
+    assert!(!exempt(&m, &repo, op_ns), "wrong name");
+
+    // Credential projection is never set on the managed object.
+    let mut m = genuine.clone();
+    m.spec.credential_projection = Some(kopiur_api::common::CredentialProjection { enabled: true });
+    assert!(!exempt(&m, &repo, op_ns), "credential projection");
+
+    // Wrong uid (forged, or the repository was recreated), or no live uid.
+    let mut m = genuine.clone();
+    for o in m.metadata.owner_references.iter_mut().flatten() {
+        o.uid = "uid-2".into();
+    }
+    assert!(!exempt(&m, &repo, op_ns), "wrong uid");
+    let mut no_uid = repo.clone();
+    no_uid.metadata.uid = None;
+    assert!(!exempt(&genuine, &no_uid, op_ns), "no live uid");
+
+    // The repository disabled its managed maintenance: nothing is exempt.
+    let disabled = shared_cluster_repo(Some(serde_json::json!({ "enabled": false })));
+    assert!(!exempt(&genuine, &disabled, op_ns), "disabled");
+    // A ReadOnly repository runs no maintenance, so nothing is its projection.
+    let mut read_only = repo.clone();
+    read_only.spec.mode = kopiur_api::common::RepositoryMode::ReadOnly;
+    assert!(!exempt(&genuine, &read_only, op_ns), "read-only");
+
+    // Placement moved away from where this object lives, or is unresolved.
+    let moved = shared_cluster_repo(Some(serde_json::json!({ "namespace": "maint" })));
+    assert!(!exempt(&genuine, &moved, op_ns), "moved placement");
+    assert!(!exempt(&genuine, &repo, None), "unresolved placement");
+
+    // A Repository-kind owner, or no owner at all.
+    let mut m = genuine.clone();
+    for o in m.metadata.owner_references.iter_mut().flatten() {
+        o.kind = "Repository".into();
+    }
+    assert!(!exempt(&m, &repo, op_ns), "Repository owner");
+    let mut m = genuine;
+    m.metadata.owner_references = None;
+    assert!(!exempt(&m, &repo, op_ns), "no owner");
+}
+
 use kopiur_api::common::{CronSpec, RepositoryKind, RepositoryRef};
 use kopiur_api::maintenance::RunStatus;
 use kopiur_api::{MaintenanceSpec, MaintenanceStatus, Ownership, TakeoverPolicy};

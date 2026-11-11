@@ -4812,12 +4812,17 @@ async fn resolve_restore_repository(
         } else {
             cfg_ns
         };
+        // Tenancy (#677): an explicit ref is this Restore's own consumption (its
+        // namespace is gated); the policy's ref is the policy's (its namespace).
+        io::ensure_consumer_tenancy(ctx, &selected, base_ns).await?;
         // Launch-side (restore mover inputs) — store-backed point read (#382 M2).
         return io::resolve_repository_ref_cached(ctx, &selected, base_ns).await;
     }
     // Explicit `spec.repository` wins for the other sources. Honors `kind`
     // (namespaced vs. ClusterRepository) via the shared resolver (ADR §5.5).
     if let Some(rref) = &restore.spec.repository {
+        // Tenancy (#677): the same gate admission applies to `spec.repository`.
+        io::ensure_consumer_tenancy(ctx, rref, namespace).await?;
         return io::resolve_repository_ref_cached(ctx, rref, namespace).await;
     }
     // SnapshotRef: derive from the referenced Snapshot (pinned resolved

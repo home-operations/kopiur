@@ -57,11 +57,21 @@ use crate::snapshot::backend_to_repository_connect;
 /// `ensure_maintenance` then surfaces an actionable `MaintenanceNamespaceUnresolved`
 /// condition rather than guessing.
 fn cluster_maintenance_placement(ctx: &Context, repo: &ClusterRepository) -> Option<String> {
+    cluster_maintenance_placement_in(repo, ctx.operator_namespace.as_deref())
+}
+
+/// **Pure** core of [`cluster_maintenance_placement`], so the Maintenance
+/// reconciler's tenancy exemption can recognise the managed object by the SAME
+/// placement rule that created it.
+pub(crate) fn cluster_maintenance_placement_in(
+    repo: &ClusterRepository,
+    operator_namespace: Option<&str>,
+) -> Option<String> {
     repo.spec
         .maintenance
         .as_ref()
         .and_then(|m| m.namespace.clone())
-        .or_else(|| ctx.operator_namespace.clone())
+        .or_else(|| operator_namespace.map(str::to_string))
 }
 
 /// Project this `ClusterRepository`'s `spec.maintenance` into its managed `Maintenance` CR

@@ -651,3 +651,173 @@ async fn repository_replication_runs_on_demand_from_the_run_requested_annotation
 
     let _ = repls.delete(name, &DeleteParams::default()).await;
 }
+
+/// Issue #677: a `RepositoryReplication` applied BEFORE the `ClusterRepository`
+/// it replicates — the order Flux picks for a bundle, and the state a role swap
+/// (rename both repositories) passes through.
+///
+/// Before the fix the admission webhook denied the apply outright ("cannot read
+/// ClusterRepository ... NotFound; denying"), so the bundle could never converge.
+/// The Kubernetes convention is to admit a dangling reference and report it on
+/// status until the referent appears. This pins every step of that:
+///
+/// 1. the create is ADMITTED (the webhook is enabled in the e2e install);
+/// 2. the replication reports `Ready=False` / `MissingDependency` naming the
+///    absent repository — a status condition, not just an Event;
+/// 3. creating the `ClusterRepository` recovers it with no edit to the
+///    replication: the ClusterRepository watch re-enqueues it, the controller's
+///    own tenancy gate passes (`allowedNamespaces.all`), a real `sync-to` runs,
+///    and the replication goes `Ready=True`.
+#[tokio::test]
+#[ignore = "requires the e2e harness (mise run //crates/e2e:test): kind + built images + helm install"]
+async fn repository_replication_applied_before_its_cluster_repository_converges() {
+    use kopiur_api::ClusterRepository;
+
+    let Some(world) = World::connect().await else {
+        return;
+    };
+    world.ensure(&[Need::Minio]).await.expect("fixtures");
+    let client = world.client().clone();
+
+    let crepos: Api<ClusterRepository> = Api::all(client.clone());
+    let repls: Api<RepositoryReplication> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let crepo = "e2e-677-onsite";
+    let name = "e2e-677-offsite";
+    // Dedicated buckets (see `consts::BUCKET_REPL_APPLY_ORDER_SRC`): kopia refuses
+    // to create a repository in a bucket that already holds objects, so this
+    // scenario must not share a bucket with any other.
+
+    // Rerun hygiene: the replication first (it holds no finalizer), then the
+    // repository, and wait both out so step 1 really starts with no referent.
+    let _ = repls.delete(name, &DeleteParams::default()).await;
+    let _ = crepos.delete(crepo, &DeleteParams::default()).await;
+    wait_until(
+        "leftovers from a previous run are gone",
+        default_timeout(),
+        poll_interval(),
+        || async {
+            let gone =
+                repls.get_opt(name).await?.is_none() && crepos.get_opt(crepo).await?.is_none();
+            Ok::<_, kube::Error>(gone.then_some(()))
+        },
+    )
+    .await
+    .expect("leftovers should delete");
+
+    // 1. Admitted although the ClusterRepository does not exist.
+    repls
+        .create(
+            &PostParams::default(),
+            &cr(serde_json::json!({
+                "apiVersion": "kopiur.home-operations.com/v1alpha1",
+                "kind": "RepositoryReplication",
+                "metadata": { "name": name, "namespace": E2E_NAMESPACE },
+                "spec": {
+                    "sourceRef": { "kind": "ClusterRepository", "name": crepo },
+                    "destination": { "s3": {
+                        "bucket": consts::BUCKET_REPL_APPLY_ORDER_DST,
+                        "endpoint": consts::MINIO_ENDPOINT,
+                        "region": "us-east-1",
+                        "tls": { "disableTls": true },
+                        "auth": { "secretRef": { "name": consts::SECRET_S3_CREDS } }
+                    }},
+                    "schedule": { "cron": "* * * * *" }
+                }
+            })),
+        )
+        .await
+        .expect(
+            "a RepositoryReplication whose ClusterRepository does not exist yet must be ADMITTED \
+             (issue #677)",
+        );
+
+    // 2. The dangling reference is reported on the Ready condition.
+    let ready = wait_until(
+        "replication reports Ready=False/MissingDependency for the absent ClusterRepository",
+        default_timeout(),
+        poll_interval(),
+        || async {
+            let s = status_json(&repls, name).await;
+            let cond = s
+                .get("conditions")
+                .and_then(|c| c.as_array())
+                .and_then(|a| {
+                    a.iter()
+                        .find(|c| c.get("type").and_then(|t| t.as_str()) == Some("Ready"))
+                })
+                .cloned();
+            Ok::<_, kube::Error>(cond.filter(|c| {
+                c.get("status").and_then(|v| v.as_str()) == Some("False")
+                    && c.get("reason").and_then(|v| v.as_str()) == Some("MissingDependency")
+            }))
+        },
+    )
+    .await
+    .expect("the missing source must surface as Ready=False reason=MissingDependency");
+    let message = ready
+        .get("message")
+        .and_then(|m| m.as_str())
+        .unwrap_or_default();
+    assert!(
+        message.contains(crepo),
+        "the condition must name the missing ClusterRepository, got: {message}"
+    );
+
+    // 3. Create the referent; the replication must recover on its own.
+    crepos
+        .create(
+            &PostParams::default(),
+            &cr(serde_json::json!({
+                "apiVersion": "kopiur.home-operations.com/v1alpha1",
+                "kind": "ClusterRepository",
+                "metadata": { "name": crepo },
+                "spec": {
+                    "backend": { "s3": {
+                        "bucket": consts::BUCKET_REPL_APPLY_ORDER_SRC,
+                        "endpoint": consts::MINIO_ENDPOINT,
+                        "region": "us-east-1",
+                        "tls": { "disableTls": true },
+                        "auth": { "secretRef": {
+                            "name": consts::SECRET_S3_CREDS, "namespace": E2E_NAMESPACE
+                        } }
+                    }},
+                    "encryption": { "passwordSecretRef": {
+                        "name": consts::SECRET_S3_CREDS,
+                        "namespace": E2E_NAMESPACE,
+                        "key": consts::KEY_KOPIA_PASSWORD
+                    }},
+                    "create": { "enabled": true },
+                    "maintenance": { "enabled": false },
+                    "allowedNamespaces": { "all": true }
+                }
+            })),
+        )
+        .await
+        .expect("create the source ClusterRepository");
+    wait_phase(&crepos, crepo, "Ready")
+        .await
+        .expect("the source ClusterRepository bootstraps");
+
+    wait_until(
+        "the recovered replication records a successful run (status.lastReplicated)",
+        default_timeout(),
+        poll_interval(),
+        || async {
+            let s = status_json(&repls, name).await;
+            Ok::<_, kube::Error>(
+                s.get("lastReplicated")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(|_| ()),
+            )
+        },
+    )
+    .await
+    .expect("once its ClusterRepository exists the replication must run without any edit");
+    wait_ready(&repls, name)
+        .await
+        .expect("the recovered replication must heal Ready=True");
+
+    let _ = repls.delete(name, &DeleteParams::default()).await;
+    let _ = crepos.delete(crepo, &DeleteParams::default()).await;
+}

@@ -2129,7 +2129,7 @@ pub struct ReplicateOp {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub must_exist: Option<bool>,
     /// `--[no-]times`: synchronize blob modification times to the destination
-    /// (kopia default `true`).
+    /// (kopia default `false`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub times: Option<bool>,
     /// `--[no-]update`: update blobs already present at the destination when the

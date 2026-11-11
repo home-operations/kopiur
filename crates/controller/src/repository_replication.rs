@@ -123,8 +123,14 @@ async fn reconcile_inner(repl: &RepositoryReplication, ctx: &Context) -> Result<
     }
 
     let source_ref = &repl.spec.source_ref;
-    // Launch-side (mirror Job inputs) — store-backed point read (#382 M2).
-    let repo = io::resolve_repository_ref_cached(ctx, source_ref, &namespace).await?;
+    // Tenancy (#677) first: admission defers the allowedNamespaces gate when the
+    // ClusterRepository did not exist yet. Then the launch-side (mirror Job
+    // inputs) store-backed point read (#382 M2). A source that is missing or
+    // refused is reported on `Ready` (reason `MissingDependency`/`BlockedOnGrant`)
+    // before the error propagates to the error policy's Event + requeue; the
+    // ClusterRepository/Repository watch re-enqueues this CR the moment the
+    // source appears, so recovery is automatic.
+    let repo = resolve_source(ctx, repl, &api, &name, &namespace).await?;
 
     // Gate on the source repository being strictly Ready. This DELIBERATELY
     // diverges from maintenance's G7 since #413: the #345 circuit breaker
@@ -149,6 +155,41 @@ async fn reconcile_inner(repl: &RepositoryReplication, ctx: &Context) -> Result<
         ctx, repl, &api, &job_api, &namespace, &name, &repo, observed,
     )
     .await
+}
+
+/// Resolve the replication's source repository for this run: the controller-side
+/// tenancy gate ([`io::ensure_consumer_tenancy`], #677) and then the store-backed
+/// point read. On a missing or refused source, surface it on `Ready` before
+/// returning the error (see the call site).
+async fn resolve_source(
+    ctx: &Context,
+    repl: &RepositoryReplication,
+    api: &Api<RepositoryReplication>,
+    name: &str,
+    namespace: &str,
+) -> Result<ResolvedRepository> {
+    let source_ref = &repl.spec.source_ref;
+    let resolved = match io::ensure_consumer_tenancy(ctx, source_ref, namespace).await {
+        Ok(()) => io::resolve_repository_ref_cached(ctx, source_ref, namespace).await,
+        Err(e) => Err(e),
+    };
+    let err = match resolved {
+        Ok(repo) => return Ok(repo),
+        Err(e) => e,
+    };
+    if let Some((reason, message)) = io::unresolved_repository_report(&err, "source repository") {
+        patch_ready_if_changed(
+            api,
+            name,
+            repl,
+            io::ReadyOutcome::Reconciling,
+            reason,
+            &message,
+            None,
+        )
+        .await?;
+    }
+    Err(err)
 }
 
 /// The `spec.suspend` arm: record any pending run request (so it is VISIBLE
@@ -691,6 +732,17 @@ async fn spawn_replication_job(
     // env into the workload-identity side's ambient credential chain; (b) the
     // destination's static credential Secret must co-reside with the Job (envFrom is
     // namespace-local and replication does not project credentials).
+    // (c) no self-mirror: admission skips this when the source did not exist yet
+    // at apply time (#677), so it is re-checked here against the live source.
+    if !kopiur_api::validate::replication_destination_differs(&repo.backend, &repl.spec.destination)
+    {
+        return Err(Error::Validation(
+            kopiur_api::ValidationError::ReplicationDestinationSameAsSource {
+                backend: repl.spec.destination.kind_str().to_string(),
+            }
+            .to_string(),
+        ));
+    }
     if let Err(e) = kopiur_api::validate::validate_replication_auth(
         &repo.backend,
         &repl.spec.destination,
