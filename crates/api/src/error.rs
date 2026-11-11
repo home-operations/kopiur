@@ -106,6 +106,17 @@ pub enum ValidationError {
     )]
     RestoreSourceRepositoryRequired,
 
+    /// An escape-hatch kopia arg (`spec.extraArgs`, `spec.kopiaArgs.*`) carries a
+    /// flag Kopiur models, owns or forbids, or a bare positional word. The message
+    /// (from [`crate::kopia_flags::check_extra_args`]) is already what/why/fix.
+    #[error("{field}: {message}")]
+    KopiaArgNotAllowed {
+        /// The list the arg is in (e.g. `spec.kopiaArgs.snapshotCreate`).
+        field: String,
+        /// What is wrong, why, and the field to use instead.
+        message: String,
+    },
+
     /// A `Repository`/`ClusterRepository` spec carried kopia-side (repo-level)
     /// retention policy fields, which conflict with CR-driven GFS retention and
     /// risk double-deletion (ADR §4.4 exclusivity).

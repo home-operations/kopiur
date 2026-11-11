@@ -628,6 +628,20 @@ pub const SCRATCH_STORAGE_CLASS_HONORED_REASON: &str = "StorageClassHonored";
 /// Event `action` (remediation hint) for the scratch storage-class no-op: set a
 /// capacity so a sized PVC is provisioned.
 pub const SET_SCRATCH_CAPACITY_ACTION: &str = "SetScratchCapacity";
+
+/// `SnapshotPolicy` warn-only condition (#708): the legacy `spec.extraArgs` carries
+/// a `kopia policy set` flag the kopia flag table refuses (Kopiur models, owns or
+/// forbids it). Admission refuses such a list on the next edit; a STORED policy
+/// carrying one keeps backing up exactly as before (the mover still passes the
+/// list), so this only reports it. `True` = refused args present; `False` once
+/// they are removed. Never blocks.
+pub const UNSUPPORTED_KOPIA_ARGS_CONDITION: &str = "UnsupportedKopiaArgs";
+/// `reason`/Event reason for [`UNSUPPORTED_KOPIA_ARGS_CONDITION`] = `True`.
+pub const UNSUPPORTED_KOPIA_ARGS_REASON: &str = "ExtraArgsRefused";
+/// `reason` for [`UNSUPPORTED_KOPIA_ARGS_CONDITION`] = `False`.
+pub const KOPIA_ARGS_SUPPORTED_REASON: &str = "ExtraArgsSupported";
+/// Event `action` (remediation hint) for refused legacy `extraArgs`.
+pub const FIX_EXTRA_ARGS_ACTION: &str = "FixExtraArgs";
 /// `action` for a `PermissionDenied` failure: make the repository path/PVC
 /// writable by the operator's UID.
 pub const CHECK_PERMISSIONS_ACTION: &str = "CheckPermissions";

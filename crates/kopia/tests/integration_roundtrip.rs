@@ -635,6 +635,7 @@ async fn snapshot_create_accepts_m4_flag_sweep_and_records_the_description() {
                 fail_fast: Some(true),
                 upload_limit_mb: Some(100),
                 description: Some("m4 flag sweep smoke test".to_string()),
+                ..Default::default()
             },
         )
         .await

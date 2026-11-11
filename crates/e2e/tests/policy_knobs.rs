@@ -423,6 +423,113 @@ async fn snapshot_create_knobs_reach_the_mover_contract() {
         .expect("the tuned backup should succeed (kopia accepted --fail-fast/--upload-limit-mb/--description)");
 }
 
+/// #708: `upload.forceHashPercent` and the `kopiaArgs.snapshotCreate` escape
+/// hatch reach the controller→mover work spec as `SnapshotOp` fields (the
+/// `snapshot create` argv, never `policy set`), kopia accepts the resulting
+/// `--force-hash 100 --log-level=debug` (`Succeeded` with a real snapshot id),
+/// and the webhook refuses an escape-hatch arg for a flag Kopiur models,
+/// naming the field to use instead. That the flag actually captures an
+/// in-place rewrite is proven against real kopia in
+/// `crates/kopia/tests/integration_force_hash.rs`.
+#[tokio::test]
+#[ignore = "requires the e2e harness (mise run //crates/e2e:test)"]
+async fn force_hash_and_kopia_args_reach_snapshot_create() {
+    let Some(world) = World::connect().await else {
+        return;
+    };
+    world
+        .ensure(&[Need::Filesystem])
+        .await
+        .expect("fixtures ready");
+    let client = world.client().clone();
+    ensure_knobs_repo(&client).await;
+
+    let configs: Api<SnapshotPolicy> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let backups: Api<Snapshot> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+
+    // Admission: `--force-hash` through the escape hatch is refused in favour of
+    // the typed field, with a what/why/fix message.
+    let smuggled = snapshot_policy_json(
+        E2E_NAMESPACE,
+        "e2e-force-hash-smuggled-cfg",
+        "Repository",
+        REPO,
+        serde_json::json!({ "kopiaArgs": { "snapshotCreate": ["--force-hash=50"] } }),
+    );
+    let msg = configs
+        .create(&PostParams::default(), &cr(smuggled))
+        .await
+        .expect_err("--force-hash in kopiaArgs.snapshotCreate must be DENIED by the webhook")
+        .to_string();
+    assert!(
+        msg.contains("spec.kopiaArgs.snapshotCreate") && msg.contains("forceHashPercent"),
+        "the denial must name the list and the field to use instead: {msg}"
+    );
+
+    let cfg = snapshot_policy_json(
+        E2E_NAMESPACE,
+        "e2e-force-hash-cfg",
+        "Repository",
+        REPO,
+        serde_json::json!({
+            "upload": { "forceHashPercent": 100 },
+            "kopiaArgs": { "snapshotCreate": ["--log-level=debug"] }
+        }),
+    );
+    configs
+        .create(&PostParams::default(), &cr(cfg))
+        .await
+        .expect("forceHashPercent + an unmodeled kopiaArgs flag must be admitted");
+    let _ = backups
+        .create(
+            &PostParams::default(),
+            &cr(snapshot_json(
+                E2E_NAMESPACE,
+                "e2e-force-hash",
+                "e2e-force-hash-cfg",
+                serde_json::json!({}),
+            )),
+        )
+        .await;
+
+    let jobs: Api<Job> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let spec = wait_for_work_spec_json(&jobs, "e2e-force-hash").await;
+    let snapshot_op = spec
+        .pointer("/operation/snapshot")
+        .unwrap_or(&serde_json::Value::Null);
+    assert_eq!(
+        snapshot_op.get("forceHashPercent").and_then(|v| v.as_u64()),
+        Some(100),
+        "upload.forceHashPercent must reach SnapshotOp; op: {snapshot_op}"
+    );
+    assert_eq!(
+        snapshot_op.get("createExtraArgs"),
+        Some(&serde_json::json!(["--log-level=debug"])),
+        "kopiaArgs.snapshotCreate must reach SnapshotOp; op: {snapshot_op}"
+    );
+    let policy = snapshot_op
+        .get("policy")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    assert!(
+        policy.get("extraArgs").is_none(),
+        "snapshotCreate args must not leak into policy set; policy: {policy}"
+    );
+
+    wait_phase(&backups, "e2e-force-hash", "Succeeded")
+        .await
+        .expect("kopia must accept --force-hash 100 --log-level=debug");
+    let landed = backups.get("e2e-force-hash").await.expect("read back");
+    assert!(
+        landed
+            .status
+            .as_ref()
+            .and_then(|s| s.snapshot.as_ref())
+            .is_some_and(|i| !i.kopia_snapshot_id.is_empty()),
+        "a real kopia snapshot id must be recorded"
+    );
+}
+
 // --- task PR4: default `files.ignoreRules` OS-artifact excludes ---
 
 /// Seed the test's OWN dynamic source PVC (never the shared `e2e-src` — content

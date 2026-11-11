@@ -25,6 +25,8 @@ pub enum Root {
     Deploy,
     /// Resolve under the docs site's content directory (the generated field reference).
     Docs,
+    /// Resolve under the workspace root (the kopia help snapshots under `crates/`).
+    Repo,
 }
 
 /// A single generated file: a path relative to a [`Root`] and its full content.
@@ -54,6 +56,15 @@ impl Artifact {
         }
     }
 
+    /// Construct a workspace-root-relative artifact (the kopia help snapshots).
+    pub fn repo(rel_path: String, content: String) -> Self {
+        Self {
+            rel_path,
+            content,
+            root: Root::Repo,
+        }
+    }
+
     /// Construct a docs-content-rooted artifact (the generated field reference).
     pub fn docs(rel_path: String, content: String) -> Self {
         Self {
@@ -69,6 +80,7 @@ fn base_dir(root: Root) -> std::path::PathBuf {
     match root {
         Root::Deploy => deploy_dir(),
         Root::Docs => docs_dir(),
+        Root::Repo => crate::paths::workspace_root(),
     }
 }
 

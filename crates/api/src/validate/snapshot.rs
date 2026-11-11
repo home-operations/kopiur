@@ -204,6 +204,7 @@ pub fn validate_backup_config(spec: &SnapshotPolicySpec) -> Vec<ValidationError>
     {
         errs.push(e);
     }
+    errs.extend(validate_kopia_knobs(spec));
     // Data-loss guard: a retention that selects no snapshots prunes EVERY Snapshot the
     // moment it runs. `retention: None` means "don't prune" (safe) and is not flagged;
     // only an explicit but empty/all-zero retention is the trap.
@@ -823,4 +824,65 @@ pub fn validate_backup_schedule(spec: &SnapshotScheduleSpec) -> Vec<ValidationEr
         errs.push(e);
     }
     errs
+}
+
+/// `spec.upload.forceHashPercent` bounds and the per-command `spec.kopiaArgs`
+/// escape hatch (#708). Both fields are new, so they live in the shared
+/// aggregate the controller re-runs: no stored object can carry a value from
+/// before these rules existed. The LEGACY `spec.extraArgs` is deliberately not
+/// checked here — see [`super::validate_legacy_extra_args`].
+fn validate_kopia_knobs(spec: &SnapshotPolicySpec) -> Vec<ValidationError> {
+    use crate::kopia_flags::KopiaCommand;
+    let mut errs = Vec::new();
+    if let Some(pct) = spec.upload.as_ref().and_then(|u| u.force_hash_percent)
+        && pct > 100
+    {
+        errs.push(ValidationError::InvalidFieldValue {
+            field: "spec.upload.forceHashPercent".to_string(),
+            reason: format!(
+                "{pct} is not a percentage: kopia re-hashes this share of files (0-100). \
+                 Fix: use 100 to re-read every file, or a lower value to re-read a random \
+                 subset"
+            ),
+        });
+    }
+    let Some(ka) = &spec.kopia_args else {
+        return errs;
+    };
+    if !spec.extra_args.is_empty() && !ka.policy_set.is_empty() {
+        errs.push(ValidationError::InvalidFieldValue {
+            field: "spec.kopiaArgs.policySet".to_string(),
+            reason: "is set together with spec.extraArgs, its original spelling; both feed \
+                     `kopia policy set` and one list must be the source of truth. Fix: move \
+                     the spec.extraArgs entries into spec.kopiaArgs.policySet and remove \
+                     spec.extraArgs"
+                .to_string(),
+        });
+    }
+    errs.extend(kopia_arg_errors(
+        "spec.kopiaArgs.policySet",
+        KopiaCommand::PolicySet,
+        &ka.policy_set,
+    ));
+    errs.extend(kopia_arg_errors(
+        "spec.kopiaArgs.snapshotCreate",
+        KopiaCommand::SnapshotCreate,
+        &ka.snapshot_create,
+    ));
+    errs
+}
+
+/// Every refused arg in one escape-hatch list, as validation errors.
+pub(super) fn kopia_arg_errors(
+    field: &str,
+    cmd: crate::kopia_flags::KopiaCommand,
+    args: &[String],
+) -> Vec<ValidationError> {
+    crate::kopia_flags::check_extra_args(cmd, args)
+        .into_iter()
+        .map(|v| ValidationError::KopiaArgNotAllowed {
+            field: field.to_string(),
+            message: v.message,
+        })
+        .collect()
 }

@@ -74,6 +74,8 @@ let spec = MoverWorkSpec {
         fail_fast: None,
         upload_limit_mb: None,
         description: None,
+        force_hash_percent: None,
+        create_extra_args: vec![],
     }),
     identity: ResolvedIdentity {
         username: "mydb".into(),

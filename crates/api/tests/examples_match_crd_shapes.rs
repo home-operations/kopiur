@@ -237,6 +237,35 @@ fn the_partial_restore_example_keeps_its_selection_and_admits() {
     assert_eq!(kopiur_api::validate::validate_restore(&spec), Ok(()));
 }
 
+/// Example 48 (#708) documents `upload.forceHashPercent: 100` and an unmodeled
+/// `kopiaArgs.snapshotCreate` flag: both must survive the round trip (a
+/// misspelled key would drop silently and leave the database backed up stale)
+/// AND pass the shared validator plus the admission-only extraArgs check.
+#[test]
+fn the_force_hash_example_keeps_its_knobs_and_admits() {
+    let text = std::fs::read_to_string(examples_dir().join("48-force-hash-in-place-writers.yaml"))
+        .expect("read example 48");
+    let docs: Vec<serde_json::Value> = serde_saphyr::from_multiple(&text).expect("yaml docs");
+    let policy = docs
+        .iter()
+        .find(|d| d.get("kind").and_then(|k| k.as_str()) == Some("SnapshotPolicy"))
+        .expect("example 48 has a SnapshotPolicy");
+    let spec: kopiur_api::SnapshotPolicySpec =
+        serde_json::from_value(policy["spec"].clone()).expect("SnapshotPolicySpec shape");
+    assert_eq!(
+        spec.upload.as_ref().and_then(|u| u.force_hash_percent),
+        Some(100),
+        "upload.forceHashPercent must survive"
+    );
+    assert_eq!(
+        spec.kopia_args.as_ref().map(|k| k.snapshot_create.clone()),
+        Some(vec!["--log-level=debug".to_string()])
+    );
+    let errs = kopiur_api::validate::validate_backup_config(&spec);
+    assert!(errs.is_empty(), "example 48 must admit: {errs:?}");
+    assert!(kopiur_api::validate::validate_legacy_extra_args(&spec, None).is_empty());
+}
+
 /// Every `Repository` document in `file`, round-tripped through `RepositorySpec`.
 ///
 /// The scenario bundles deliberately carry several same-named `Repository`

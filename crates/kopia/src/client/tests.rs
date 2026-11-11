@@ -744,6 +744,7 @@ fn snapshot_create_args_fail_fast_upload_limit_and_description() {
         fail_fast: Some(true),
         upload_limit_mb: Some(100),
         description: Some("smoke test".to_string()),
+        ..Default::default()
     };
     assert_eq!(
         snapshot_create_args("/data", None, &BTreeMap::new(), None, &opts),
@@ -769,6 +770,57 @@ fn snapshot_create_args_fail_fast_upload_limit_and_description() {
     assert_eq!(
         snapshot_create_args("/data", None, &BTreeMap::new(), None, &opts_false),
         vec!["snapshot", "create", "/data", "--json", "--no-fail-fast"]
+    );
+}
+
+/// #708: `forceHashPercent` reaches `snapshot create` as `--force-hash <n>`;
+/// absent emits nothing (kopia's default, 0). Verified against the pinned kopia
+/// 0.23.1 by `integration_roundtrip.rs`'s in-place-rewrite test.
+#[test]
+fn snapshot_create_args_force_hash_is_emitted_only_when_set() {
+    let base = snapshot_create_args(
+        "/data",
+        None,
+        &BTreeMap::new(),
+        None,
+        &SnapshotCreateOptions::default(),
+    );
+    assert!(!base.iter().any(|a| a.starts_with("--force-hash")));
+    for pct in [0u8, 37, 100] {
+        let opts = SnapshotCreateOptions {
+            force_hash_percent: Some(pct),
+            ..Default::default()
+        };
+        let args = snapshot_create_args("/data", None, &BTreeMap::new(), None, &opts);
+        assert_eq!(
+            &args[4..],
+            &["--force-hash".to_string(), pct.to_string()],
+            "{args:?}"
+        );
+    }
+}
+
+/// #708: `kopiaArgs.snapshotCreate` is appended verbatim AFTER every flag Kopiur
+/// sets, so kopia sees Kopiur's own flags first and the extras last.
+#[test]
+fn snapshot_create_args_appends_extra_args_last() {
+    let opts = SnapshotCreateOptions {
+        fail_fast: Some(true),
+        extra_args: vec!["--log-level=debug".into(), "--send-snapshot-report".into()],
+        ..Default::default()
+    };
+    let args = snapshot_create_args("/data", None, &BTreeMap::new(), None, &opts);
+    assert_eq!(
+        args,
+        vec![
+            "snapshot",
+            "create",
+            "/data",
+            "--json",
+            "--fail-fast",
+            "--log-level=debug",
+            "--send-snapshot-report"
+        ]
     );
 }
 

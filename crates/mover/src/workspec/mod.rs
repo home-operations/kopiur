@@ -234,6 +234,15 @@ pub struct SnapshotOp {
     /// runs never set this.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// `snapshot create --force-hash` (#708). Resolved from
+    /// `SnapshotPolicy.spec.upload.forceHashPercent`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub force_hash_percent: Option<u8>,
+    /// Extra `snapshot create` flags (#708), from
+    /// `SnapshotPolicy.spec.kopiaArgs.snapshotCreate` (admission-checked against
+    /// the kopia flag table). Appended after every flag Kopiur sets.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub create_extra_args: Vec<String>,
 }
 
 impl SnapshotOp {
@@ -244,6 +253,53 @@ impl SnapshotOp {
             fail_fast: self.fail_fast,
             upload_limit_mb: self.upload_limit_mb,
             description: self.description.clone(),
+            force_hash_percent: self.force_hash_percent,
+            extra_args: self.create_extra_args.clone(),
+        }
+    }
+}
+
+/// What [`PolicyArgsSpec::scope_plan`] writes at each kopia policy scope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourcePolicyPlan {
+    /// `policy_replace`d at `username@hostname:/source/path`.
+    pub path: kopiur_kopia::PolicyArgs,
+    /// `policy_set` at `username@hostname`.
+    pub identity: kopiur_kopia::PolicyArgs,
+}
+
+/// The `snapshot create` argv flags a `SnapshotPolicy` RECIPE sets (as opposed
+/// to `policy set` knobs, which ride [`PolicyArgsSpec`], and per-run fields like
+/// `Snapshot.spec.description`). The controller copies these onto every
+/// [`SnapshotOp`] it builds; one pure mapping so they can never go inert.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RecipeCreateFlags {
+    /// `spec.errorHandling.failFast` (only ever `Some(true)`: false leaves kopia's default).
+    pub fail_fast: Option<bool>,
+    /// `spec.upload.limitMb`.
+    pub upload_limit_mb: Option<i64>,
+    /// `spec.upload.forceHashPercent` (#708).
+    pub force_hash_percent: Option<u8>,
+    /// `spec.kopiaArgs.snapshotCreate` (#708).
+    pub extra_args: Vec<String>,
+}
+
+impl RecipeCreateFlags {
+    /// Resolve from a `SnapshotPolicy` spec.
+    pub fn from_policy(spec: &kopiur_api::SnapshotPolicySpec) -> Self {
+        let up = spec.upload.as_ref();
+        Self {
+            fail_fast: spec
+                .error_handling
+                .as_ref()
+                .and_then(|e| e.fail_fast.then_some(true)),
+            upload_limit_mb: up.and_then(|u| u.limit_mb),
+            force_hash_percent: up.and_then(|u| u.force_hash_percent),
+            extra_args: spec
+                .kopia_args
+                .as_ref()
+                .map(|k| k.snapshot_create.clone())
+                .unwrap_or_default(),
         }
     }
 }
@@ -345,6 +401,19 @@ impl PolicyArgsSpec {
         }
     }
 
+    /// Split into what the mover writes at each kopia policy scope before a
+    /// `snapshot create`: the per-source PATH scope, which it REPLACES (#681),
+    /// and the `username@hostname` IDENTITY scope, which it writes but never
+    /// deletes (it carries the mandatory retention pin plus the one knob kopia
+    /// refuses on a path, `--max-parallel-snapshots`).
+    pub fn scope_plan(&self) -> SourcePolicyPlan {
+        let (path, identity) = kopiur_kopia::split_policy_scopes(self.to_kopia());
+        SourcePolicyPlan {
+            path,
+            identity: identity_retention_policy(identity),
+        }
+    }
+
     /// Resolve a [`PolicyArgsSpec`] from a `SnapshotPolicy` spec's flattened policy
     /// knobs (ADR-0004 §4b, ADR-0005 §13(b)/§13(f)). The single mapping the
     /// controller uses so the policy fields are never inert. `max_parallel_*` are
@@ -398,7 +467,15 @@ impl PolicyArgsSpec {
             max_parallel_file_reads: up
                 .and_then(|u| u.max_parallel_file_reads)
                 .map(|n| n.max(0) as u32),
-            extra_args: spec.extra_args.clone(),
+            // The legacy `spec.extraArgs` and `spec.kopiaArgs.policySet` are the
+            // same list (admission refuses both at once); a stored object can
+            // only carry the legacy one, so concatenating is exact either way.
+            extra_args: spec
+                .extra_args
+                .iter()
+                .chain(spec.kopia_args.iter().flat_map(|k| k.policy_set.iter()))
+                .cloned()
+                .collect(),
         }
     }
 }
@@ -1858,6 +1935,49 @@ pub const KOPIUR_PIN_NAME: &str = "kopiur-retain";
 /// overflow risk of reaching for an unbounded value on a numeric CLI flag.
 pub const KOPIA_KEEP_MAX: i64 = i32::MAX as i64; // 2_147_483_647
 
+/// Build the identity-scope `policy set` args applied before every `snapshot
+/// create` (M0b, confirmed data-loss bug): kopia's six `--keep-*` retention
+/// fields, ALWAYS pinned to [`KOPIA_KEEP_MAX`], with `user_identity_policy`
+/// (the one knob `split_policy_scopes` moves to the identity scope —
+/// currently only `max_parallel_snapshots`) folded in on top. That knob is
+/// written as `inherit` when the operator did not configure it: this scope is
+/// written but never replaced, so omitting the flag would keep a value an
+/// earlier spec stored there (#681). Lives in the library (not the mover
+/// binary) so the mandatory pin and the #708 flag round-trip tests can reach it
+/// without spawning kopia.
+pub fn identity_retention_policy(
+    user_identity_policy: Option<kopiur_kopia::PolicyArgs>,
+) -> kopiur_kopia::PolicyArgs {
+    kopiur_kopia::PolicyArgs {
+        keep_latest: Some(KOPIA_KEEP_MAX),
+        keep_hourly: Some(KOPIA_KEEP_MAX),
+        keep_daily: Some(KOPIA_KEEP_MAX),
+        keep_weekly: Some(KOPIA_KEEP_MAX),
+        keep_monthly: Some(KOPIA_KEEP_MAX),
+        keep_annual: Some(KOPIA_KEEP_MAX),
+        // Floor, same shape and same reasoning as the six `keep_*` pins above:
+        // a kopia-side retention setting Kopiur did not choose must not silently
+        // change what a backup run produces. With `ignoreIdenticalSnapshots` on,
+        // kopia writes NO manifest for an unchanged source — so a `Snapshot` CR
+        // that expected to own one owns nothing, and the whole
+        // finalizer/retention/restore model rests on that 1:1. kopia's own
+        // default is `false`, but a repository's global policy or a third-party
+        // `extraArgs` can flip it out of band, which is how #351 was reachable
+        // without the CRD field ever having been wired.
+        //
+        // Explicitly `false`, not unset: unset INHERITS, and inheriting is the
+        // bug. An opt-in (`files.ignoreIdenticalSnapshots: true`) overrides this
+        // from the more specific path scope.
+        ignore_identical_snapshots: Some(false),
+        max_parallel_snapshots: Some(
+            user_identity_policy
+                .and_then(|p| p.max_parallel_snapshots)
+                .unwrap_or(kopiur_kopia::PolicyInt::Inherit),
+        ),
+        ..Default::default()
+    }
+}
+
 /// Which verification tier to run (ADR-0005 §4). Externally-tagged on the wire so
 /// it round-trips as `{ "quick": {} }` / `{ "deep": {...} }` and a new tier cannot
 /// compile until handled. Mirrors Maintenance's quick/full split.
@@ -2667,6 +2787,8 @@ impl Default for MoverOptions {
 ///         fail_fast: None,
 ///         upload_limit_mb: None,
 ///         description: None,
+///         force_hash_percent: None,
+///         create_extra_args: vec![],
 ///     }),
 ///     identity: ResolvedIdentity {
 ///         username: "mydb".into(),
