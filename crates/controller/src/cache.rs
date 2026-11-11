@@ -169,28 +169,38 @@ pub fn replication_cache(
     effective: Option<&CacheDefaults>,
     kopia_caches: std::num::NonZeroU32,
 ) -> Result<(CacheVolume, CacheTuning)> {
+    let ways = i64::from(kopia_caches.get());
+    // Each connection needs room for 1MiB + 1MiB under the 90% ceiling (3Mi), or one
+    // of its caches would run at kopia's unbounded default (#714 review). Admission
+    // refuses a smaller shared capacity on a new or edited block; a STORED one is not
+    // refused here (that would stop a working replication on upgrade) — its per-run
+    // volume is raised to the minimum instead.
+    let min_mib = 3 * ways;
+    let raised;
+    let effective = match effective {
+        Some(c)
+            if ways > 1
+                && c.capacity
+                    .as_deref()
+                    .and_then(kopiur_api::common::quantity_to_mib)
+                    .is_some_and(|mib| mib < min_mib) =>
+        {
+            raised = CacheDefaults {
+                capacity: Some(format!("{min_mib}Mi")),
+                ..c.clone()
+            };
+            Some(&raised)
+        }
+        other => other,
+    };
     let volume = verify_cache_volume(effective);
     let configured = configured_capacity(&volume);
     let r = cache_budgets(effective, configured)?;
-    let ways = i64::from(kopia_caches.get());
     let share_mib = configured
         .and_then(kopiur_api::common::quantity_to_mib)
         .map(|mib| mib / ways);
     let r = match share_mib {
-        Some(share) if ways > 1 => {
-            // Each connection needs room for 1MiB + 1MiB under the 90% ceiling (3Mi),
-            // or one of its caches would run at kopia's unbounded default (#714 review).
-            if share < 3 {
-                return Err(crate::error::Error::Validation(format!(
-                    "mover.cache.capacity `{}` is too small: {ways} kopia caches share this \
-                     volume and need at least {}Mi. Fix: raise `capacity`, or remove it for an \
-                     unsized emptyDir cache",
-                    configured.unwrap_or_default(),
-                    3 * ways
-                )));
-            }
-            kopiur_api::common::fit_cache_budgets(&r, &format!("{share}Mi"))
-        }
+        Some(share) if ways > 1 => kopiur_api::common::fit_cache_budgets(&r, &format!("{share}Mi")),
         _ => r,
     };
     Ok((volume, tuning_of(&r)))
@@ -961,17 +971,36 @@ mod tests {
 
     /// Greptile on #714: with `capacity: 3Mi` a SnapshotReplication split the
     /// volume into 1MiB shares, but each of its two caches kept 1MiB + 1MiB — 4MiB
-    /// of budgets on a 3MiB volume. Every cache on a shared volume now fits, and a
-    /// volume too small to give each connection 1MiB + 1MiB is refused with a fix.
+    /// of budgets on a 3MiB volume. Every cache on a shared volume now fits.
+    ///
+    /// A follow-up review pointed out that refusing such a run would stop a STORED
+    /// replication (admission only refuses new or edited blocks), so instead the
+    /// per-run volume is raised to the minimum that holds every cache (6Mi for two).
     #[test]
-    fn shared_cache_volumes_fit_every_cache_or_are_refused() {
+    fn shared_cache_volumes_fit_every_cache_and_tiny_ones_are_raised() {
         let two = std::num::NonZeroU32::new(2).unwrap();
-        let tiny = CacheDefaults {
-            capacity: Some("3Mi".into()),
-            ..Default::default()
-        };
-        let err = replication_cache(Some(&tiny), two).unwrap_err().to_string();
-        assert!(err.contains("too small") && err.contains("6Mi"), "{err}");
+        for small in ["3Mi", "5Mi"] {
+            let tiny = CacheDefaults {
+                capacity: Some(small.into()),
+                storage_class_name: Some("fast".into()),
+                ..Default::default()
+            };
+            let (volume, t) = replication_cache(Some(&tiny), two)
+                .expect("a stored replication with a tiny cache must still run");
+            assert_eq!(
+                volume,
+                CacheVolume::Ephemeral {
+                    capacity: "6Mi".into(),
+                    storage_class: Some("fast".into()),
+                },
+                "{small}: the per-run volume is raised to the two-cache minimum"
+            );
+            let all = 2 * (t.content_cache_size_mb.unwrap() + t.metadata_cache_size_mb.unwrap());
+            assert!(
+                all * 100 <= 6 * 90,
+                "{small}: two caches total {all}MiB on 6Mi"
+            );
+        }
         for cap in [6, 7, 10, 33, 100, 1000] {
             let eff = CacheDefaults {
                 capacity: Some(format!("{cap}Mi")),
