@@ -830,11 +830,14 @@ async fn handle_maintenance(
     // Admission-only: the quick/full jitter windows, which the shared aggregate has
     // never validated at all — so PARSE and bound are both new rejections here.
     errs.extend(api::validate::validate_maintenance_admission_extras(&spec));
-    // Skipped for the operator's managed projection of a repository (#707 review).
+    // Skipped for a VERIFIED projection of a repository (#707/#714 review): the
+    // controller-owner repository is fetched, its uid matched, and its own
+    // `spec.maintenance.mover.cache` must equal this object's.
+    let parent_cache = verified_parent_maintenance_cache(req, &obj.metadata, client).await;
     errs.extend(api::validate::validate_maintenance_cache_legacy_budgets(
         &spec,
         decode_old_spec::<MaintenanceSpec>(req).as_ref(),
-        obj.metadata.owner_references.as_deref().unwrap_or_default(),
+        parent_cache.as_ref().map(Option::as_ref),
     ));
     if !errs.is_empty() {
         return Err(AdmissionError::Invalid(errs));
@@ -870,6 +873,35 @@ const SNAPSHOT_REPLICATION_RUN_COMMAND: &str = "kubectl kopiur replication run -
 
 /// Refuse a malformed `run-requested` annotation at admission (issue #380).
 ///
+/// The `spec.maintenance.mover.cache` of the repository this `Maintenance` claims
+/// as its controller owner — `Some` only when that repository exists and its uid
+/// matches the owner reference, so a user-written owner reference alone proves
+/// nothing (#714 review). `None` (no exemption, fail closed) without a client, on
+/// any lookup error, or on a uid mismatch.
+async fn verified_parent_maintenance_cache(
+    req: &AdmissionRequest<DynamicObject>,
+    meta: &ObjectMeta,
+    client: Option<&Client>,
+) -> Option<Option<api::common::CacheDefaults>> {
+    let owner = api::validate::repository_controller_ref(
+        meta.owner_references.as_deref().unwrap_or_default(),
+    )?;
+    let client = client?;
+    let cache_of = |m: Option<api::maintenance::RepositoryMaintenanceSpec>| {
+        m.and_then(|m| m.mover).and_then(|m| m.cache)
+    };
+    let (uid, cache) = if owner.kind == "ClusterRepository" {
+        let api: Api<api::ClusterRepository> = Api::all(client.clone());
+        let r = api.get_opt(&owner.name).await.ok()??;
+        (r.metadata.uid, cache_of(r.spec.maintenance))
+    } else {
+        let api: Api<api::Repository> = Api::namespaced(client.clone(), req.namespace.as_deref()?);
+        let r = api.get_opt(&owner.name).await.ok()??;
+        (r.metadata.uid, cache_of(r.spec.maintenance))
+    };
+    (uid.as_deref() == Some(owner.uid.as_str())).then_some(cache)
+}
+
 /// The annotation is user input on both replication kinds exactly as it is on
 /// `Maintenance`, and it flows into a scheduling decision — so a typo'd
 /// timestamp is refused here rather than reaching a reconciler that can only
@@ -974,9 +1006,15 @@ async fn handle_snapshot_replication(
     let mut errs = api::validate::validate_snapshot_replication(&spec);
     // Admission-only: the jitter 24h cap (the parse half is already shared).
     errs.extend(api::validate::validate_snapshot_replication_admission_extras(&spec));
+    let old_srepl = decode_old_spec::<SnapshotReplicationSpec>(req);
     errs.extend(api::validate::validate_cache_legacy_budgets_for(
         &spec,
-        decode_old_spec::<SnapshotReplicationSpec>(req).as_ref(),
+        old_srepl.as_ref(),
+    ));
+    // Two kopia caches share its volume (#714 review).
+    errs.extend(api::validate::validate_snapshot_replication_cache_minimum(
+        &spec,
+        old_srepl.as_ref(),
     ));
     if !errs.is_empty() {
         return Err(AdmissionError::Invalid(errs));

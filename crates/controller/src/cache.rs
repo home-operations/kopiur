@@ -172,11 +172,25 @@ pub fn replication_cache(
     let volume = verify_cache_volume(effective);
     let configured = configured_capacity(&volume);
     let r = cache_budgets(effective, configured)?;
-    let share = configured
+    let ways = i64::from(kopia_caches.get());
+    let share_mib = configured
         .and_then(kopiur_api::common::quantity_to_mib)
-        .map(|mib| format!("{}Mi", mib / i64::from(kopia_caches.get())));
-    let r = match share {
-        Some(share) if kopia_caches.get() > 1 => kopiur_api::common::fit_cache_budgets(&r, &share),
+        .map(|mib| mib / ways);
+    let r = match share_mib {
+        Some(share) if ways > 1 => {
+            // Each connection needs room for 1MiB + 1MiB under the 90% ceiling (3Mi),
+            // or one of its caches would run at kopia's unbounded default (#714 review).
+            if share < 3 {
+                return Err(crate::error::Error::Validation(format!(
+                    "mover.cache.capacity `{}` is too small: {ways} kopia caches share this \
+                     volume and need at least {}Mi. Fix: raise `capacity`, or remove it for an \
+                     unsized emptyDir cache",
+                    configured.unwrap_or_default(),
+                    3 * ways
+                )));
+            }
+            kopiur_api::common::fit_cache_budgets(&r, &format!("{share}Mi"))
+        }
         _ => r,
     };
     Ok((volume, tuning_of(&r)))
@@ -943,5 +957,29 @@ mod tests {
             both * 100 <= 2048 * 90,
             "two caches must fit the volume: {both}"
         );
+    }
+
+    /// Greptile on #714: with `capacity: 3Mi` a SnapshotReplication split the
+    /// volume into 1MiB shares, but each of its two caches kept 1MiB + 1MiB — 4MiB
+    /// of budgets on a 3MiB volume. Every cache on a shared volume now fits, and a
+    /// volume too small to give each connection 1MiB + 1MiB is refused with a fix.
+    #[test]
+    fn shared_cache_volumes_fit_every_cache_or_are_refused() {
+        let two = std::num::NonZeroU32::new(2).unwrap();
+        let tiny = CacheDefaults {
+            capacity: Some("3Mi".into()),
+            ..Default::default()
+        };
+        let err = replication_cache(Some(&tiny), two).unwrap_err().to_string();
+        assert!(err.contains("too small") && err.contains("6Mi"), "{err}");
+        for cap in [6, 7, 10, 33, 100, 1000] {
+            let eff = CacheDefaults {
+                capacity: Some(format!("{cap}Mi")),
+                ..Default::default()
+            };
+            let (_, t) = replication_cache(Some(&eff), two).unwrap();
+            let all = 2 * (t.content_cache_size_mb.unwrap() + t.metadata_cache_size_mb.unwrap());
+            assert!(all * 100 <= cap * 90, "{cap}Mi: two caches total {all}MiB");
+        }
     }
 }

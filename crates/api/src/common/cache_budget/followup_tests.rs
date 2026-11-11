@@ -118,3 +118,47 @@ fn fitted_budgets_never_exceed_the_mounted_volume() {
     }
     assert!(checked > 50, "{checked}");
 }
+
+/// Greptile on #714: a positive capacity under 1Mi (`512Ki`) rounded to 0MiB,
+/// was treated as "no capacity", and skipped the minimum check, leaving both
+/// caches unset on a sized volume. Admission refuses it; a stored object runs.
+#[test]
+fn a_sub_mebibyte_capacity_is_refused_at_admission() {
+    let c = cfg("capacity: 512Ki\n");
+    let err = resolve_cache_budgets(&c, Some("512Ki"), LegacyBudgets::Enforce, F).unwrap_err();
+    assert!(err.to_string().contains("too small"), "{err}");
+    assert!(resolve(&c).is_ok(), "a stored object must keep running");
+}
+
+/// Greptile on #714: flooring each scaled budget at 1MiB could push the pair past
+/// the ceiling of a small volume. After rounding, the fitted pair always stays
+/// within 90% of the available space (whenever that holds 1MiB + 1MiB at all).
+#[test]
+fn fitting_never_overshoots_the_ceiling_after_rounding() {
+    for configured in ["3Mi", "6Mi", "10Mi", "64Mi", "1Gi"] {
+        let c_mib = quantity_to_mib(configured).unwrap();
+        for content in [
+            None,
+            Some(CacheSize::Percent(89)),
+            Some(CacheSize::Percent(1)),
+        ] {
+            let c = CacheDefaults {
+                capacity: Some(configured.into()),
+                content_cache_size: content.clone(),
+                ..Default::default()
+            };
+            let Ok(r) = resolve_cache_budgets(&c, Some(configured), LegacyBudgets::Enforce, F)
+            else {
+                continue;
+            };
+            for avail in 3..=c_mib.min(200) {
+                let f = fit_cache_budgets(&r, &format!("{avail}Mi"));
+                let total = f.content_cache_size_mb.unwrap() + f.metadata_cache_size_mb.unwrap();
+                assert!(
+                    total * 100 <= avail * i64::from(MAX_CACHE_BUDGET_PERCENT),
+                    "{c:?} fitted to {avail}Mi: {f:?}"
+                );
+            }
+        }
+    }
+}

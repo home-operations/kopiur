@@ -356,6 +356,12 @@ pub fn resolve_cache_budgets(
         "metadataCacheSize",
     )?;
 
+    // A capacity that parses but rounds to 0MiB (e.g. `512Ki`) is a SIZED volume too
+    // small to bound either cache — refuse it at admission rather than treat it as
+    // "no capacity" (#714 review). Stored objects keep running (pass-through).
+    if capacity.and_then(quantity_to_mib) == Some(0) {
+        ctx.check_both_bounded(None, None)?;
+    }
     let Some(cap) = ctx.cap_mib else {
         // No fixed-size volume: nothing to default against or bound by.
         return Ok(ResolvedCache {
@@ -440,10 +446,24 @@ pub fn fit_cache_budgets(r: &ResolvedCache, available: &str) -> ResolvedCache {
         return r.clone();
     }
     let scale = |b: Option<i64>| b.map(|mb| (mb * avail / resolved).max(1));
+    let (mut content, mut metadata) = (
+        scale(r.content_cache_size_mb),
+        scale(r.metadata_cache_size_mb),
+    );
+    // The 1MiB floor can push the pair past the ceiling on a small volume (#714
+    // review): take the excess off the larger budget, never below 1MiB.
+    let ceiling = avail * i64::from(MAX_CACHE_BUDGET_PERCENT) / 100;
+    if let (Some(c), Some(m)) = (content.as_mut(), metadata.as_mut()) {
+        let excess = *c + *m - ceiling;
+        if excess > 0 {
+            let larger = if *c >= *m { c } else { m };
+            *larger = (*larger - excess).max(1);
+        }
+    }
     ResolvedCache {
         capacity: Some(available.to_string()),
-        content_cache_size_mb: scale(r.content_cache_size_mb),
-        metadata_cache_size_mb: scale(r.metadata_cache_size_mb),
+        content_cache_size_mb: content,
+        metadata_cache_size_mb: metadata,
     }
 }
 
