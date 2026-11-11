@@ -100,32 +100,58 @@ async fn record_maintenance_status_metrics(maint: &Maintenance, ctx: &Context, o
     }
 }
 
-/// **Pure.** Whether `maint` carries an ownerReference to the `ClusterRepository`
-/// named `repo_name` with uid `repo_uid` — i.e. it is that repository's own
-/// projected `spec.maintenance`. Matching the uid (not just kind + name) means a
-/// tenant cannot claim the exemption by hand-writing an ownerReference: it would
-/// need the live object's uid, and a stale/recreated repository never matches.
-fn owner_refs_name_cluster_repository(
+/// **Pure.** Whether `maint` is exactly the `Maintenance` the operator projects
+/// from `repo.spec.maintenance` — the only object exempt from the consumer
+/// tenancy gate, because it is the repository owner's own authorization.
+///
+/// A matching ownerReference alone is NOT enough (PR #705 review): any tenant who
+/// can read the `ClusterRepository` can copy its uid onto a hand-written
+/// `Maintenance`, which would then outlive their removal from
+/// `allowedNamespaces`. So the object must match the projection on every axis a
+/// tenant cannot fake from their own namespace:
+/// - it lives in the repository's resolved placement namespace
+///   (`spec.maintenance.namespace`, else the operator's) — creating objects there
+///   needs the repository owner's RBAC, not a tenant's;
+/// - it carries the name the projection uses (the repository's own name);
+/// - its CONTROLLER ownerReference is this `ClusterRepository` by kind, name and
+///   live uid (a recreated repository never matches);
+/// - the repository currently wants a managed `Maintenance` (enabled, writable);
+/// - it requests no credential projection, which the projection never sets.
+fn is_managed_cluster_maintenance(
     maint: &Maintenance,
-    repo_name: &str,
-    repo_uid: Option<&str>,
+    repo: &kopiur_api::ClusterRepository,
+    operator_namespace: Option<&str>,
 ) -> bool {
-    let Some(uid) = repo_uid else {
+    let repo_name = repo.name_any();
+    let Some(uid) = repo.metadata.uid.as_deref() else {
         return false;
     };
-    maint.metadata.owner_references.iter().flatten().any(|o| {
-        o.kind == "ClusterRepository"
+    let wanted =
+        repo.spec.mode.allows_writes() && repo.spec.maintenance.as_ref().is_none_or(|m| m.enabled);
+    let Some(placement) =
+        crate::cluster_repository::cluster_maintenance_placement_in(repo, operator_namespace)
+    else {
+        return false;
+    };
+    let controlled_by_repo = maint.metadata.owner_references.iter().flatten().any(|o| {
+        o.controller == Some(true)
+            && o.kind == "ClusterRepository"
             && o.name == repo_name
             && o.uid == uid
             && o.api_version.starts_with("kopiur.home-operations.com/")
-    })
+    });
+    wanted
+        && controlled_by_repo
+        && maint.metadata.namespace.as_deref() == Some(placement.as_str())
+        && maint.metadata.name.as_deref() == Some(repo_name.as_str())
+        && maint.spec.credential_projection.is_none()
 }
 
 /// Whether this `Maintenance` is the managed projection of the very
-/// `ClusterRepository` it targets (exempt from the consumer tenancy gate: it is
-/// the repository owner's own authorization). A namespaced `Repository` ref is
-/// never gated, so it needs no answer here. An absent repository answers `false`
-/// and the gate then reports it as a missing dependency.
+/// `ClusterRepository` it targets (see [`is_managed_cluster_maintenance`]). A
+/// namespaced `Repository` ref is never gated, so it needs no answer here. An
+/// absent repository answers `false` and the gate then reports it as a missing
+/// dependency.
 async fn owned_by_repository(
     maint: &Maintenance,
     repo_ref: &kopiur_api::common::RepositoryRef,
@@ -137,7 +163,8 @@ async fn owned_by_repository(
         RepositoryKind::ClusterRepository => {
             let repo = io::fetch_cluster_repository(ctx, &repo_ref.name).await?;
             Ok(repo.is_some_and(|r| {
-                owner_refs_name_cluster_repository(maint, &repo_ref.name, r.metadata.uid.as_deref())
+                r.name_any() == repo_ref.name
+                    && is_managed_cluster_maintenance(maint, &r, ctx.operator_namespace.as_deref())
             }))
         }
     }

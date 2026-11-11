@@ -790,7 +790,7 @@ The gate is checked in two places. The admission webhook rejects a consumer whos
 - **The `ClusterRepository` did not exist yet when the consumer was applied.** Admission lets that through with a warning, so GitOps tools can apply a bundle in any order (see [Applying before the source repository exists](/replication/#applying-before-the-source-repository-exists)). The gate is enforced once the repository appears.
 - **You narrowed the gate later.** A consumer whose namespace is no longer admitted stops starting new work and reports `Ready=False` with reason `BlockedOnGrant` (on kinds that report it there; always as a Warning Event). Widening the gate again resumes it on its own. Deleting the consumer, or its snapshots, is never blocked by the gate.
 
-A `Maintenance` that the `ClusterRepository` projects from its own `spec.maintenance` is the repository owner's own and is not gated.
+A `Maintenance` that the `ClusterRepository` projects from its own `spec.maintenance` is the repository owner's own and is not gated. That exemption covers only the projected object itself: the one named after the repository, in its maintenance placement namespace (`spec.maintenance.namespace`, else the operator's namespace), controlled by the live `ClusterRepository`, while `spec.maintenance` is enabled. A `Maintenance` you write yourself in a tenant namespace is always gated, even if you copy the repository's `ownerReferences` onto it.
 
 `selector` gates evaluate both `matchLabels` and `matchExpressions` (`In`, `NotIn`, `Exists`, `DoesNotExist`). An operator kopiur does not recognize denies.
 
