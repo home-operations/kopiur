@@ -1016,7 +1016,9 @@ fn seed_source_volume(backend: &Backend) -> Option<VolumeMountSpec> {
     filesystem_repo_mount_source(backend).map(|source| VolumeMountSpec {
         source,
         mount_path: filesystem_repo_path(backend).unwrap_or_default(),
-        read_only: true,
+        // Derived from the access the mover connects the seed source with, never
+        // a literal (see `RepositoryAccess`).
+        read_only: kopiur_mover::workspec::SeedOpSpec::SOURCE_ACCESS.mounts_read_only(),
     })
 }
 

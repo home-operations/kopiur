@@ -250,6 +250,15 @@ jobs:
             bins: "cache_budgets"
             backends: false
             csi: true
+          # #464 live-pod inherit hold + heal: the scale-to-zero and staged
+          # copyMethod scenarios wait out real scheduling (~11 min together), which
+          # left reshape-core within a slow artifact download of the 30-minute job
+          # limit (a cancelled run on #715). `csi: true` for the staged-copyMethod
+          # scenario's csi-hostpath-sc source.
+          - shard: inherit-hold
+            bins: "inherit_hold"
+            backends: false
+            csi: true
           # Hooks (ADR §4.8) + GFS time-bucketed retention + policy knobs. The
           # httpRequest hook reuses the WebDAV fixture as its receiver, so this
           # shard preloads the backend images.
