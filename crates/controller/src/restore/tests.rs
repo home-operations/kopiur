@@ -4032,3 +4032,35 @@ fn the_fanout_status_body_preserves_a_healed_inherit_hold() {
         "pinning the defect: a stale base erases the heal from the fan-out body"
     );
 }
+
+// --- the restore repository volume and the mover's connect mode agree ---
+
+/// The `E2E (populator-fanout)` flake, as a pure rule. The restore mover mounted a
+/// filesystem repository READ-ONLY and connected kopia READ-WRITE; kopia then
+/// auto-compacted the manifest set on load (16+ contents), the compaction write hit the
+/// read-only mount, and the restore failed with `read-only file system`
+/// (`MoverJobFailed`). The mount here and the mover's connect both come from
+/// `RestoreOp::REPOSITORY_ACCESS`, so this pins the pairing from the controller side:
+/// a read-only mount is only ever emitted alongside a `--readonly` connect.
+#[test]
+fn a_restore_mounts_a_filesystem_repository_exactly_as_the_mover_connects_to_it() {
+    use kopiur_api::backend::{Backend, FilesystemBackend, PvcVolume, RepoVolume};
+    let backend = Backend::Filesystem(FilesystemBackend {
+        path: "/repo".into(),
+        volume: Some(RepoVolume::Pvc(PvcVolume {
+            name: "nas-repo".into(),
+        })),
+    });
+    let mount = restore_repo_volume(&backend).expect("a PVC-backed filesystem repo is mounted");
+    assert_eq!(mount.mount_path, "/repo");
+    assert!(
+        RestoreOp::REPOSITORY_ACCESS.connects_read_only(),
+        "a restore only reads the repository, so the mover connects --readonly"
+    );
+    assert_eq!(
+        mount.read_only,
+        RestoreOp::REPOSITORY_ACCESS.connects_read_only(),
+        "the repository volume's readOnly must match the mover's connect mode: a read-only \
+         mount under a read-write connect fails reads once kopia auto-compacts manifests"
+    );
+}

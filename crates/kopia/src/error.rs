@@ -180,6 +180,13 @@ impl KopiaErrorClass {
         } else if s.contains("permission denied")
             || s.contains("operation not permitted")
             || s.contains("eacces")
+            // EROFS: the repository path is on a read-only mount. Not writable for
+            // the same practical reason as EACCES, and just as permanent — and it
+            // must be checked BEFORE the Locked arm: kopia's EROFS errors arrive
+            // wrapped in a Go stack whose frames mention "lock" (the
+            // populator-fanout flake was reported as `class Locked`, retryable, so
+            // the Job's backoff re-ran a doomed restore).
+            || s.contains("read-only file system")
         {
             // Local repo path not writable by our UID. Checked before SourceError
             // (which used to absorb "permission denied" and wrongly mark it
@@ -583,6 +590,26 @@ mod tests {
             KopiaErrorClass::classify("something totally unexpected"),
             KopiaErrorClass::Unknown
         );
+    }
+
+    /// The populator-fanout flake, verbatim from CI (trimmed): a write through a
+    /// read-only repository mount, wrapped in Go stack frames named
+    /// `…Locked`. It was classified `Locked` — retryable — off those frame
+    /// names. A read-only mount is a permanent, not-writable condition.
+    #[test]
+    fn classify_a_read_only_file_system_as_permission_denied_not_locked() {
+        let ci = "unable to find snapshot manifests: error auto-compacting contents: unable to \
+             flush contents after auto-compaction: error writing pack file: unable to complete \
+             PutBlobInPath:/repo/q8a/6fd/fb456db61e1acaaac11353cefa9-sdd0e288b11614b14147.f \
+             despite 2 retries: cannot create temporary file: cannot create directory: \
+             unexpected error creating directory: mkdir /repo/q8a: read-only file system\n\
+             github.com/kopia/kopia/repo/manifest.(*committedManifestManager).maybeCompactLocked\n\
+             github.com/kopia/kopia/repo/manifest.(*committedManifestManager).loadCommittedContentsLocked";
+        assert_eq!(
+            KopiaErrorClass::classify(ci),
+            KopiaErrorClass::PermissionDenied
+        );
+        assert!(!KopiaErrorClass::classify(ci).is_retryable());
     }
 
     /// Issue #477, verbatim: a remote backend dropping connections while the

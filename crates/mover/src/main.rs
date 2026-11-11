@@ -50,9 +50,10 @@ use kopiur_mover::status::{
 use kopiur_mover::verify::quick_coverage;
 use kopiur_mover::workspec::{
     self, BootstrapRepositoryOp, BrowseSessionOp, KOPIA_KEEP_MAX, KOPIUR_PIN_NAME, MaintenanceOp,
-    MoverWorkSpec, Operation, ReplicateOp, RestoreOp, RestoreScope, RestoreSelection,
-    RestoreSelector, SnapshotAnchor, SnapshotDeleteBatchOp, SnapshotPinOp, SnapshotReplicateOp,
-    ThrottleSpec, VerifyOp, VerifyTier, maintenance_restamp_target, restore_scope,
+    MoverWorkSpec, Operation, ReplicateOp, RepositoryAccess, RestoreOp, RestoreScope,
+    RestoreSelection, RestoreSelector, SnapshotAnchor, SnapshotDeleteBatchOp, SnapshotPinOp,
+    SnapshotReplicateOp, ThrottleSpec, VerifyOp, VerifyTier, maintenance_restamp_target,
+    restore_scope,
 };
 #[cfg(test)]
 use kopiur_mover::workspec::{SnapshotDeleteItem, SnapshotDeleteOp};
@@ -281,42 +282,19 @@ async fn run(cli: &MoverCli) -> Result<()> {
             // `Default` (empty) throttle from their controllers, so
             // `apply_repository_throttle` is a no-op for them today — that is a
             // controller-side gap, deliberately out of scope for this change.
+            //
+            // The access mode is decided HERE, per variant, for the same reason:
+            // a restore reads through a read-only filesystem mount, and a
+            // read-write connect over it fails once kopia auto-compacts the
+            // manifest set on load (see `RepositoryAccess`).
+            Operation::Restore(_) => {
+                run_generic_flow(&client, &spec, &connect, RestoreOp::REPOSITORY_ACCESS).await
+            }
             Operation::Snapshot(_)
-            | Operation::Restore(_)
             | Operation::SnapshotDelete(_)
             | Operation::SnapshotDeleteBatch(_)
             | Operation::SnapshotPin(_) => {
-                // A best-effort status reporter. If we cannot build a kube client
-                // (e.g. running outside a cluster), we log instead of failing.
-                // SnapshotDeleteBatch's targetRef names the Job itself — nothing
-                // the controller owns — and the mover is deliberately NOT granted
-                // RBAC to PATCH it, so hand-select the log-only reporter for it:
-                // a PATCH must never even be attempted, not just best-effort
-                // degraded (this selection is hand-wired, not compiler-enforced —
-                // see `wants_log_only_reporter`).
-                let reporter = if wants_log_only_reporter(&spec.operation) {
-                    StatusReporter::log_only(spec.target_ref.clone())
-                } else {
-                    StatusReporter::try_new(&spec).await
-                };
-                // Connect AND throttle as one operation — see `connect_and_throttle`.
-                match connect_and_throttle(&client, &connect, spec.cache, &spec.throttle).await {
-                    Err(e) => {
-                        terminal_failure(&reporter, e.into_mover_error(KopiaOp::RepositoryConnect))
-                            .await
-                    }
-                    Ok(()) => match execute(&client, &spec, &reporter).await {
-                        Ok(update) => {
-                            reporter.report(&update).await;
-                            info!(
-                                phase = update.phase.as_deref().unwrap_or("done"),
-                                "operation succeeded"
-                            );
-                            Ok(())
-                        }
-                        Err(e) => terminal_failure(&reporter, e).await,
-                    },
-                }
+                run_generic_flow(&client, &spec, &connect, RepositoryAccess::ReadWrite).await
             }
         },
     };
@@ -331,6 +309,46 @@ async fn run(cli: &MoverCli) -> Result<()> {
     metrics.shutdown();
 
     result
+}
+
+/// The shared lifecycle of the operations without a flow of their own
+/// (snapshot, restore, delete, batch delete, pin): connect with `access` and
+/// apply the repository throttle as one step, then run with periodic progress
+/// PATCHes and report the terminal outcome.
+async fn run_generic_flow(
+    client: &KopiaClient,
+    spec: &MoverWorkSpec,
+    connect: &ConnectSpec,
+    access: RepositoryAccess,
+) -> Result<()> {
+    // A best-effort status reporter. If we cannot build a kube client
+    // (e.g. running outside a cluster), we log instead of failing.
+    // SnapshotDeleteBatch's targetRef names the Job itself — nothing
+    // the controller owns — and the mover is deliberately NOT granted
+    // RBAC to PATCH it, so hand-select the log-only reporter for it:
+    // a PATCH must never even be attempted, not just best-effort
+    // degraded (this selection is hand-wired, not compiler-enforced —
+    // see `wants_log_only_reporter`).
+    let reporter = if wants_log_only_reporter(&spec.operation) {
+        StatusReporter::log_only(spec.target_ref.clone())
+    } else {
+        StatusReporter::try_new(spec).await
+    };
+    // Connect AND throttle as one operation — see `connect_and_throttle`.
+    match connect_and_throttle(client, connect, spec.cache, &spec.throttle, access).await {
+        Err(e) => terminal_failure(&reporter, e.into_mover_error(KopiaOp::RepositoryConnect)).await,
+        Ok(()) => match execute(client, spec, &reporter).await {
+            Ok(update) => {
+                reporter.report(&update).await;
+                info!(
+                    phase = update.phase.as_deref().unwrap_or("done"),
+                    "operation succeeded"
+                );
+                Ok(())
+            }
+            Err(e) => terminal_failure(&reporter, e).await,
+        },
+    }
 }
 
 /// Why a repository connection is not usable for work: it never opened, or it
@@ -377,14 +395,24 @@ impl ConnectFailure {
 /// Fusing them means a future flow cannot obtain a connection without also
 /// obtaining its cap. `connect_funnel_is_the_only_way_flows_connect` (below)
 /// makes an attempt to bypass it loud.
+///
+/// `access` is the connection mode, passed by every caller rather than
+/// defaulted: a read-only volume under a read-write connect fails reads once
+/// kopia's manifest auto-compaction kicks in (see [`RepositoryAccess`]), so each
+/// flow states which one it is.
 async fn connect_and_throttle(
     client: &KopiaClient,
     connect: &ConnectSpec,
     cache: kopiur_kopia::CacheTuning,
     throttle: &ThrottleSpec,
+    access: RepositoryAccess,
 ) -> std::result::Result<(), ConnectFailure> {
+    let options = ConnectOptions {
+        readonly: access.connects_read_only(),
+        persist_credentials: false,
+    };
     client
-        .repository_connect(connect, cache)
+        .repository_connect_with(connect, cache, options)
         .await
         .map_err(ConnectFailure::Connect)?;
     apply_repository_throttle(client, throttle)
@@ -1763,8 +1791,9 @@ impl BootstrapConnectFailure {
 /// (`repository_connect_readonly`) instead of the normal read-write connect —
 /// bootstrap is a connect/scan probe, and a read-write connect from a
 /// ReadOnly consumer repo was exactly what let it clobber the primary's
-/// maintenance owner. Every other mover flow (restore, delete, snapshot)
-/// stays on the plain read-write connect regardless.
+/// maintenance owner. The other flows state their own mode to
+/// [`connect_and_throttle`] (a restore always connects `--readonly`; see
+/// [`RestoreOp::REPOSITORY_ACCESS`]).
 ///
 /// The ONE funnel for every bootstrap connect (probe, post-create reconnect,
 /// post-seed reconnect), so [`apply_repository_throttle`]'s no-exceptions
@@ -2205,8 +2234,14 @@ async fn seed_create_and_connect_local(
     // on the heaviest transfer kopiur performs. (The seed SOURCE's own cap is a
     // separate knob on a separate connection — `replicaThrottle`, applied in
     // `seed_connect_source`; kopia's limits never cross between the two.)
-    if let Err(e) =
-        connect_and_throttle(&local_client, local_connect, spec.cache, &spec.throttle).await
+    if let Err(e) = connect_and_throttle(
+        &local_client,
+        local_connect,
+        spec.cache,
+        &spec.throttle,
+        RepositoryAccess::ReadWrite,
+    )
+    .await
     {
         let e = e.into_mover_error(KopiaOp::SeedLocalConnect);
         error!(class = %e.kopia_class(), "could not open a throttled connection to the seed target repository");
@@ -3306,7 +3341,15 @@ async fn run_maintenance_flow(
     // Connect AND cap, as one operation (`connect_and_throttle`): a full
     // maintenance rewrites and drops blobs, so it is exactly the kind of backend
     // traffic `moverDefaults.throttle` exists to bound.
-    if let Err(e) = connect_and_throttle(client, connect, spec.cache, &spec.throttle).await {
+    if let Err(e) = connect_and_throttle(
+        client,
+        connect,
+        spec.cache,
+        &spec.throttle,
+        RepositoryAccess::ReadWrite,
+    )
+    .await
+    {
         let e = e.into_mover_error(KopiaOp::MaintenanceConnect);
         patch_maintenance_status(&spec.target_ref, &maintenance_failed_body_from_mover(&e)).await;
         error!(class = %e.kopia_class(), "could not open a throttled connection for maintenance");
@@ -3476,7 +3519,15 @@ async fn run_verify_flow(
     // Connect AND cap, as one operation: verification READS the repository — a
     // deep verify scratch-restores a whole snapshot — so it is throttled like
     // any other data flow.
-    if let Err(e) = connect_and_throttle(client, connect, spec.cache, &spec.throttle).await {
+    if let Err(e) = connect_and_throttle(
+        client,
+        connect,
+        spec.cache,
+        &spec.throttle,
+        RepositoryAccess::ReadWrite,
+    )
+    .await
+    {
         let e = e.into_mover_error(KopiaOp::VerifyConnect);
         patch_verify_failure(spec, op, &e.to_string()).await;
         error!(class = %e.kopia_class(), "could not open a throttled connection for verification");
@@ -3773,7 +3824,15 @@ async fn run_replicate_flow(
     // the connection `repository sync-to` reads through — a whole-repository blob
     // mirror is the single heaviest read this flow performs, and the source is
     // often the link the user capped.
-    if let Err(e) = connect_and_throttle(client, connect, spec.cache, &spec.throttle).await {
+    if let Err(e) = connect_and_throttle(
+        client,
+        connect,
+        spec.cache,
+        &spec.throttle,
+        RepositoryAccess::ReadWrite,
+    )
+    .await
+    {
         let e = e.into_mover_error(KopiaOp::ReplicateConnect);
         patch_replicate_status(&spec.target_ref, &replicate_failed_body(&e.to_string())).await;
         error!(class = %e.kopia_class(), "could not open a throttled connection to the replication source");
@@ -5226,6 +5285,56 @@ mod tests {
                     }
                 ),
                 "expected a ThrottleSet kopia failure, got {err:?}"
+            );
+        }
+
+        /// The kopia argv of `connect_and_throttle(.., access)`, recorded by a shim.
+        async fn connect_argv(access: RepositoryAccess) -> String {
+            let argv_dir = tempfile::tempdir().unwrap();
+            let argv = argv_dir.path().join("argv");
+            let s = shim(&format!(
+                "#!/bin/sh\necho \"$*\" >> \"{}\"\nexit 0\n",
+                argv.display()
+            ));
+            let connect = ConnectSpec::Filesystem {
+                path: "/repo".into(),
+            };
+            if connect_and_throttle(
+                &client_for(&s),
+                &connect,
+                kopiur_kopia::CacheTuning::default(),
+                &ThrottleSpec::default(),
+                access,
+            )
+            .await
+            .is_err()
+            {
+                panic!("the shim accepts every connect");
+            }
+            std::fs::read_to_string(&argv).expect("the shim recorded its argv")
+        }
+
+        /// The populator-fanout flake, from the mover side: a restore reads a
+        /// filesystem repository through a READ-ONLY mount, so its connect must
+        /// be `--readonly` — or kopia auto-compacts the manifest set on load
+        /// (16+ contents), the write hits the read-only mount, and the restore
+        /// fails `read-only file system`. The generic arm hands a restore
+        /// `RestoreOp::REPOSITORY_ACCESS`; this pins that the funnel turns it
+        /// into kopia's flag, and that read-write flows do not get it.
+        #[tokio::test]
+        async fn a_read_only_access_connects_readonly_and_a_read_write_one_does_not() {
+            assert_eq!(RestoreOp::REPOSITORY_ACCESS, RepositoryAccess::ReadOnly);
+            let restore = connect_argv(RestoreOp::REPOSITORY_ACCESS).await;
+            assert!(
+                restore.starts_with("repository connect filesystem")
+                    && restore.contains("--readonly"),
+                "a restore must connect --readonly; got: {restore}"
+            );
+            let snapshot = connect_argv(RepositoryAccess::ReadWrite).await;
+            assert!(
+                snapshot.starts_with("repository connect filesystem")
+                    && !snapshot.contains("--readonly"),
+                "a read-write flow must not connect --readonly; got: {snapshot}"
             );
         }
 

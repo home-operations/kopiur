@@ -640,7 +640,54 @@ pub fn restore_scope(op: &RestoreOp) -> RestoreScope<'_> {
     }
 }
 
+/// How a mover run opens the repository: the kopia connection mode AND, for a
+/// filesystem repository, how the controller mounts its volume. One value
+/// decides both, because they must agree.
+///
+/// A mismatch is not merely untidy. kopia AUTO-COMPACTS the manifest set on
+/// every load once it holds 16 or more manifest contents, and compaction
+/// WRITES; the only client it spares is one opened read-only. A read-write
+/// connection over a read-only volume therefore fails ordinary reads — `snapshot
+/// list`, `snapshot restore` — with `read-only file system` whenever the
+/// repository's writers happen to have left the count at the threshold. That
+/// is what made restores from filesystem repositories fail intermittently with
+/// `MoverJobFailed` (the `E2E (populator-fanout)` flake), pinned against the
+/// real binary by `crates/kopia/tests/integration_readonly_manifest_compaction.rs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepositoryAccess {
+    /// Connect read-write; a filesystem repository's volume is mounted writable.
+    ReadWrite,
+    /// Connect with `kopia repository connect --readonly`; a filesystem
+    /// repository's volume is mounted `readOnly: true`.
+    ReadOnly,
+}
+
+impl RepositoryAccess {
+    /// Whether the kopia connection is opened `--readonly`.
+    pub fn connects_read_only(self) -> bool {
+        match self {
+            RepositoryAccess::ReadOnly => true,
+            RepositoryAccess::ReadWrite => false,
+        }
+    }
+
+    /// Whether a filesystem repository's volume is mounted `readOnly: true`.
+    /// Deliberately the same answer as [`Self::connects_read_only`]: see the
+    /// type docs for what a read-only mount under a read-write connect does.
+    pub fn mounts_read_only(self) -> bool {
+        self.connects_read_only()
+    }
+}
+
 impl RestoreOp {
+    /// How a restore opens the repository: READ-ONLY. A restore only ever reads
+    /// it (`snapshot list`/`restore`/`ls`/`show`; pins go to the Kubernetes API,
+    /// not to kopia), so the controller mounts a filesystem repository read-only
+    /// and the mover must connect `--readonly` to match — or kopia's manifest
+    /// auto-compaction tries to write through the read-only mount and fails the
+    /// restore (see [`RepositoryAccess`]).
+    pub const REPOSITORY_ACCESS: RepositoryAccess = RepositoryAccess::ReadOnly;
+
     /// Translate the carried restore flags into the kopia client's options.
     /// Every field is mapped explicitly (no `..Default::default()` swallowing a
     /// field silently) — this is the regression guard for the M2 gap-sweep bug
