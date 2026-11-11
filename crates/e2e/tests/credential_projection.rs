@@ -544,6 +544,39 @@ async fn projected_copies_do_not_accumulate_across_runs() {
     let _ = crepos.delete(crepo, &DeleteParams::default()).await;
 }
 
+/// Delete `name` and WAIT until it is gone, stripping its finalizers if it sits
+/// terminating — a previous try's object, which this test only removes so the
+/// retry starts clean. Never used on an object the test is asserting about.
+async fn purge<K>(api: &Api<K>, name: &str)
+where
+    K: kube::Resource + Clone + DeserializeOwned + std::fmt::Debug,
+    <K as kube::Resource>::DynamicType: Default,
+{
+    let _ = api.delete(name, &DeleteParams::default()).await;
+    wait_until(
+        &format!("leftover {name} is gone"),
+        default_timeout(),
+        poll_interval(),
+        || async {
+            let Some(obj) = api.get_opt(name).await? else {
+                return Ok(Some(()));
+            };
+            if obj.meta().deletion_timestamp.is_some() {
+                let _ = api
+                    .patch(
+                        name,
+                        &PatchParams::default(),
+                        &Patch::Merge(serde_json::json!({ "metadata": { "finalizers": null } })),
+                    )
+                    .await;
+            }
+            Ok(None)
+        },
+    )
+    .await
+    .unwrap_or_else(|e| panic!("a previous try's {name} must clear before the retry: {e}"));
+}
+
 /// **The stuck-finalizer guard (#255), now via the policy-cascade Delete mode.** Delete
 /// the `SnapshotPolicy` and let its `onPolicyDelete: Delete` cascade remove the child,
 /// and a `deletionPolicy: Delete` Snapshot must still finish deleting its kopia snapshot
@@ -585,6 +618,14 @@ async fn snapshot_deletion_survives_a_policy_deleted_first() {
     let crepo = "e2e-proj-orphan-crepo";
     let cfg = "e2e-proj-orphan-cfg";
     let backup = "e2e-proj-orphan-backup";
+
+    // A failed try leaves all three behind — the Snapshot pinned by its cleanup
+    // finalizer, which is exactly the state this test asserts against — and a
+    // retry then dies `AlreadyExists` on the ClusterRepository before reaching
+    // anything it retries. Purge them first, child before parent.
+    purge(&backups, backup).await;
+    purge(&configs, cfg).await;
+    purge(&crepos, crepo).await;
 
     crepos
         .create(

@@ -3195,3 +3195,149 @@ fn a_partial_restore_without_paths_or_into_a_stream_is_rejected() {
     });
     assert!(partial_restore_problem(&streamed).is_some());
 }
+
+// --- Operation::repository_access: one answer per operation, every operation ---
+
+/// One minimal instance of EVERY [`Operation`] variant, decoded from the wire
+/// shape (`{ "<variant>": { ... } }`), paired with the access the operation must
+/// connect with. A bootstrap appears twice — its access follows `readOnly`.
+///
+/// The `kind_str` coverage check in the test below is what makes this list
+/// exhaustive in practice: a new variant that is not added here fails it.
+fn every_operation_with_its_access() -> Vec<(Operation, RepositoryAccess)> {
+    let anchor = serde_json::json!({ "sourcePath": "/pvc/db" });
+    let fs = serde_json::json!({ "filesystem": { "path": "/repo" } });
+    let restore = serde_json::json!({
+        "source": { "snapshot": "k1" },
+        "targetPath": "/restore",
+        "anchor": anchor,
+    });
+    let mut partial = restore.clone();
+    partial["paths"] = serde_json::json!(["docs"]);
+    let bootstrap = |read_only: bool| {
+        serde_json::json!({ "bootstrapRepository": {
+            "autoCreate": false,
+            "scanCatalog": false,
+            "readOnly": read_only,
+        } })
+    };
+    let fixtures = [
+        (
+            serde_json::json!({ "snapshot": { "sourcePath": "/data" } }),
+            RepositoryAccess::ReadWrite,
+        ),
+        (
+            serde_json::json!({ "restore": restore }),
+            RepositoryAccess::ReadOnly,
+        ),
+        (
+            serde_json::json!({ "partialRestore": partial }),
+            RepositoryAccess::ReadOnly,
+        ),
+        (
+            serde_json::json!({ "snapshotDelete": { "snapshotId": "k1", "anchor": anchor } }),
+            RepositoryAccess::ReadWrite,
+        ),
+        (
+            serde_json::json!({ "snapshotDeleteBatch": { "items": [] } }),
+            RepositoryAccess::ReadWrite,
+        ),
+        (bootstrap(false), RepositoryAccess::ReadWrite),
+        (bootstrap(true), RepositoryAccess::ReadOnly),
+        (
+            serde_json::json!({ "maintenance": {
+                "mode": "quick", "owner": "kopiur/ns/repo", "takeoverPolicy": "Never",
+            } }),
+            RepositoryAccess::ReadWrite,
+        ),
+        (
+            serde_json::json!({ "snapshotPin": { "snapshotId": "k1", "pin": true, "anchor": anchor } }),
+            RepositoryAccess::ReadWrite,
+        ),
+        (
+            serde_json::json!({ "verify": { "tier": { "quick": {} } } }),
+            RepositoryAccess::ReadWrite,
+        ),
+        (
+            serde_json::json!({ "replicate": { "destination": fs } }),
+            RepositoryAccess::ReadWrite,
+        ),
+        (
+            serde_json::json!({ "browseSession": {} }),
+            RepositoryAccess::ReadOnly,
+        ),
+        (
+            serde_json::to_value(Operation::SnapshotReplicate(sample_snapshot_replicate_op()))
+                .expect("serialize snapshotReplicate"),
+            RepositoryAccess::ReadOnly,
+        ),
+    ];
+    fixtures
+        .into_iter()
+        .map(|(wire, access)| {
+            let op: Operation = serde_json::from_value(wire.clone())
+                .unwrap_or_else(|e| panic!("fixture {wire} must decode as an Operation: {e}"));
+            (op, access)
+        })
+        .collect()
+}
+
+/// The populator-fanout flake was a restore connecting read-write through a
+/// read-only repository mount. `Operation::repository_access` is now THE answer
+/// for every operation — the mover connects by it and the controller derives
+/// every read-only mount from it — and this pins the whole matrix, so changing
+/// one operation's mode, or adding an operation, is a deliberate edit here.
+#[test]
+fn every_operation_connects_with_its_declared_repository_access() {
+    let all = every_operation_with_its_access();
+    let covered: std::collections::BTreeSet<&str> =
+        all.iter().map(|(op, _)| op.kind_str()).collect();
+    assert_eq!(
+        covered,
+        [
+            "BootstrapRepository",
+            "BrowseSession",
+            "Maintenance",
+            "PartialRestore",
+            "Replicate",
+            "Restore",
+            "Snapshot",
+            "SnapshotDelete",
+            "SnapshotDeleteBatch",
+            "SnapshotPin",
+            "SnapshotReplicate",
+            "Verify",
+        ]
+        .into_iter()
+        .collect(),
+        "every Operation variant needs a fixture here (and a decision in \
+         `Operation::repository_access`)"
+    );
+    for (op, want) in &all {
+        assert_eq!(
+            op.repository_access(),
+            *want,
+            "{} must connect {want:?}",
+            op.kind_str()
+        );
+        // The pairing the bug broke: a read-only mount only ever under a
+        // read-only connect.
+        assert!(
+            !op.repository_access().mounts_read_only()
+                || op.repository_access().connects_read_only(),
+            "{}: a read-only mount under a read-write connect",
+            op.kind_str()
+        );
+    }
+    // The reader flows are exactly the ones that may mount read-only.
+    assert_eq!(RestoreOp::REPOSITORY_ACCESS, RepositoryAccess::ReadOnly);
+    assert_eq!(
+        SnapshotReplicateOp::SOURCE_ACCESS,
+        RepositoryAccess::ReadOnly
+    );
+    assert_eq!(
+        BrowseSessionOp::REPOSITORY_ACCESS,
+        RepositoryAccess::ReadOnly
+    );
+    assert_eq!(SeedOpSpec::SOURCE_ACCESS, RepositoryAccess::ReadOnly);
+}

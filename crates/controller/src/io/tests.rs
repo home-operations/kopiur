@@ -5647,3 +5647,97 @@ mod stale_work_condition_clear {
         }
     }
 }
+
+// --- read-only repository mounts are derived from an access, never literal ---
+
+/// Every `read_only:` given to a repository volume built from
+/// `filesystem_repo_mount_source(..)`, across the controller and the shared ops
+/// crate, as `(file:line, value expression)`.
+fn repository_mount_read_only_exprs() -> Vec<(String, String)> {
+    fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("read src dir") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                walk(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+    let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let mut files = Vec::new();
+    walk(&crates.join("controller/src"), &mut files);
+    walk(&crates.join("ops/src"), &mut files);
+    // Assembled at runtime so this test's own source never matches.
+    let call = format!("{}(", "filesystem_repo_mount_source");
+    let mut found = Vec::new();
+    for file in files {
+        let text = std::fs::read_to_string(&file).expect("read source");
+        let lines: Vec<&str> = text.lines().collect();
+        for (i, line) in lines.iter().enumerate() {
+            if !line.contains(&call) || line.trim_start().starts_with("//") {
+                continue;
+            }
+            // The `read_only:` of the VolumeMountSpec this call builds, joined
+            // up to its terminating comma (a multi-line expression included). A
+            // mount-source probe with no VolumeMountSpec (an `.is_none()` check)
+            // has none and is skipped.
+            let window = &lines[i..(i + 12).min(lines.len())];
+            let Some(start) = window
+                .iter()
+                .position(|l| l.trim_start().starts_with("read_only:"))
+            else {
+                continue;
+            };
+            let mut expr = String::new();
+            for l in &window[start..] {
+                if !expr.is_empty() {
+                    expr.push(' ');
+                }
+                expr.push_str(l.trim());
+                if l.trim_end().ends_with(',') {
+                    break;
+                }
+            }
+            found.push((
+                format!("{}:{}", file.display(), i + 1),
+                expr.trim_end_matches(',').to_string(),
+            ));
+        }
+    }
+    found
+}
+
+/// The populator-fanout flake's bug class, made a ratchet. The restore mover
+/// mounted a filesystem repository with a literal `read_only: true` while the
+/// mover connected kopia read-write — two decisions in two crates that nothing
+/// tied together — and every restore over a repository at kopia's manifest
+/// auto-compaction threshold failed `read-only file system`.
+///
+/// A WRITABLE repository mount is always safe (a writable mount under a
+/// `--readonly` connect never makes kopia write). A READ-ONLY one is only safe
+/// under a read-only connect, so it must be derived from the access the mover
+/// connects with (`RepositoryAccess::mounts_read_only`, via
+/// `Operation::repository_access` or an op's access constant). A new read-only
+/// mount written as a literal fails here.
+#[test]
+fn read_only_repository_mounts_derive_from_an_access() {
+    let exprs = repository_mount_read_only_exprs();
+    assert!(
+        exprs.len() >= 10,
+        "sanity: expected to find the controller's repository mounts, found {exprs:?}"
+    );
+    for (site, expr) in &exprs {
+        assert!(
+            expr == "read_only: false" || expr.contains("mounts_read_only()"),
+            "{site}: repository volume mounted with `{expr}`. A read-only mount under a \
+             read-write kopia connect fails every read once kopia auto-compacts the \
+             repository's manifests (the populator-fanout flake), so a repository mount is \
+             either `read_only: false` or derived from the access the mover connects with: \
+             `operation.repository_access().mounts_read_only()` or the op's access constant \
+             (`RestoreOp::REPOSITORY_ACCESS`, `SnapshotReplicateOp::SOURCE_ACCESS`, \
+             `SeedOpSpec::SOURCE_ACCESS`, `BrowseSessionOp::REPOSITORY_ACCESS`). Never a \
+             literal `true`."
+        );
+    }
+}

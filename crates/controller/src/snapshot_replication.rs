@@ -1239,7 +1239,11 @@ async fn spawn_snapshot_replication_job(
         io::filesystem_repo_mount_source(&source.backend).map(|mount_source| VolumeMountSpec {
             source: mount_source,
             mount_path: io::filesystem_repo_path(&source.backend).unwrap_or_default(),
-            read_only: true,
+            // Derived from the access the mover CONNECTS the source with, never
+            // a literal: a read-only mount under a read-write connect fails reads
+            // once kopia auto-compacts manifests (see `RepositoryAccess`).
+            read_only: kopiur_mover::workspec::SnapshotReplicateOp::SOURCE_ACCESS
+                .mounts_read_only(),
         });
     // A filesystem DESTINATION needs its volume mounted read-write — `kopia
     // snapshot migrate` writes the copies into it. Carried in the
