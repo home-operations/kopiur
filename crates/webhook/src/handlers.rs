@@ -916,13 +916,16 @@ const REPOSITORY_REPLICATION_RUN_COMMAND: &str = "kubectl kopiur replication run
 /// The `SnapshotReplication` counterpart.
 const SNAPSHOT_REPLICATION_RUN_COMMAND: &str = "kubectl kopiur replication run --kind snapshot";
 
-/// Refuse a malformed `run-requested` annotation at admission (issue #380).
-///
 /// The `spec.maintenance.mover.cache` of the repository this `Maintenance` claims
 /// as its controller owner — `Some` only when that repository exists and its uid
 /// matches the owner reference, so a user-written owner reference alone proves
 /// nothing (#714 review). `None` (no exemption, fail closed) without a client, on
 /// any lookup error, or on a uid mismatch.
+///
+/// The owner is read through [`crate::referent::fetch`] like every other
+/// point-read, but with the OPPOSITE polarity to a reference check: only a
+/// verified [`crate::referent::Referent::Found`] grants the exemption; a
+/// `Missing` owner and an `Unreadable` one both deny it.
 async fn verified_parent_maintenance_cache(
     req: &AdmissionRequest<DynamicObject>,
     meta: &ObjectMeta,
@@ -937,16 +940,31 @@ async fn verified_parent_maintenance_cache(
     };
     let (uid, cache) = if owner.kind == "ClusterRepository" {
         let api: Api<api::ClusterRepository> = Api::all(client.clone());
-        let r = api.get_opt(&owner.name).await.ok()??;
+        let r = verified_owner(crate::referent::fetch(&api, &owner.name).await)?;
         (r.metadata.uid, cache_of(r.spec.maintenance))
     } else {
         let api: Api<api::Repository> = Api::namespaced(client.clone(), req.namespace.as_deref()?);
-        let r = api.get_opt(&owner.name).await.ok()??;
+        let r = verified_owner(crate::referent::fetch(&api, &owner.name).await)?;
         (r.metadata.uid, cache_of(r.spec.maintenance))
     };
     (uid.as_deref() == Some(owner.uid.as_str())).then_some(cache)
 }
 
+/// **Pure.** The owner repository for the managed-Maintenance cache exemption,
+/// only when it was verifiably read. Exhaustive so a new [`crate::referent::Referent`]
+/// state cannot silently grant the exemption: NotFound and any read error are
+/// "no exemption" (fail closed), the opposite of a reference check's "admit on
+/// NotFound".
+fn verified_owner<T>(read: crate::referent::Referent<T>) -> Option<T> {
+    use crate::referent::Referent;
+    match read {
+        Referent::Found(owner) => Some(owner),
+        Referent::Missing | Referent::Unreadable(_) => None,
+    }
+}
+
+/// Refuse a malformed `run-requested` annotation at admission (issue #380).
+///
 /// The annotation is user input on both replication kinds exactly as it is on
 /// `Maintenance`, and it flows into a scheduling decision — so a typo'd
 /// timestamp is refused here rather than reaching a reconciler that can only
@@ -4140,6 +4158,103 @@ mod tests {
                 resp.result.message.contains("ClusterRepository/a"),
                 "{}",
                 resp.result.message
+            );
+        }
+
+        /// A `Maintenance` CREATE claiming `ClusterRepository/shared` (uid
+        /// `uid-1`) as its controller owner, carrying a cache whose budgets the
+        /// legacy bound refuses unless the owner verifiably vouches for it (#714).
+        fn projected_maintenance_request() -> AdmissionRequest<DynamicObject> {
+            let mut req = admission_request(
+                "Maintenance",
+                json!({
+                    "repository": { "kind": "ClusterRepository", "name": "shared" },
+                    "ownership": { "owner": "kopiur/shared" },
+                    "schedule": {
+                        "quick": { "cron": "0 */6 * * *" },
+                        "full": { "cron": "0 3 * * 0" },
+                    },
+                    "mover": { "cache": { "capacity": "2Gi", "contentCacheSizeMb": 5000 } },
+                }),
+            );
+            let owner = serde_json::from_value(json!([{
+                "apiVersion": "kopiur.home-operations.com/v1alpha1",
+                "kind": "ClusterRepository",
+                "name": "shared",
+                "uid": "uid-1",
+                "controller": true,
+            }]))
+            .expect("owner refs decode");
+            req.object
+                .as_mut()
+                .expect("object")
+                .metadata
+                .owner_references = Some(owner);
+            req
+        }
+
+        /// A `Client` answering every GET with `ClusterRepository/shared` (uid
+        /// `uid-1`) whose `spec.maintenance.mover.cache` matches the request's.
+        fn owner_repo_client() -> Client {
+            let body = json!({
+                "apiVersion": "kopiur.home-operations.com/v1alpha1",
+                "kind": "ClusterRepository",
+                "metadata": { "name": "shared", "uid": "uid-1" },
+                "spec": {
+                    "backend": { "filesystem": { "path": "/repo" } },
+                    "encryption": {
+                        "passwordSecretRef": { "name": "pw", "namespace": "kopiur-system" },
+                    },
+                    "allowedNamespaces": { "all": true },
+                    "maintenance": {
+                        "mover": { "cache": { "capacity": "2Gi", "contentCacheSizeMb": 5000 } },
+                    },
+                },
+            });
+            let svc = tower::service_fn(move |_req: http::Request<kube::client::Body>| {
+                let body = body.clone();
+                async move {
+                    let resp = http::Response::builder()
+                        .status(200)
+                        .header("content-type", "application/json")
+                        .body(kube::client::Body::from(serde_json::to_vec(&body).unwrap()))
+                        .unwrap();
+                    Ok::<_, std::convert::Infallible>(resp)
+                }
+            });
+            Client::new(svc, "test-ns")
+        }
+
+        /// #714's exemption still applies through `referent::fetch` when the
+        /// owner is verifiably Found with a matching uid and cache.
+        #[tokio::test]
+        async fn a_verified_owner_still_exempts_the_projected_maintenance() {
+            let client = owner_repo_client();
+            let resp = dispatch(&projected_maintenance_request(), Some(&client)).await;
+            assert!(resp.allowed, "{}", resp.result.message);
+        }
+
+        /// The exemption has the OPPOSITE polarity to a reference check: an
+        /// owner that does not exist (404) grants nothing, so the legacy bound
+        /// applies and the object is refused.
+        #[tokio::test]
+        async fn a_not_found_owner_grants_no_legacy_cache_exemption() {
+            let client = not_found_client();
+            let resp = dispatch(&projected_maintenance_request(), Some(&client)).await;
+            assert!(
+                !resp.allowed,
+                "a missing owner must not vouch for the cache"
+            );
+        }
+
+        /// ...and neither does an owner that cannot be read (403).
+        #[tokio::test]
+        async fn an_unreadable_owner_grants_no_legacy_cache_exemption() {
+            let client = status_client(403, "Forbidden");
+            let resp = dispatch(&projected_maintenance_request(), Some(&client)).await;
+            assert!(
+                !resp.allowed,
+                "an unreadable owner must not vouch for the cache"
             );
         }
     }
