@@ -495,7 +495,13 @@ async fn assert_marker(
     .await
     .expect("create reader pod");
     if let Err(e) = wait::pod_succeeded(client, E2E_NAMESPACE, reader).await {
-        let diagnostics = claim_diagnostics(client, reader, claim, restore).await;
+        // Bounded: a slow apiserver must not hold the test past CI's job timeout,
+        // which would lose this report AND the reader cleanup below.
+        let diagnostics = wait::diagnostics_within(
+            std::time::Duration::from_secs(90),
+            claim_diagnostics(client, reader, claim, restore),
+        )
+        .await;
         // Delete the reader before panicking: a non-terminal pod mounting
         // `claim` pins it `Terminating` (pvc-protection), which is exactly the
         // leftover that used to poison every nextest retry of this file.
