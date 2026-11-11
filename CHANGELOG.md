@@ -1,5 +1,45 @@
 # Changelog
 
+## [0.10.19](https://github.com/home-operations/kopiur/compare/0.10.18...0.10.19) (2026-11-11)
+
+
+### Features
+
+* **cache:** size kopia cache budgets from capacity; grow persistent cache PVCs ([#707](https://github.com/home-operations/kopiur/issues/707)) ([96d77c8](https://github.com/home-operations/kopiur/commit/96d77c841724fbdbd940edc84cedc09b3462c65a))
+* **policy:** forceHashPercent for in-place writers + kopia flag-coverage ratchet ([#708](https://github.com/home-operations/kopiur/issues/708)) ([#717](https://github.com/home-operations/kopiur/issues/717)) ([5becf1c](https://github.com/home-operations/kopiur/commit/5becf1c20c8d8e301533cf90565ea6f6a2fa9476))
+* **restore:** partial, in-place restore of selected paths ([#704](https://github.com/home-operations/kopiur/issues/704)) ([a6ba6a8](https://github.com/home-operations/kopiur/commit/a6ba6a84b259d7cbface975eb14e2ea24e1cd1c3))
+
+
+### Bug Fixes
+
+* **cache:** [#707](https://github.com/home-operations/kopiur/issues/707) review follow-ups — bounded small caches, pending resizes, replication caches ([#714](https://github.com/home-operations/kopiur/issues/714)) ([5d984f1](https://github.com/home-operations/kopiur/commit/5d984f1f88b97b9b89d7d44f6cb6c275a1bfc5ff))
+* **doctor:** CLI and console agree; bound failed manual runs; in-deadline staging waits are Normal ([#703](https://github.com/home-operations/kopiur/issues/703)) ([05d7a0f](https://github.com/home-operations/kopiur/commit/05d7a0f0ae70291a792ded4f392d059cfc1fdcc5))
+* **doctor:** newest warnings survive the cap; never advise deleting a failed run that owns a backup ([#712](https://github.com/home-operations/kopiur/issues/712)) ([beda4cb](https://github.com/home-operations/kopiur/commit/beda4cb2019fc50dcbe2f60fd108fbf996273efd))
+* honor repository suspend everywhere, fix replication suspended state and per-source size chart ([#689](https://github.com/home-operations/kopiur/issues/689)) ([#706](https://github.com/home-operations/kopiur/issues/706)) ([0ab7bd2](https://github.com/home-operations/kopiur/commit/0ab7bd2a8c438a6599d71039d830caaea27a2a12))
+* **mover:** count cached files in quick-verify stats.files ([#702](https://github.com/home-operations/kopiur/issues/702)) ([13ef1e4](https://github.com/home-operations/kopiur/commit/13ef1e491bd3827c4adae41375eb5a7da56079f8))
+* **mover:** replace the per-source kopia policy instead of merging into it ([#700](https://github.com/home-operations/kopiur/issues/700)) ([e58426d](https://github.com/home-operations/kopiur/commit/e58426dba1770845f4cd3ae94aa52ffc716b4835))
+* **mover:** restores from filesystem repositories fail intermittently — connect kopia --readonly to match the read-only mount ([#715](https://github.com/home-operations/kopiur/issues/715)) ([09fe130](https://github.com/home-operations/kopiur/commit/09fe130510bad40666049c8a25582ae135c50d29))
+* **restore:** fail closed on movers without partial restore; keep path spaces ([#713](https://github.com/home-operations/kopiur/issues/713)) ([8315ad0](https://github.com/home-operations/kopiur/commit/8315ad0a5e65cca77392bac6d33bc9fd80a87874))
+* **webhook:** admit references to repositories that do not exist yet ([#705](https://github.com/home-operations/kopiur/issues/705)) ([83f44d7](https://github.com/home-operations/kopiur/commit/83f44d7411ffff3dd959db1740c738c3a9441c9f))
+
+
+### Continuous Integration
+
+* **e2e:** move the [#464](https://github.com/home-operations/kopiur/issues/464) inherit-hold scenarios out of reshape-core into their own shard ([#716](https://github.com/home-operations/kopiur/issues/716)) ([3f07635](https://github.com/home-operations/kopiur/commit/3f07635014637e3f94efb6ffc60c77397740367d))
+
+
+### Miscellaneous Chores
+
+* **github-action:** update action jdx/mise-action (v5.2.6 → v5.2.7) ([#701](https://github.com/home-operations/kopiur/issues/701)) ([13078e6](https://github.com/home-operations/kopiur/commit/13078e6e4a64951051170ff179535cbf001ed8c3))
+* **github-action:** update github-actions ([#694](https://github.com/home-operations/kopiur/issues/694)) ([9d3b6de](https://github.com/home-operations/kopiur/commit/9d3b6de2eb3ca6e65494e2afd6f0c5f918b5f084))
+* **mise:** update tool promtool (3.15.1 → 3.16.0) ([#697](https://github.com/home-operations/kopiur/issues/697)) ([6fb33e4](https://github.com/home-operations/kopiur/commit/6fb33e4de6d92af4a02a53bf1ffa708515f5055c))
+* **mise:** update tool yq (4.54.1 → 4.54.2) ([#698](https://github.com/home-operations/kopiur/issues/698)) ([983ac1e](https://github.com/home-operations/kopiur/commit/983ac1ea1da818a628b42cf1771affac1e9378fe))
+* **npm:** update dependency @tanstack/router-plugin (1.168.48 → 1.169.0) ([#699](https://github.com/home-operations/kopiur/issues/699)) ([e47448d](https://github.com/home-operations/kopiur/commit/e47448dd6c4e18bb69c837d0e74efd3d36db662a))
+* **npm:** update dependency @vitejs/plugin-react (6.2.1 → 6.3.0) ([#709](https://github.com/home-operations/kopiur/issues/709)) ([fbd0955](https://github.com/home-operations/kopiur/commit/fbd0955726eb971349619a94320728eae5a0780c))
+* **npm:** update dependency vite (8.3.6 → 8.3.7) ([#710](https://github.com/home-operations/kopiur/issues/710)) ([1c5c7f6](https://github.com/home-operations/kopiur/commit/1c5c7f6591a7bc2a46bd4887a99c53ffba328fbe))
+* **npm:** update web ui dependencies ([#711](https://github.com/home-operations/kopiur/issues/711)) ([4321e80](https://github.com/home-operations/kopiur/commit/4321e80eabac9a5d3df9932176bafc786da41096))
+* **rust:** update crate rust-embed (8.13.0 → 8.14.0) ([#718](https://github.com/home-operations/kopiur/issues/718)) ([9f1e9cf](https://github.com/home-operations/kopiur/commit/9f1e9cf72894a797efb478b6c864dc9fe26b7be0))
+
 ## [0.10.18](https://github.com/home-operations/kopiur/compare/0.10.17...0.10.18) (2026-11-08)
 
 
