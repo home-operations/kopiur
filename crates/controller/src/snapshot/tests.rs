@@ -2917,6 +2917,7 @@ fn resolved_run_status_pins_repository_and_concrete_source() {
         "media-ns",
         &ws,
         kopiur_api::single_repository_ref(&cfg.spec).unwrap(),
+        Default::default(),
     );
     // The deletion path re-resolves the repo from this pinned ref alone, so
     // it must carry the namespace the recipe resolved against.
@@ -4937,6 +4938,84 @@ fn build_backup_run_lets_a_snapshot_mover_cache_win_the_per_run_budgets() {
     assert_eq!(ws.cache.metadata_cache_size_mb, Some(512));
 }
 
+/// #613: a capacity with no budgets used to hand kopia nothing (its multi-GiB
+/// defaults), so the cache outgrew a small volume. Now the budgets default to a
+/// share of the capacity the run's volume actually has.
+#[test]
+fn build_backup_run_defaults_cache_budgets_to_a_share_of_capacity() {
+    let cfg = policy_with_mover(serde_json::json!({ "cache": { "capacity": "2Gi" } }));
+    let (ws, ..) =
+        build_backup_run(&dummy_backup(), &cfg, &resolved_s3_repo(), "ns", "pg").unwrap();
+    // 2048MiB × 60% / 15%.
+    assert_eq!(ws.cache.content_cache_size_mb, Some(1228));
+    assert_eq!(ws.cache.metadata_cache_size_mb, Some(307));
+}
+
+/// #613: percent budgets resolve against the capacity of the volume the run
+/// mounts — for an Ephemeral cache that includes a per-run `capacity` override.
+#[test]
+fn build_backup_run_resolves_percent_budgets_against_the_mounted_volume() {
+    let cfg = policy_with_mover(serde_json::json!({
+        "cache": {
+            "capacity": "2Gi",
+            "contentCacheSize": { "percent": 63 },
+            "metadataCacheSize": { "percent": 12 },
+        },
+    }));
+    let repo = resolved_s3_repo();
+    let (ws, ..) = build_backup_run(&dummy_backup(), &cfg, &repo, "ns", "pg").unwrap();
+    assert_eq!(ws.cache.content_cache_size_mb, Some(1290));
+    assert_eq!(ws.cache.metadata_cache_size_mb, Some(245));
+
+    // A one-shot doubling the (ephemeral) volume doubles the budgets with it.
+    let backup = backup_with_mover(serde_json::json!({ "cache": { "capacity": "4Gi" } }));
+    let (ws, ..) = build_backup_run(&backup, &cfg, &repo, "ns", "pg").unwrap();
+    assert_eq!(ws.cache.content_cache_size_mb, Some(2580));
+    assert_eq!(ws.cache.metadata_cache_size_mb, Some(491));
+}
+
+/// #613: a merged config that cannot be resolved (a percent with no capacity on
+/// any layer) refuses the run with a Validation error naming the field — never a
+/// silent fall back to kopia's unbounded defaults.
+#[test]
+fn build_backup_run_refuses_a_percent_budget_with_no_capacity_anywhere() {
+    let cfg = policy_with_mover(serde_json::json!({
+        "cache": { "contentCacheSize": { "percent": 50 } },
+    }));
+    let err = build_backup_run(&dummy_backup(), &cfg, &resolved_s3_repo(), "ns", "pg")
+        .expect_err("an unresolvable percent must refuse the run");
+    let msg = err.to_string();
+    assert!(matches!(err, crate::error::Error::Validation(_)), "{msg}");
+    assert!(
+        msg.contains("contentCacheSize") && msg.contains("capacity"),
+        "{msg}"
+    );
+}
+
+/// #613: the resolved budgets are pinned on the Snapshot.
+#[test]
+fn resolved_run_status_pins_the_resolved_cache() {
+    let cfg = policy_with_mover(serde_json::json!({ "cache": { "capacity": "10Gi" } }));
+    let (ws, ..) =
+        build_backup_run(&dummy_backup(), &cfg, &resolved_s3_repo(), "ns", "pg").unwrap();
+    let cache = kopiur_api::common::ResolvedCache {
+        capacity: Some("10Gi".into()),
+        content_cache_size_mb: ws.cache.content_cache_size_mb,
+        metadata_cache_size_mb: ws.cache.metadata_cache_size_mb,
+    };
+    let resolved = resolved_run_status(
+        &cfg,
+        "ns",
+        &ws,
+        kopiur_api::single_repository_ref(&cfg.spec).unwrap(),
+        cache.clone(),
+    );
+    assert_eq!(resolved.cache, Some(cache));
+    let v = serde_json::to_value(&resolved).unwrap();
+    assert_eq!(v["cache"]["contentCacheSizeMb"], 6144);
+    assert_eq!(v["cache"]["metadataCacheSizeMb"], 1536);
+}
+
 /// A `SnapshotPolicy` with one PVC source and the given `mover` JSON.
 fn policy_with_mover(mover_json: serde_json::Value) -> SnapshotPolicy {
     use kopiur_api::snapshot_policy::{PvcSource, Source};
@@ -5083,8 +5162,9 @@ async fn an_ephemeral_per_run_capacity_reaches_the_mover_volume_with_no_api_call
         "cache": { "capacity": "500Gi", "storageClassName": "slow" },
     }));
 
-    let volume = crate::cache::resolve_cache_volume(
-        &client,
+    let ctx = crate::context::Context::test_context(client);
+    let resolved = crate::cache::resolve_cache_volume(
+        &ctx,
         "ns",
         Default::default(),
         "kopiur-cache-pg-ns-abc123",
@@ -5093,8 +5173,10 @@ async fn an_ephemeral_per_run_capacity_reaches_the_mover_volume_with_no_api_call
     .await
     .expect("the ephemeral path provisions nothing, so it cannot fail on the client");
 
+    // #613: the budgets resolve against the volume actually mounted.
+    assert_eq!(resolved.capacity.as_deref(), Some("500Gi"));
     assert_eq!(
-        volume,
+        resolved.volume,
         CacheVolume::Ephemeral {
             capacity: "500Gi".into(),
             storage_class: Some("slow".into()),

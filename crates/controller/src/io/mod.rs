@@ -36,3 +36,6 @@ pub use staging::*;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod cache_pvc_tests;

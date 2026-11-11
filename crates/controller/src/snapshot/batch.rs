@@ -1026,6 +1026,7 @@ mod tests {
                 repository: pinned_repo,
                 sources: vec![],
                 credential_projection: None,
+                cache: None,
             }),
             ..Default::default()
         });

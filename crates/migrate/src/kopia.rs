@@ -278,6 +278,93 @@ fn note_ignored_url_path(notes: &mut Vec<FieldNote>, url: &str, path: &str, back
 
 /// "true"/"1"/"yes", case-insensitive — how the fork's entry.sh reads its
 /// boolean-ish env values.
+/// The fork mover's cache knobs, as read off a ReplicationSource/Destination.
+struct ForkCache<'a> {
+    capacity: Option<&'a str>,
+    storage_class: Option<&'a str>,
+    metadata_mb: Option<i64>,
+    content_mb: Option<i64>,
+}
+
+/// Translate the fork's mover cache knobs into a kopiur `mover.cache` block for
+/// `kind` (`SnapshotPolicy` / `Restore`), recording every field.
+///
+/// The MiB budgets carry over as `metadataCacheSizeMb` / `contentCacheSizeMb` —
+/// unless, against `cacheCapacity`, they would fail kopiur's admission bound (each
+/// within the capacity, the pair within 90% of it; #613). VolSync accepted such
+/// budgets and the cache then filled its volume; emitting them would only produce a
+/// manifest the webhook refuses. They are dropped instead — marked `Unmappable`
+/// (so `--strict` flags it) — and kopiur's capacity defaults apply.
+fn map_mover_cache(
+    t: &mut Translation,
+    kind: &str,
+    fork: ForkCache<'_>,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut cache = serde_json::Map::new();
+    if let Some(cap) = fork.capacity {
+        cache.insert("capacity".into(), serde_json::json!(cap));
+        t.mapped(
+            "spec.kopia.cacheCapacity",
+            &format!("{kind}.spec.mover.cache.capacity"),
+        );
+    }
+    if let Some(class) = fork.storage_class {
+        cache.insert("storageClassName".into(), serde_json::json!(class));
+        t.mapped(
+            "spec.kopia.cacheStorageClassName",
+            &format!("{kind}.spec.mover.cache.storageClassName"),
+        );
+    }
+    let candidate = kopiur_api::common::CacheDefaults {
+        capacity: fork.capacity.map(str::to_string),
+        metadata_cache_size_mb: fork.metadata_mb,
+        content_cache_size_mb: fork.content_mb,
+        ..Default::default()
+    };
+    if let Some(err) = kopiur_api::validate::validate_cache_legacy_budgets(
+        Some(&candidate),
+        None,
+        &format!("{kind}.spec.mover.cache"),
+    ) {
+        for field in [
+            fork.metadata_mb
+                .map(|_| "spec.kopia.metadataCacheSizeLimitMB"),
+            fork.content_mb
+                .map(|_| "spec.kopia.contentCacheSizeLimitMB"),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            t.unmappable(
+                field,
+                &format!(
+                    "the fork's cache budgets do not fit cacheCapacity ({err}). kopiur refuses \
+                     them, because kopia overshoots its cache budgets between sweeps and the \
+                     cache then fills its volume. Dropped: kopiur defaults the budgets to 60% \
+                     (content) and 15% (metadata) of the capacity. Set \
+                     mover.cache.contentCacheSize/metadataCacheSize by hand to override."
+                ),
+            );
+        }
+        return cache;
+    }
+    if let Some(mb) = fork.metadata_mb {
+        cache.insert("metadataCacheSizeMb".into(), serde_json::json!(mb));
+        t.mapped(
+            "spec.kopia.metadataCacheSizeLimitMB",
+            &format!("{kind}.spec.mover.cache.metadataCacheSizeMb"),
+        );
+    }
+    if let Some(mb) = fork.content_mb {
+        cache.insert("contentCacheSizeMb".into(), serde_json::json!(mb));
+        t.mapped(
+            "spec.kopia.contentCacheSizeLimitMB",
+            &format!("{kind}.spec.mover.cache.contentCacheSizeMb"),
+        );
+    }
+    cache
+}
+
 fn truthy(v: &str) -> bool {
     matches!(v.to_ascii_lowercase().as_str(), "true" | "1" | "yes")
 }
@@ -1040,35 +1127,16 @@ pub fn translate_source(
 
     // Mover knobs.
     let mut mover = serde_json::Map::new();
-    let mut cache = serde_json::Map::new();
-    if let Some(cap) = &kopia.cache_capacity {
-        cache.insert("capacity".into(), serde_json::json!(cap));
-        t.mapped(
-            "spec.kopia.cacheCapacity",
-            "SnapshotPolicy.spec.mover.cache.capacity",
-        );
-    }
-    if let Some(class) = &kopia.cache_storage_class_name {
-        cache.insert("storageClassName".into(), serde_json::json!(class));
-        t.mapped(
-            "spec.kopia.cacheStorageClassName",
-            "SnapshotPolicy.spec.mover.cache.storageClassName",
-        );
-    }
-    if let Some(mb) = kopia.metadata_cache_size_limit_mb {
-        cache.insert("metadataCacheSizeMb".into(), serde_json::json!(mb));
-        t.mapped(
-            "spec.kopia.metadataCacheSizeLimitMB",
-            "SnapshotPolicy.spec.mover.cache.metadataCacheSizeMb",
-        );
-    }
-    if let Some(mb) = kopia.content_cache_size_limit_mb {
-        cache.insert("contentCacheSizeMb".into(), serde_json::json!(mb));
-        t.mapped(
-            "spec.kopia.contentCacheSizeLimitMB",
-            "SnapshotPolicy.spec.mover.cache.contentCacheSizeMb",
-        );
-    }
+    let cache = map_mover_cache(
+        &mut t,
+        "SnapshotPolicy",
+        ForkCache {
+            capacity: kopia.cache_capacity.as_deref(),
+            storage_class: kopia.cache_storage_class_name.as_deref(),
+            metadata_mb: kopia.metadata_cache_size_limit_mb,
+            content_mb: kopia.content_cache_size_limit_mb,
+        },
+    );
     if !cache.is_empty() {
         mover.insert("cache".into(), serde_json::Value::Object(cache));
     }
@@ -1427,35 +1495,16 @@ pub fn translate_destination(
     }
 
     // Destination mover cache knobs carry to the restore's mover.
-    let mut cache = serde_json::Map::new();
-    if let Some(cap) = &kopia.cache_capacity {
-        cache.insert("capacity".into(), serde_json::json!(cap));
-        t.mapped(
-            "spec.kopia.cacheCapacity",
-            "Restore.spec.mover.cache.capacity",
-        );
-    }
-    if let Some(class) = &kopia.cache_storage_class_name {
-        cache.insert("storageClassName".into(), serde_json::json!(class));
-        t.mapped(
-            "spec.kopia.cacheStorageClassName",
-            "Restore.spec.mover.cache.storageClassName",
-        );
-    }
-    if let Some(mb) = kopia.metadata_cache_size_limit_mb {
-        cache.insert("metadataCacheSizeMb".into(), serde_json::json!(mb));
-        t.mapped(
-            "spec.kopia.metadataCacheSizeLimitMB",
-            "Restore.spec.mover.cache.metadataCacheSizeMb",
-        );
-    }
-    if let Some(mb) = kopia.content_cache_size_limit_mb {
-        cache.insert("contentCacheSizeMb".into(), serde_json::json!(mb));
-        t.mapped(
-            "spec.kopia.contentCacheSizeLimitMB",
-            "Restore.spec.mover.cache.contentCacheSizeMb",
-        );
-    }
+    let cache = map_mover_cache(
+        &mut t,
+        "Restore",
+        ForkCache {
+            capacity: kopia.cache_capacity.as_deref(),
+            storage_class: kopia.cache_storage_class_name.as_deref(),
+            metadata_mb: kopia.metadata_cache_size_limit_mb,
+            content_mb: kopia.content_cache_size_limit_mb,
+        },
+    );
     if !cache.is_empty() {
         restore_spec["mover"] = serde_json::json!({ "cache": serde_json::Value::Object(cache) });
     }
@@ -1928,6 +1977,43 @@ mod tests {
     }
 
     // --- translate_source ---
+
+    /// #613: fork budgets that overflow `cacheCapacity` are not carried over (the
+    /// webhook would refuse them, and they are exactly what filled the cache volume);
+    /// they are recorded Unmappable and kopiur's capacity defaults apply instead.
+    #[test]
+    fn fork_cache_budgets_that_overflow_capacity_are_dropped_not_emitted() {
+        let spec = source_spec(serde_json::json!({
+            "sourcePVC": "data",
+            "trigger": { "schedule": "0 3 * * *" },
+            "kopia": {
+                "repository": "vs-secret",
+                "cacheCapacity": "2Gi",
+                "metadataCacheSizeLimitMB": 1000,
+                "contentCacheSizeLimitMB": 1500,
+            }
+        }));
+        let t = translate_source("app", "media", &spec, &repo_ref()).unwrap();
+        let cache = &t.objects[0]["spec"]["mover"]["cache"];
+        assert_eq!(cache["capacity"], "2Gi");
+        assert!(cache.get("metadataCacheSizeMb").is_none(), "{cache}");
+        assert!(cache.get("contentCacheSizeMb").is_none(), "{cache}");
+        assert!(t.has_unmappable, "--strict must flag the dropped budgets");
+        let note = t
+            .notes
+            .iter()
+            .find(|n| n.field == "spec.kopia.contentCacheSizeLimitMB")
+            .expect("the dropped budget is accounted for");
+        let Disposition::Unmappable { reason } = &note.disposition else {
+            panic!("expected Unmappable, got {:?}", note.disposition);
+        };
+        assert!(reason.contains("60%"), "{reason}");
+
+        // The emitted policy passes kopiur's own validators, admission included.
+        let policy: kopiur_api::snapshot_policy::SnapshotPolicySpec =
+            serde_json::from_value(t.objects[0]["spec"].clone()).unwrap();
+        assert!(kopiur_api::validate::validate_cache_legacy_budgets_for(&policy, None).is_empty());
+    }
 
     #[test]
     fn full_kopia_source_translates_with_identity_pinned() {

@@ -900,16 +900,75 @@ spec:
                         nullable: true
                         properties:
                           capacity:
-                            description: Size of the PVC backing the mover's kopia cache (e.g. `10Gi`).
+                            description: |-
+                              Size of the volume backing the mover's kopia cache (e.g. `10Gi`). When set,
+                              unset cache budgets default to a percentage of it (content 60%, metadata
+                              15%) and the two budgets together may claim at most 90% of it. Raising it on
+                              a `Persistent` cache grows the existing PVC when its StorageClass allows
+                              volume expansion; a smaller value is never applied to an existing PVC.
                             nullable: true
                             type: string
+                          contentCacheSize:
+                            description: |-
+                              kopia content cache budget (`--content-cache-size-mb`): `{ percent: N }` of
+                              `capacity`, or `{ size: <quantity> }`. Absent with a known `capacity`, it
+                              defaults to 60% of it. Mutually exclusive with `contentCacheSizeMb`.
+                            nullable: true
+                            oneOf:
+                            - required:
+                              - percent
+                            - required:
+                              - size
+                            properties:
+                              percent:
+                                description: |-
+                                  Percent of the cache volume's `capacity` (1–100). Needs a `capacity`, set on
+                                  this layer or inherited from `moverDefaults.cache`. Rounded down to whole MiB.
+                                format: uint32
+                                minimum: 0.0
+                                type: integer
+                              size:
+                                description: |-
+                                  An absolute size as a Kubernetes quantity (e.g. `1Gi`, `500Mi`). Rounded down
+                                  to whole MiB; must be at least `1Mi` and, when a `capacity` is known, fit in it.
+                                type: string
+                            type: object
                           contentCacheSizeMb:
-                            description: kopia content cache budget in MiB (`--content-cache-size-mb`).
+                            description: |-
+                              kopia content cache budget in MiB (`--content-cache-size-mb`). The original
+                              spelling of `contentCacheSize`; set one or the other, not both.
                             format: int64
                             nullable: true
                             type: integer
+                          metadataCacheSize:
+                            description: |-
+                              kopia metadata cache budget (`--metadata-cache-size-mb`): `{ percent: N }` of
+                              `capacity`, or `{ size: <quantity> }`. Absent with a known `capacity`, it
+                              defaults to 15% of it. Mutually exclusive with `metadataCacheSizeMb`.
+                            nullable: true
+                            oneOf:
+                            - required:
+                              - percent
+                            - required:
+                              - size
+                            properties:
+                              percent:
+                                description: |-
+                                  Percent of the cache volume's `capacity` (1–100). Needs a `capacity`, set on
+                                  this layer or inherited from `moverDefaults.cache`. Rounded down to whole MiB.
+                                format: uint32
+                                minimum: 0.0
+                                type: integer
+                              size:
+                                description: |-
+                                  An absolute size as a Kubernetes quantity (e.g. `1Gi`, `500Mi`). Rounded down
+                                  to whole MiB; must be at least `1Mi` and, when a `capacity` is known, fit in it.
+                                type: string
+                            type: object
                           metadataCacheSizeMb:
-                            description: kopia metadata cache budget in MiB (`--metadata-cache-size-mb`).
+                            description: |-
+                              kopia metadata cache budget in MiB (`--metadata-cache-size-mb`). The original
+                              spelling of `metadataCacheSize`; set one or the other, not both.
                             format: int64
                             nullable: true
                             type: integer
@@ -1956,16 +2015,75 @@ spec:
                     nullable: true
                     properties:
                       capacity:
-                        description: Size of the PVC backing the mover's kopia cache (e.g. `10Gi`).
+                        description: |-
+                          Size of the volume backing the mover's kopia cache (e.g. `10Gi`). When set,
+                          unset cache budgets default to a percentage of it (content 60%, metadata
+                          15%) and the two budgets together may claim at most 90% of it. Raising it on
+                          a `Persistent` cache grows the existing PVC when its StorageClass allows
+                          volume expansion; a smaller value is never applied to an existing PVC.
                         nullable: true
                         type: string
+                      contentCacheSize:
+                        description: |-
+                          kopia content cache budget (`--content-cache-size-mb`): `{ percent: N }` of
+                          `capacity`, or `{ size: <quantity> }`. Absent with a known `capacity`, it
+                          defaults to 60% of it. Mutually exclusive with `contentCacheSizeMb`.
+                        nullable: true
+                        oneOf:
+                        - required:
+                          - percent
+                        - required:
+                          - size
+                        properties:
+                          percent:
+                            description: |-
+                              Percent of the cache volume's `capacity` (1–100). Needs a `capacity`, set on
+                              this layer or inherited from `moverDefaults.cache`. Rounded down to whole MiB.
+                            format: uint32
+                            minimum: 0.0
+                            type: integer
+                          size:
+                            description: |-
+                              An absolute size as a Kubernetes quantity (e.g. `1Gi`, `500Mi`). Rounded down
+                              to whole MiB; must be at least `1Mi` and, when a `capacity` is known, fit in it.
+                            type: string
+                        type: object
                       contentCacheSizeMb:
-                        description: kopia content cache budget in MiB (`--content-cache-size-mb`).
+                        description: |-
+                          kopia content cache budget in MiB (`--content-cache-size-mb`). The original
+                          spelling of `contentCacheSize`; set one or the other, not both.
                         format: int64
                         nullable: true
                         type: integer
+                      metadataCacheSize:
+                        description: |-
+                          kopia metadata cache budget (`--metadata-cache-size-mb`): `{ percent: N }` of
+                          `capacity`, or `{ size: <quantity> }`. Absent with a known `capacity`, it
+                          defaults to 15% of it. Mutually exclusive with `metadataCacheSizeMb`.
+                        nullable: true
+                        oneOf:
+                        - required:
+                          - percent
+                        - required:
+                          - size
+                        properties:
+                          percent:
+                            description: |-
+                              Percent of the cache volume's `capacity` (1–100). Needs a `capacity`, set on
+                              this layer or inherited from `moverDefaults.cache`. Rounded down to whole MiB.
+                            format: uint32
+                            minimum: 0.0
+                            type: integer
+                          size:
+                            description: |-
+                              An absolute size as a Kubernetes quantity (e.g. `1Gi`, `500Mi`). Rounded down
+                              to whole MiB; must be at least `1Mi` and, when a `capacity` is known, fit in it.
+                            type: string
+                        type: object
                       metadataCacheSizeMb:
-                        description: kopia metadata cache budget in MiB (`--metadata-cache-size-mb`).
+                        description: |-
+                          kopia metadata cache budget in MiB (`--metadata-cache-size-mb`). The original
+                          spelling of `metadataCacheSize`; set one or the other, not both.
                         format: int64
                         nullable: true
                         type: integer

@@ -176,11 +176,19 @@ pub(super) fn build_backup_run(
     //
     // `effective_backup_mover` is pure, so computing it here as well as in the
     // reconciler cannot diverge from it.
+    //
+    // #613: the budgets resolve against the capacity of the cache volume this run
+    // mounts (`cache_volume_spec`). For a `Persistent` cache the reconciler
+    // re-resolves them against the LIVE claim's capacity once it has ensured it
+    // (`launch`), since a pending or refused resize can leave the claim smaller.
     let recipe_mover = kopiur_api::snapshot::effective_backup_mover(&backup.spec, &config.spec);
+    let volume_capacity =
+        super::cache_volume_spec(repo, config, recipe_mover.as_ref()).and_then(|c| c.capacity);
     let cache = crate::cache::cache_tuning(
         crate::cache::effective_cache(repo, recipe_mover.as_ref().and_then(|m| m.cache.as_ref()))
             .as_ref(),
-    );
+        volume_capacity.as_deref(),
+    )?;
     let work_spec = MoverWorkSpec {
         version: 1,
         operation: Operation::Snapshot(SnapshotOp {

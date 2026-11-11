@@ -1956,14 +1956,25 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
             .then_some(backup.spec.repository.as_ref())
             .flatten(),
     );
-    let cache_volume = crate::cache::resolve_cache_volume(
-        &ctx.client,
+    let resolved_volume = crate::cache::resolve_cache_volume(
+        ctx,
         &namespace,
         io::owner_ref_for(&config, "SnapshotPolicy")?,
         &cache_pvc,
         cache_volume_spec(&repo, &config, recipe_mover.as_ref()).as_ref(),
     )
     .await?;
+    // #613: kopia's cache budgets must fit the volume ACTUALLY mounted. For a
+    // persistent claim that is its live capacity (a pending or refused resize can
+    // leave it smaller than the spec), so re-resolve against it here; for per-run
+    // volumes this reproduces what `build_backup_run` already computed.
+    let resolved_cache = crate::cache::cache_budgets(
+        crate::cache::effective_cache(&repo, recipe_mover.as_ref().and_then(|m| m.cache.as_ref()))
+            .as_ref(),
+        resolved_volume.capacity.as_deref(),
+    )?;
+    work_spec.cache = crate::cache::tuning_of(&resolved_cache);
+    let cache_volume = resolved_volume.volume;
     // RWO Multi-Attach avoidance: pin the mover to the node the source PVC is
     // attached to, so it co-locates with the app pod already holding the volume.
     // Only the single-`pvc` source needs this — an NFS source is network-mounted, so
@@ -2076,7 +2087,7 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
         // reads `resolved.repository` so cleanup still works once the
         // recipe is gone — the namespace-deletion cascade usually reaps the
         // SnapshotPolicy (no finalizer) before this Snapshot's finalizer runs.
-        "resolved": resolved_run_status(&config, &namespace, &work_spec, repo_ref),
+        "resolved": resolved_run_status(&config, &namespace, &work_spec, repo_ref, resolved_cache),
         // The SAME value written into the kopia `kopiur-meta` tag above —
         // single source, so tag and status cannot diverge.
         "recorded": recorded,
@@ -4303,9 +4314,13 @@ async fn build_batch_job(
         kopiur_api::consts::effective_max_concurrent_delete_jobs(repo.concurrency.as_ref()),
         &crate::naming::snapdel_cache_pvc_name(repo_ref),
     );
-    let cache_volume =
-        crate::cache::resolve_snapdel_cache_volume(&ctx.client, job_ns, owner.clone(), &cache_plan)
-            .await?;
+    let resolved_volume =
+        crate::cache::resolve_snapdel_cache_volume(ctx, job_ns, owner.clone(), &cache_plan).await?;
+    let cache_tuning = crate::cache::cache_tuning(
+        effective_cache.as_ref(),
+        resolved_volume.capacity.as_deref(),
+    )?;
+    let cache_volume = resolved_volume.volume;
     let work_spec = MoverWorkSpec {
         version: 1,
         operation: Operation::SnapshotDeleteBatch(SnapshotDeleteBatchOp { items }),
@@ -4324,7 +4339,7 @@ async fn build_batch_job(
         },
         hook_plan: Default::default(),
         options: MoverOptions::default(),
-        cache: crate::cache::cache_tuning(effective_cache.as_ref()),
+        cache: cache_tuning,
         throttle: io::throttle_spec(repo.mover_defaults.as_ref()),
     };
     // Annotation: the SORTED member UID set — the single source of truth for

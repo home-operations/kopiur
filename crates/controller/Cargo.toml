@@ -30,6 +30,9 @@ tokio = { workspace = true }
 # each HTTP request (`http::Method` + path + query) into bounded metric labels.
 tower = { workspace = true }
 http = "1"
+# Compare a cache PVC's requested storage with `mover.cache.capacity` (grow-only
+# expansion, #613) — the same parser kopiur-api's validators use.
+kube_quantity = "0.9.0"
 futures = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
