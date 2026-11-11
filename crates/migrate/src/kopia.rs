@@ -2074,7 +2074,7 @@ mod tests {
                 "cacheStorageClassName": "fast",
                 "metadataCacheSizeLimitMB": 700,
                 "contentCacheSizeLimitMB": 200,
-                "additionalArgs": ["--one-file-system"],
+                "additionalArgs": ["--one-file-system=true"],
                 "moverResources": { "limits": { "memory": "1Gi" } },
                 "moverSecurityContext": { "fsGroup": 1000 },
                 "actions": { "beforeSnapshot": "sync" },
@@ -2104,7 +2104,7 @@ mod tests {
         assert_eq!(policy["spec"]["retention"]["keepHourly"], 6);
         assert_eq!(policy["spec"]["compression"]["compressor"], "zstd");
         assert_eq!(policy["spec"]["upload"]["maxParallelFileReads"], 4);
-        assert_eq!(policy["spec"]["extraArgs"][0], "--one-file-system");
+        assert_eq!(policy["spec"]["extraArgs"][0], "--one-file-system=true");
         assert_eq!(policy["spec"]["mover"]["cache"]["capacity"], "2Gi");
         assert_eq!(policy["spec"]["mover"]["cache"]["metadataCacheSizeMb"], 700);
         assert_eq!(policy["spec"]["mover"]["cache"]["contentCacheSizeMb"], 200);

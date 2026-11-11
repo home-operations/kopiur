@@ -90,6 +90,10 @@ pub fn check_extra_args(cmd: KopiaCommand, args: &[String]) -> Vec<ExtraArgViola
         i += 1;
         match parse_token(cmd, raw) {
             Token::EndOfFlags => {
+                // Refused even as the LAST token: Kopiur appends its own common
+                // flags (`--no-auto-maintenance`) after the extra args, and `--`
+                // would turn them into positionals.
+                out.push(end_of_flags_violation(cmd));
                 out.extend(
                     args[i..]
                         .iter()
@@ -115,22 +119,59 @@ pub fn check_extra_args(cmd: KopiaCommand, args: &[String]) -> Vec<ExtraArgViola
                         None => !args[i].starts_with('-'),
                     };
                 let shown = if takes_next {
-                    format!("{raw} {}", args[i])
+                    i += 1;
+                    format!("{raw} {}", args[i - 1])
                 } else {
                     raw.to_string()
                 };
-                if takes_next {
-                    i += 1;
-                }
-                if let Some(s) = spec
-                    && !s.disposition.allowed_in_extra_args()
-                {
-                    out.push(flag_violation(cmd, shown, &name, &s.disposition));
-                }
+                out.extend(known_flag_violation(
+                    cmd,
+                    shown,
+                    &name,
+                    spec,
+                    inline_value || takes_next,
+                ));
             }
         }
     }
     out
+}
+
+/// The violation, if any, for a flag the table knows: its disposition refuses
+/// it, or it is valued and ends the list without its value (it would then take
+/// Kopiur's own appended `--no-auto-maintenance` as the value).
+fn known_flag_violation(
+    cmd: KopiaCommand,
+    shown: String,
+    name: &str,
+    spec: Option<&'static FlagSpec>,
+    has_value: bool,
+) -> Option<ExtraArgViolation> {
+    let s = spec?;
+    if !s.disposition.allowed_in_extra_args() {
+        return Some(flag_violation(cmd, shown, name, &s.disposition));
+    }
+    (s.arity == Arity::Value && !has_value).then(|| ExtraArgViolation {
+        message: format!(
+            "`{shown}`: `--{name}` needs a value, and with none after it kopia would \
+             take the next flag Kopiur appends as its value. Fix: write `--{name}=<value>`"
+        ),
+        arg: shown,
+        flag: Some(name.to_string()),
+    })
+}
+
+fn end_of_flags_violation(cmd: KopiaCommand) -> ExtraArgViolation {
+    ExtraArgViolation {
+        arg: "--".to_string(),
+        flag: None,
+        message: format!(
+            "`--` ends kopia's flag parsing: everything after it, including the flags \
+             Kopiur itself appends to `{}`, would be read as positional arguments and the \
+             run would fail. Fix: remove it",
+            cmd.display()
+        ),
+    }
 }
 
 fn positional_violation(cmd: KopiaCommand, word: &str) -> ExtraArgViolation {
@@ -270,10 +311,39 @@ mod tests {
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].flag, None);
         assert!(v[0].message.contains("second policy target"));
-        // Everything after `--` is positional.
+        // Everything after `--` is positional (and `--` itself is refused).
         let v = check(KopiaCommand::PolicySet, &["--", "--add-ignore=x"]);
-        assert_eq!(v.len(), 1);
-        assert_eq!(v[0].arg, "--add-ignore=x");
+        assert_eq!(v.len(), 2, "{v:?}");
+        assert_eq!(v[1].arg, "--add-ignore=x");
+    }
+
+    /// Greptile on #717: Kopiur appends its own common flags
+    /// (`--no-auto-maintenance`) AFTER the extra args, so a `--` anywhere — even
+    /// as the last token — turns them into positionals and the run fails.
+    #[test]
+    fn end_of_flags_marker_is_refused_even_when_last() {
+        for args in [&["--"][..], &["--log-level=debug", "--"], &["--", "x"]] {
+            let v = check(KopiaCommand::SnapshotCreate, args);
+            assert!(
+                v.iter()
+                    .any(|x| x.arg == "--" && x.message.contains("`--`")),
+                "{args:?}: {v:?}"
+            );
+        }
+    }
+
+    /// Same hazard: a valued flag ending the list would take Kopiur's
+    /// appended `--no-auto-maintenance` as its value.
+    #[test]
+    fn a_trailing_valued_flag_without_its_value_is_refused() {
+        let v = check(KopiaCommand::PolicySet, &["--max-file-size"]);
+        assert_eq!(v.len(), 1, "{v:?}");
+        assert!(v[0].message.contains("needs a value"), "{}", v[0].message);
+        // With its value it is fine, in both spellings.
+        assert!(check(KopiaCommand::PolicySet, &["--max-file-size", "10"]).is_empty());
+        assert!(check(KopiaCommand::PolicySet, &["--max-file-size=10"]).is_empty());
+        // A short valued alias at the end is refused the same way.
+        assert!(!check(KopiaCommand::PolicySet, &["-p"]).is_empty());
     }
 
     #[test]
