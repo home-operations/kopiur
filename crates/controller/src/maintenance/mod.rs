@@ -212,6 +212,36 @@ async fn ensure_maintenance_tenancy(
     io::ensure_consumer_tenancy(ctx, repo_ref, namespace).await
 }
 
+/// The G7/#689 repository hold: `true` when this pass must park (the caller
+/// requeues), having written `LeaseOwned=False` with the hold's reason.
+///
+/// The hold stops NEW work only. A Job launched before it keeps running and
+/// settles on its own; its outcome is recorded before parking
+/// ([`observe_settled_runs`]), or a yielded slot (no `lastRunAt`) re-fires
+/// after the unsuspend and a finished manual run reads as lost once its TTL
+/// reaps it (#706 review).
+async fn held_behind_repository(
+    ctx: &Context,
+    api: &Api<Maintenance>,
+    job_api: &Api<Job>,
+    maint: &Maintenance,
+    repo_defaults: Option<&ScheduleDefaults>,
+    now: DateTime<Utc>,
+) -> Result<bool> {
+    let repo_ref = &maint.spec.repository;
+    let namespace = maint
+        .namespace()
+        .ok_or_else(|| Error::Invariant("Maintenance has no namespace".into()))?;
+    let name = maint.name_any();
+    let availability = io::repository_maintainable_cached(ctx, repo_ref, &namespace).await?;
+    let Some((reason, message)) = maintenance_hold(availability, repo_ref, &namespace) else {
+        return Ok(false);
+    };
+    observe_settled_runs(api, job_api, &name, maint, repo_defaults, now).await?;
+    patch_condition_if_changed(api, &name, maint, "False", reason, &message).await?;
+    Ok(true)
+}
+
 async fn reconcile_inner(maint: &Maintenance, ctx: &Context) -> Result<Action> {
     let errs = validate::validate_maintenance(&maint.spec);
     if let Some(first) = errs.into_iter().next() {
@@ -252,14 +282,7 @@ async fn reconcile_inner(maint: &Maintenance, ctx: &Context) -> Result<Action> {
     let now = Utc::now();
     let job_api: Api<Job> = Api::namespaced(ctx.client.clone(), &namespace);
 
-    let availability = io::repository_maintainable_cached(ctx, repo_ref, &namespace).await?;
-    if let Some((reason, message)) = maintenance_hold(availability, repo_ref, &namespace) {
-        // The hold stops NEW work only. A Job launched before it keeps running
-        // and settles on its own; record that outcome before parking, or a
-        // yielded slot (no `lastRunAt`) re-fires after the unsuspend and a
-        // finished manual run reads as lost once its TTL reaps it (#706 review).
-        observe_settled_runs(&api, &job_api, &name, maint, repo_defaults, now).await?;
-        patch_condition_if_changed(&api, &name, maint, "False", reason, &message).await?;
+    if held_behind_repository(ctx, &api, &job_api, maint, repo_defaults, now).await? {
         return Ok(Action::requeue(REQUEUE_NOT_READY));
     }
 
