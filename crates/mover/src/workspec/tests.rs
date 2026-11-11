@@ -45,6 +45,8 @@ fn backup_roundtrip() {
             fail_fast: None,
             upload_limit_mb: None,
             description: None,
+            force_hash_percent: None,
+            create_extra_args: vec![],
         }),
         identity: sample_identity(),
         repository: RepositoryConnect::Filesystem {
@@ -77,11 +79,15 @@ fn snapshot_op_create_knobs_roundtrip_wire_shape_and_map_to_kopia() {
         fail_fast: Some(true),
         upload_limit_mb: Some(250),
         description: Some("pre-upgrade snapshot".into()),
+        force_hash_percent: Some(100),
+        create_extra_args: vec!["--log-level=debug".into()],
     };
     let json = serde_json::to_value(&op).unwrap();
     assert_eq!(json["failFast"], true);
     assert_eq!(json["uploadLimitMb"], 250);
     assert_eq!(json["description"], "pre-upgrade snapshot");
+    assert_eq!(json["forceHashPercent"], 100);
+    assert_eq!(json["createExtraArgs"][0], "--log-level=debug");
     let reparsed: SnapshotOp = serde_json::from_value(json).unwrap();
     assert_eq!(reparsed, op);
     assert_eq!(
@@ -90,6 +96,8 @@ fn snapshot_op_create_knobs_roundtrip_wire_shape_and_map_to_kopia() {
             fail_fast: Some(true),
             upload_limit_mb: Some(250),
             description: Some("pre-upgrade snapshot".into()),
+            force_hash_percent: Some(100),
+            extra_args: vec!["--log-level=debug".into()],
         }
     );
 }
@@ -108,6 +116,8 @@ fn snapshot_op_old_wire_decodes_with_m4_fields_defaulted() {
     assert_eq!(op.fail_fast, None);
     assert_eq!(op.upload_limit_mb, None);
     assert_eq!(op.description, None);
+    assert_eq!(op.force_hash_percent, None);
+    assert!(op.create_extra_args.is_empty());
     assert_eq!(
         op.create_options(),
         kopiur_kopia::SnapshotCreateOptions::default()
@@ -768,6 +778,8 @@ fn externally_tagged_operation_shape() {
             fail_fast: None,
             upload_limit_mb: None,
             description: None,
+            force_hash_percent: None,
+            create_extra_args: vec![],
         }),
         identity: sample_identity(),
         repository: RepositoryConnect::Filesystem {
@@ -1140,6 +1152,7 @@ fn policy_args_from_policy_maps_all_flattened_knobs() {
             ignore_identical_snapshots: false,
         }),
         extra_args: vec!["--one-file-system".into()],
+        kopia_args: None,
         error_handling: Some(ErrorHandling {
             ignore_file_errors: true,
             ignore_dir_errors: false,
@@ -1153,6 +1166,7 @@ fn policy_args_from_policy_maps_all_flattened_knobs() {
             max_parallel_file_reads: Some(8),
             // Same non-leak guard as `fail_fast` above, for `limitMb`.
             limit_mb: Some(100),
+            force_hash_percent: Some(100),
         }),
         verification: None,
         preflight: None,
@@ -1229,6 +1243,7 @@ fn empty_policy_spec() -> kopiur_api::SnapshotPolicySpec {
         compression: None,
         files: None,
         extra_args: vec![],
+        kopia_args: None,
         error_handling: None,
         upload: None,
         verification: None,
@@ -3194,4 +3209,39 @@ fn a_partial_restore_without_paths_or_into_a_stream_is_rejected() {
         timeout_seconds: 60,
     });
     assert!(partial_restore_problem(&streamed).is_some());
+}
+
+/// #708: the recipe's `snapshot create` flags resolve from the policy — absent
+/// fields stay absent (no flag, today's behaviour), set ones carry through.
+#[test]
+fn recipe_create_flags_carry_force_hash_and_kopia_args() {
+    let none = RecipeCreateFlags::from_policy(&empty_policy_spec());
+    assert_eq!(none, RecipeCreateFlags::default());
+
+    let mut spec = empty_policy_spec();
+    spec.upload = Some(kopiur_api::snapshot_policy::Upload {
+        force_hash_percent: Some(100),
+        ..Default::default()
+    });
+    spec.kopia_args = Some(kopiur_api::snapshot_policy::KopiaArgs {
+        snapshot_create: vec!["--log-level=debug".into()],
+        policy_set: vec!["--max-file-size=10".into()],
+    });
+    let flags = RecipeCreateFlags::from_policy(&spec);
+    assert_eq!(flags.force_hash_percent, Some(100));
+    assert_eq!(flags.extra_args, vec!["--log-level=debug".to_string()]);
+    // `policySet` rides the policy, never `snapshot create`.
+    let policy = PolicyArgsSpec::from_policy(&spec);
+    assert_eq!(policy.extra_args, vec!["--max-file-size=10".to_string()]);
+}
+
+/// #708: the legacy `spec.extraArgs` keeps reaching `policy set` unchanged.
+#[test]
+fn legacy_extra_args_still_reach_policy_set() {
+    let mut spec = empty_policy_spec();
+    spec.extra_args = vec!["--one-file-system=true".into()];
+    assert_eq!(
+        PolicyArgsSpec::from_policy(&spec).extra_args,
+        vec!["--one-file-system=true".to_string()]
+    );
 }

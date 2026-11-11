@@ -982,3 +982,6 @@ mod cache_tests;
 
 #[cfg(test)]
 mod cache_followup_tests;
+
+#[cfg(test)]
+mod kopia_args_tests;

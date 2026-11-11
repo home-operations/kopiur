@@ -964,6 +964,8 @@ mod tests {
                 policy: Default::default(),
                 fail_fast: None,
                 upload_limit_mb: None,
+                force_hash_percent: None,
+                create_extra_args: vec![],
                 description: None,
             }),
             identity: ResolvedIdentity {

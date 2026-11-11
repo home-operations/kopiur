@@ -357,3 +357,38 @@ pub fn validate_cache_legacy_budgets_for<T: CacheBlocks>(
 // one kind and not the other. That is acceptable precisely because it is
 // admission that matters here — the webhook covers both kinds identically, and the
 // reconcile-side re-check is a defense-in-depth pass, not the gate.
+
+/// The legacy `spec.extraArgs` (`kopia policy set` escape hatch) checked against
+/// the kopia flag table (#708): a flag Kopiur models, owns or forbids is refused.
+///
+/// Admission-only, and only when the list CHANGED: `extraArgs` predates the
+/// table, so stored policies carrying a now-refused flag exist. They keep backing
+/// up exactly as before (the mover still passes the list) and report the problem
+/// through an `UnsupportedKopiaArgs` condition built from
+/// [`legacy_extra_args_findings`]; this refuses the next apply that edits the
+/// list while keeping one. `old` is the previous object's spec (`None` on CREATE).
+pub fn validate_legacy_extra_args(
+    spec: &SnapshotPolicySpec,
+    old: Option<&SnapshotPolicySpec>,
+) -> Vec<ValidationError> {
+    if old.is_some_and(|o| o.extra_args == spec.extra_args) {
+        return Vec::new();
+    }
+    super::snapshot::kopia_arg_errors(
+        "spec.extraArgs",
+        crate::kopia_flags::KopiaCommand::PolicySet,
+        &spec.extra_args,
+    )
+}
+
+/// The refused args in a policy's legacy `spec.extraArgs`, regardless of when
+/// they were admitted — what the controller surfaces as the
+/// `UnsupportedKopiaArgs` condition on a stored object it keeps running.
+pub fn legacy_extra_args_findings(
+    spec: &SnapshotPolicySpec,
+) -> Vec<crate::kopia_flags::ExtraArgViolation> {
+    crate::kopia_flags::check_extra_args(
+        crate::kopia_flags::KopiaCommand::PolicySet,
+        &spec.extra_args,
+    )
+}

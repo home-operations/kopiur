@@ -14,6 +14,11 @@ the checked-in deploy artifacts:
 - `gen-docs` → `docs/src/content/docs/field-reference.md`, rendered from the CRD schemas
 - `gen-ui-types` → one `.ts` per `kopiur-ui-model` wire type under
   `crates/ui/web/src/api/types/`, exported with `ts-rs`
+- `gen-kopia-flags` → the flags `kopia help <command>` lists for every command
+  Kopiur invokes, under `crates/api/tests/fixtures/kopia-flags/`. The only
+  subcommand that runs an external binary (the mise-pinned kopia, or
+  `KOPIA_BIN`), so it is not part of the hermetic [`collect`]; the
+  `kopia_flag_coverage` test in `kopiur-api` is the gate that consumes it
 - `gen-all` → all of the above + the Grafana dashboard copy under
   `deploy/helm/kopiur/files/dashboards/`
 

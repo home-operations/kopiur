@@ -191,26 +191,29 @@ pub(super) fn build_backup_run(
     )?;
     let work_spec = MoverWorkSpec {
         version: 1,
-        operation: Operation::Snapshot(SnapshotOp {
-            source_path: source_path.clone(),
-            stdin,
-            tags: tags_for(backup, config),
-            // Flattened SnapshotPolicy policy knobs → kopia `policy set` flags
-            // (compression / files / errorHandling / upload / extraArgs). Wired so
-            // these never stay inert (ADR-0005 §13(b)/§13(f), ADR-0004 §4b).
-            policy: policy_args_for(config),
-            // `snapshot create` argv flags (M4 flag sweep, issue #216 category
-            // sweep) — NOT `policy set` knobs, so they ride here rather than
-            // `policy_args_for`'s `PolicyArgsSpec`. `failFast`/`limitMb` are
-            // the recipe's (`SnapshotPolicy`); `description` is this run's
-            // (`Snapshot.spec`), matching the recipe/invocation split.
-            fail_fast: config
-                .spec
-                .error_handling
-                .as_ref()
-                .and_then(|e| e.fail_fast.then_some(true)),
-            upload_limit_mb: config.spec.upload.as_ref().and_then(|u| u.limit_mb),
-            description: backup.spec.description.clone(),
+        operation: Operation::Snapshot({
+            // `snapshot create` argv flags (M4 flag sweep, issue #216; #708) —
+            // NOT `policy set` knobs, so they ride here rather than
+            // `policy_args_for`'s `PolicyArgsSpec`. `failFast`/`limitMb`/
+            // `forceHashPercent`/`kopiaArgs.snapshotCreate` are the recipe's
+            // (`SnapshotPolicy`); `description` is this run's (`Snapshot.spec`),
+            // matching the recipe/invocation split.
+            let recipe = kopiur_mover::workspec::RecipeCreateFlags::from_policy(&config.spec);
+            SnapshotOp {
+                source_path: source_path.clone(),
+                stdin,
+                tags: tags_for(backup, config),
+                // Flattened SnapshotPolicy policy knobs → kopia `policy set` flags
+                // (compression / files / errorHandling / upload / extraArgs /
+                // kopiaArgs.policySet). Wired so these never stay inert
+                // (ADR-0005 §13(b)/§13(f), ADR-0004 §4b).
+                policy: policy_args_for(config),
+                fail_fast: recipe.fail_fast,
+                upload_limit_mb: recipe.upload_limit_mb,
+                description: backup.spec.description.clone(),
+                force_hash_percent: recipe.force_hash_percent,
+                create_extra_args: recipe.extra_args,
+            }
         }),
         identity,
         repository: repository_connect(repo)?,

@@ -104,9 +104,11 @@ Kopiur pins `--ignore-identical-snapshots=false` at the kopia identity scope on 
 
 An explicit `ignoreRules` list **replaces** the default outright rather than adding to it, and `ignoreRules: []` turns off ignoring anything at all. Kopiur rewrites the source's kopia policy from the spec before every snapshot, so a rule you remove stops applying on the next snapshot (see [Backups → Kopiur owns the per-source kopia policy](/backups/#compression-files--extraargs--kopia-tuning-and-ignores)). See [Backups → `files.ignoreRules` default](/backups/#filesignorerules-default-os-artifact-excludes) for why each entry is there, plus a copy-paste block of recommended extras.
 
-### `extraArgs`
+### `kopiaArgs` and `extraArgs`
 
-An escape hatch for kopia `policy set` flags that do not yet have a field of their own. They are applied to the source's kopia policy on every run, after Kopiur deletes the stored policy, so `extraArgs` is also the way to keep a kopia policy setting Kopiur would otherwise reset.
+Escape hatches for kopia flags that do not yet have a field of their own. `kopiaArgs.policySet` is appended to `kopia policy set` for the source's policy on every run, after Kopiur deletes the stored policy, so it is also the way to keep a kopia policy setting Kopiur would otherwise reset. `kopiaArgs.snapshotCreate` is appended to `kopia snapshot create` on every backup run. `extraArgs` is the original spelling of `kopiaArgs.policySet`; set one of the two.
+
+Every arg is checked at admission against Kopiur's reviewed table of kopia's flags. A flag a field already sets (use the field), one Kopiur controls itself, or one that is unsafe under Kopiur is refused with the reason and the field to use instead. For `extraArgs` the check runs only when an apply changes the list; a stored policy carrying a refused flag keeps running and reports an `UnsupportedKopiaArgs` condition. See [Backups → kopiaArgs](/backups/#kopiaargs--escape-hatches-for-unmodeled-kopia-flags).
 
 ### `errorHandling`
 
@@ -125,6 +127,8 @@ Upload parallelism, which is kopia's upload policy.
 `maxParallelSnapshots` maps to `--max-parallel-snapshots` and is how many sources snapshot at the same time. `maxParallelFileReads` maps to `--max-parallel-file-reads` and is the file-read concurrency within one snapshot. `limitMb` maps to `--upload-limit-mb`, which kopia leaves unlimited by default, and aborts the snapshot once that many MB have been uploaded. It is named `limitMb` rather than `uploadLimitMb` to avoid the `upload.uploadLimitMb` stutter.
 
 Like `failFast`, `limitMb` is a `snapshot create` argument rather than a `policy set` value, but it lives here beside its parallelism siblings. Any knob you leave out keeps kopia's default.
+
+`forceHashPercent` (0 to 100) maps to `snapshot create --force-hash`: kopia re-reads and re-hashes that share of files even when their size and mtime match the previous snapshot. Without it kopia reuses such a file's previous content unread, which backs up a file rewritten in place without an mtime change (MariaDB/InnoDB's `ib_logfile0`, the Aria logs) stale. `100` re-reads every file and is the only value that guarantees it; it costs a full read of the volume per snapshot. See [Backups → forceHashPercent](/backups/#forcehashpercent--databases-that-rewrite-files-in-place).
 
 ### `verification`
 

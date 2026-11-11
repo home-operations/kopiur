@@ -10,6 +10,7 @@ import examples09MoverPermissions from "@repo/deploy/examples/09-mover-permissio
 import examples12RestoreMoverCache from "@repo/deploy/examples/12-restore-mover-cache.yaml?raw";
 import examples35PolicyDeletionCascade from "@repo/deploy/examples/35-policy-deletion-cascade.yaml?raw";
 import examples40MultiRepositoryPolicy from "@repo/deploy/examples/40-multi-repository-policy.yaml?raw";
+import examples48ForceHash from "@repo/deploy/examples/48-force-hash-in-place-writers.yaml?raw";
 import examplesTryitBackups from "@repo/deploy/examples/tryit/backups.yaml?raw";
 
 Backing up is three resources, not one, and keeping them separate is the whole point. This page explains what each does, then walks the handful of fields you'll actually change.
@@ -326,24 +327,25 @@ files:
   ignoreRules: ["*.tmp", "*/cache/*"] # paths kopia skips, REPLACING the default set (see below)
   ignoreCacheDirs: true # honor CACHEDIR.TAG
   ignoreIdenticalSnapshots: false # take a new snapshot even if nothing changed
-extraArgs: [] # escape hatch for kopia flags not modeled above
+kopiaArgs:
+  policySet: [] # escape hatch for `kopia policy set` flags not modeled above
 ```
 
-| Field                            | What it does                                                                                       |
-| -------------------------------- | -------------------------------------------------------------------------------------------------- |
-| `compression.compressor`         | The kopia compressor (e.g. `zstd`, `gzip`, `s2`); omit to leave content uncompressed.              |
-| `compression.neverCompress`      | Globs to never attempt to compress: already-compressed media, archives.                            |
-| `files.ignoreRules`              | `.gitignore`-style globs of paths to exclude from the snapshot.                                    |
-| `files.ignoreCacheDirs`          | Honor `CACHEDIR.TAG` markers (skip directories tagged as caches).                                  |
-| `files.ignoreIdenticalSnapshots` | When `true`, kopia won't create a new snapshot if the source is exactly identical to the last one. |
-| `extraArgs`                      | Pass-through kopia flags for anything not modeled above.                                           |
+| Field                            | What it does                                                                                                                               |
+| -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| `compression.compressor`         | The kopia compressor (e.g. `zstd`, `gzip`, `s2`); omit to leave content uncompressed.                                                      |
+| `compression.neverCompress`      | Globs to never attempt to compress: already-compressed media, archives.                                                                    |
+| `files.ignoreRules`              | `.gitignore`-style globs of paths to exclude from the snapshot.                                                                            |
+| `files.ignoreCacheDirs`          | Honor `CACHEDIR.TAG` markers (skip directories tagged as caches).                                                                          |
+| `files.ignoreIdenticalSnapshots` | When `true`, kopia won't create a new snapshot if the source is exactly identical to the last one.                                         |
+| `kopiaArgs.policySet`            | Extra `kopia policy set` flags for anything not modeled above. See [escape hatches](#kopiaargs--escape-hatches-for-unmodeled-kopia-flags). |
 
 :::note[Kopiur owns the per-source kopia policy]
 
 kopia stores policies in the repository; it does not read them from the CRD. Before every snapshot the mover rebuilds the kopia policy for that source (`<username>@<hostname>:<sourcePath>`) from these fields. It deletes the stored policy, then writes the current spec. Two things follow:
 
 - Removing an entry or a field takes effect on the **next** snapshot. A rule you drop from `ignoreRules` stops excluding its path. A knob you remove falls back to the value the source inherits from the identity (`<username>@<hostname>`) or global kopia policy, which is kopia's default unless something changed it there.
-- A setting you make on that source with `kopia policy set` outside Kopiur is wiped by the next run. To keep a kopia setting that has no field here, put it in `extraArgs`; Kopiur reapplies `extraArgs` on every run.
+- A setting you make on that source with `kopia policy set` outside Kopiur is wiped by the next run. To keep a kopia setting that has no field here, put it in `kopiaArgs.policySet`; Kopiur reapplies it on every run.
 
 Kopiur 0.10.18 and earlier only ever _added_ to the stored policy, so a removed `ignoreRules` entry kept applying. Upgrading fixes this from the first snapshot after the upgrade, with no manual cleanup.
 
@@ -428,6 +430,51 @@ upload:
 ```
 
 `limitMb` is named that way to avoid the `upload.uploadLimitMb` stutter. Like `failFast`, it's a `snapshot create` argv flag rather than a `policy set` setting, but it lives here beside its parallelism siblings.
+
+#### `forceHashPercent` — databases that rewrite files in place
+
+kopia decides whether to read a file by comparing its **size and modification time** with the previous snapshot. When both match, it reuses the previous snapshot's content **without reading the file**. That is what makes incremental snapshots fast, and it is correct for nearly every workload.
+
+It is wrong for a program that rewrites a file **in place without changing its size or mtime**. The snapshot then silently carries the previous content of that file while every other file is current, and kopia reports success. This is confirmed for **MariaDB/InnoDB**: the fixed-size redo log `ib_logfile0` and the Aria logs (`aria_log.00000001`, `aria_log_control`) changed during a clean shutdown while their mtimes stayed hours (and days) old, so a restore paired current data pages with an older redo log. Other engines that preallocate and overwrite files may behave the same way. CSI snapshots (`copyMethod: Snapshot`) do not help: kopia still compares size and mtime against the previous snapshot.
+
+`upload.forceHashPercent` passes `kopia snapshot create --force-hash`, which re-reads and re-hashes that percentage of files regardless:
+
+<Code
+  code={region(examples48ForceHash, "policy")}
+  lang="yaml"
+  title="deploy/examples/48-force-hash-in-place-writers.yaml"
+/>
+
+- **`100` is the only value that guarantees correctness.** It re-reads every file on every snapshot. Lower values pick files at random, which only bounds how long a file can stay stale.
+- **The cost is a full read of the volume per snapshot.** Uploads stay deduplicated, so unchanged data is hashed but not re-uploaded. For the typically small volume of a database this is cheap; for a large media volume, keep it off.
+- **Absent means kopia's default, `0`**: today's behaviour, no flag passed. The webhook refuses a value above `100`.
+
+### kopiaArgs — escape hatches for unmodeled kopia flags
+
+`kopiaArgs` appends extra flags to one kopia command, for the rare kopia setting that has no field yet:
+
+| Field                      | Appended to                                                 |
+| -------------------------- | ----------------------------------------------------------- |
+| `kopiaArgs.policySet`      | `kopia policy set`, for each source's policy, on every run. |
+| `kopiaArgs.snapshotCreate` | `kopia snapshot create`, on every backup run.               |
+
+Kopiur keeps a reviewed table of **every** flag kopia offers on the commands it runs, and the webhook checks each extra arg against it, in all three spellings (`--flag=value`, `--flag value`, `--no-flag`). A flag is accepted only when it is log-only or knowingly left at kopia's default. Anything else is refused with what, why, and what to do instead:
+
+- a flag a field already sets, such as `--force-hash` or `--compression`, names the field to use (`spec.upload.forceHashPercent`, `spec.compression.compressor`);
+- a flag Kopiur must control itself, such as `--json`, `--override-source` or `--global`, says why;
+- a flag that is dangerous or meaningless under Kopiur, such as `--keep-latest`, `--start-time` or `--shallow`, says why and names the replacement when there is one (`spec.retention`);
+- a bare word that is not a flag is refused, because `kopia policy set` would read it as a second policy target.
+
+```console
+$ kubectl apply -f policy.yaml
+Error from server (Forbidden): admission webhook denied the request: spec.kopiaArgs.snapshotCreate: `--force-hash=50`: Kopiur already sets `--force-hash` on `kopia snapshot create` from SnapshotPolicy spec.upload.forceHashPercent, and two sources for one setting would disagree. Fix: remove it and set SnapshotPolicy spec.upload.forceHashPercent instead
+```
+
+:::caution[`extraArgs` is the old spelling of `kopiaArgs.policySet`]
+
+`spec.extraArgs` still works and still reaches `kopia policy set`, exactly as before. Set it **or** `kopiaArgs.policySet`, not both. The flag check applies to it too, but only when an apply **changes** the list: a policy stored before this check keeps backing up unchanged, and if its `extraArgs` carries a refused flag it shows an `UnsupportedKopiaArgs` condition (and a Warning Event) naming each one. Fix the list, ideally by moving it to `kopiaArgs.policySet`, the next time you edit it.
+
+:::
 
 ### verification — prove the snapshots are restorable
 

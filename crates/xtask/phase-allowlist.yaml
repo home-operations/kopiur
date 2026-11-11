@@ -123,6 +123,13 @@ allow:
       with no capacity behind it. Deep verify still runs on an `emptyDir`, so
       nothing is ever held; documented "never blocks" at the const.
   - file: crates/controller/src/consts.rs
+    snippet: UNSUPPORTED_KOPIA_ARGS_CONDITION
+    reason: >-
+      `SnapshotPolicy` warn-only notice (#708) that a stored legacy
+      `spec.extraArgs` carries a kopia flag admission now refuses. The mover still
+      passes the list and backups run unchanged, so nothing is ever held; the
+      next edit of the list is what admission refuses.
+  - file: crates/controller/src/consts.rs
     snippet: SCHEDULE_TIMEZONE_AMBIGUOUS_CONDITION
     reason: >-
       `SnapshotSchedule` warn-only notice that the inherited cron timezone was

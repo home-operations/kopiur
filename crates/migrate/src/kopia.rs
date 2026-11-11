@@ -1121,8 +1121,28 @@ pub fn translate_source(
     if let Some(args) = &kopia.additional_args
         && !args.is_empty()
     {
-        policy_spec["extraArgs"] = serde_json::json!(args);
-        t.mapped("spec.kopia.additionalArgs", "SnapshotPolicy.spec.extraArgs");
+        // #708: the webhook refuses an escape-hatch flag Kopiur models, owns or
+        // forbids, so emitting one would only fail at `kubectl apply`. Refuse the
+        // list up front with kopia-flag-table reasons instead.
+        let refused = kopiur_api::kopia_flags::check_extra_args(
+            kopiur_api::kopia_flags::KopiaCommand::PolicySet,
+            args,
+        );
+        if refused.is_empty() {
+            policy_spec["extraArgs"] = serde_json::json!(args);
+            t.mapped("spec.kopia.additionalArgs", "SnapshotPolicy.spec.extraArgs");
+        } else {
+            let why: Vec<String> = refused.into_iter().map(|v| v.message).collect();
+            t.unmappable(
+                "spec.kopia.additionalArgs",
+                &format!(
+                    "dropped: kopiur refuses some of these kopia flags, so the list was not \
+                     copied to SnapshotPolicy.spec.extraArgs: {}. Re-add the accepted ones by \
+                     hand.",
+                    why.join("; ")
+                ),
+            );
+        }
     }
 
     // Mover knobs.
@@ -2013,6 +2033,29 @@ mod tests {
         let policy: kopiur_api::snapshot_policy::SnapshotPolicySpec =
             serde_json::from_value(t.objects[0]["spec"].clone()).unwrap();
         assert!(kopiur_api::validate::validate_cache_legacy_budgets_for(&policy, None).is_empty());
+    }
+
+    /// #708: an `additionalArgs` list carrying a flag kopiur's flag table refuses
+    /// would only be denied by the webhook at `kubectl apply`, so it is dropped
+    /// and accounted for as Unmappable, with the table's reason.
+    #[test]
+    fn additional_args_with_a_refused_kopia_flag_are_unmappable() {
+        let spec = source_spec(serde_json::json!({
+            "sourcePVC": "data",
+            "kopia": { "additionalArgs": ["--keep-latest=3", "--one-file-system=true"] }
+        }));
+        let t = translate_source("app", "ns", &spec, &repo_ref()).unwrap();
+        assert!(t.objects[0]["spec"].get("extraArgs").is_none());
+        let note = t
+            .notes
+            .iter()
+            .find(|n| n.field == "spec.kopia.additionalArgs")
+            .expect("accounted for");
+        let Disposition::Unmappable { reason } = &note.disposition else {
+            panic!("expected Unmappable, got {:?}", note.disposition);
+        };
+        assert!(reason.contains("--keep-latest=3"), "{reason}");
+        assert!(t.has_unmappable);
     }
 
     #[test]

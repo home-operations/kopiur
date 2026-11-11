@@ -49,13 +49,15 @@ use kopiur_mover::status::{
 };
 use kopiur_mover::verify::quick_coverage;
 use kopiur_mover::workspec::{
-    self, BootstrapRepositoryOp, BrowseSessionOp, KOPIA_KEEP_MAX, KOPIUR_PIN_NAME, MaintenanceOp,
-    MoverWorkSpec, Operation, ReplicateOp, RestoreOp, RestoreScope, RestoreSelection,
-    RestoreSelector, SnapshotAnchor, SnapshotDeleteBatchOp, SnapshotPinOp, SnapshotReplicateOp,
-    ThrottleSpec, VerifyOp, VerifyTier, maintenance_restamp_target, restore_scope,
+    self, BootstrapRepositoryOp, BrowseSessionOp, KOPIUR_PIN_NAME, MaintenanceOp, MoverWorkSpec,
+    Operation, ReplicateOp, RestoreOp, RestoreScope, RestoreSelection, RestoreSelector,
+    SnapshotAnchor, SnapshotDeleteBatchOp, SnapshotPinOp, SnapshotReplicateOp, ThrottleSpec,
+    VerifyOp, VerifyTier, maintenance_restamp_target, restore_scope,
 };
 #[cfg(test)]
-use kopiur_mover::workspec::{SnapshotDeleteItem, SnapshotDeleteOp};
+use kopiur_mover::workspec::{
+    KOPIA_KEEP_MAX, SnapshotDeleteItem, SnapshotDeleteOp, identity_retention_policy,
+};
 
 fn main() -> std::process::ExitCode {
     let cli = MoverCli::parse();
@@ -565,15 +567,14 @@ async fn run_operation(
             // ("only global, username@hostname or @hostname"), so that one knob
             // is folded into the identity-scope policy_set below instead of the
             // path-scoped one (the policy_knobs e2e regression).
-            let (path_policy, user_identity_policy) =
-                kopiur_kopia::split_policy_scopes(op.policy.to_kopia());
+            let scopes = op.policy.scope_plan();
             // The path scope is REPLACED, every run, even when the spec is
             // empty: kopia stores the policy and `policy set` only adds to it,
             // so a rule or knob dropped from the spec would otherwise stay in
             // force (#681). Kopiur owns this scope outright: it is per source,
             // and nothing else in Kopiur writes it.
             client
-                .policy_replace(&override_source, &path_policy)
+                .policy_replace(&override_source, &scopes.path)
                 .await
                 .map_err(kopia(KopiaOp::PolicyReplace))?;
             // The identity-scoped `policy set` ALWAYS runs too: it carries the
@@ -585,10 +586,7 @@ async fn run_operation(
             // references. It is written, never replaced: that scope can hold
             // settings Kopiur does not own.
             client
-                .policy_set(
-                    &identity_scope,
-                    &identity_retention_policy(user_identity_policy),
-                )
+                .policy_set(&identity_scope, &scopes.identity)
                 .await
                 .map_err(kopia(KopiaOp::PolicySet))?;
             // Captured before the create so an `Unchanged` run can still report a
@@ -1705,48 +1703,6 @@ async fn run_bootstrap_flow(
             class: KopiaErrorClass::from_label(class),
             message: message.to_string(),
         })
-    }
-}
-
-/// Build the identity-scope `policy set` args applied before every `snapshot
-/// create` (M0b, confirmed data-loss bug): kopia's six `--keep-*` retention
-/// fields, ALWAYS pinned to [`KOPIA_KEEP_MAX`], with `user_identity_policy`
-/// (the one knob `split_policy_scopes` moves to the identity scope —
-/// currently only `max_parallel_snapshots`) folded in on top. That knob is
-/// written as `inherit` when the operator did not configure it: this scope is
-/// written but never replaced, so omitting the flag would keep a value an
-/// earlier spec stored there (#681). Pulled out of `run_operation` so the
-/// mandatory pin is unit-testable without spawning kopia.
-fn identity_retention_policy(
-    user_identity_policy: Option<kopiur_kopia::PolicyArgs>,
-) -> kopiur_kopia::PolicyArgs {
-    kopiur_kopia::PolicyArgs {
-        keep_latest: Some(KOPIA_KEEP_MAX),
-        keep_hourly: Some(KOPIA_KEEP_MAX),
-        keep_daily: Some(KOPIA_KEEP_MAX),
-        keep_weekly: Some(KOPIA_KEEP_MAX),
-        keep_monthly: Some(KOPIA_KEEP_MAX),
-        keep_annual: Some(KOPIA_KEEP_MAX),
-        // Floor, same shape and same reasoning as the six `keep_*` pins above:
-        // a kopia-side retention setting Kopiur did not choose must not silently
-        // change what a backup run produces. With `ignoreIdenticalSnapshots` on,
-        // kopia writes NO manifest for an unchanged source — so a `Snapshot` CR
-        // that expected to own one owns nothing, and the whole
-        // finalizer/retention/restore model rests on that 1:1. kopia's own
-        // default is `false`, but a repository's global policy or a third-party
-        // `extraArgs` can flip it out of band, which is how #351 was reachable
-        // without the CRD field ever having been wired.
-        //
-        // Explicitly `false`, not unset: unset INHERITS, and inheriting is the
-        // bug. An opt-in (`files.ignoreIdenticalSnapshots: true`) overrides this
-        // from the more specific path scope.
-        ignore_identical_snapshots: Some(false),
-        max_parallel_snapshots: Some(
-            user_identity_policy
-                .and_then(|p| p.max_parallel_snapshots)
-                .unwrap_or(kopiur_kopia::PolicyInt::Inherit),
-        ),
-        ..Default::default()
     }
 }
 

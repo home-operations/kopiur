@@ -2220,6 +2220,7 @@ mod tests {
                 compression: None,
                 files: None,
                 extra_args: vec![],
+                kopia_args: None,
                 error_handling: None,
                 upload: None,
                 verification: Some(verification),

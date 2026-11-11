@@ -224,9 +224,16 @@ async fn handle_snapshot_policy(
     errs.extend(api::validate::validate_backup_config_admission_extras(
         &spec,
     ));
+    let old_spec = decode_old_spec::<SnapshotPolicySpec>(req);
     errs.extend(api::validate::validate_cache_legacy_budgets_for(
         &spec,
-        decode_old_spec::<SnapshotPolicySpec>(req).as_ref(),
+        old_spec.as_ref(),
+    ));
+    // #708: the legacy `extraArgs` predates the kopia flag table, so it is only
+    // checked when this apply changes it (stored objects keep running).
+    errs.extend(api::validate::validate_legacy_extra_args(
+        &spec,
+        old_spec.as_ref(),
     ));
     if !errs.is_empty() {
         return Err(AdmissionError::Invalid(errs));
