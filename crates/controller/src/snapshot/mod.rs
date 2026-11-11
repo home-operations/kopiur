@@ -1436,6 +1436,7 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
         // other variant is an invariant breach, enumerated so a new operation
         // cannot compile into silence here.
         Operation::Restore(_)
+        | Operation::PartialRestore(_)
         | Operation::SnapshotDelete(_)
         | Operation::SnapshotDeleteBatch(_)
         | Operation::BootstrapRepository(_)

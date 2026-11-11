@@ -174,6 +174,7 @@ impl From<&crate::error::MoverError> for FailureBlock {
             | MoverError::RestoreNoSnapshot { .. }
             | MoverError::RestoreAsOfInvalid { .. }
             | MoverError::RestorePathsMissing { .. }
+            | MoverError::PartialRestoreInvalid { .. }
             | MoverError::RestoreTargetDir { .. }
             | MoverError::RestoreTargetSymlink { .. }
             | MoverError::ScratchNotWritable { .. }

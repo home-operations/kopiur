@@ -296,7 +296,13 @@ kubectl kopiur restore --from-snapshot samba-20261105063900-pvc-mp3 --to-pvc mp3
   --path docs/report.odt --path music/album --overwrite-files true --wait
 ```
 
-The web console's Restore form has the same field, one path per line, and a restore's detail view lists the paths it selected.
+The web console's Restore form has the same field, one path per line, and a restore's detail view lists the paths it selected. Each line is sent exactly as typed, so a leading or trailing space is part of the file name.
+
+:::caution[Partial restores need a matching mover image]
+
+A partial restore is sent to the mover as its own operation. If you pin an older mover image (`KOPIUR_MOVER_IMAGE` or the chart's `mover.image`) that predates partial restore, the mover refuses the work spec and the `Restore` fails. It never falls back to restoring the whole snapshot over your volume. Upgrade the mover image to the controller's version to use `selection`.
+
+:::
 
 :::caution[What a path may look like (webhook-enforced)]
 
