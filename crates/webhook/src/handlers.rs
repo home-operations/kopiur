@@ -830,9 +830,11 @@ async fn handle_maintenance(
     // Admission-only: the quick/full jitter windows, which the shared aggregate has
     // never validated at all — so PARSE and bound are both new rejections here.
     errs.extend(api::validate::validate_maintenance_admission_extras(&spec));
-    errs.extend(api::validate::validate_cache_legacy_budgets_for(
+    // Skipped for the operator's managed projection of a repository (#707 review).
+    errs.extend(api::validate::validate_maintenance_cache_legacy_budgets(
         &spec,
         decode_old_spec::<MaintenanceSpec>(req).as_ref(),
+        obj.metadata.owner_references.as_deref().unwrap_or_default(),
     ));
     if !errs.is_empty() {
         return Err(AdmissionError::Invalid(errs));

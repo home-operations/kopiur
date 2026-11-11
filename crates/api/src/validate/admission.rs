@@ -178,11 +178,11 @@ pub fn validate_cache_legacy_budgets(
     old: Option<&crate::common::CacheDefaults>,
     field: &str,
 ) -> Option<ValidationError> {
+    // With a capacity on the layer the full admission view applies: the bound on
+    // `*CacheSizeMb`, and a capacity large enough to bound BOTH caches (#707
+    // review). Both tighten pre-existing fields, hence admission-only.
     let cache = cache?;
     if old == Some(cache) || cache.capacity.is_none() {
-        return None;
-    }
-    if cache.content_cache_size_mb.is_none() && cache.metadata_cache_size_mb.is_none() {
         return None;
     }
     crate::common::resolve_cache_budgets(
@@ -192,6 +192,32 @@ pub fn validate_cache_legacy_budgets(
         field,
     )
     .err()
+}
+
+/// [`validate_cache_legacy_budgets_for`] for a `Maintenance`, skipped when it is the
+/// operator's managed projection of a `Repository`/`ClusterRepository` (a
+/// controller owner reference of that kind).
+///
+/// That object copies the repository's `spec.maintenance.mover`, which was admitted
+/// on the repository itself — so a stored repository whose block predates the
+/// bound must still get its maintenance when it is (re-)enabled. Refusing the
+/// operator's CREATE (no old object to compare against) would leave maintenance
+/// silently never starting (#707 review). A user-authored `Maintenance` is checked
+/// as usual.
+pub fn validate_maintenance_cache_legacy_budgets(
+    spec: &MaintenanceSpec,
+    old: Option<&MaintenanceSpec>,
+    owner_refs: &[k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference],
+) -> Vec<ValidationError> {
+    let managed = owner_refs.iter().any(|o| {
+        o.controller == Some(true)
+            && o.api_version.starts_with(crate::GROUP)
+            && matches!(o.kind.as_str(), "Repository" | "ClusterRepository")
+    });
+    if managed {
+        return Vec::new();
+    }
+    validate_cache_legacy_budgets_for(spec, old)
 }
 
 /// Every mover cache block a spec carries, with its field path — so the webhook

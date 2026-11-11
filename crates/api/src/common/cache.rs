@@ -49,7 +49,8 @@ pub struct CacheDefaults {
     /// unset cache budgets default to a percentage of it (content 60%, metadata
     /// 15%) and the two budgets together may claim at most 90% of it. Raising it on
     /// a `Persistent` cache grows the existing PVC when its StorageClass allows
-    /// volume expansion; a smaller value is never applied to an existing PVC.
+    /// volume expansion; a smaller value is never applied to an existing PVC. Must be
+    /// at least `3Mi` (1MiB for each cache under the 90% ceiling).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capacity: Option<String>,
     /// StorageClass for the cache PVC; absent uses the cluster default.

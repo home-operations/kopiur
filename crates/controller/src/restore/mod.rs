@@ -3784,10 +3784,10 @@ async fn run_restore_mover(
         effective_cache.as_ref(),
     )
     .await?;
-    work_spec.cache = crate::cache::cache_tuning(
+    work_spec.cache = crate::cache::tuning_of(&crate::cache::cache_budgets_for_volume(
         effective_cache.as_ref(),
-        resolved_volume.capacity.as_deref(),
-    )?;
+        &resolved_volume,
+    )?);
     let cache_volume = resolved_volume.volume;
     // RWO Multi-Attach avoidance for the restore DESTINATION PVC: when restoring into
     // an existing ReadWriteOnce PVC held by a running app pod, pin the restore mover to
