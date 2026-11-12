@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.10.20](https://github.com/home-operations/kopiur/compare/0.10.19...0.10.20) (2026-11-12)
+
+
+### Miscellaneous Chores
+
+* **npm:** update dependency astro (7.4.8 → 7.4.10) ([#719](https://github.com/home-operations/kopiur/issues/719)) ([4b999c2](https://github.com/home-operations/kopiur/commit/4b999c2e52f36c658a1868d2889193183666d74d))
+* **npm:** update dependency jsdom (30.1.3 → 31.0.0) ([#685](https://github.com/home-operations/kopiur/issues/685)) ([cf923f3](https://github.com/home-operations/kopiur/commit/cf923f3ba96bc9176a2b4210df985ae53818326a))
+* **npm:** update dependency vite (8.3.7 → 8.3.8) ([#721](https://github.com/home-operations/kopiur/issues/721)) ([2e35f10](https://github.com/home-operations/kopiur/commit/2e35f10170298849699eeed20d4f04aac2a7a114))
+* **rust:** update crate axum-server (0.8.0 → 0.9.2) ([#684](https://github.com/home-operations/kopiur/issues/684)) ([187ed79](https://github.com/home-operations/kopiur/commit/187ed79224686644f21b6b581f431c94463b3445))
+
 ## [0.10.19](https://github.com/home-operations/kopiur/compare/0.10.18...0.10.19) (2026-11-11)
 
 
