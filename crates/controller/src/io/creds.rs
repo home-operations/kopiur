@@ -584,15 +584,17 @@ pub fn projection_decision(consumer_enabled: bool, owner_allowed: bool) -> Proje
     }
 }
 
-/// Wrap credential Secret names as **verbatim** (unprefixed) `envFrom` entries —
-/// the single-backend default every mover but replication uses. kopia reads the
-/// plain env-var names (`KOPIA_PASSWORD`, `AWS_*`, …). The replication mover builds
-/// its own prefixed destination entry on top of these (issue #200).
-pub fn plain_creds(names: Vec<String>) -> Vec<crate::jobs::CredsEnvFrom> {
-    names
-        .into_iter()
-        .map(crate::jobs::CredsEnvFrom::plain)
-        .collect()
+/// A repository's resolved credential Secret names as `envFrom` entries, with
+/// the password Secret keyed when `passwordSecretRef.key` is not
+/// `KOPIA_PASSWORD` (#725). `names` is password-first, as
+/// [`resolve_mover_creds`] returns it. The replication movers add their
+/// prefixed destination entries on top (issue #200). See
+/// [`crate::jobs::repo_creds`].
+pub fn repo_creds(
+    names: Vec<String>,
+    encryption: &kopiur_api::common::Encryption,
+) -> Vec<crate::jobs::CredsEnvFrom> {
+    crate::jobs::repo_creds(names, encryption)
 }
 
 /// The credential Secret names a mover Job should load via `envFrom`, plus how
@@ -1423,6 +1425,69 @@ mod tests {
                 "the pre-check must be a metadata-only GET, sent Accept: {}",
                 accepts[0]
             );
+        }
+    }
+    fn enc_with_key(key: Option<&str>) -> kopiur_api::common::Encryption {
+        serde_json::from_value(serde_json::json!({
+            "passwordSecretRef": { "name": "kopiur", "key": key }
+        }))
+        .unwrap()
+    }
+
+    /// #725: `passwordSecretRef.key` was ignored — every pod loaded the Secret
+    /// through `envFrom` alone, so only a key literally named `KOPIA_PASSWORD`
+    /// reached kopia. The password Secret (always first) now carries the key.
+    #[test]
+    fn repo_creds_carries_a_custom_password_key_on_the_password_secret() {
+        let out = repo_creds(
+            vec!["kopiur".into(), "s3-keys".into()],
+            &enc_with_key(Some("KOPIUR_PASSWORD")),
+        );
+        assert_eq!(
+            out,
+            vec![
+                crate::jobs::CredsEnvFrom::plain("kopiur")
+                    .with_password_key(Some("KOPIUR_PASSWORD")),
+                crate::jobs::CredsEnvFrom::plain("s3-keys"),
+            ]
+        );
+        let env = crate::jobs::creds_password_env(&out);
+        assert_eq!(env.len(), 1);
+        assert_eq!(env[0].name, "KOPIA_PASSWORD");
+        let sel = env[0]
+            .value_from
+            .as_ref()
+            .and_then(|v| v.secret_key_ref.as_ref())
+            .expect("secretKeyRef");
+        assert_eq!(
+            (sel.name.as_str(), sel.key.as_str()),
+            ("kopiur", "KOPIUR_PASSWORD")
+        );
+    }
+
+    /// A projected copy is renamed but keeps its keys, so the key follows the
+    /// resolved name, not the spec's.
+    #[test]
+    fn repo_creds_keys_the_projected_copy_name() {
+        let out = repo_creds(vec!["app-snap-creds-0".into()], &enc_with_key(Some("pw")));
+        let env = crate::jobs::creds_password_env(&out);
+        let sel = env[0]
+            .value_from
+            .as_ref()
+            .unwrap()
+            .secret_key_ref
+            .as_ref()
+            .unwrap();
+        assert_eq!(sel.name, "app-snap-creds-0");
+        assert_eq!(sel.key, "pw");
+    }
+
+    #[test]
+    fn repo_creds_with_the_default_key_stays_envfrom_only() {
+        for key in [None, Some("KOPIA_PASSWORD")] {
+            let out = repo_creds(vec!["kopiur".into()], &enc_with_key(key));
+            assert_eq!(out, vec![crate::jobs::CredsEnvFrom::plain("kopiur")]);
+            assert!(crate::jobs::creds_password_env(&out).is_empty());
         }
     }
 }

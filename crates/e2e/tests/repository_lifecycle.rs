@@ -1415,3 +1415,107 @@ async fn a_repository_without_parameters_keeps_kopias_defaults() {
 
     let _ = repos.delete(repo, &DeleteParams::default()).await;
 }
+
+/// A repository password stored under a key other than `KOPIA_PASSWORD` works
+/// end to end (#725). The Secret holds ONLY the custom key, the reporter's
+/// exact failing layout: every pod loaded the Secret through `envFrom`, which
+/// exposes each key under its own name, so kopia never saw a `KOPIA_PASSWORD`
+/// and the bootstrap mover failed. The repository is volume-backed so both the
+/// bootstrap and the backup run in mover Jobs, the broken path (the in-process
+/// filesystem arm reads the key directly and never had the bug).
+#[tokio::test]
+#[ignore = "requires the e2e harness (mise run //crates/e2e:test): kind + built images + helm install"]
+async fn custom_password_secret_key_bootstraps_and_backs_up() {
+    use kopiur_e2e::{apply_secret, consts};
+    const SECRET: &str = "e2e-pwkey-creds";
+    const KEY: &str = "KOPIUR_PASSWORD";
+    const REPO: &str = "e2e-pwkey-repo";
+    const POLICY: &str = "e2e-pwkey-policy";
+    const SNAPSHOT: &str = "e2e-pwkey-snap";
+
+    let Some(world) = World::connect().await else {
+        return;
+    };
+    world.ensure(&[Need::Filesystem]).await.expect("fixtures");
+    let client = world.client().clone();
+    let repos: Api<Repository> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let policies: Api<SnapshotPolicy> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let snapshots: Api<Snapshot> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+
+    // The password under the custom key ONLY: no `KOPIA_PASSWORD` to fall back on.
+    apply_secret(
+        &client,
+        E2E_NAMESPACE,
+        SECRET,
+        &[(KEY, consts::KOPIA_PASSWORD)],
+    )
+    .await
+    .expect("seed the custom-key password Secret");
+    ensure_repo(&client, "pwkey").await;
+
+    create_idempotent(
+        &repos,
+        &cr(repository_json_with(
+            REPO,
+            "pwkey",
+            consts::ISOLATED_REPO_PATH,
+            SECRET,
+            serde_json::json!({
+                "encryption": { "passwordSecretRef": { "name": SECRET, "key": KEY } }
+            }),
+        )),
+        "create the custom-key repository",
+    )
+    .await;
+    // The overlay must have landed, or this would quietly test the default key.
+    let landed = repos.get(REPO).await.expect("get repo");
+    assert_eq!(
+        landed.spec.encryption.password_secret_ref.key.as_deref(),
+        Some(KEY),
+        "the repository must reference the custom password key"
+    );
+
+    // Bootstrap mover Job: timed out here before the fix.
+    wait_phase(&repos, REPO, "Ready")
+        .await
+        .expect("a repository with a custom password key must reach Ready");
+
+    create_idempotent(
+        &policies,
+        &cr(snapshot_policy_json(
+            E2E_NAMESPACE,
+            POLICY,
+            "Repository",
+            REPO,
+            serde_json::json!({}),
+        )),
+        "create the policy",
+    )
+    .await;
+    create_idempotent(
+        &snapshots,
+        &cr(snapshot_json(
+            E2E_NAMESPACE,
+            SNAPSHOT,
+            POLICY,
+            serde_json::json!({}),
+        )),
+        "create the snapshot",
+    )
+    .await;
+    // Backup mover Job: the same key must reach it too.
+    wait_phase(&snapshots, SNAPSHOT, "Succeeded")
+        .await
+        .expect("a backup into a custom-password-key repository must succeed");
+    let status = status_json(&snapshots, SNAPSHOT).await;
+    let id = status
+        .pointer("/snapshot/kopiaSnapshotID")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    assert!(
+        !id.is_empty(),
+        "a Succeeded Snapshot must record a real kopia snapshot id; got {status}"
+    );
+
+    let _ = snapshots.delete(SNAPSHOT, &DeleteParams::default()).await;
+}

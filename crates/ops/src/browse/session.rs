@@ -502,6 +502,19 @@ impl ExecSession {
     }
 }
 
+/// The session pod's `envFrom` entries for `creds` (password-first, as
+/// [`session_creds`] returns them), keyed so a password stored under a custom
+/// `passwordSecretRef.key` still reaches kopia as `KOPIA_PASSWORD` (#725). Pure.
+fn session_env_from(
+    creds: &[SessionCreds],
+    encryption: &kopiur_api::common::Encryption,
+) -> Vec<jobs::CredsEnvFrom> {
+    jobs::repo_creds(
+        creds.iter().map(|c| c.env_from_name().to_string()),
+        encryption,
+    )
+}
+
 /// Create the session Job (the work spec rides its pod env — the session is
 /// one self-cleaning object), returning the Job name.
 async fn create_session_job(
@@ -521,10 +534,7 @@ async fn create_session_job(
     // The browse session talks to a single repository; its Secret(s) load
     // verbatim, from the operator's copies when they live elsewhere.
     let creds = session_creds(target, &name)?;
-    let creds_secrets: Vec<jobs::CredsEnvFrom> = creds
-        .iter()
-        .map(|c| jobs::CredsEnvFrom::plain(c.env_from_name()))
-        .collect();
+    let creds_secrets = session_env_from(&creds, &target.repo.encryption);
     let projection = session_projection_metadata(&creds, &target.snapshot);
     let work_spec = session_work_spec(target, ttl);
     let mover = resolve_mover_image(ctx, image).await?;
@@ -1013,6 +1023,38 @@ pub async fn delete_session(ctx: &OpsCtx, namespace: &str, job_name: &str) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #725: a browse session loaded the password through `envFrom` alone, so
+    /// a custom `passwordSecretRef.key` never became `KOPIA_PASSWORD`. The key
+    /// follows the name the pod loads — here the operator's projected copy.
+    #[test]
+    fn session_env_from_keys_a_custom_password_key() {
+        let enc = |key: Option<&str>| -> kopiur_api::common::Encryption {
+            serde_json::from_value(serde_json::json!({
+                "passwordSecretRef": { "name": "creds", "key": key }
+            }))
+            .unwrap()
+        };
+        let creds = vec![
+            SessionCreds::Projected {
+                source_namespace: "kopiur".into(),
+                source_name: "creds".into(),
+                copy_name: "kopiur-browse-nas-0123abcd-creds-0".into(),
+            },
+            SessionCreds::Direct("s3-keys".into()),
+        ];
+        let out = session_env_from(&creds, &enc(Some("KOPIUR_PASSWORD")));
+        assert_eq!(
+            out,
+            vec![
+                jobs::CredsEnvFrom::plain("kopiur-browse-nas-0123abcd-creds-0")
+                    .with_password_key(Some("KOPIUR_PASSWORD")),
+                jobs::CredsEnvFrom::plain("s3-keys"),
+            ]
+        );
+        // The default key needs no explicit env var.
+        assert!(jobs::creds_password_env(&session_env_from(&creds, &enc(None))).is_empty());
+    }
 
     #[test]
     fn session_job_name_is_deterministic_distinct_and_short() {

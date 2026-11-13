@@ -16,7 +16,7 @@ use kopiur_api::{ClusterRepository, Maintenance, Repository};
 use crate::error::{Error, Result};
 
 /// Default key within the encryption password Secret when unset.
-pub const DEFAULT_PASSWORD_KEY: &str = "KOPIA_PASSWORD";
+pub const DEFAULT_PASSWORD_KEY: &str = kopiur_api::creds::KOPIA_PASSWORD_ENV;
 
 /// Default key within a `tls.caBundleRef` ConfigMap when unset — re-exported
 /// from [`kopiur_api::consts`] (shared with the kubectl-plugin's client-side

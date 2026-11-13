@@ -82,6 +82,25 @@ pub fn secret_env(secret: &Secret) -> BTreeMap<String, String> {
     out
 }
 
+/// Expose a repository password stored under a custom
+/// `encryption.passwordSecretRef.key` as `KOPIA_PASSWORD`, the name kopia
+/// reads. `key` is [`kopiur_api::creds::remapped_password_key`]: `None` means
+/// the Secret already uses `KOPIA_PASSWORD` and nothing changes. Mirrors the
+/// explicit env var a mover pod carries, which wins over any `KOPIA_PASSWORD`
+/// key loaded from the Secrets themselves (#725).
+pub fn apply_password_key(
+    env: &mut BTreeMap<String, String>,
+    password_secret: &BTreeMap<String, String>,
+    key: Option<&str>,
+) {
+    if let Some(password) = key.and_then(|k| password_secret.get(k)) {
+        env.insert(
+            kopiur_api::creds::KOPIA_PASSWORD_ENV.to_string(),
+            password.clone(),
+        );
+    }
+}
+
 impl LocalSession {
     /// Fetch the credentials, stage everything into a private temp dir, and
     /// connect read-only with the local kopia binary.
@@ -126,7 +145,9 @@ impl LocalSession {
             target.repo.namespace.as_deref(),
         );
         let mut env = BTreeMap::new();
-        for r in refs {
+        // The password Secret is always the first reference.
+        let mut password_secret = BTreeMap::new();
+        for (idx, r) in refs.into_iter().enumerate() {
             let ns = match r.namespace.as_deref() {
                 Some(ns) => ns.to_string(),
                 None => {
@@ -146,8 +167,17 @@ impl LocalSession {
                 },
                 _ => classify_kube("get", "Secret", "secrets", Some(&ns), Some(&r.name), e).into(),
             })?;
-            env.extend(secret_env(&secret));
+            let vars = secret_env(&secret);
+            if idx == 0 {
+                password_secret = vars.clone();
+            }
+            env.extend(vars);
         }
+        apply_password_key(
+            &mut env,
+            &password_secret,
+            kopiur_api::creds::remapped_password_key(&target.repo.encryption),
+        );
 
         // Private working dir: kopia config/cache/logs + staged file creds.
         let workdir = std::env::temp_dir().join(format!(
@@ -303,6 +333,24 @@ mod tests {
         ));
         assert!(!kopia_bin_available(Path::new("fake-kopia"), None));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// #725: `--local` read only a key literally named `KOPIA_PASSWORD`.
+    #[test]
+    fn custom_password_key_becomes_kopia_password() {
+        let secret = BTreeMap::from([("KOPIUR_PASSWORD".to_string(), "right".to_string())]);
+        // A stray KOPIA_PASSWORD from another Secret must not win.
+        let mut env = BTreeMap::from([
+            ("KOPIUR_PASSWORD".to_string(), "right".to_string()),
+            ("KOPIA_PASSWORD".to_string(), "stale".to_string()),
+        ]);
+        apply_password_key(&mut env, &secret, Some("KOPIUR_PASSWORD"));
+        assert_eq!(env.get("KOPIA_PASSWORD").map(String::as_str), Some("right"));
+
+        // Default key: untouched.
+        let mut env = BTreeMap::from([("KOPIA_PASSWORD".to_string(), "pw".to_string())]);
+        apply_password_key(&mut env, &secret, None);
+        assert_eq!(env.get("KOPIA_PASSWORD").map(String::as_str), Some("pw"));
     }
 
     #[test]

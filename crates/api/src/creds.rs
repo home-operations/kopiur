@@ -151,6 +151,30 @@ pub fn mover_creds_secrets(backend: &Backend, enc: &Encryption) -> Vec<String> {
         .collect()
 }
 
+/// The env var kopia reads the repository encryption password from, and the
+/// default `encryption.passwordSecretRef.key`.
+pub const KOPIA_PASSWORD_ENV: &str = "KOPIA_PASSWORD";
+
+/// The key in the password Secret that holds the repository password:
+/// `encryption.passwordSecretRef.key`, defaulting to [`KOPIA_PASSWORD_ENV`].
+pub fn password_secret_key(enc: &Encryption) -> &str {
+    enc.password_secret_ref
+        .key
+        .as_deref()
+        .unwrap_or(KOPIA_PASSWORD_ENV)
+}
+
+/// The password key a pod must map onto `KOPIA_PASSWORD` explicitly, or `None`
+/// when the key is already `KOPIA_PASSWORD`.
+///
+/// Credential Secrets reach kopia through `envFrom`, which exposes every key
+/// under its own name and cannot rename one. So a password stored under any
+/// other key never becomes `KOPIA_PASSWORD` unless the pod also carries a
+/// `secretKeyRef` for it (#725).
+pub fn remapped_password_key(enc: &Encryption) -> Option<&str> {
+    Some(password_secret_key(enc)).filter(|key| *key != KOPIA_PASSWORD_ENV)
+}
+
 /// Env-var prefix under which a replication mover receives the **destination**
 /// backend's credential Secret (`envFrom.prefix`). The source backend's Secret is
 /// delivered unprefixed (kopia reads the plain names at `repository connect` and
@@ -207,6 +231,30 @@ pub const SEED_KOPIA_PASSWORD_ENV: &str = "KOPIUR_SEED_KOPIA_PASSWORD";
 #[cfg(test)]
 mod dest_env_tests {
     use super::*;
+
+    fn enc(key: Option<&str>) -> Encryption {
+        serde_json::from_value(serde_json::json!({
+            "passwordSecretRef": { "name": "creds", "key": key }
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn password_key_defaults_to_kopia_password() {
+        assert_eq!(password_secret_key(&enc(None)), "KOPIA_PASSWORD");
+        assert_eq!(password_secret_key(&enc(Some("pw"))), "pw");
+    }
+
+    /// #725: only a key that is not literally `KOPIA_PASSWORD` needs a remap.
+    #[test]
+    fn only_a_custom_password_key_is_remapped() {
+        assert_eq!(remapped_password_key(&enc(None)), None);
+        assert_eq!(remapped_password_key(&enc(Some("KOPIA_PASSWORD"))), None);
+        assert_eq!(
+            remapped_password_key(&enc(Some("KOPIUR_PASSWORD"))),
+            Some("KOPIUR_PASSWORD")
+        );
+    }
 
     #[test]
     fn dest_env_prefix_is_stable() {
