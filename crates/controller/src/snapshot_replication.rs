@@ -1477,7 +1477,7 @@ async fn resolve_srepl_creds(
     let (pw_name, pw_key) = dest_password_ref(&dst_creds.names, &dest.encryption)?;
     let extra_env = vec![dest_password_env(&pw_name, &pw_key)];
     Ok((
-        snapshot_replication_creds_env_from(src_creds.names, dst_creds.names),
+        snapshot_replication_creds_env_from(src_creds.names, &source.encryption, dst_creds.names),
         extra_env,
     ))
 }
@@ -1493,9 +1493,10 @@ async fn resolve_srepl_creds(
 /// env-var names (the `RepositoryReplication` loaded-twice contract, #200).
 fn snapshot_replication_creds_env_from(
     source_names: Vec<String>,
+    source_encryption: &Encryption,
     dest_names: Vec<String>,
 ) -> Vec<jobs::CredsEnvFrom> {
-    let mut creds = io::plain_creds(source_names);
+    let mut creds = io::repo_creds(source_names, source_encryption);
     creds.extend(
         dest_names
             .into_iter()
@@ -2348,6 +2349,7 @@ mod tests {
     fn creds_put_source_plain_and_every_destination_secret_prefixed() {
         let out = snapshot_replication_creds_env_from(
             vec!["src-pw".into(), "src-s3".into()],
+            &src_enc(None),
             vec!["dst-pw".into(), "dst-s3".into()],
         );
         assert_eq!(
@@ -2367,7 +2369,11 @@ mod tests {
         // prefixed (destination) — kopia reads the two copies under different
         // env-var names, so collapsing them to one entry would strip the
         // destination's credentials (the #200 loaded-twice contract).
-        let out = snapshot_replication_creds_env_from(vec!["shared".into()], vec!["shared".into()]);
+        let out = snapshot_replication_creds_env_from(
+            vec!["shared".into()],
+            &src_enc(None),
+            vec!["shared".into()],
+        );
         assert_eq!(
             out,
             vec![
@@ -2375,6 +2381,35 @@ mod tests {
                 jobs::CredsEnvFrom::prefixed("shared", "KOPIUR_DEST_"),
             ]
         );
+    }
+
+    /// A source repository `encryption` block with the given password key.
+    fn src_enc(key: Option<&str>) -> kopiur_api::common::Encryption {
+        serde_json::from_value(serde_json::json!({
+            "passwordSecretRef": { "name": "src-pw", "key": key }
+        }))
+        .unwrap()
+    }
+
+    /// #725: the SOURCE password under a custom key maps onto the plain
+    /// `KOPIA_PASSWORD`; the destination's keeps its own dedicated env var.
+    #[test]
+    fn creds_source_custom_password_key_is_carried() {
+        let out = snapshot_replication_creds_env_from(
+            vec!["src-pw".into()],
+            &src_enc(Some("KOPIUR_PASSWORD")),
+            vec!["dst-pw".into()],
+        );
+        assert_eq!(
+            out,
+            vec![
+                jobs::CredsEnvFrom::plain("src-pw").with_password_key(Some("KOPIUR_PASSWORD")),
+                jobs::CredsEnvFrom::prefixed("dst-pw", "KOPIUR_DEST_"),
+            ]
+        );
+        let env = jobs::creds_password_env(&out);
+        assert_eq!(env.len(), 1);
+        assert_eq!(env[0].name, "KOPIA_PASSWORD");
     }
 
     #[test]

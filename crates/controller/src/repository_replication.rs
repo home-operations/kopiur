@@ -889,7 +889,7 @@ async fn spawn_replication_job(
     }
     // Source Secrets load verbatim (kopia reads the plain names at connect and
     // persists them); the destination Secret rides under `KOPIUR_DEST_`.
-    let creds_secrets = replication_creds_env_from(creds.names, dest_secret);
+    let creds_secrets = replication_creds_env_from(creds.names, &repo.encryption, dest_secret);
 
     let resolved_mover = kopiur_api::common::resolve_mover(
         repo.mover_defaults.as_ref(),
@@ -1039,9 +1039,10 @@ pub fn due_slot(
 /// no auth Secret (`None`) and contributes nothing.
 fn replication_creds_env_from(
     source_names: Vec<String>,
+    source_encryption: &kopiur_api::common::Encryption,
     dest_secret: Option<&kopiur_api::common::SecretRef>,
 ) -> Vec<jobs::CredsEnvFrom> {
-    let mut creds = io::plain_creds(source_names);
+    let mut creds = io::repo_creds(source_names, source_encryption);
     if let Some(secret) = dest_secret {
         creds.push(jobs::CredsEnvFrom::prefixed(
             secret.name.clone(),
@@ -1518,6 +1519,7 @@ mod tests {
         // A source with a password + backend Secret; the destination brings its own.
         let out = replication_creds_env_from(
             vec!["src-pw".into(), "src-s3".into()],
+            &src_enc(None),
             Some(&SecretRef {
                 name: "dst-s3".into(),
                 namespace: None,
@@ -1541,6 +1543,7 @@ mod tests {
         // collapsing them to one entry would strip the destination's credentials (#200).
         let out = replication_creds_env_from(
             vec!["shared".into()],
+            &src_enc(None),
             Some(&SecretRef {
                 name: "shared".into(),
                 namespace: None,
@@ -1555,11 +1558,40 @@ mod tests {
         );
     }
 
+    /// A source repository `encryption` block with the given password key.
+    fn src_enc(key: Option<&str>) -> kopiur_api::common::Encryption {
+        serde_json::from_value(serde_json::json!({
+            "passwordSecretRef": { "name": "src-pw", "key": key }
+        }))
+        .unwrap()
+    }
+
+    /// #725: the source repository's custom password key rides the source
+    /// Secret; the prefixed destination entry is untouched.
+    #[test]
+    fn creds_source_custom_password_key_is_carried() {
+        let out = replication_creds_env_from(
+            vec!["src-pw".into()],
+            &src_enc(Some("KOPIUR_PASSWORD")),
+            Some(&kopiur_api::common::SecretRef {
+                name: "dst-s3".into(),
+                namespace: None,
+            }),
+        );
+        assert_eq!(
+            out,
+            vec![
+                jobs::CredsEnvFrom::plain("src-pw").with_password_key(Some("KOPIUR_PASSWORD")),
+                jobs::CredsEnvFrom::prefixed("dst-s3", "KOPIUR_DEST_"),
+            ]
+        );
+    }
+
     #[test]
     fn creds_workload_identity_or_filesystem_destination_adds_nothing() {
         // A destination with no auth Secret (workload identity / filesystem) → only
         // the source entries, none prefixed.
-        let out = replication_creds_env_from(vec!["src-pw".into()], None);
+        let out = replication_creds_env_from(vec!["src-pw".into()], &src_enc(None), None);
         assert_eq!(out, vec![jobs::CredsEnvFrom::plain("src-pw")]);
     }
 

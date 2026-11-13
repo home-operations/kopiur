@@ -425,6 +425,10 @@ pub fn build_server_deployment(inputs: &ServerBuildInputs<'_>) -> Deployment {
         });
     }
 
+    // A repository password stored under a custom Secret key: `envFrom` cannot
+    // rename it, so map it onto `KOPIA_PASSWORD` explicitly (#725).
+    env.extend(crate::jobs::creds_password_env(&inputs.creds_secrets));
+
     // Repo creds (KOPIA_PASSWORD + backend creds) via envFrom — one entry per
     // distinct Secret, exactly like the mover Job, so an object-store repo whose
     // password and backend keys live in separate Secrets both reach kopia (#416).
@@ -1034,12 +1038,13 @@ async fn ensure_in(
             );
         }
     }
-    let creds_secrets = io::plain_creds(
+    let creds_secrets = io::repo_creds(
         creds_plan
             .sources
             .iter()
             .map(|s| s.env_from_name().to_string())
             .collect(),
+        rc.encryption,
     );
 
     // The identity the server pod runs as: the backend's workload-identity SA

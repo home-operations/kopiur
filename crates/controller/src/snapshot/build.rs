@@ -162,7 +162,10 @@ pub(super) fn build_backup_run(
         },
     };
 
-    let creds_secrets = io::plain_creds(io::mover_creds_secrets(&repo.backend, &repo.encryption));
+    let creds_secrets = io::repo_creds(
+        io::mover_creds_secrets(&repo.backend, &repo.encryption),
+        &repo.encryption,
+    );
 
     // Effective kopia cache budgets: the repository's cacheDefaults overlaid by this
     // run's effective mover.cache (ADR §3.1) — the policy's, with this Snapshot's

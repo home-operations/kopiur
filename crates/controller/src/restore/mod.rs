@@ -3729,7 +3729,7 @@ async fn run_restore_mover(
         note,
     )
     .await?;
-    let creds_secrets = io::plain_creds(creds.names);
+    let creds_secrets = io::repo_creds(creds.names, &repo.encryption);
 
     let identity = MoverIdentity {
         username: "restore".into(),

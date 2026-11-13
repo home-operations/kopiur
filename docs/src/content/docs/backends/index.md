@@ -56,7 +56,7 @@ The three create-time tunables (`encryption`, `splitter`, `hash`) are fixed fore
 
 ## Credential keys at a glance
 
-The mover reads these **exact** key names from the Secret you reference and feeds them to kopia. `KOPIA_PASSWORD` is required for **every** backend.
+The mover reads these **exact** key names from the Secret you reference and feeds them to kopia. `KOPIA_PASSWORD` is required for **every** backend. It can live under a different key if you name that key in `encryption.passwordSecretRef.key`.
 
 | Backend                                | Secret keys (besides `KOPIA_PASSWORD`)                                    | Spec key             |
 | -------------------------------------- | ------------------------------------------------------------------------- | -------------------- |

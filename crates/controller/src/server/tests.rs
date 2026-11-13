@@ -813,3 +813,30 @@ fn creds_plan_cluster_falls_back_to_server_ns_last() {
         }]
     );
 }
+
+/// #725: the server pod loaded the repository password through `envFrom`
+/// alone, so a custom `passwordSecretRef.key` never became `KOPIA_PASSWORD`.
+#[test]
+fn deployment_maps_a_custom_password_key_onto_kopia_password() {
+    let mut i = inputs("ns", gen_auth());
+    i.creds_secrets =
+        vec![CredsEnvFrom::plain("nas-creds").with_password_key(Some("KOPIUR_PASSWORD"))];
+    let dep = build_server_deployment(&i);
+    let c = &dep.spec.unwrap().template.spec.unwrap().containers[0];
+    let password: Vec<_> = c
+        .env
+        .as_ref()
+        .unwrap()
+        .iter()
+        .filter(|e| e.name == "KOPIA_PASSWORD")
+        .collect();
+    assert_eq!(password.len(), 1);
+    assert!(password[0].value.is_none(), "never a plaintext password");
+    let sel = password[0]
+        .value_from
+        .as_ref()
+        .and_then(|v| v.secret_key_ref.as_ref())
+        .expect("secretKeyRef");
+    assert_eq!(sel.name, "nas-creds");
+    assert_eq!(sel.key, "KOPIUR_PASSWORD");
+}

@@ -1667,7 +1667,7 @@ async fn bootstrap_via_mover(
     // ambient ones. Appended without deduping, for the same reason replication
     // loads a shared Secret twice: the mover reads the two copies under
     // different env-var names.
-    let mut creds_secrets = io::plain_creds(creds.names);
+    let mut creds_secrets = io::repo_creds(creds.names, &repo.spec.encryption);
     if let Some(s) = seed.as_ref() {
         creds_secrets.extend(s.creds.iter().cloned());
         if s.projected > 0 {

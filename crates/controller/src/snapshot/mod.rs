@@ -1687,7 +1687,7 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
         note,
     )
     .await?;
-    let creds_secrets = io::plain_creds(creds.names);
+    let creds_secrets = io::repo_creds(creds.names, &repo.encryption);
 
     // ADR §4.8: beforeSnapshot hooks (quiesce/flush) run to completion BEFORE the
     // mover Job is created. `status.hooks.preCompletedAt` makes the list run
@@ -4305,7 +4305,7 @@ async fn build_batch_job(
     if creds.projected > 0 {
         ctx.metrics.inc_secrets_projected(job_ns, creds.projected);
     }
-    let creds_secrets = io::plain_creds(creds.names);
+    let creds_secrets = io::repo_creds(creds.names, &repo.encryption);
     // #582: honor the repository's `moverDefaults.cache` (volume AND budgets). A
     // delete loads the repository index like a backup does, so an always-emptyDir
     // cache re-downloaded the whole index on every batch Job.
@@ -4551,7 +4551,7 @@ async fn reconcile_pin(
         ctx.metrics
             .inc_secrets_projected(namespace, creds.projected);
     }
-    let creds_secrets = io::plain_creds(creds.names);
+    let creds_secrets = io::repo_creds(creds.names, &repo.encryption);
     let work_spec = MoverWorkSpec {
         version: 1,
         operation: Operation::SnapshotPin(SnapshotPinOp {

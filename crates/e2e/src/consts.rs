@@ -265,6 +265,9 @@ pub const REPO_SUBPATHS: &[&str] = &[
     // the Persistent cache PVC growing with `capacity`.
     "cachebudget",
     "cachegrow",
+    // #725: a repository whose password lives under a custom Secret key
+    // (repository_lifecycle.rs).
+    "pwkey",
 ];
 // --- web console (kopiur-ui) roles and bindings ---------------------------------
 /// The aggregate human ClusterRole the chart renders (`ui.rbac.userRoles`). Bound

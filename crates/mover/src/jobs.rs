@@ -176,6 +176,10 @@ pub struct CredsEnvFrom {
     pub name: String,
     /// Env-var name prefix applied to every key (`envFrom.prefix`); `None` = verbatim.
     pub prefix: Option<String>,
+    /// The key in this Secret holding the repository password, when it is not
+    /// already `KOPIA_PASSWORD`. `envFrom` cannot rename a key, so the pod also
+    /// gets an explicit `KOPIA_PASSWORD` env var read from this key (#725).
+    pub password_key: Option<String>,
 }
 
 impl CredsEnvFrom {
@@ -184,6 +188,7 @@ impl CredsEnvFrom {
         CredsEnvFrom {
             name: name.into(),
             prefix: None,
+            password_key: None,
         }
     }
 
@@ -192,8 +197,83 @@ impl CredsEnvFrom {
         CredsEnvFrom {
             name: name.into(),
             prefix: Some(prefix.into()),
+            password_key: None,
         }
     }
+
+    /// Mark this Secret as holding the repository password under `key`, a key
+    /// other than `KOPIA_PASSWORD` (pass
+    /// [`kopiur_api::creds::remapped_password_key`]). `None` changes nothing.
+    pub fn with_password_key(mut self, key: Option<&str>) -> Self {
+        self.password_key = key.map(str::to_string);
+        self
+    }
+
+    /// The explicit `KOPIA_PASSWORD` env var for a password stored under a
+    /// custom key: a `valueFrom.secretKeyRef`, so the plaintext never rides the
+    /// pod spec. `None` when `envFrom` already delivers it. Carries the same
+    /// prefix `envFrom` applies to this Secret's other keys.
+    pub fn password_env(&self) -> Option<k8s_openapi::api::core::v1::EnvVar> {
+        use k8s_openapi::api::core::v1::{EnvVar, EnvVarSource, SecretKeySelector};
+        let key = self.password_key.as_ref()?;
+        Some(EnvVar {
+            name: format!(
+                "{}{}",
+                self.prefix.as_deref().unwrap_or_default(),
+                kopiur_api::creds::KOPIA_PASSWORD_ENV
+            ),
+            value: None,
+            value_from: Some(EnvVarSource {
+                secret_key_ref: Some(SecretKeySelector {
+                    name: self.name.clone(),
+                    key: key.clone(),
+                    optional: Some(false),
+                }),
+                ..Default::default()
+            }),
+        })
+    }
+}
+
+/// A repository's credential Secrets as **verbatim** (unprefixed) `envFrom`
+/// entries, for any pod that runs kopia against it (mover Job, web-UI server,
+/// browse session).
+///
+/// `names` is the password-first list
+/// ([`kopiur_api::creds::mover_creds_secret_refs`] order) under the names the
+/// pod loads — a projected or mirrored copy's name where one is in use; copies
+/// keep the source's keys. When `encryption.passwordSecretRef.key` is not
+/// `KOPIA_PASSWORD`, the first entry carries the key so the pod maps it onto
+/// `KOPIA_PASSWORD` (#725). Taking the encryption block, not a bare name list,
+/// is what keeps a new caller from dropping the key again.
+pub fn repo_creds(
+    names: impl IntoIterator<Item = String>,
+    encryption: &kopiur_api::common::Encryption,
+) -> Vec<CredsEnvFrom> {
+    let password_key = kopiur_api::creds::remapped_password_key(encryption);
+    names
+        .into_iter()
+        .enumerate()
+        .map(|(idx, name)| {
+            let creds = CredsEnvFrom::plain(name);
+            if idx == 0 {
+                creds.with_password_key(password_key)
+            } else {
+                creds
+            }
+        })
+        .collect()
+}
+
+/// The explicit password env vars a pod loading `creds` needs
+/// ([`CredsEnvFrom::password_env`]). A container's `env` wins over its
+/// `envFrom`, so these also override a stray `KOPIA_PASSWORD` key in a Secret
+/// whose configured password key is something else.
+pub fn creds_password_env(creds: &[CredsEnvFrom]) -> Vec<k8s_openapi::api::core::v1::EnvVar> {
+    creds
+        .iter()
+        .filter_map(CredsEnvFrom::password_env)
+        .collect()
 }
 
 /// A volume mounted into the mover pod at a path, from either a PVC or NFS.
@@ -638,6 +718,9 @@ pub fn build_job(inputs: &MoverJobInputs<'_>) -> Result<Job, BuildJobError> {
             value_from: None,
         });
     }
+    // A repository password stored under a custom Secret key: `envFrom` cannot
+    // rename it, so map it onto `KOPIA_PASSWORD` explicitly (#725).
+    env.extend(creds_password_env(&inputs.creds_secrets));
     // Caller-supplied extra env (e.g. a `valueFrom.secretKeyRef` the plain
     // passthrough pairs cannot express) lands after the fixed set, before the
     // observability passthrough.
@@ -1606,6 +1689,71 @@ mod tests {
             .find(|e| e.name == RESULT_CONFIGMAP_ENV)
             .expect("result configmap env present");
         assert_eq!(result_env.value.as_deref(), Some("repo-discovery"));
+    }
+
+    /// #725: a password under a custom Secret key must reach kopia as
+    /// `KOPIA_PASSWORD`. `envFrom` alone exposes it under its own name only.
+    #[test]
+    fn custom_password_key_is_mapped_onto_kopia_password() {
+        let ws = sample_work_spec();
+        let mut i = inputs(&ws, JobLimits::default());
+        i.creds_secrets = vec![
+            CredsEnvFrom::plain("kopiur").with_password_key(Some("KOPIUR_PASSWORD")),
+            CredsEnvFrom::plain("s3-creds"),
+        ];
+
+        let job = build_job(&i).unwrap();
+        let container = &job.spec.unwrap().template.spec.unwrap().containers[0];
+        let password: Vec<_> = container
+            .env
+            .as_ref()
+            .unwrap()
+            .iter()
+            .filter(|e| e.name == "KOPIA_PASSWORD")
+            .collect();
+        assert_eq!(password.len(), 1, "exactly one KOPIA_PASSWORD env var");
+        assert!(
+            password[0].value.is_none(),
+            "plaintext must never ride the Job spec"
+        );
+        let sel = password[0]
+            .value_from
+            .as_ref()
+            .and_then(|v| v.secret_key_ref.as_ref())
+            .expect("secretKeyRef");
+        assert_eq!(sel.name, "kopiur");
+        assert_eq!(sel.key, "KOPIUR_PASSWORD");
+        assert_eq!(sel.optional, Some(false));
+        // The Secret's other keys still load through envFrom.
+        assert_eq!(container.env_from.as_ref().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn default_password_key_adds_no_explicit_env() {
+        let ws = sample_work_spec();
+        let mut i = inputs(&ws, JobLimits::default());
+        i.creds_secrets = vec![CredsEnvFrom::plain("kopiur").with_password_key(None)];
+
+        let job = build_job(&i).unwrap();
+        let container = &job.spec.unwrap().template.spec.unwrap().containers[0];
+        assert!(
+            container
+                .env
+                .as_ref()
+                .unwrap()
+                .iter()
+                .all(|e| e.name != "KOPIA_PASSWORD"),
+            "envFrom already delivers KOPIA_PASSWORD"
+        );
+    }
+
+    #[test]
+    fn password_env_keeps_the_envfrom_prefix() {
+        let env = CredsEnvFrom::prefixed("dst", "KOPIUR_DEST_")
+            .with_password_key(Some("pw"))
+            .password_env()
+            .unwrap();
+        assert_eq!(env.name, "KOPIUR_DEST_KOPIA_PASSWORD");
     }
 
     #[test]

@@ -1669,7 +1669,7 @@ async fn bootstrap_cluster_via_mover(
     // This repository's own Secrets load VERBATIM; a seed source's ride under
     // `KOPIUR_SEED_` so its keys cannot collide with the identically-named
     // ambient ones (the namespaced twin explains why they are not deduped).
-    let mut creds_secrets = io::plain_creds(creds_names);
+    let mut creds_secrets = io::repo_creds(creds_names, &repo.spec.encryption);
     if let Some(s) = seed.as_ref() {
         creds_secrets.extend(s.creds.iter().cloned());
         if s.projected > 0 {

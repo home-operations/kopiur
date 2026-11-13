@@ -73,7 +73,7 @@ A backend is selected by **which key you set** (`backend.s3`, `backend.azure`, a
 
 ### Credential Secret keys by backend
 
-The mover reads these **well-known keys** from the Secret you reference and feeds them to kopia. Put your credentials under these exact key names. `KOPIA_PASSWORD`, the repository encryption password, is required for **every** backend. See [Backend configuration](/backends/#credential-keys-at-a-glance) for the full per-backend setup and the env-vs-file credential detail.
+The mover reads these **well-known keys** from the Secret you reference and feeds them to kopia. Put your backend credentials under these exact key names. The repository encryption password is required for **every** backend. It is read from the key `encryption.passwordSecretRef.key` names, which defaults to `KOPIA_PASSWORD`. See [Backend configuration](/backends/#credential-keys-at-a-glance) for the full per-backend setup and the env-vs-file credential detail.
 
 | Backend        | Secret keys the mover reads                                               | Notes                                                                                                                          |
 | -------------- | ------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
@@ -122,7 +122,7 @@ spec:
   encryption:
     passwordSecretRef:
       name: repo-creds
-      key: KOPIA_PASSWORD # which key inside the Secret holds the password
+      key: KOPIA_PASSWORD # which key inside the Secret holds the password (any name; this is the default)
   create:
     enabled: true # create the repo if it doesn't exist yet (default: true)
     # All of the below are consulted ONLY at creation time, then fixed forever
