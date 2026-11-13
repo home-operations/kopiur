@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.10.21](https://github.com/home-operations/kopiur/compare/0.10.20...0.10.21) (2026-11-13)
+
+
+### Bug Fixes
+
+* **creds:** honor a custom encryption.passwordSecretRef.key in every kopia pod ([#725](https://github.com/home-operations/kopiur/issues/725)) ([#730](https://github.com/home-operations/kopiur/issues/730)) ([1b2d209](https://github.com/home-operations/kopiur/commit/1b2d209109faa81fb5b83f8d6dd50b39b7008885))
+
+
+### Miscellaneous Chores
+
+* **mise:** update tool node (26.13.0 → v26.13.1) ([#727](https://github.com/home-operations/kopiur/issues/727)) ([220923e](https://github.com/home-operations/kopiur/commit/220923e41219e35d37cfdd52d816488edc3e67e5))
+* **mise:** update tool yq (4.54.2 → 4.54.3) ([#722](https://github.com/home-operations/kopiur/issues/722)) ([5d90ddc](https://github.com/home-operations/kopiur/commit/5d90ddcbdc88099fa37b8cba6cd263ce28281d9f))
+* **npm:** update dependency @astrojs/starlight (0.42.10 → 0.42.11) ([#731](https://github.com/home-operations/kopiur/issues/731)) ([95fc265](https://github.com/home-operations/kopiur/commit/95fc26553d68d1914de2cd80b815ebf78b1c91fe))
+* **npm:** update dependency @testing-library/user-event (14.6.9 → 14.6.10) ([#729](https://github.com/home-operations/kopiur/issues/729)) ([7c3a889](https://github.com/home-operations/kopiur/commit/7c3a889c5afdbf22760102a9f7b08d2945bd4b97))
+* **npm:** update dependency astro (7.4.10 → 7.4.11) ([#728](https://github.com/home-operations/kopiur/issues/728)) ([76b90e8](https://github.com/home-operations/kopiur/commit/76b90e832922a6a46c87cd24c8d39d629cb29bb2))
+* **npm:** update dependency lucide-react (1.71.0 → 1.72.0) ([#724](https://github.com/home-operations/kopiur/issues/724)) ([d28f824](https://github.com/home-operations/kopiur/commit/d28f824106d248ca4379b816dce256571bbe1699))
+* **rust:** update crate kube (5.0.0 → 5.1.0) ([#726](https://github.com/home-operations/kopiur/issues/726)) ([fe34a2f](https://github.com/home-operations/kopiur/commit/fe34a2f0b33912fe3bdd82802c49e89a4f8d1caa))
+
 ## [0.10.20](https://github.com/home-operations/kopiur/compare/0.10.19...0.10.20) (2026-11-12)
 
 
