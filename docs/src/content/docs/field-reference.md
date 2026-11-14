@@ -1133,6 +1133,7 @@ Externally tagged — set **exactly one** of: `generate` · `insecure` · `secre
 | `create` | [object](#clusterrepository-speccreate) | — | What to do when the repository does not yet exist (absent means it must already exist). |
 | `credentialProjection` | [object](#clusterrepository-speccredentialprojection) | — | Repository-owner gate for projecting credential Secrets into a foreign consumer namespace. |
 | `deletionProtection` | [object](#clusterrepository-specdeletionprotection) | — | Mass-deletion circuit breaker for this repository's Snapshots. |
+| `execution` | [object](#clusterrepository-specexecution) | — | Where the backup movers of this repository's consumers run (absent = each consumer's own namespace). **Experimental**: `mode: Central` depends on the alpha Kubernetes `CrossNamespaceVolumeDataSource` feature. |
 | `health` | [object](#clusterrepository-spechealth) | — | Repository health thresholds (tunes the index-blob-count warning). |
 | `identityDefaults` | [object](#clusterrepository-specidentitydefaults) | — | Identity defaults (CEL `*Expr`) applied when consumers don't override. |
 | `maintenance` | [object](#clusterrepository-specmaintenance) | — | Maintenance control; `maintenance.namespace` selects where the owned `Maintenance` CR lands. |
@@ -1484,6 +1485,12 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc`.
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `threshold` | integer | `10`<br><sub>min 0</sub> | Pending EXTERNAL destructive Snapshot deletions (deletionTimestamp set, effective deletionPolicy Delete, not operator-pruned) that trip the breaker for this repository: at or above this, those deletions are HELD (finalizers wait) until acknowledged via the `kopiur.home-operations.com/allow-mass-deletion` annotation. `0` disables the breaker. Default 10. |
+
+#### ClusterRepository `spec.execution`
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `mode` | enum: InNamespace \| Central | **required** | `InNamespace` runs each backup mover beside its source PVC, in the `Snapshot`'s namespace. `Central` runs it in the operator namespace: the operator cuts the CSI `VolumeSnapshot` in the workload namespace, restores it into a temporary PVC in the operator namespace through a cross-namespace `dataSourceRef` (authorized by a `ReferenceGrant` it creates beside the `VolumeSnapshot`), and the mover reads that PVC. No mover pod and no repository credential then enters the workload namespace.<br>`Central` applies to backups only (restores, verification, and browse sessions still run in the consumer's namespace) and serves only a single-PVC source under `copyMethod: Snapshot` with no `sourcePathOverride` (the override is also the mount path inside the mover pod, which holds the repository credentials); any other source or copy method fails the `Snapshot` with the reason. It needs, on the cluster: the `CrossNamespaceVolumeDataSource` feature gate on kube-apiserver and kube-controller-manager, the same gate on the CSI driver's external-provisioner, the Gateway API `ReferenceGrant` CRD, and the repository's credential Secret(s) (and a filesystem backend's PVC) in the operator namespace. A `mover.cache` of `mode: Persistent` is provisioned per run instead, because the persistent cache PVC lives in the workload namespace. |
 
 #### ClusterRepository `spec.health`
 
@@ -2965,6 +2972,7 @@ Externally tagged — set **exactly one** of: `pvc`.
 | --- | --- | --- | --- |
 | `attempts` | integer | — | Number of attempts so far (bounded by `failurePolicy.backoffLimit`). |
 | `name` | string | — | Name of the mover `Job`. |
+| `namespace` | string | — | Namespace of the mover `Job` and its staged PVC when they are not in the `Snapshot`'s own namespace: set under the repository's `execution.mode: Central`, absent otherwise. Pinned before anything is created there, so cleanup finds the objects even after the repository's `execution` is edited or the repository is deleted. |
 
 #### Snapshot `status.recorded`
 

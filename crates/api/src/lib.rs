@@ -40,7 +40,7 @@ pub mod validate;
 pub use backend::{Backend, NfsVolume, PvcVolume, RepoVolume};
 pub use cluster_repository::{
     AllowedNamespaces, ClusterRepoCredentialProjection, ClusterRepository, ClusterRepositorySpec,
-    ClusterRepositoryStatus,
+    ClusterRepositoryStatus, ExecutionMode, ExecutionSpec,
 };
 pub use common::{
     CacheDefaults, CacheVolumeMode, CronSpec, DeletionPolicy, IdentityDefaults,

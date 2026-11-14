@@ -9,6 +9,7 @@
 
 mod apply;
 mod cached;
+mod central;
 mod colocation;
 mod creds;
 mod events;
@@ -23,6 +24,7 @@ mod staging;
 
 pub use apply::*;
 pub use cached::*;
+pub use central::*;
 pub use colocation::*;
 pub use creds::*;
 pub use events::*;

@@ -1943,6 +1943,7 @@ mod tests {
             mode: RepositoryMode::ReadWrite,
             deletion_protection: None,
             concurrency: None,
+            execution: kopiur_api::ExecutionMode::InNamespace,
             mass_deletion_ack: None,
             catalog: None,
             ca_bundle_pem: None,

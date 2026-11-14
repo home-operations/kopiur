@@ -385,6 +385,14 @@ pub fn verify_cache_volume(effective: Option<&CacheDefaults>) -> CacheVolume {
     }
 }
 
+/// The cache volume for a mover that cannot mount the owner's persistent cache PVC
+/// (a central backup mover runs outside the `SnapshotPolicy`'s namespace). Same
+/// rule as [`verify_cache_volume`]: a `capacity` yields a fresh sized ephemeral
+/// volume whatever the `mode`, and no `capacity` yields an `emptyDir`.
+pub fn per_run_cache_volume(effective: Option<&CacheDefaults>) -> ResolvedCacheVolume {
+    ResolvedCacheVolume::per_run(verify_cache_volume(effective))
+}
+
 /// How a repository's `SnapshotDeleteBatch` (`snapdel-*`) Jobs get their kopia cache
 /// (#582): the cache volume to mount, plus, only for a persistent claim, the PVC the
 /// controller must ensure first. A typed plan rather than a bare [`CacheVolume`] so
@@ -542,6 +550,7 @@ mod tests {
             owner_ref: Default::default(),
             deletion_protection: None,
             concurrency: None,
+            execution: kopiur_api::ExecutionMode::InNamespace,
             mass_deletion_ack: None,
             catalog: None,
             ca_bundle_pem: None,

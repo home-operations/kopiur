@@ -38,6 +38,7 @@ use kube::{Api, ResourceExt};
 use kopiur_api::{CopyMethod, SnapshotPolicy, StagingSpec};
 
 use super::apply::{FIELD_MANAGER, apply};
+use super::central::{CentralSite, MoverSite, StageCleanup};
 use super::child_labels;
 use crate::error::{Error, Result};
 
@@ -105,7 +106,7 @@ pub(crate) fn fmt_go_duration_pub(d: std::time::Duration) -> String {
     fmt_go_duration(d)
 }
 
-fn volume_snapshot_api(client: &kube::Client, ns: &str) -> Api<DynamicObject> {
+pub(super) fn volume_snapshot_api(client: &kube::Client, ns: &str) -> Api<DynamicObject> {
     Api::namespaced_with(client.clone(), ns, &volume_snapshot_ar())
 }
 
@@ -964,19 +965,15 @@ struct ResolvedStagedClass {
 #[allow(clippy::too_many_arguments)]
 async fn resolve_staged_class(
     client: &kube::Client,
-    pvc_api: &Api<PersistentVolumeClaim>,
+    existing_stage: Option<&PersistentVolumeClaim>,
     plan: StagedClassPlan<'_>,
     staging: Option<&StagingSpec>,
     ns: &str,
     source_name: &str,
-    staged_pvc: &str,
     snapshot_cr: &str,
 ) -> Result<std::result::Result<ResolvedStagedClass, (&'static str, String)>> {
     let snap_api: Api<kopiur_api::Snapshot> = Api::namespaced(client.clone(), ns);
-    let staged_pin = match pvc_api.get_opt(staged_pvc).await? {
-        Some(pvc) => staged_pvc_pin(&pvc),
-        None => None,
-    };
+    let staged_pin = existing_stage.and_then(staged_pvc_pin);
     let cr_pin = match staged_pin {
         Some(_) => None,
         None => snap_api
@@ -1471,6 +1468,12 @@ pub(crate) fn staging_applicability(
 /// VolumeSnapshot, wait `readyToUse`, create staged PVC) and returns a [`StagingOutcome`]
 /// — **no** status side effects (the reconciler maps the outcome). Idempotent: every
 /// create is SSA over a deterministic name.
+///
+/// `site` is where the staged PVC goes: beside the source, or, under central
+/// execution, the operator namespace, restored there through a cross-namespace
+/// `dataSourceRef` (see [`super::central`]). The `VolumeSnapshot` is always cut in
+/// `ns`, beside the source.
+#[allow(clippy::too_many_arguments)]
 pub async fn resolve_staging(
     client: &kube::Client,
     scope: &crate::config::WatchScope,
@@ -1479,8 +1482,19 @@ pub async fn resolve_staging(
     ns: &str,
     snapshot_cr: &str,
     owner: &k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference,
+    site: &MoverSite,
 ) -> Result<StagingOutcome> {
     let copy_method = policy.spec.copy_method;
+    // The reconciler refuses every other shape before it resolves a central
+    // site; reaching here with one would stage (or mount) in the wrong namespace.
+    if let MoverSite::Central(_) = site
+        && (copy_method != CopyMethod::Snapshot || pin.and_then(|p| p.group.as_ref()).is_some())
+    {
+        return Err(Error::Invariant(
+            "central execution reached staging without a single-PVC `copyMethod: Snapshot` source"
+                .into(),
+        ));
+    }
     // The source THIS run covers. Without the pin a fanned-out child would
     // stage `sources[0]`, which for a `pvcSelector` policy has no PVC at all —
     // so every child would silently skip staging and read its live volume
@@ -1497,7 +1511,14 @@ pub async fn resolve_staging(
         pinned_pvc.as_deref(),
         matches!(scope, crate::config::WatchScope::Namespaced(_)),
     ) {
-        StagingApplicability::NotApplicable => return Ok(StagingOutcome::NotApplicable),
+        StagingApplicability::NotApplicable => {
+            return match site {
+                MoverSite::InNamespace => Ok(StagingOutcome::NotApplicable),
+                MoverSite::Central(_) => Err(Error::Invariant(
+                    "central execution reached staging with no PVC source".into(),
+                )),
+            };
+        }
         StagingApplicability::ClusterScopeRequired => {
             // Group staging is STRICTLY more cluster-scoped than single-volume
             // staging — on top of StorageClasses it needs cluster-scoped
@@ -1528,7 +1549,9 @@ pub async fn resolve_staging(
         });
     };
 
-    let staged_pvc = staged_pvc_name(snapshot_cr);
+    let staged_pvc = site.staged_pvc_name(snapshot_cr);
+    let stage_ns = site.namespace(ns);
+    let stage_api: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), stage_ns);
     let vs_name = volume_snapshot_name(snapshot_cr);
     let staging = policy.spec.staging.as_ref();
 
@@ -1574,14 +1597,23 @@ pub async fn resolve_staging(
             .is_some(),
         &storage,
     );
+    // The staged PVC's name is derived, and central and in-namespace runs share
+    // the operator namespace: a claim of this name may be another Snapshot's.
+    // Using it would back up that Snapshot's data; cleanup would delete it.
+    let existing_stage = stage_api.get_opt(&staged_pvc).await?;
+    if let Some(foreign) = existing_stage
+        .as_ref()
+        .filter(|pvc| site.is_foreign(&pvc.metadata, &owner.uid))
+    {
+        return Ok(foreign_stage_outcome(foreign, stage_ns, &staged_pvc));
+    }
     let resolved = match resolve_staged_class(
         client,
-        &pvc_api,
+        existing_stage.as_ref(),
         plan,
         staging,
         ns,
         source_name,
-        &staged_pvc,
         snapshot_cr,
     )
     .await?
@@ -1620,7 +1652,7 @@ pub async fn resolve_staging(
                     data_source_for(copy_method, source_name, &member.volume_snapshot_name);
                 let mut staged = build_staged_pvc(
                     &staged_pvc,
-                    ns,
+                    stage_ns,
                     &source_pvc,
                     data_source,
                     member.restore_size.as_ref().map(|q| q.0.as_str()),
@@ -1628,10 +1660,16 @@ pub async fn resolve_staging(
                     owner.clone(),
                 );
                 mark_staged_class_inferred(&mut staged, class_inferred);
-                apply(&pvc_api, &staged_pvc, &staged).await?;
-                if let Some(outcome) =
-                    staged_pvc_bind_gate(client, &pvc_api, ns, &staged, &staged_pvc, timeout)
-                        .await?
+                apply(&stage_api, &staged_pvc, &staged).await?;
+                if let Some(outcome) = staged_pvc_bind_gate(
+                    client,
+                    &stage_api,
+                    stage_ns,
+                    &staged,
+                    &staged_pvc,
+                    timeout,
+                )
+                .await?
                 {
                     return Ok(outcome);
                 }
@@ -1741,7 +1779,7 @@ pub async fn resolve_staging(
         let data_source = data_source_for(copy_method, source_name, &vs_name);
         let mut staged = build_staged_pvc(
             &staged_pvc,
-            ns,
+            stage_ns,
             &source_pvc,
             data_source,
             restore_size.as_deref(),
@@ -1749,13 +1787,33 @@ pub async fn resolve_staging(
             owner.clone(),
         );
         mark_staged_class_inferred(&mut staged, class_inferred);
-        apply(&pvc_api, &staged_pvc, &staged).await?;
+        match site {
+            MoverSite::InNamespace => {
+                apply(&stage_api, &staged_pvc, &staged).await?;
+            }
+            MoverSite::Central(central) => {
+                let stage = CentralStage {
+                    site: central,
+                    source_ns: ns,
+                    volume_snapshot: &vs_name,
+                    snapshot_cr,
+                    owner,
+                };
+                if let Some(outcome) =
+                    apply_central_stage(client, &stage_api, &stage, &staged_pvc, &mut staged)
+                        .await?
+                {
+                    return Ok(outcome);
+                }
+            }
+        }
         // Gate on the bind for Immediate classes: minting the Job while the CSI
         // restore is in flight is exactly the wedge-then-delete-the-VS race.
         if let Some(outcome) =
-            staged_pvc_bind_gate(client, &pvc_api, ns, &staged, &staged_pvc, timeout).await?
+            staged_pvc_bind_gate(client, &stage_api, stage_ns, &staged, &staged_pvc, timeout)
+                .await?
         {
-            return Ok(outcome);
+            return Ok(central_bind_hint(site, outcome));
         }
         return Ok(StagingOutcome::Ready(StagedSource {
             storage_class_name: staged_class_of(&staged),
@@ -1771,7 +1829,7 @@ pub async fn resolve_staging(
     let data_source = data_source_for(CopyMethod::Clone, source_name, &vs_name);
     let mut staged = build_staged_pvc(
         &staged_pvc,
-        ns,
+        stage_ns,
         &source_pvc,
         data_source,
         None,
@@ -1779,12 +1837,12 @@ pub async fn resolve_staging(
         owner.clone(),
     );
     mark_staged_class_inferred(&mut staged, class_inferred);
-    apply(&pvc_api, &staged_pvc, &staged).await?;
+    apply(&stage_api, &staged_pvc, &staged).await?;
     // Same bind gate as the Snapshot tail — a CSI full clone is the SLOWEST staging
     // method there is, so skipping the gate here would reproduce the original bug
     // verbatim for `copyMethod: Clone`.
     if let Some(outcome) =
-        staged_pvc_bind_gate(client, &pvc_api, ns, &staged, &staged_pvc, timeout).await?
+        staged_pvc_bind_gate(client, &stage_api, stage_ns, &staged, &staged_pvc, timeout).await?
     {
         return Ok(outcome);
     }
@@ -1796,6 +1854,114 @@ pub async fn resolve_staging(
         copy_method: "Clone",
         staging_timeout_seconds,
     }))
+}
+
+/// The outcome for a staged-PVC name already taken by another Snapshot's claim
+/// (see [`MoverSite::is_foreign`]): a wait while that claim is being deleted (a
+/// just-deleted Snapshot of the same name), else a failure, because nothing this
+/// run does will free the name.
+fn foreign_stage_outcome(
+    foreign: &PersistentVolumeClaim,
+    stage_ns: &str,
+    staged_pvc: &str,
+) -> StagingOutcome {
+    let message =
+        super::central::name_conflict_message("PersistentVolumeClaim", stage_ns, staged_pvc);
+    match foreign.metadata.deletion_timestamp {
+        Some(_) => StagingOutcome::Waiting {
+            reason: crate::consts::STAGED_PVC_BINDING_REASON,
+            message,
+        },
+        None => StagingOutcome::Failed {
+            reason: super::central::REASON_CENTRAL_NAME_CONFLICT,
+            message,
+        },
+    }
+}
+
+/// What [`apply_central_stage`] needs beyond the staged PVC itself.
+struct CentralStage<'a> {
+    site: &'a CentralSite,
+    /// The workload namespace holding the source PVC and its `VolumeSnapshot`.
+    source_ns: &'a str,
+    volume_snapshot: &'a str,
+    snapshot_cr: &'a str,
+    /// The `Snapshot` CR, as an owner reference (its UID marks central objects).
+    owner: &'a k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference,
+}
+
+/// Create the central staged PVC: grant the operator namespace access to the
+/// `VolumeSnapshot`, apply the claim with its cross-namespace `dataSourceRef`,
+/// and prove the API server kept that reference. Returns `Some(outcome)` to
+/// surface instead of continuing, `None` when the claim is in place.
+async fn apply_central_stage(
+    client: &kube::Client,
+    stage_api: &Api<PersistentVolumeClaim>,
+    stage: &CentralStage<'_>,
+    staged_pvc: &str,
+    staged: &mut PersistentVolumeClaim,
+) -> Result<Option<StagingOutcome>> {
+    let uid = &stage.owner.uid;
+    // The grant goes first: the provisioner refuses the claim until it sees one.
+    let grant_name = super::central::reference_grant_name(stage.snapshot_cr);
+    let grant = super::central::build_reference_grant(
+        &grant_name,
+        stage.source_ns,
+        &stage.site.namespace,
+        stage.volume_snapshot,
+        stage.owner.clone(),
+    );
+    let grant_api = super::central::reference_grant_api(client, stage.source_ns);
+    match apply(&grant_api, &grant_name, &grant).await {
+        Ok(_) => {}
+        // An unserved kind answers 404 to an apply (a served one creates).
+        Err(Error::Kube(kube::Error::Api(e))) if e.code == 404 => {
+            return Ok(Some(StagingOutcome::Failed {
+                reason: super::central::REASON_REFERENCE_GRANT_MISSING,
+                message: super::central::reference_grant_missing_message(),
+            }));
+        }
+        Err(e) => return Err(e),
+    }
+
+    super::central::centralize_staged_pvc(
+        staged,
+        stage.source_ns,
+        stage.volume_snapshot,
+        stage.snapshot_cr,
+        uid,
+    );
+    let stored = apply(stage_api, staged_pvc, staged).await?;
+    if !super::central::cross_namespace_ref_survived(
+        &stored,
+        stage.source_ns,
+        stage.volume_snapshot,
+    ) {
+        // The reconciler's failure path reaps the claim (and any empty volume
+        // already provisioned for it) before anything can mount it.
+        return Ok(Some(StagingOutcome::Failed {
+            reason: super::central::REASON_CROSS_NAMESPACE_DISABLED,
+            message: super::central::cross_namespace_disabled_message(
+                &stage.site.namespace,
+                staged_pvc,
+            ),
+        }));
+    }
+    Ok(None)
+}
+
+/// Add the central-execution bind hint to a bind failure (see
+/// [`MoverSite::with_bind_hint`]); every other outcome passes through.
+fn central_bind_hint(site: &MoverSite, outcome: StagingOutcome) -> StagingOutcome {
+    match outcome {
+        StagingOutcome::Failed { reason, message } => StagingOutcome::Failed {
+            reason,
+            message: site.with_bind_hint(message),
+        },
+        outcome @ (StagingOutcome::NotApplicable
+        | StagingOutcome::Ready(_)
+        | StagingOutcome::Waiting { .. }) => outcome,
+    }
 }
 
 /// The `storageClassName` actually written to a built staged PVC's spec — the single
@@ -1815,26 +1981,57 @@ fn staged_class_of(staged: &PersistentVolumeClaim) -> Option<String> {
 /// bound staged PV `Retain → Delete` (so a `Retain` StorageClass doesn't leak the PV +
 /// backend volume), and deletes the staged PVC and the VolumeSnapshot. Safe to call on
 /// every terminal reconcile — once the objects are gone it is a no-op.
+///
+/// `site` locates the staged PVC and the mover pods. Under central execution they
+/// are in the operator namespace and carry no owner reference, so a claim is
+/// deleted only when its label names `snapshot_uid`; the `ReferenceGrant` beside
+/// the `VolumeSnapshot` is deleted with it. A claim that belongs to another run
+/// ([`MoverSite::is_foreign`]) is never touched, on either site.
+///
+/// Returns [`StageCleanup::Retry`] only for a central run whose deleted
+/// `VolumeSnapshot` is still held by the CSI provisioner's finalizer (see
+/// [`super::central::release_source_protection`]); in-namespace cleanup is
+/// always [`StageCleanup::Complete`].
 pub async fn cleanup_staged_source(
     client: &kube::Client,
     ns: &str,
     snapshot_cr: &str,
     group: Option<&kopiur_api::SnapshotSourceGroup>,
-) -> Result<()> {
-    let staged_pvc = staged_pvc_name(snapshot_cr);
+    site: &MoverSite,
+    snapshot_uid: &str,
+) -> Result<StageCleanup> {
+    let staged_pvc = site.staged_pvc_name(snapshot_cr);
+    let stage_ns = site.namespace(ns);
     let vs_name = volume_snapshot_name(snapshot_cr);
+    // The pods to release are the mover Job's. In-namespace this keeps the
+    // historical selector (the raw Snapshot name).
+    let job_label = match site {
+        MoverSite::InNamespace => snapshot_cr.to_string(),
+        MoverSite::Central(central) => central.job_name.clone(),
+    };
 
-    let pvc_api: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), ns);
-    if let Some(pvc) = pvc_api.get_opt(&staged_pvc).await? {
+    let pvc_api: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), stage_ns);
+    let staged = pvc_api
+        .get_opt(&staged_pvc)
+        .await?
+        .filter(|pvc| !site.is_foreign(&pvc.metadata, snapshot_uid));
+    if let Some(pvc) = staged {
+        // The claim is about to go, and with it the only proof that the restore
+        // from the VolumeSnapshot finished. Record it first (central runs only:
+        // see `central::source_protection_decision`).
+        if let MoverSite::Central(_) = site
+            && super::central::stage_restore_finished(&pvc, ns, &vs_name)
+        {
+            super::central::mark_stage_restored(client, ns, &vs_name).await;
+        }
         // Release pvc-protection: delete the finished mover pod(s) (the backup Job is
         // named after the Snapshot CR). The Job object itself is preserved. Use
         // list + delete-by-name (not delete_collection), since the controller is granted
         // the `delete`/`list` verbs but NOT the distinct `deletecollection` verb.
-        let pod_api: Api<Pod> = Api::namespaced(client.clone(), ns);
+        let pod_api: Api<Pod> = Api::namespaced(client.clone(), stage_ns);
         let mover_pods = pod_api
             .list(
-                &ListParams::default()
-                    .labels(&format!("batch.kubernetes.io/job-name={snapshot_cr}")),
+                &ListParams::default().labels(&format!("batch.kubernetes.io/job-name={job_label}")),
             )
             .await
             .map(|l| l.items)
@@ -1879,14 +2076,25 @@ pub async fn cleanup_staged_source(
             &group.volume_group_snapshot_name,
         )
         .await?;
-        return Ok(());
+        return Ok(StageCleanup::Complete);
     }
 
     let vs_api = volume_snapshot_api(client, ns);
     if vs_api.get_opt(&vs_name).await?.is_some() {
         delete_ignore_404(&vs_api, &vs_name).await?;
     }
-    Ok(())
+    match site {
+        MoverSite::InNamespace => Ok(StageCleanup::Complete),
+        MoverSite::Central(_) => {
+            // 404-tolerant on both counts: already gone, or the kind is not served.
+            delete_ignore_404(
+                &super::central::reference_grant_api(client, ns),
+                &super::central::reference_grant_name(snapshot_cr),
+            )
+            .await?;
+            Ok(super::central::release_source_protection(client, ns, &vs_name).await)
+        }
+    }
 }
 
 async fn delete_ignore_404<K>(api: &Api<K>, name: &str) -> Result<()>
@@ -1903,6 +2111,31 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A staged-PVC name held by another Snapshot's claim: wait while that claim
+    /// is going away, fail when it is not (nothing this run does frees the name).
+    #[test]
+    fn a_foreign_staged_claim_is_waited_out_only_while_it_is_terminating() {
+        let mut foreign = PersistentVolumeClaim::default();
+        match foreign_stage_outcome(&foreign, "kopiur-system", "nightly-abc-src") {
+            StagingOutcome::Failed { reason, message } => {
+                assert_eq!(reason, super::super::central::REASON_CENTRAL_NAME_CONFLICT);
+                assert!(
+                    message.contains("kopiur-system/nightly-abc-src"),
+                    "{message}"
+                );
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+        foreign.metadata.deletion_timestamp =
+            Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+                k8s_openapi::jiff::Timestamp::UNIX_EPOCH,
+            ));
+        assert!(matches!(
+            foreign_stage_outcome(&foreign, "kopiur-system", "nightly-abc-src"),
+            StagingOutcome::Waiting { .. }
+        ));
+    }
 
     fn class(name: &str, driver: &str, default: bool) -> ClassInfo {
         ClassInfo {

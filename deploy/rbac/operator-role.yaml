@@ -167,6 +167,14 @@ rules:
   - patch
   - delete
 - apiGroups:
+  - gateway.networking.k8s.io
+  resources:
+  - referencegrants
+  verbs:
+  - create
+  - patch
+  - delete
+- apiGroups:
   - ""
   resources:
   - serviceaccounts

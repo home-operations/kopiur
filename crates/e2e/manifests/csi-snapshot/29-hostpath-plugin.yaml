@@ -328,7 +328,12 @@ spec:
           args:
             - -v=5
             - --csi-address=/csi/csi.sock
-            - --feature-gates=Topology=true
+            # CrossNamespaceVolumeDataSource: provision a PVC from a VolumeSnapshot in
+            # another namespace (kopiur `execution.mode: Central`). With it on, the
+            # provisioner syncs a ReferenceGrant informer at startup, so the CRD
+            # (09-crd-referencegrants.yaml) and the RBAC rule (20-rbac-provisioner.yaml)
+            # must both be in place or it never becomes ready.
+            - --feature-gates=Topology=true,CrossNamespaceVolumeDataSource=true
             # end csi-provisioner args
           securityContext:
             # This is necessary only for systems with SELinux, where

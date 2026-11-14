@@ -1285,6 +1285,7 @@ mod tests {
             },
             deletion_protection: None,
             concurrency: None,
+            execution: kopiur_api::ExecutionMode::InNamespace,
             mass_deletion_ack: None,
             catalog: None,
             ca_bundle_pem: Some("SOURCE-CA".into()),

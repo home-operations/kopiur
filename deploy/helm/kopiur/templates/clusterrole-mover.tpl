@@ -113,4 +113,27 @@ rules:
     resources:
       - pods/exec
     verbs: [create, get]
+---
+# Dedicated central mover ClusterRole (`ClusterRepository.spec.execution.mode:
+# Central`). RBAC rules SYNCED from `cargo xtask gen-rbac`
+# (deploy/rbac/mover-clusterrole.yaml, fourth document): that xtask is the
+# SOURCE OF TRUTH; edit it and re-run, then re-sync these rules.
+#
+# A central backup mover runs in the operator namespace and patches the status
+# of a Snapshot in a workload namespace. The controller mints the same-named
+# ServiceAccount in the operator namespace and a RoleBinding to THIS role in each
+# centrally backed-up namespace. One ServiceAccount is therefore bound in many
+# namespaces, so the role holds `snapshots/status` and nothing else.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "kopiur.centralMoverName" . }}
+  labels:
+    {{- include "kopiur.labels" . | nindent 4 }}
+rules:
+  - apiGroups:
+      - kopiur.home-operations.com
+    resources:
+      - snapshots/status
+    verbs: [get, patch]
 {{- end }}
