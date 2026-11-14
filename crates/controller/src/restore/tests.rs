@@ -2927,6 +2927,7 @@ fn pooled_repo(cap: Option<u32>) -> crate::io::ResolvedRepository {
             max_concurrent_delete_jobs: None,
         }),
         mass_deletion_ack: None,
+        execution: kopiur_api::ExecutionMode::InNamespace,
         catalog: None,
         ca_bundle_pem: None,
     }

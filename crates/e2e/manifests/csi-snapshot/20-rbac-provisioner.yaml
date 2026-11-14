@@ -61,9 +61,10 @@ rules:
   # has the CrossNamespaceVolumeDataSource controller capability.
   # In that case, external-provisioner requires "get", "list", "watch"
   # permissions  for "referencegrants" on "gateway.networking.k8s.io".
-  #- apiGroups: ["gateway.networking.k8s.io"]
-  #  resources: ["referencegrants"]
-  #  verbs: ["get", "list", "watch"]
+  # Enabled here: 29-hostpath-plugin.yaml turns the feature gate on.
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources: ["referencegrants"]
+    verbs: ["get", "list", "watch"]
 
 ---
 kind: ClusterRoleBinding

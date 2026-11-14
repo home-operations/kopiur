@@ -511,6 +511,10 @@ pub const STAGED_PVC_BINDING_REASON: &str = "WaitingForStagedPvcBind";
 /// Event `action` (remediation hint) for a staging preflight failure: install the
 /// CSI snapshot stack / VolumeSnapshotClass, or set `copyMethod: Direct`.
 pub const FIX_SNAPSHOT_STACK_ACTION: &str = "InstallSnapshotStackOrUseDirect";
+/// Event `action` (remediation hint) for a backup its repository's
+/// `execution.mode: Central` cannot serve: fix the recipe or the cluster
+/// prerequisites, or drop `execution` from the ClusterRepository.
+pub const FIX_CENTRAL_EXECUTION_ACTION: &str = "FixCentralExecutionOrRunInNamespace";
 /// `Snapshot` condition reporting whether the mover's resolved securityContext can read
 /// the backup **source** PVC (a securityContext-only heuristic; the mover's runtime
 /// readability preflight is the authoritative check). `True` = provably compatible (root

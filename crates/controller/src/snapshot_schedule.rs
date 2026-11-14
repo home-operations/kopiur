@@ -1884,7 +1884,7 @@ async fn replace_active_runs(
             );
             continue;
         }
-        io::delete_mover_run(&ctx.client, namespace, name).await?;
+        stop_replaced_mover(ctx, namespace, name, live.as_ref()).await?;
         io::annotate_then_delete_snapshot(api, name, PrunedBy::ReplacedRun).await?;
         tracing::info!(
             schedule = %schedule.name_any(), snapshot = %name,
@@ -1911,6 +1911,45 @@ async fn replace_active_runs(
         .await;
     }
     Ok(deleted)
+}
+
+/// Stop the mover of a run being replaced, wherever that run put it.
+///
+/// A centrally executed run's Job is in the operator namespace, under the name
+/// its status pinned. An in-namespace run's Job carries the Snapshot's own name;
+/// in the operator namespace a Job of that name can instead be another
+/// Snapshot's central Job, which is not this run's to stop.
+async fn stop_replaced_mover(
+    ctx: &Context,
+    namespace: &str,
+    name: &str,
+    live: Option<&Snapshot>,
+) -> Result<()> {
+    let site = io::MoverSite::pinned(
+        live.and_then(|s| s.status.as_ref())
+            .and_then(|s| s.job.as_ref()),
+        namespace,
+        name,
+    );
+    match &site {
+        io::MoverSite::InNamespace => {
+            let theirs = io::is_another_runs_central_job(
+                &ctx.client,
+                ctx.operator_namespace.as_deref(),
+                namespace,
+                name,
+            )
+            .await?;
+            if theirs {
+                return Ok(());
+            }
+            io::delete_mover_run(&ctx.client, namespace, name).await
+        }
+        io::MoverSite::Central(central) => {
+            let uid = live.and_then(|s| s.uid()).unwrap_or_default();
+            io::delete_central_job(&ctx.client, central, &uid).await
+        }
+    }
 }
 
 /// This schedule's produced `Snapshot` children (the `SCHEDULE_LABEL`

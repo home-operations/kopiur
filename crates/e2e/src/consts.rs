@@ -268,6 +268,10 @@ pub const REPO_SUBPATHS: &[&str] = &[
     // #725: a repository whose password lives under a custom Secret key
     // (repository_lifecycle.rs).
     "pwkey",
+    // `execution.mode: Central` (central_execution.rs): the central backup, and
+    // the repository the refusal scenario points its policies at.
+    "central",
+    "central-refuse",
 ];
 // --- web console (kopiur-ui) roles and bindings ---------------------------------
 /// The aggregate human ClusterRole the chart renders (`ui.rbac.userRoles`). Bound

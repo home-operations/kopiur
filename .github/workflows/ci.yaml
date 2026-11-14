@@ -245,9 +245,11 @@ jobs:
           # #613 mover cache budgets: percent budgets reaching kopia, and a
           # Persistent cache PVC growing with `capacity` (needs an expandable
           # StorageClass, hence `csi: true` for csi-hostpath-sc). Its own shard so
-          # reshape-core stays well under the job timeout.
+          # reshape-core stays well under the job timeout. central_execution
+          # (`execution.mode: Central`) rides along: it needs the same CSI stack
+          # plus the cross-namespace feature gate the e2e kind config turns on.
           - shard: cache-budgets
-            bins: "cache_budgets"
+            bins: "cache_budgets central_execution"
             backends: false
             csi: true
           # #464 live-pod inherit hold + heal: the scale-to-zero and staged
