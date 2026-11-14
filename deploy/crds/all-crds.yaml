@@ -5164,6 +5164,43 @@ spec:
                 required:
                 - passwordSecretRef
                 type: object
+              execution:
+                description: |-
+                  Where the backup movers of this repository's consumers run (absent =
+                  each consumer's own namespace). **Experimental**: `mode: Central`
+                  depends on the alpha Kubernetes `CrossNamespaceVolumeDataSource` feature.
+                nullable: true
+                properties:
+                  mode:
+                    description: |-
+                      `InNamespace` runs each backup mover beside its source PVC, in the
+                      `Snapshot`'s namespace. `Central` runs it in the operator namespace: the
+                      operator cuts the CSI `VolumeSnapshot` in the workload namespace, restores
+                      it into a temporary PVC in the operator namespace through a cross-namespace
+                      `dataSourceRef` (authorized by a `ReferenceGrant` it creates beside the
+                      `VolumeSnapshot`), and the mover reads that PVC. No mover pod and no
+                      repository credential then enters the workload namespace.
+                      
+                      `Central` applies to backups only (restores, verification, and browse
+                      sessions still run in the consumer's namespace) and serves only a
+                      single-PVC source under `copyMethod: Snapshot` with no
+                      `sourcePathOverride` (the override is also the mount path inside the
+                      mover pod, which holds the repository credentials); any other source or
+                      copy method fails the `Snapshot` with the reason. It needs, on the
+                      cluster: the `CrossNamespaceVolumeDataSource` feature gate on
+                      kube-apiserver and kube-controller-manager, the same gate on the CSI
+                      driver's external-provisioner, the Gateway API `ReferenceGrant` CRD, and
+                      the repository's credential Secret(s) (and a filesystem backend's PVC)
+                      in the operator namespace. A `mover.cache` of `mode: Persistent` is
+                      provisioned per run instead, because the persistent cache PVC lives in
+                      the workload namespace.
+                    enum:
+                    - InNamespace
+                    - Central
+                    type: string
+                required:
+                - mode
+                type: object
               health:
                 description: Repository health thresholds (tunes the index-blob-count warning).
                 nullable: true
@@ -11680,6 +11717,15 @@ spec:
                     type: integer
                   name:
                     description: Name of the mover `Job`.
+                    nullable: true
+                    type: string
+                  namespace:
+                    description: |-
+                      Namespace of the mover `Job` and its staged PVC when they are not in the
+                      `Snapshot`'s own namespace: set under the repository's
+                      `execution.mode: Central`, absent otherwise. Pinned before anything is
+                      created there, so cleanup finds the objects even after the repository's
+                      `execution` is edited or the repository is deleted.
                     nullable: true
                     type: string
                 type: object

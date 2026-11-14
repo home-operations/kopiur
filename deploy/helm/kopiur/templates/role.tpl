@@ -124,6 +124,14 @@ rules:
     # `patch` because N members race to server-side-apply the SAME shared group
     # object; SSA over a deterministic name is what makes that convergent.
     verbs: [get, list, watch, create, patch, delete]
+  # `execution.mode: Central`: the per-Snapshot ReferenceGrant that lets the
+  # operator namespace's staged PVC restore from ONE VolumeSnapshot in the
+  # workload namespace. create+patch back the server-side apply, delete the
+  # cleanup; nothing reads them back.
+  - apiGroups: [gateway.networking.k8s.io]
+    resources:
+      - referencegrants
+    verbs: [create, patch, delete]
   # Per-namespace mover RBAC minted by the controller (§4.12). Minted via
   # server-side apply (PATCH), so `patch`/`update` are required, not just create/get.
   # `list`/`watch` for workload identity (SA watch — see clusterrole.yaml).

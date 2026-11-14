@@ -1,0 +1,106 @@
+# Example 49 - execution.mode: Central (run backup movers in the operator namespace)
+#
+# EXPERIMENTAL. A platform team sets `execution.mode: Central` once on a shared
+# ClusterRepository. Each tenant backup then runs its mover Job in the operator
+# namespace (`kopiur-system` here), not in the tenant namespace:
+#
+#   1. Kopiur cuts a CSI VolumeSnapshot of the source PVC in the tenant namespace.
+#   2. Kopiur creates a ReferenceGrant beside that VolumeSnapshot.
+#   3. Kopiur restores the snapshot into a temporary PVC in `kopiur-system`,
+#      through a cross-namespace `dataSourceRef`.
+#   4. The mover Job in `kopiur-system` reads that PVC and writes to the repository.
+#   5. Kopiur deletes the temporary PVC, the VolumeSnapshot, and the ReferenceGrant.
+#
+# No mover pod runs in the tenant namespace, and the repository credentials stay
+# in `kopiur-system`. Tenants change nothing in their SnapshotPolicy.
+#
+# Maps to `ClusterRepository.spec.execution` (crates/api/src/cluster_repository.rs).
+#
+# REQUIRES, on the cluster (see docs/src/content/docs/central-execution.mdx):
+#   - the alpha `CrossNamespaceVolumeDataSource` feature gate on kube-apiserver
+#     and kube-controller-manager,
+#   - the same feature gate on the CSI driver's external-provisioner, with
+#     get/list/watch on `referencegrants.gateway.networking.k8s.io`,
+#   - the Gateway API `ReferenceGrant` CRD,
+#   - the CSI snapshot stack and a VolumeSnapshotClass for the source's driver,
+#   - a cluster-scoped install (`installScope: cluster`).
+#
+# LIMITS: backups only (restores, verification, and browse sessions still run in
+# the tenant namespace), and only a single-PVC source under `copyMethod: Snapshot`
+# with no `sourcePathOverride`. Any other policy against this repository fails
+# with the reason.
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: kopia-platform-creds
+  # The operator namespace. A central mover loads the Secret from here, so the
+  # tenant namespace never holds a copy.
+  namespace: kopiur-system
+type: Opaque
+stringData:
+  AWS_ACCESS_KEY_ID: "REPLACE_ME"
+  AWS_SECRET_ACCESS_KEY: "REPLACE_ME"
+  KOPIA_PASSWORD: "REPLACE_ME"
+---
+# region repository
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: ClusterRepository
+metadata:
+  name: shared-central
+spec:
+  backend:
+    s3:
+      bucket: org-kopia-repo
+      endpoint: s3.us-east-1.amazonaws.com
+      region: us-east-1
+      auth:
+        secretRef:
+          name: kopia-platform-creds
+          namespace: kopiur-system # must be the operator namespace for Central
+  encryption:
+    passwordSecretRef:
+      name: kopia-platform-creds
+      namespace: kopiur-system # must be the operator namespace for Central
+      key: KOPIA_PASSWORD
+  create:
+    enabled: true
+  allowedNamespaces:
+    list:
+      - billing
+  # The one new field. Absent (or `mode: InNamespace`) keeps each mover beside
+  # its source PVC, which is the default.
+  execution:
+    mode: Central
+# endregion repository
+---
+# region policy
+# The tenant side is an ordinary policy. `copyMethod: Snapshot` is the default;
+# it is written out here because Central accepts nothing else.
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: SnapshotPolicy
+metadata:
+  name: postgres-data
+  namespace: billing
+spec:
+  repository:
+    kind: ClusterRepository
+    name: shared-central
+  copyMethod: Snapshot
+  sources:
+    - pvc:
+        name: postgres-data
+  retention:
+    keepDaily: 14
+# endregion policy
+---
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: SnapshotSchedule
+metadata:
+  name: postgres-data-nightly
+  namespace: billing
+spec:
+  policyRef:
+    name: postgres-data
+  schedule:
+    cron: "H 2 * * *"

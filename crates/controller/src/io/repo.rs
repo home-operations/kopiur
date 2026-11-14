@@ -151,6 +151,12 @@ pub struct ResolvedRepository {
     /// kinds must feed the same gate through the same field or a
     /// `ClusterRepository`'s cap would silently not apply.
     pub concurrency: Option<kopiur_api::common::ConcurrencySpec>,
+    /// Where this repository's consumers' backup movers run
+    /// (`ClusterRepository.spec.execution.mode`). A namespaced `Repository` has
+    /// no such field and is always [`ExecutionMode::InNamespace`]: its
+    /// credentials live with its consumers, so there is nothing to keep out of
+    /// their namespace.
+    pub execution: kopiur_api::ExecutionMode,
     /// The RAW value of [`crate::consts::ALLOW_MASS_DELETION_ANNOTATION`] from
     /// the repository's `metadata.annotations`, if present. Deliberately
     /// unparsed here: parsing/clamping the RFC3339 ack (and rejecting a
@@ -342,6 +348,7 @@ pub(crate) fn resolved_from_namespaced(
         owner_ref,
         deletion_protection: repo.spec.deletion_protection,
         concurrency: repo.spec.concurrency,
+        execution: kopiur_api::ExecutionMode::InNamespace,
         mass_deletion_ack,
         catalog: repo.spec.catalog,
         ca_bundle_pem,
@@ -375,6 +382,7 @@ pub(crate) fn resolved_from_cluster(
         owner_ref,
         deletion_protection: repo.spec.deletion_protection,
         concurrency: repo.spec.concurrency,
+        execution: repo.spec.execution.map(|e| e.mode).unwrap_or_default(),
         mass_deletion_ack,
         catalog: repo.spec.catalog,
         ca_bundle_pem,

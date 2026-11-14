@@ -1,0 +1,226 @@
+---
+title: Central execution (run backup movers in the operator namespace)
+sidebar:
+  label: Central execution
+---
+
+import { Code } from "@astrojs/starlight/components";
+import { region } from "@utils/region";
+import examples49CentralExecution from "@repo/deploy/examples/49-central-execution.yaml?raw";
+
+By default, Kopiur runs each backup mover Job in the namespace of the `Snapshot`,
+beside the source PVC. **Central execution** moves that Job to the operator
+namespace. You turn it on with one field on a `ClusterRepository`.
+
+:::caution[Experimental: it depends on an alpha Kubernetes feature]
+
+Central execution uses the `CrossNamespaceVolumeDataSource` feature. That feature
+is alpha in Kubernetes and off by default. A cluster administrator must turn it
+on in three places. Kubernetes can change or remove an alpha feature, so do not
+make this your only backup path.
+
+:::
+
+## When you want this
+
+A mover in the workload namespace has two costs:
+
+- The repository credentials must be readable in that namespace, because a pod
+  can only load a Secret from its own namespace.
+- A pod that holds those credentials runs beside tenant workloads.
+
+With central execution, the workload namespace holds no repository credentials
+and runs no mover pod. Tenants do not change their `SnapshotPolicy`.
+
+Do not use it when your storage has no CSI snapshot support, or when you cannot
+change the feature gates of the cluster. The default placement works on any
+storage.
+
+## How it works
+
+A pod can only mount a PVC from its own namespace. The data therefore crosses
+namespaces as a CSI snapshot.
+
+```text
+workload namespace (billing)             operator namespace (kopiur-system)
+
+  PVC postgres-data
+        |
+        v  1. snapshot
+  VolumeSnapshot  <---- 3. dataSourceRef ----  staged PVC
+  ReferenceGrant  (2. permits step 3)              |
+                                                   v  4. mount
+                                               mover Job  ---->  repository
+```
+
+1. Kopiur creates a `VolumeSnapshot` of the source PVC in the workload namespace.
+   This is the same step as [`copyMethod: Snapshot`](/copy-methods/).
+2. Kopiur creates a `ReferenceGrant` beside the `VolumeSnapshot`. The grant names
+   that one `VolumeSnapshot` and the operator namespace.
+3. Kopiur creates the staged PVC in the operator namespace. Its
+   `spec.dataSourceRef` points at the `VolumeSnapshot` in the workload namespace.
+4. The mover Job runs in the operator namespace, reads the staged PVC, and
+   writes to the repository.
+5. Kopiur deletes the staged PVC, the `VolumeSnapshot`, and the `ReferenceGrant`.
+
+The `Snapshot` object stays in the workload namespace. Its status, events, and
+retention work as before.
+
+## What the cluster needs
+
+A cluster administrator must provide all of these. Kopiur cannot set them up.
+
+| Requirement                                                                         | Where                                                                  |
+| ----------------------------------------------------------------------------------- | ---------------------------------------------------------------------- |
+| Feature gate `CrossNamespaceVolumeDataSource=true`                                  | kube-apiserver and kube-controller-manager                             |
+| Flag `--feature-gates=CrossNamespaceVolumeDataSource=true`                          | the `csi-provisioner` (external-provisioner) sidecar of the CSI driver |
+| `get`, `list`, `watch` on `referencegrants.gateway.networking.k8s.io`               | the ServiceAccount of that `csi-provisioner`                           |
+| The `ReferenceGrant` CRD (`gateway.networking.k8s.io/v1beta1`)                      | the cluster (it ships with the Gateway API CRDs)                       |
+| The CSI snapshot stack and a `VolumeSnapshotClass` for the driver of the source PVC | the cluster (see [Copy methods](/copy-methods/))                       |
+| A cluster-scoped Kopiur install (`installScope: cluster`)                           | the Helm release                                                       |
+| The repository credential Secret, and the PVC of a filesystem backend               | the operator namespace                                                 |
+
+:::danger[Set the provisioner flag and its RBAC together]
+
+When the feature gate is on, the `csi-provisioner` reads `ReferenceGrant` objects
+at startup. If the CRD or the RBAC rule is missing, the provisioner does not
+become ready, and the driver provisions no volumes at all. Install the CRD and
+the RBAC rule first, then set the flag.
+
+:::
+
+### What happens when the API server gate is off
+
+With the gate off, kube-apiserver removes the `dataSourceRef` from the staged PVC
+and stores a claim for an **empty** volume. A backup of that volume would succeed
+and contain nothing.
+
+Kopiur reads the stored claim back before it starts the mover. If the reference
+is gone, Kopiur deletes the claim and fails the `Snapshot` with the reason
+`CrossNamespaceDataSourceDisabled`. No backup is taken.
+
+## Enable it
+
+Set `execution.mode: Central` on the `ClusterRepository`. Keep its Secret in the
+operator namespace.
+
+<Code
+  code={region(examples49CentralExecution, "repository")}
+  lang="yaml"
+  title="deploy/examples/49-central-execution.yaml"
+/>
+
+The tenant policy is an ordinary one. `copyMethod: Snapshot` is the default.
+
+<Code
+  code={region(examples49CentralExecution, "policy")}
+  lang="yaml"
+  title="deploy/examples/49-central-execution.yaml"
+/>
+
+The values that you change:
+
+- `execution.mode`: `Central`, or `InNamespace` (the default, same as no
+  `execution` block).
+- The `namespace` of both Secret references: the operator namespace. This is the
+  namespace of the Helm release.
+- `allowedNamespaces`: the tenant namespaces that can use the repository.
+
+## See where a backup ran
+
+The `Snapshot` records the mover Job in its status:
+
+```console
+$ kubectl get snapshot -n billing postgres-data-20260706 -o jsonpath='{.status.job}'
+{"name":"postgres-data-20260706-1f0c7a55d2e9b6a4","namespace":"kopiur-system"}
+```
+
+`status.job.namespace` is present only for a central backup. The Job name is the
+`Snapshot` name plus a hash of its namespace and name, because Jobs from many
+namespaces share the operator namespace.
+
+Read the mover log with `kubectl kopiur logs snapshot <name> -n billing`. The
+command follows `status.job` to the operator namespace, so you need read access
+to pods there. Without that access, read `status.logTail` on the `Snapshot`.
+
+## Limits
+
+- **Backups only.** Restores, verification, snapshot pins, and browse sessions
+  still run in the workload namespace. They need the repository credentials
+  there, by a Secret that you create or by
+  [credential projection](/restores/#credentials-in-a-fresh-namespace--credentialprojection).
+- **One PVC, `copyMethod: Snapshot`.** A policy with `copyMethod: Clone` or
+  `Direct`, an NFS source, a `stream` source, or `groupBy: VolumeGroupSnapshot`
+  fails with the reason `CentralExecutionUnsupported`. Kopiur does not fall back
+  to a mover in the workload namespace.
+- **No `sourcePathOverride`.** That field also sets the path where Kopiur
+  mounts the source volume inside the mover pod. A central mover pod holds the
+  repository credentials, so a tenant must not choose a path there. A volume
+  mounted over the mover binaries would run tenant code with those credentials.
+  Kopiur mounts every central source under `/pvc/`.
+- **No persistent cache.** A `mover.cache` with `mode: Persistent` becomes a
+  per-run volume of the same capacity. The persistent cache PVC belongs to the
+  `SnapshotPolicy` and lives in the workload namespace.
+- **Hooks still act in the workload namespace.** The controller runs
+  `workloadExec` hooks through the API server. A `runJob` hook creates its Job
+  in the workload namespace.
+- **The privileged-mover opt-in stays on the workload namespace.** A mover that
+  needs root still requires the
+  `kopiur.home-operations.com/privileged-movers` annotation there. The pod
+  itself must also pass the Pod Security level of the operator namespace.
+- **Zonal volumes.** The staged PVC and the mover pod must land in the zone of
+  the snapshot. Kopiur adds no placement rule for this.
+- **The operator keeps its cluster-wide RBAC.** Central execution keeps movers
+  and credentials out of tenant namespaces. It does not yet reduce the
+  permissions of the controller.
+
+## When a backup fails
+
+Each of these appears as the reason of the `SourceStaged` condition on the
+`Snapshot`, with a message that states the fix. The `Snapshot` is `Failed`. The
+next scheduled run, or a new `Snapshot`, tries again.
+
+| Reason                             | Meaning                                                                                                  |
+| ---------------------------------- | -------------------------------------------------------------------------------------------------------- |
+| `CentralExecutionUnsupported`      | The policy uses a source or copy method that cannot cross namespaces.                                    |
+| `CentralExecutionUnavailable`      | The install is namespace-scoped, or the controller has no `KOPIUR_NAMESPACE`.                            |
+| `ReferenceGrantCRDMissing`         | The `ReferenceGrant` CRD is not installed.                                                               |
+| `CrossNamespaceDataSourceDisabled` | The feature gate is off on kube-apiserver. Kopiur deleted the empty claim.                               |
+| `StagedPvcBindTimeout`             | The staged PVC did not bind. The usual cause is the provisioner flag or its `referencegrants` RBAC rule. |
+| `CentralObjectNameConflict`        | A PVC with the derived name belongs to another `Snapshot`. Kopiur does not use or delete it.             |
+
+A missing credential Secret in the operator namespace appears as
+`CredentialsAvailable=False`, as it does for any mover.
+
+## Cleanup
+
+The Job and the staged PVC cannot carry an owner reference to the `Snapshot`,
+because an owner must live in the same namespace. Kopiur labels them with the
+UID of the `Snapshot` (`kopiur.home-operations.com/snapshot-uid`) and records
+their location in `status.job`.
+
+- The staged PVC, the `VolumeSnapshot`, and the `ReferenceGrant` go when the
+  backup finishes or fails.
+- The Job goes when you delete the `Snapshot`, or earlier by
+  `ttlSecondsAfterFinished`.
+
+Deleting a `Snapshot` at any point, also while its stage is still being
+prepared, removes all of these objects.
+
+Some versions of the CSI external-provisioner do not remove their protection
+finalizer from the `VolumeSnapshot` after a cross-namespace restore. The
+`VolumeSnapshot` then stays `Terminating` until the periodic sweep of the
+provisioner removes the finalizer (5 minutes by default). See
+[external-provisioner issue 1613](https://github.com/kubernetes-csi/external-provisioner/issues/1613).
+
+If you remove the finalizer of a `Snapshot` by hand, Kopiur does not run this
+cleanup. Find leftovers with:
+
+```console
+$ kubectl get jobs,pvc -n kopiur-system -l kopiur.home-operations.com/snapshot-uid
+```
+
+## RBAC
+
+Central execution adds one mover identity and one controller rule. See
+[RBAC reference](/rbac/#the-central-mover-kopiur-central-mover).

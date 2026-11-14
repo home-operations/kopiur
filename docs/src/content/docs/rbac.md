@@ -4,7 +4,7 @@ title: RBAC reference
 
 Everything Kopiur is allowed to do in your cluster, in one place. Use it for security review, for scoping a namespaced install, and for debugging `Forbidden` errors.
 
-Kopiur runs as **four principals**:
+Kopiur runs as **five principals**:
 
 | ServiceAccount                      | Who uses it                                                                                                                                     | Bound to                                                                   |
 | ----------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------- |
@@ -12,6 +12,7 @@ Kopiur runs as **four principals**:
 | `kopiur-mover`                      | Every ordinary mover `Job` (snapshot, restore, bootstrap, maintenance, verify, replicate, pin, delete)                                          | `kopiur-mover` ClusterRole/Role                                            |
 | `kopiur-snapshot-replication-mover` | Only `SnapshotReplication` mover Jobs                                                                                                           | `kopiur-snapshot-replication-mover` ClusterRole/Role                       |
 | `kopiur-stream-mover`               | Only mover Jobs for a [`stream` source](/stream-sources/) or a `streamExec` restore target. **The only mover principal that holds `pods/exec`** | `kopiur-stream-mover` ClusterRole/Role                                     |
+| `kopiur-central-mover`              | Only backup mover Jobs of a `ClusterRepository` with [`execution.mode: Central`](/central-execution/). Cluster scope only                       | `kopiur-central-mover` ClusterRole                                         |
 
 The authoritative definitions are **generated** by `cargo xtask gen-rbac` into `deploy/rbac/`, as `operator-clusterrole.yaml`, `operator-role.yaml`, `mover-clusterrole.yaml` and `mover-role.yaml`.
 
@@ -31,6 +32,7 @@ What each rule is **for**, grouped by purpose:
 | core → `secrets`                                                                                                                                                                                                       | get, list, watch, create, patch, delete           | Read repository credential Secrets (and re-reconcile when they change); **create/patch/delete** is the credential-projection feature (copying a repo's Secret into a consumer namespace, plus reaping the copies: legacy-copy sweep, reap-on-shrink, reap-on-disable) and the self-managed webhook TLS Secret.                        |
 | `batch` → `jobs`                                                                                                                                                                                                       | get, list, watch, create, update, patch, delete   | Create and track the mover Jobs; reap them per `failedJobsHistoryLimit`.                                                                                                                                                                                                                                                              |
 | `snapshot.storage.k8s.io` → `volumesnapshots`; `groupsnapshot.storage.k8s.io` → `volumegroupsnapshots`                                                                                                                 | get, list, watch, create, **patch**, delete       | CSI snapshot / group-snapshot copy methods (`SnapshotPolicy.spec.copyMethod`).                                                                                                                                                                                                                                                        |
+| `gateway.networking.k8s.io` → `referencegrants`                                                                                                                                                                        | create, patch, delete                             | [Central execution](/central-execution/) only: the per-`Snapshot` `ReferenceGrant` that lets the staged PVC in the operator namespace restore from one `VolumeSnapshot` in the workload namespace. The rule is inert when the Gateway API CRD is not installed.                                                                       |
 | core → `serviceaccounts`; `rbac.authorization.k8s.io` → `rolebindings`                                                                                                                                                 | get, **list, watch** (SAs), create, update, patch | Mint the per-namespace mover ServiceAccount + RoleBinding on demand (see below). `list`/`watch` on ServiceAccounts re-reconciles a repository the moment its `auth.workloadIdentity` SA is created.                                                                                                                                   |
 | core → `namespaces`                                                                                                                                                                                                    | get, list, watch                                  | Read the two per-namespace opt-in annotations — `kopiur.home-operations.com/privileged-movers` (elevated mover) and `kopiur.home-operations.com/stream-exec-movers` (the `pods/exec` grant, the one check that fails **closed** when this read is unavailable) — and drive `pvcSelector` namespace selection. _(Cluster scope only.)_ |
 | `groupsnapshot.storage.k8s.io` → `volumegroupsnapshotclasses`                                                                                                                                                          | get, list, watch                                  | Resolve the group-snapshot class for `groupBy: VolumeGroupSnapshot`, the same way `volumesnapshotclasses` is resolved for per-volume staging. _(Cluster scope only, which is why group staging needs `installScope: cluster`.)_                                                                                                       |
@@ -94,6 +96,23 @@ kubectl delete serviceaccount kopiur-stream-mover -n <ns>
 
 Substitute your release's prefix if `fullnameOverride`/the release name is not `kopiur`, and delete the RoleBinding **first** — it is the object that carries the privilege. See [Streamed command sources → Revoking the opt-in](/stream-sources/#revoking-the-opt-in).
 :::
+
+### The central mover (`kopiur-central-mover`)
+
+A backup under [`execution.mode: Central`](/central-execution/) runs its mover Job in the operator namespace. The mover still reports to the `Snapshot` object, which lives in the workload namespace. Its identity therefore spans two namespaces:
+
+- the `kopiur-central-mover` ServiceAccount lives in the operator namespace, and
+- a `kopiur-central-mover` RoleBinding in each centrally backed-up namespace names that ServiceAccount.
+
+One ServiceAccount is bound in many namespaces, so its role is the smallest of all the movers:
+
+| API group → resources                             | Verbs      | Why                                                                 |
+| ------------------------------------------------- | ---------- | ------------------------------------------------------------------- |
+| `kopiur.home-operations.com` → `snapshots/status` | get, patch | Report progress and the terminal result onto the `Snapshot` object. |
+
+It holds no `configmaps` verbs and no other status kind. The generic mover role holds both, and a ServiceAccount that carried them in every tenant namespace at once would be a cluster-wide write.
+
+Like the other mover identities, the RoleBinding carries no owner reference and nothing deletes it. To revoke it, run `kubectl delete rolebinding kopiur-central-mover -n <ns>`.
 
 ### The runtime-minted per-namespace mover identity
 

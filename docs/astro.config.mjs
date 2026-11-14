@@ -70,6 +70,7 @@ export default defineConfig({
             },
             "backups",
             "copy-methods",
+            "central-execution",
             "stream-sources",
             "access-modes",
             "restores",

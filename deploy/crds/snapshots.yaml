@@ -973,6 +973,15 @@ spec:
                     description: Name of the mover `Job`.
                     nullable: true
                     type: string
+                  namespace:
+                    description: |-
+                      Namespace of the mover `Job` and its staged PVC when they are not in the
+                      `Snapshot`'s own namespace: set under the repository's
+                      `execution.mode: Central`, absent otherwise. Pinned before anything is
+                      created there, so cleanup finds the objects even after the repository's
+                      `execution` is edited or the repository is deleted.
+                    nullable: true
+                    type: string
                 type: object
               logTail:
                 description: The last lines of the run's output, written by the mover at the terminal transition.

@@ -1934,6 +1934,7 @@ fn mover_identity_names_agree_with_the_chart_at_every_length() {
         let chart_mover = format!("{base}-mover");
         let chart_stream = format!("{base}-stream-mover");
         let chart_srepl = format!("{base}-snapshot-replication-mover");
+        let chart_central = format!("{base}-central-mover");
 
         // (1) Both sides agree — the controller derives from the chart's mover name.
         assert_eq!(
@@ -1946,6 +1947,12 @@ fn mover_identity_names_agree_with_the_chart_at_every_length() {
             snapshot_replication_mover_name(&chart_mover),
             chart_srepl,
             "snapshot-replication name diverged from the chart at fullname len {}",
+            fullname.len()
+        );
+        assert_eq!(
+            central_mover_name(&chart_mover),
+            chart_central,
+            "central name diverged from the chart at fullname len {}",
             fullname.len()
         );
 
@@ -1972,8 +1979,19 @@ fn mover_identity_names_agree_with_the_chart_at_every_length() {
             fullname.len()
         );
 
+        // The central role is bound in MANY namespaces to one ServiceAccount, so it
+        // must never share a name with a role that carries more than it does.
+        for other in [&chart_mover, &chart_stream, &chart_srepl] {
+            assert_ne!(
+                chart_central,
+                *other,
+                "the central mover role collided with {other} at fullname len {}",
+                fullname.len()
+            );
+        }
+
         // (3) Every emitted name is applyable.
-        for name in [&chart_mover, &chart_stream, &chart_srepl] {
+        for name in [&chart_mover, &chart_stream, &chart_srepl, &chart_central] {
             assert!(
                 is_dns1123_subdomain_63(name),
                 "not a valid <=63-byte DNS-1123 subdomain ({} bytes): {name}",
@@ -2003,10 +2021,17 @@ fn a_hand_set_mover_role_name_still_yields_three_distinct_identities() {
     for base in &bases {
         let stream = stream_mover_name(base);
         let srepl = snapshot_replication_mover_name(base);
+        let central = central_mover_name(base);
         assert_ne!(stream, *base, "stream collided with the mover role: {base}");
         assert_ne!(srepl, *base, "srepl collided with the mover role: {base}");
         assert_ne!(stream, srepl, "stream collided with srepl: {base}");
-        for name in [&stream, &srepl] {
+        assert_ne!(
+            central, *base,
+            "central collided with the mover role: {base}"
+        );
+        assert_ne!(central, stream, "central collided with stream: {base}");
+        assert_ne!(central, srepl, "central collided with srepl: {base}");
+        for name in [&stream, &srepl, &central] {
             assert!(
                 is_dns1123_subdomain_63(name),
                 "not a valid <=63-byte DNS-1123 subdomain ({} bytes): {name}",
@@ -2053,6 +2078,7 @@ fn chart_helpers_cap_the_mover_stem_not_the_finished_name() {
     for (helper, suffix) in [
         ("moverName", "-mover"),
         ("streamMoverName", "-stream-mover"),
+        ("centralMoverName", "-central-mover"),
         (
             "snapshotReplicationMoverName",
             "-snapshot-replication-mover",

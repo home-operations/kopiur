@@ -138,12 +138,33 @@ pub fn gone_fallback(kind: &str, name: &str, tails: &[RecordedTail]) -> String {
     out
 }
 
-/// Resolve the mover Job name for the target CR.
+/// A mover Job and the namespace it runs in. That is the CR's own namespace,
+/// except for a centrally executed backup, whose `status.job.namespace` names
+/// the operator namespace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct JobAt {
+    name: String,
+    namespace: String,
+}
+
+/// The mover Job a Snapshot's status records, if it records one.
+fn recorded_job(snap: &Snapshot, snapshot_ns: &str) -> Option<JobAt> {
+    let job = snap.status.as_ref()?.job.as_ref()?;
+    Some(JobAt {
+        name: job.name.clone()?,
+        namespace: job
+            .namespace
+            .clone()
+            .unwrap_or_else(|| snapshot_ns.to_string()),
+    })
+}
+
+/// Resolve the mover Job for the target CR.
 async fn resolve_job(
     ctx: &KubeCtx,
     target: LogsTarget,
     name: &str,
-) -> Result<Result<String, String>, CliError> {
+) -> Result<Result<JobAt, String>, CliError> {
     let ns = ctx.namespace.as_str();
     match target {
         LogsTarget::Snapshot => {
@@ -153,12 +174,7 @@ async fn resolve_job(
             })?;
             // The controller records the Job name in status; fall back to an
             // ownerRef scan for status written by an older controller.
-            if let Some(job) = snap
-                .status
-                .as_ref()
-                .and_then(|s| s.job.as_ref())
-                .and_then(|j| j.name.clone())
-            {
+            if let Some(job) = recorded_job(&snap, ns) {
                 return Ok(Ok(job));
             }
             let uid = snap.uid().unwrap_or_default();
@@ -168,7 +184,10 @@ async fn resolve_job(
                 .await
                 .map_err(|e| classify_kube("list", "Job", "jobs", Some(ns), None, e))?;
             match newest_job_owned_by(listed.items, &uid) {
-                Some(job) => Ok(Ok(job.name_any())),
+                Some(job) => Ok(Ok(JobAt {
+                    name: job.name_any(),
+                    namespace: ns.to_string(),
+                })),
                 None => Ok(Err(gone_fallback(
                     "snapshot",
                     name,
@@ -188,7 +207,10 @@ async fn resolve_job(
                 .await
                 .map_err(|e| classify_kube("list", "Job", "jobs", Some(ns), None, e))?;
             match newest_job_owned_by(listed.items, &uid) {
-                Some(job) => Ok(Ok(job.name_any())),
+                Some(job) => Ok(Ok(JobAt {
+                    name: job.name_any(),
+                    namespace: ns.to_string(),
+                })),
                 // Per claim for a fanned-out populator (#443, wave 2 finding 8).
                 None => Ok(Err(gone_fallback(
                     "restore",
@@ -201,18 +223,17 @@ async fn resolve_job(
 }
 
 /// Stream one pod's logs to stdout.
-async fn stream_pod(ctx: &KubeCtx, pod: &str, params: &LogParams) -> Result<(), CliError> {
-    let pods: Api<Pod> = Api::namespaced(ctx.client.clone(), ctx.namespace.as_str());
-    let stream = pods.log_stream(pod, params).await.map_err(|e| {
-        classify_kube(
-            "get",
-            "Pod",
-            "pods/log",
-            Some(ctx.namespace.as_str()),
-            Some(pod),
-            e,
-        )
-    })?;
+async fn stream_pod(
+    ctx: &KubeCtx,
+    ns: &str,
+    pod: &str,
+    params: &LogParams,
+) -> Result<(), CliError> {
+    let pods: Api<Pod> = Api::namespaced(ctx.client.clone(), ns);
+    let stream = pods
+        .log_stream(pod, params)
+        .await
+        .map_err(|e| classify_kube("get", "Pod", "pods/log", Some(ns), Some(pod), e))?;
     let mut lines = stream.lines();
     while let Some(line) = lines
         .try_next()
@@ -242,10 +263,10 @@ pub async fn run(
             });
         }
     };
-    let ns = ctx.namespace.as_str();
+    let ns = job.namespace.as_str();
     let pods: Api<Pod> = Api::namespaced(ctx.client.clone(), ns);
     let listed = pods
-        .list(&ListParams::default().labels(&format!("{JOB_NAME_LABEL}={job}")))
+        .list(&ListParams::default().labels(&format!("{JOB_NAME_LABEL}={}", job.name)))
         .await
         .map_err(|e| classify_kube("list", "Pod", "pods", Some(ns), None, e))?;
     let Some(pod) = newest_pod(listed.items) else {
@@ -262,7 +283,7 @@ pub async fn run(
         tail_lines: args.tail,
         ..LogParams::default()
     };
-    stream_pod(ctx, &pod.name_any(), &params).await?;
+    stream_pod(ctx, ns, &pod.name_any(), &params).await?;
     Ok(CmdOutput {
         text: String::new(),
         exit: 0,
@@ -330,7 +351,7 @@ fn restore_terminal(restore: &Restore) -> bool {
 /// gone / (terminal?, job name?).
 enum Observation {
     Gone,
-    Alive { terminal: bool, job: Option<String> },
+    Alive { terminal: bool, job: Option<JobAt> },
 }
 
 /// Observe the target CR once: phase terminality + the mover Job, resolved the
@@ -347,11 +368,7 @@ async fn observe(
             let Some(snap) = api.get_opt(name).await? else {
                 return Ok(Observation::Gone);
             };
-            let job = snap
-                .status
-                .as_ref()
-                .and_then(|st| st.job.as_ref())
-                .and_then(|j| j.name.clone());
+            let job = recorded_job(&snap, ns);
             Ok(Observation::Alive {
                 terminal: snapshot_terminal(&snap),
                 job,
@@ -370,7 +387,10 @@ async fn observe(
             let listed = jobs
                 .list(&ListParams::default().labels(&format!("{OP_LABEL}={OP_RESTORE}")))
                 .await?;
-            let job = newest_job_owned_by(listed.items, &uid).map(|j| j.name_any());
+            let job = newest_job_owned_by(listed.items, &uid).map(|j| JobAt {
+                name: j.name_any(),
+                namespace: ns.to_string(),
+            });
             Ok(Observation::Alive {
                 terminal: restore_terminal(&restore),
                 job,
@@ -389,8 +409,6 @@ pub async fn stream_target_logs_when_ready(ctx: &KubeCtx, target: LogsTarget, na
     const POLL: std::time::Duration = std::time::Duration::from_secs(2);
     // ~20s of consecutive stream failures before the user hears about it.
     const QUIET_FAILURES: u32 = 10;
-    let ns = ctx.namespace.as_str();
-    let pods: Api<Pod> = Api::namespaced(ctx.client.clone(), ns);
     // A retried Job produces a new pod; keep following the newest unseen pod
     // until the CR is terminal and the last pod has been streamed.
     let mut streamed: Option<String> = None;
@@ -414,8 +432,9 @@ pub async fn stream_target_logs_when_ready(ctx: &KubeCtx, target: LogsTarget, na
             tokio::time::sleep(POLL).await;
             continue;
         };
+        let pods: Api<Pod> = Api::namespaced(ctx.client.clone(), &job.namespace);
         let pod = match pods
-            .list(&ListParams::default().labels(&format!("{JOB_NAME_LABEL}={job}")))
+            .list(&ListParams::default().labels(&format!("{JOB_NAME_LABEL}={}", job.name)))
             .await
         {
             Ok(listed) => newest_pod(listed.items).map(|p| p.name_any()),
@@ -444,7 +463,7 @@ pub async fn stream_target_logs_when_ready(ctx: &KubeCtx, target: LogsTarget, na
             follow: true,
             ..LogParams::default()
         };
-        match stream_pod(ctx, &pod, &params).await {
+        match stream_pod(ctx, &job.namespace, &pod, &params).await {
             Ok(()) => {
                 // The follow stream ends when the container exits; loop to
                 // catch a retry pod or finish at the terminal phase.

@@ -65,6 +65,19 @@ const SNAPSHOT_REPLICATION_MOVER_NAME: &str = "kopiur-snapshot-replication-mover
 /// bound is therefore the NAMESPACE (the RoleBinding is namespace-local), which is
 /// why the feature additionally requires a cluster-admin namespace opt-in.
 const STREAM_MOVER_NAME: &str = "kopiur-stream-mover";
+/// The dedicated central mover role (`ClusterRepository.spec.execution.mode:
+/// Central`).
+///
+/// A central backup mover runs in the operator namespace and patches the status
+/// of a `Snapshot` in a workload namespace, so its ONE ServiceAccount is bound in
+/// every centrally backed-up namespace. It therefore holds `snapshots/status`
+/// and nothing else: the generic mover role's `configmaps` verbs and its other
+/// status kinds, summed over every such namespace, would hand one pod a
+/// cluster-wide write the in-namespace model never grants.
+///
+/// Cluster install only: central execution spans two namespaces, which a
+/// namespaced install's Role cannot.
+const CENTRAL_MOVER_NAME: &str = "kopiur-central-mover";
 /// Name of the leader-election Role + RoleBinding the cluster artifact pairs
 /// with its ClusterRole (the Lease is namespace-local; see [`leader_election_rules`]).
 const LEADER_ROLE_NAME: &str = "kopiur-leader-election";
@@ -262,6 +275,15 @@ fn workload_rules() -> Vec<PolicyRule> {
             &["volumegroupsnapshots".into()],
             &["get", "list", "watch", "create", "patch", "delete"],
         ),
+        // `execution.mode: Central`: the per-Snapshot `ReferenceGrant` that lets
+        // the operator namespace's staged PVC restore from ONE VolumeSnapshot in
+        // the workload namespace. `create`+`patch` back the server-side apply,
+        // `delete` the cleanup; nothing reads them back.
+        rule(
+            &["gateway.networking.k8s.io"],
+            &["referencegrants".into()],
+            &["create", "patch", "delete"],
+        ),
         // Per-namespace mover RBAC minted by the controller (§4.12): a
         // `kopiur-mover` ServiceAccount plus a RoleBinding to the `kopiur-mover`
         // role, created in each mover Job's namespace. `io::ensure_mover_rbac`
@@ -431,6 +453,16 @@ fn stream_mover_rules(cluster: bool) -> Vec<PolicyRule> {
     rules.push(rule(&[""], &["pods".into()], &["get", "list"]));
     rules.push(rule(&[""], &["pods/exec".into()], &["create", "get"]));
     rules
+}
+
+/// Rules for the dedicated central mover: the status of the one kind it backs
+/// up. See [`CENTRAL_MOVER_NAME`] for why nothing else belongs here.
+fn central_mover_rules() -> Vec<PolicyRule> {
+    vec![rule(
+        &[KOPIA_GROUP],
+        &["snapshots/status".into()],
+        &["get", "patch"],
+    )]
 }
 
 /// Splice `apiVersion`/`kind` into a serialized k8s-openapi object and render
@@ -663,10 +695,18 @@ fn mover_cluster_artifact() -> Result<Artifact> {
         rules: Some(stream_mover_rules(true)),
         ..Default::default()
     };
+    // The dedicated central mover role: one ServiceAccount bound in many
+    // namespaces, so it carries `snapshots/status` only.
+    let central_clusterrole = ClusterRole {
+        metadata: metadata(CENTRAL_MOVER_NAME, None),
+        rules: Some(central_mover_rules()),
+        ..Default::default()
+    };
     let content = document(&[
         render(&clusterrole)?,
         render(&srepl_clusterrole)?,
         render(&stream_clusterrole)?,
+        render(&central_clusterrole)?,
     ]);
     Ok(Artifact::new(
         "rbac/mover-clusterrole.yaml".to_string(),

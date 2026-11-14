@@ -65,17 +65,24 @@ if kind get clusters 2>/dev/null | grep -qx "$CLUSTER"; then
   # stuck containerd shim left by a killed run) otherwise fails every later step with a
   # cryptic "failed to get cluster internal kubeconfig". Probe it; if the probe fails,
   # tear it down (force-reaping the node container) and recreate so a bad cluster self-heals.
+  # The feature gates of kind-config.yaml are set when the cluster is created and
+  # cannot be added to a running one. A healthy cluster from before that file
+  # existed lacks them, and tests/central_execution.rs would then fail on a
+  # dropped cross-namespace dataSourceRef. Treat it as a cluster to recreate.
   if kind export kubeconfig --name "$CLUSTER" --kubeconfig "$KUBECONFIG" >/dev/null 2>&1 \\
-     && kubectl --kubeconfig "$KUBECONFIG" get --raw=/healthz >/dev/null 2>&1; then
+     && kubectl --kubeconfig "$KUBECONFIG" get --raw=/healthz >/dev/null 2>&1 \\
+     && kubectl --kubeconfig "$KUBECONFIG" -n kube-system get pods -l component=kube-apiserver \\
+          -o jsonpath='{.items[*].spec.containers[*].command}' 2>/dev/null \\
+          | grep -q 'CrossNamespaceVolumeDataSource=true'; then
     echo "==> reusing healthy kind cluster '$CLUSTER'"
   else
-    echo "==> existing kind cluster '$CLUSTER' is unhealthy; recreating"
+    echo "==> existing kind cluster '$CLUSTER' is unhealthy or lacks the feature gates of kind-config.yaml; recreating"
     mise run //crates/e2e:down
-    kind create cluster --name "$CLUSTER" --kubeconfig "$KUBECONFIG"
+    kind create cluster --name "$CLUSTER" --kubeconfig "$KUBECONFIG" --config crates/e2e/kind-config.yaml
   fi
 else
   echo "==> creating kind cluster '$CLUSTER'"
-  kind create cluster --name "$CLUSTER" --kubeconfig "$KUBECONFIG"
+  kind create cluster --name "$CLUSTER" --kubeconfig "$KUBECONFIG" --config crates/e2e/kind-config.yaml
 fi
 kind export kubeconfig --name "$CLUSTER" --kubeconfig "$KUBECONFIG"
 """
@@ -173,7 +180,7 @@ docker exec "$NODE" sh -c '
   # PVC ROOT is the kopia repo — a subdir under one shared PVC gives no isolation.
   # Each scenario binds its own PVC over one of these dirs. KEEP IN LOCKSTEP with
   # crates/e2e/src/consts.rs::REPO_SUBPATHS.
-  for s in stream stream-fail moverdefaults scc-shadow recmeta nsdel-orphan nsdel-delete pin pinrestore populator populator2 popempty popempty2 readonly kstatus verify vfydeep vfyinh vfygate vfycache repl-src repl-dst repl-s3-src repl-run-src repl-run-dst projgate hooks gfs errh colocation colocation-off colocation-missing copymethod copymethod-csi copymethod-explicit idxhealth epochparams epochparams-default staging-recover staging-timeout staging-override staging-mismatch massdel-cascade massdel-breaker massdel-prune massdel-single massdel-nooverlap massdel-throttle massdel-outage massdel-cap2 massdel-heldprune massdel-cache adopt-prune adopt-ignore adopt-quiet polcasc-retain polcasc-delete polcasc-simul recrestore partial waitanchor waitref multipvc-fanout multipvc-group vfyfanout populator-fanout unchanged-dedup unchanged-default srepl-src srepl-dst srepl-coex-src srepl-coex-dst srepl-sel-src srepl-sel-dst srepl-susp-src srepl-susp-dst srepl-run-src srepl-run-dst mrepo-a mrepo-b mrepo-ret-a mrepo-ret-b mrepo-down-a mrepo-down-b mrepo-rest-a mrepo-rest-b seed-primary seed-mirror seed-blob seed-mig-src seed-mig-dst seed-empty-src seed-empty-dst conc-cap conc-counted conc-restore conc-uncapped conc-env-a conc-env-b conc-replace ui ui-cluster privroot cachebudget cachegrow pwkey; do
+  for s in stream stream-fail moverdefaults scc-shadow recmeta nsdel-orphan nsdel-delete pin pinrestore populator populator2 popempty popempty2 readonly kstatus verify vfydeep vfyinh vfygate vfycache repl-src repl-dst repl-s3-src repl-run-src repl-run-dst projgate hooks gfs errh colocation colocation-off colocation-missing copymethod copymethod-csi copymethod-explicit idxhealth epochparams epochparams-default staging-recover staging-timeout staging-override staging-mismatch massdel-cascade massdel-breaker massdel-prune massdel-single massdel-nooverlap massdel-throttle massdel-outage massdel-cap2 massdel-heldprune massdel-cache adopt-prune adopt-ignore adopt-quiet polcasc-retain polcasc-delete polcasc-simul recrestore partial waitanchor waitref multipvc-fanout multipvc-group vfyfanout populator-fanout unchanged-dedup unchanged-default srepl-src srepl-dst srepl-coex-src srepl-coex-dst srepl-sel-src srepl-sel-dst srepl-susp-src srepl-susp-dst srepl-run-src srepl-run-dst mrepo-a mrepo-b mrepo-ret-a mrepo-ret-b mrepo-down-a mrepo-down-b mrepo-rest-a mrepo-rest-b seed-primary seed-mirror seed-blob seed-mig-src seed-mig-dst seed-empty-src seed-empty-dst conc-cap conc-counted conc-restore conc-uncapped conc-env-a conc-env-b conc-replace ui ui-cluster privroot cachebudget cachegrow pwkey central central-refuse; do
     mkdir -p "/kopiur-e2e/repos/$s"
   done
   # Source dir with one UNREADABLE file for the errorHandling.ignoreFileErrors
@@ -208,7 +215,7 @@ docker save "$BUSYBOX" | docker exec -i "$NODE" ctr --namespace=k8s.io images im
 '''
 
 [tasks.snapshot-manifests]
-description = "Fetch the host-path CSI driver and sidecar RBAC at the commits pinned by vendir"
+description = "Fetch the host-path CSI driver, sidecar RBAC and ReferenceGrant CRD at the commits pinned by vendir"
 dir = "{{config_root}}/../.."
 run = """
 vendir sync --locked --file crates/e2e/manifests/csi-snapshot/vendir.yml \\
@@ -261,17 +268,33 @@ preload registry.k8s.io/sig-storage/livenessprobe:v2.20.0
 echo "==> applying snapshot CRDs from the chart + waiting for establishment"
 helm show crds "$CHART" > "$CHART_DIR/snapshot-crds.yaml"
 kubectl apply -f "$CHART_DIR/snapshot-crds.yaml"
+# The ReferenceGrant CRD, for cross-namespace data sources (tests/central_execution.rs).
+kubectl apply -f "$MANIFESTS/gateway-api/gateway.networking.k8s.io_referencegrants.yaml"
 kubectl wait --for=condition=established --timeout=60s \\
   crd/volumesnapshotclasses.snapshot.storage.k8s.io \\
   crd/volumesnapshotcontents.snapshot.storage.k8s.io \\
   crd/volumesnapshots.snapshot.storage.k8s.io \\
   crd/volumegroupsnapshotclasses.groupsnapshot.storage.k8s.io \\
   crd/volumegroupsnapshotcontents.groupsnapshot.storage.k8s.io \\
-  crd/volumegroupsnapshots.groupsnapshot.storage.k8s.io
+  crd/volumegroupsnapshots.groupsnapshot.storage.k8s.io \\
+  crd/referencegrants.gateway.networking.k8s.io
 
 echo "==> installing snapshot-controller from the pinned chart"
 helm upgrade --install snapshot-controller "$CHART" --namespace kube-system \\
   --skip-crds --set controller.verbosity=5 --wait --timeout=150s
+
+# tests/central_execution.rs needs the CrossNamespaceVolumeDataSource gate on the
+# csi-provisioner sidecar. vendir fetches the upstream plugin manifest unchanged, so
+# the gate is added to a copy. With the gate on, the provisioner syncs a
+# ReferenceGrant informer at startup: the CRD above and the RBAC fixture below must
+# both be in place or it never becomes ready.
+PLUGIN=target/e2e/csi-hostpath-plugin.yaml
+sed 's/--feature-gates=Topology=true$/--feature-gates=Topology=true,CrossNamespaceVolumeDataSource=true/' \\
+  "$HOSTPATH/csi-hostpath-plugin.yaml" > "$PLUGIN"
+if ! grep -q 'CrossNamespaceVolumeDataSource=true' "$PLUGIN"; then
+  echo "error: the csi-provisioner feature-gates line changed upstream; update the sed in snapshot-stack" >&2
+  exit 1
+fi
 
 echo "==> applying csi-driver-host-path + classes (vendored)"
 kubectl apply -f "$HOSTPATH/csi-hostpath-driverinfo.yaml" \\
@@ -279,7 +302,8 @@ kubectl apply -f "$HOSTPATH/csi-hostpath-driverinfo.yaml" \\
   -f "$MANIFESTS/attacher/rbac.yaml" \\
   -f "$MANIFESTS/snapshotter/rbac-csi-snapshotter.yaml" \\
   -f "$MANIFESTS/resizer/rbac.yaml" \\
-  -f "$HOSTPATH/csi-hostpath-plugin.yaml" \\
+  -f "$FIXTURES/34-provisioner-referencegrants-rbac.yaml" \\
+  -f "$PLUGIN" \\
   -f "$HOSTPATH/csi-hostpath-snapshotclass.yaml" \\
   -f "$MANIFESTS/hostpath/examples/csi-storageclass.yaml" \\
   -f "$FIXTURES/32-hostpath-storageclass-wffc.yaml" \\
