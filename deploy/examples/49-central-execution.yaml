@@ -1,8 +1,9 @@
-# Example 49 - execution.mode: Central (run backup movers in the operator namespace)
+# Example 49 - execution.mode: Central (run movers in the operator namespace)
 #
 # EXPERIMENTAL. A platform team sets `execution.mode: Central` once on a shared
-# ClusterRepository. Each tenant backup then runs its mover Job in the operator
-# namespace (`kopiur-system` here), not in the tenant namespace:
+# ClusterRepository. Each tenant backup, and each populator restore, then runs
+# its mover Job in the operator namespace (`kopiur-system` here), not in the
+# tenant namespace. A backup works like this:
 #
 #   1. Kopiur cuts a CSI VolumeSnapshot of the source PVC in the tenant namespace.
 #   2. Kopiur creates a ReferenceGrant beside that VolumeSnapshot.
@@ -11,12 +12,20 @@
 #   4. The mover Job in `kopiur-system` reads that PVC and writes to the repository.
 #   5. Kopiur deletes the temporary PVC, the VolumeSnapshot, and the ReferenceGrant.
 #
+# A populator restore (`target.populator`) works like this:
+#
+#   1. A PVC in the tenant namespace claims the Restore with `dataSourceRef`.
+#   2. Kopiur creates a temporary "prime" PVC in `kopiur-system`.
+#   3. The mover Job in `kopiur-system` restores the snapshot into the prime PVC.
+#   4. Kopiur hands the volume of the prime PVC to the tenant PVC.
+#
 # No mover pod runs in the tenant namespace, and the repository credentials stay
 # in `kopiur-system`. Tenants change nothing in their SnapshotPolicy.
 #
 # Maps to `ClusterRepository.spec.execution` (crates/api/src/cluster_repository.rs).
 #
-# REQUIRES, on the cluster (see docs/src/content/docs/central-execution.mdx):
+# REQUIRES, on the cluster, for backups (a restore needs only the last item;
+# see docs/src/content/docs/central-execution.mdx):
 #   - the alpha `CrossNamespaceVolumeDataSource` feature gate on kube-apiserver
 #     and kube-controller-manager,
 #   - the same feature gate on the CSI driver's external-provisioner, with
@@ -25,10 +34,13 @@
 #   - the CSI snapshot stack and a VolumeSnapshotClass for the source's driver,
 #   - a cluster-scoped install (`installScope: cluster`).
 #
-# LIMITS: backups only (restores, verification, and browse sessions still run in
-# the tenant namespace), and only a single-PVC source under `copyMethod: Snapshot`
-# with no `sourcePathOverride`. Any other policy against this repository fails
-# with the reason.
+# LIMITS:
+#   - Backups: only a single-PVC source under `copyMethod: Snapshot` with no
+#     `sourcePathOverride`. Any other policy against this repository fails with
+#     the reason.
+#   - Restores: only `target.populator`. A restore into a named PVC
+#     (`target.pvc`, `target.pvcRef`) still runs in the tenant namespace and
+#     needs the credentials there. Verification and browse sessions do too.
 ---
 apiVersion: v1
 kind: Secret
@@ -104,3 +116,41 @@ spec:
     name: postgres-data
   schedule:
     cron: "H 2 * * *"
+---
+# region restore
+# A populator restore runs centrally too. The Restore names what to restore;
+# the PVC below claims it. The restore mover never runs in `billing`.
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: Restore
+metadata:
+  name: postgres-data-restore
+  namespace: billing
+spec:
+  source:
+    fromPolicy:
+      name: postgres-data
+      offset: 0 # 0 = latest snapshot
+  target:
+    populator: {}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-data-restored
+  namespace: billing
+spec:
+  storageClassName: fast-ssd
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 100Gi
+  # This is what makes the PVC a claim on the Restore. Kopiur fills a
+  # temporary PVC in `kopiur-system` and hands its volume to this one. If the
+  # StorageClass uses `WaitForFirstConsumer`, the restore starts when a pod
+  # that mounts this PVC is scheduled.
+  dataSourceRef:
+    apiGroup: kopiur.home-operations.com
+    kind: Restore
+    name: postgres-data-restore
+# endregion restore

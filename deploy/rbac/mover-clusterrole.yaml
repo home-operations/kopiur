@@ -115,6 +115,7 @@ rules:
   - kopiur.home-operations.com
   resources:
   - snapshots/status
+  - restores/status
   verbs:
   - get
   - patch

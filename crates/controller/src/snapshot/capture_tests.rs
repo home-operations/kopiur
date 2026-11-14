@@ -209,3 +209,12 @@ fn only_an_unlaunched_view_can_predate_the_central_pin() {
         assert!(!pin_may_be_unseen(Some(&later)), "{later:?}");
     }
 }
+
+/// A central RESTORE's mover Job also lives in the operator namespace. A backup
+/// whose Job name happens to match it must not adopt it either.
+#[test]
+fn a_backup_run_never_adopts_a_central_restore_job() {
+    let theirs = job_with_labels(&[(io::CENTRAL_RESTORE_UID_LABEL, "restore-uid")]);
+    assert!(own_job(&io::MoverSite::InNamespace, theirs.clone(), "uid-b").is_err());
+    assert!(own_job(&central_site(), theirs, "restore-uid").is_err());
+}

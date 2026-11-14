@@ -4348,3 +4348,156 @@ fn a_restore_mounts_a_filesystem_repository_exactly_as_the_mover_connects_to_it(
         );
     }
 }
+
+/// A populator restore moves to the operator namespace only while nothing of it
+/// stands beside its claims. The evidence is a claim record that names a prime
+/// PVC or a mover Job, or an owned prime PVC in the namespace; a record that
+/// only reports a wait (no snapshot yet, no pod scheduled) created nothing.
+#[test]
+fn a_populate_counts_as_started_in_namespace_only_once_it_created_something() {
+    use kopiur_api::{RestoreClaimStatus, RestoreStatus};
+    let status = |claim: RestoreClaimStatus| RestoreStatus {
+        claims: std::collections::BTreeMap::from([("data".to_string(), claim)]),
+        ..Default::default()
+    };
+    assert!(!populate_started_in_namespace(None, false));
+    assert!(!populate_started_in_namespace(
+        Some(&RestoreStatus::default()),
+        false
+    ));
+    // Waiting, nothing created: still free to run centrally.
+    let waiting = status(RestoreClaimStatus {
+        uid: Some("uid-1".into()),
+        phase: Some(RestoreClaimPhase::Pending),
+        ..Default::default()
+    });
+    assert!(!populate_started_in_namespace(Some(&waiting), false));
+
+    let with_prime = status(RestoreClaimStatus {
+        pvc_prime: Some("prime-uid-1".into()),
+        ..Default::default()
+    });
+    assert!(populate_started_in_namespace(Some(&with_prime), false));
+    let with_job = status(RestoreClaimStatus {
+        job: Some("restore-populate-1".into()),
+        ..Default::default()
+    });
+    assert!(populate_started_in_namespace(Some(&with_job), false));
+    // An owned prime PVC in the namespace that no record names yet (a crash
+    // between its creation and the status write).
+    assert!(populate_started_in_namespace(None, true));
+}
+
+fn populator_restore(pin: Option<&str>) -> Restore {
+    let mut restore = Restore::new(
+        "restore-pg",
+        serde_json::from_value(serde_json::json!({
+            "repository": { "kind": "ClusterRepository", "name": "shared" },
+            "source": { "snapshotRef": { "name": "nightly" } },
+            "target": { "populator": {} },
+        }))
+        .unwrap(),
+    );
+    restore.metadata.uid = Some("restore-uid-1".into());
+    restore.status = pin.map(|ns| kopiur_api::RestoreStatus {
+        execution: Some(kopiur_api::RestoreExecutionStatus {
+            namespace: ns.to_string(),
+        }),
+        ..Default::default()
+    });
+    restore
+}
+
+fn labelled(labels: &[(&str, &str)]) -> kube::core::ObjectMeta {
+    kube::core::ObjectMeta {
+        labels: Some(
+            labels
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        ),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn artifacts_are_looked_for_where_the_restore_pinned_them() {
+    let in_namespace = ArtifactScope::of(&populator_restore(None), "billing");
+    assert_eq!(in_namespace.namespace(), "billing");
+    let central = ArtifactScope::of(&populator_restore(Some("kopiur-system")), "billing");
+    assert_eq!(central.namespace(), "kopiur-system");
+}
+
+/// In the operator namespace every tenant's artifacts stand side by side, and a
+/// Restore's name is tenant-chosen. A central restore therefore reads an object
+/// as its own artifact, and deletes it, only when it carries this Restore's UID.
+/// Without this, cleanup of one tenant's claim deleted whatever Job in the
+/// operator namespace happened to be named `<restore>-populate`.
+#[test]
+fn a_central_restore_owns_only_artifacts_labelled_with_its_uid() {
+    let central = ArtifactScope::of(&populator_restore(Some("kopiur-system")), "billing");
+    let ours = labelled(&[(io::CENTRAL_RESTORE_UID_LABEL, "restore-uid-1")]);
+    let another_restore = labelled(&[(io::CENTRAL_RESTORE_UID_LABEL, "restore-uid-2")]);
+    let a_backup = labelled(&[(io::CENTRAL_SNAPSHOT_UID_LABEL, "restore-uid-1")]);
+    let unrelated = labelled(&[]);
+    assert!(central.owns(&ours));
+    assert!(!central.owns(&another_restore));
+    assert!(!central.owns(&a_backup));
+    assert!(!central.owns(&unrelated));
+
+    // In its own namespace a restore finds its artifacts by name, as it always
+    // has, except that it never claims a central run's object.
+    let in_namespace = ArtifactScope::of(&populator_restore(None), "billing");
+    assert!(in_namespace.owns(&unrelated));
+    assert!(!in_namespace.owns(&ours));
+    assert!(!in_namespace.owns(&a_backup));
+}
+
+/// The evidence that a restore ran beside its claims must outlast the
+/// artifacts: a finished claim's record no longer names its prime PVC or Job.
+/// Reading that as "nothing started" re-ran the site decision on every settled
+/// pass and let a later repository edit move a finished in-namespace restore.
+#[test]
+fn a_finished_in_namespace_populate_still_counts_as_started() {
+    use kopiur_api::{RestoreClaimStatus, RestoreStatus};
+    for phase in [
+        RestoreClaimPhase::Populating,
+        RestoreClaimPhase::Rebinding,
+        RestoreClaimPhase::Populated,
+        RestoreClaimPhase::AlreadyBound,
+        RestoreClaimPhase::Failed,
+    ] {
+        let status = RestoreStatus {
+            claims: std::collections::BTreeMap::from([(
+                "data".to_string(),
+                RestoreClaimStatus {
+                    phase: Some(phase.clone()),
+                    ..Default::default()
+                },
+            )]),
+            ..Default::default()
+        };
+        assert!(
+            populate_started_in_namespace(Some(&status), false),
+            "{phase:?}"
+        );
+    }
+    // A status written before per-claim records existed.
+    for (phase, started) in [
+        (RestorePhase::Pending, false),
+        (RestorePhase::Resolving, false),
+        (RestorePhase::Restoring, true),
+        (RestorePhase::Completed, true),
+        (RestorePhase::Failed, true),
+    ] {
+        let legacy = RestoreStatus {
+            phase: Some(phase.clone()),
+            ..Default::default()
+        };
+        assert_eq!(
+            populate_started_in_namespace(Some(&legacy), false),
+            started,
+            "{phase:?}"
+        );
+    }
+}

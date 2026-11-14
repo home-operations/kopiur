@@ -68,12 +68,13 @@ const STREAM_MOVER_NAME: &str = "kopiur-stream-mover";
 /// The dedicated central mover role (`ClusterRepository.spec.execution.mode:
 /// Central`).
 ///
-/// A central backup mover runs in the operator namespace and patches the status
-/// of a `Snapshot` in a workload namespace, so its ONE ServiceAccount is bound in
-/// every centrally backed-up namespace. It therefore holds `snapshots/status`
-/// and nothing else: the generic mover role's `configmaps` verbs and its other
-/// status kinds, summed over every such namespace, would hand one pod a
-/// cluster-wide write the in-namespace model never grants.
+/// A central mover runs in the operator namespace and patches the status of the
+/// `Snapshot` it backs up, or of the `Restore` it populates, in a workload
+/// namespace. Its ONE ServiceAccount is therefore bound in every namespace that
+/// uses central execution. It holds those two status subresources and nothing
+/// else: the generic mover role's `configmaps` verbs and its other status
+/// kinds, summed over every such namespace, would hand one pod a cluster-wide
+/// write the in-namespace model never grants.
 ///
 /// Cluster install only: central execution spans two namespaces, which a
 /// namespaced install's Role cannot.
@@ -455,12 +456,13 @@ fn stream_mover_rules(cluster: bool) -> Vec<PolicyRule> {
     rules
 }
 
-/// Rules for the dedicated central mover: the status of the one kind it backs
-/// up. See [`CENTRAL_MOVER_NAME`] for why nothing else belongs here.
+/// Rules for the dedicated central mover: the status of the two kinds it runs
+/// for (a backup's `Snapshot`, a populator `Restore`). See
+/// [`CENTRAL_MOVER_NAME`] for why nothing else belongs here.
 fn central_mover_rules() -> Vec<PolicyRule> {
     vec![rule(
         &[KOPIA_GROUP],
-        &["snapshots/status".into()],
+        &["snapshots/status".into(), "restores/status".into()],
         &["get", "patch"],
     )]
 }
@@ -696,7 +698,7 @@ fn mover_cluster_artifact() -> Result<Artifact> {
         ..Default::default()
     };
     // The dedicated central mover role: one ServiceAccount bound in many
-    // namespaces, so it carries `snapshots/status` only.
+    // namespaces, so it carries the two status subresources only.
     let central_clusterrole = ClusterRole {
         metadata: metadata(CENTRAL_MOVER_NAME, None),
         rules: Some(central_mover_rules()),

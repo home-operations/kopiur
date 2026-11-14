@@ -368,6 +368,26 @@ pub async fn repository_availability_cached(
     }
 }
 
+/// Store-backed read of where a repository's movers run
+/// (`ClusterRepository.spec.execution.mode`). A namespaced `Repository` has no
+/// such field and is always [`kopiur_api::ExecutionMode::InNamespace`], with no
+/// lookup. Same store-then-live contract as [`repository_availability_cached`].
+pub async fn repository_execution_cached(
+    ctx: &Context,
+    repo_ref: &RepositoryRef,
+    default_ns: &str,
+) -> Result<kopiur_api::ExecutionMode> {
+    match repo_lookup(repo_ref, default_ns) {
+        RepoLookup::Namespaced { .. } => Ok(kopiur_api::ExecutionMode::InNamespace),
+        RepoLookup::Cluster { name } => {
+            let repo = fetch_cluster_repository(ctx, &name)
+                .await?
+                .ok_or_else(|| Error::MissingDependency(format!("ClusterRepository {name}")))?;
+            Ok(repo.spec.execution.map(|e| e.mode).unwrap_or_default())
+        }
+    }
+}
+
 /// Store-backed MAINTENANCE gate (issue #413, #689): whether the target
 /// repository accepts maintenance now. Suspension wins — a suspended
 /// repository runs no maintenance, including an externally-authored

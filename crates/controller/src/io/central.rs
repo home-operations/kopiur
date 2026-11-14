@@ -52,6 +52,12 @@ pub const CENTRAL_SNAPSHOT_UID_LABEL: &str = "kopiur.home-operations.com/snapsho
 /// label-value limit.
 pub const CENTRAL_SNAPSHOT_ANNOTATION: &str = "kopiur.home-operations.com/snapshot";
 
+/// The restore-side counterpart of [`CENTRAL_SNAPSHOT_UID_LABEL`].
+pub use kopiur_api::consts::CENTRAL_RESTORE_UID_LABEL;
+/// Annotation naming the `Restore` (`<namespace>/<name>`) a central object
+/// belongs to.
+pub const CENTRAL_RESTORE_ANNOTATION: &str = "kopiur.home-operations.com/restore";
+
 /// The source cannot be backed up centrally (wrong copy method or source shape).
 pub const REASON_CENTRAL_UNSUPPORTED: &str = "CentralExecutionUnsupported";
 /// This install cannot run movers centrally (no operator namespace, or a
@@ -162,10 +168,7 @@ impl MoverSite {
     /// run owns no object that carries the central label at all.
     pub fn is_foreign(&self, meta: &kube::core::ObjectMeta, uid: &str) -> bool {
         match self {
-            MoverSite::InNamespace => meta
-                .labels
-                .as_ref()
-                .is_some_and(|l| l.contains_key(CENTRAL_SNAPSHOT_UID_LABEL)),
+            MoverSite::InNamespace => has_central_mark(meta),
             MoverSite::Central(_) => !is_ours(meta, uid),
         }
     }
@@ -414,6 +417,14 @@ pub fn is_ours(meta: &kube::core::ObjectMeta, uid: &str) -> bool {
         .is_some_and(|v| v == uid)
 }
 
+/// Whether `meta` is a central object of ANY run, backup or restore. No
+/// in-namespace run owns such an object, whatever its name.
+pub fn has_central_mark(meta: &kube::core::ObjectMeta) -> bool {
+    meta.labels.as_ref().is_some_and(|l| {
+        l.contains_key(CENTRAL_SNAPSHOT_UID_LABEL) || l.contains_key(CENTRAL_RESTORE_UID_LABEL)
+    })
+}
+
 /// The message for a central object that belongs to another `Snapshot`.
 pub fn name_conflict_message(kind: &str, namespace: &str, name: &str) -> String {
     format!(
@@ -656,6 +667,212 @@ pub async fn delete_central_job(
         Ok(_) => Ok(()),
         Err(kube::Error::Api(e)) if e.code == 404 => Ok(()),
         Err(e) => Err(Error::Kube(e)),
+    }
+}
+
+/// Where a populator restore's prime PVCs and mover Jobs live.
+///
+/// A populator restore fills a temporary "prime" PVC and then hands its
+/// `PersistentVolume` to the PVC that claimed the `Restore`. A
+/// `PersistentVolume` is cluster-scoped, so the prime PVC and the mover need not
+/// be in the claim's namespace: under central execution they are in the operator
+/// namespace, and nothing but the finished volume enters the workload namespace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RestoreSite {
+    /// The `Restore`'s own namespace; artifacts are owner-referenced to it.
+    InNamespace,
+    /// The operator namespace (`execution.mode: Central`).
+    Central {
+        /// The namespace the prime PVCs and mover Jobs live in.
+        namespace: String,
+    },
+}
+
+impl RestoreSite {
+    /// The site a restore already committed to, read from `status.execution`.
+    /// No pin means in-namespace: the pin is written before any central object
+    /// is created.
+    pub fn pinned(status: Option<&kopiur_api::RestoreStatus>) -> RestoreSite {
+        match status.and_then(|s| s.execution.as_ref()) {
+            Some(execution) => RestoreSite::Central {
+                namespace: execution.namespace.clone(),
+            },
+            None => RestoreSite::InNamespace,
+        }
+    }
+
+    /// The namespace of the prime PVCs, the mover Jobs and their pods.
+    pub fn namespace<'a>(&'a self, restore_ns: &'a str) -> &'a str {
+        match self {
+            RestoreSite::InNamespace => restore_ns,
+            RestoreSite::Central { namespace } => namespace,
+        }
+    }
+
+    /// Whether an object found under one of this restore's names belongs to
+    /// some other run (see [`MoverSite::is_foreign`], whose rule this mirrors).
+    pub fn is_foreign(&self, meta: &kube::core::ObjectMeta, restore_uid: &str) -> bool {
+        match self {
+            RestoreSite::InNamespace => has_central_mark(meta),
+            RestoreSite::Central { .. } => !is_restores(meta, restore_uid),
+        }
+    }
+}
+
+/// Whether a central object carries this `Restore`'s UID.
+pub fn is_restores(meta: &kube::core::ObjectMeta, restore_uid: &str) -> bool {
+    meta.labels
+        .as_ref()
+        .and_then(|l| l.get(CENTRAL_RESTORE_UID_LABEL))
+        .is_some_and(|v| v == restore_uid)
+}
+
+/// Mark `meta` as a central object of the `Restore` `restore_ns/restore_name`
+/// and drop the owner reference a cross-namespace object must not carry.
+pub fn mark_central_restore(
+    meta: &mut kube::core::ObjectMeta,
+    restore_ns: &str,
+    restore_name: &str,
+    restore_uid: &str,
+) {
+    meta.owner_references = None;
+    meta.labels.get_or_insert_with(BTreeMap::new).insert(
+        CENTRAL_RESTORE_UID_LABEL.to_string(),
+        restore_uid.to_string(),
+    );
+    meta.annotations.get_or_insert_with(BTreeMap::new).insert(
+        CENTRAL_RESTORE_ANNOTATION.to_string(),
+        format!("{restore_ns}/{restore_name}"),
+    );
+}
+
+/// Whether a populator restore that has not committed to a site yet runs
+/// centrally. A pinned restore stays central. An unpinned one that already
+/// created artifacts beside its claims stays there: the repository's
+/// `execution` was switched afterwards, and moving now would strand them.
+pub fn restore_wants_central(
+    pinned: &RestoreSite,
+    mode: ExecutionMode,
+    started_in_namespace: bool,
+) -> bool {
+    match (pinned, mode) {
+        (RestoreSite::Central { .. }, _) => true,
+        (RestoreSite::InNamespace, ExecutionMode::Central) => !started_in_namespace,
+        (RestoreSite::InNamespace, ExecutionMode::InNamespace) => false,
+    }
+}
+
+/// Why a run pinned to a central site cannot launch against `kind`, if it
+/// cannot. `subject`/`name` name the run's object for the message.
+///
+/// A central mover takes the repository's credential Secrets and a filesystem
+/// repository's PVC from the operator namespace BY NAME. Those names must come
+/// from a `ClusterRepository`, which only a cluster administrator can write. A
+/// namespaced `Repository` is tenant-authored: honoring one here would let a
+/// tenant point a mover at any Secret or PVC in the operator namespace. The pin
+/// outlives edits of the run's repository reference, so this is checked at
+/// every launch, not only when the site is chosen.
+pub fn central_repository_refusal(
+    site: &RestoreSite,
+    kind: kopiur_api::common::RepositoryKind,
+    subject: &str,
+    name: &str,
+) -> Option<String> {
+    use kopiur_api::common::RepositoryKind;
+    match (site, kind) {
+        (RestoreSite::InNamespace, _)
+        | (RestoreSite::Central { .. }, RepositoryKind::ClusterRepository) => None,
+        (RestoreSite::Central { namespace }, RepositoryKind::Repository) => Some(format!(
+            "{subject} `{name}` runs its mover centrally, in namespace `{namespace}`, but its \
+             repository now resolves to a namespaced Repository. Central execution only serves \
+             a ClusterRepository, because the mover takes the repository's Secrets and volumes \
+             from that namespace. Fix: point it back at the ClusterRepository, or delete it and \
+             create a new {subject}"
+        )),
+    }
+}
+
+/// The namespace whose privileged-movers opt-in an elevated mover still lacks,
+/// if any. The workload namespace must consent, as always. A central mover pod
+/// runs in `mover_ns` instead, so that namespace must consent as well: one
+/// namespace cannot opt another into privileged pods.
+pub async fn privileged_opt_in_missing(
+    client: &kube::Client,
+    workload_ns: &str,
+    mover_ns: &str,
+) -> Result<Option<String>> {
+    for ns in privileged_consent_namespaces(workload_ns, mover_ns) {
+        if !super::mover::namespace_allows_privileged_movers(client, ns).await? {
+            return Ok(Some(ns.to_string()));
+        }
+    }
+    Ok(None)
+}
+
+/// The namespaces that must each opt in to an elevated mover: the workload's,
+/// then the mover's when it is a different one.
+pub fn privileged_consent_namespaces<'a>(workload_ns: &'a str, mover_ns: &'a str) -> Vec<&'a str> {
+    if workload_ns == mover_ns {
+        vec![workload_ns]
+    } else {
+        vec![workload_ns, mover_ns]
+    }
+}
+
+/// Delete every central object of the `Restore` with UID `restore_uid`: its
+/// mover Jobs (their pods cascade) and its prime PVCs. Called from the
+/// `Restore`'s finalizer, because no owner reference reaches these objects.
+/// Idempotent and 404-tolerant.
+pub async fn reap_central_restore(
+    client: &kube::Client,
+    central_ns: &str,
+    restore_uid: &str,
+) -> Result<()> {
+    let selector = format!("{CENTRAL_RESTORE_UID_LABEL}={restore_uid}");
+    let params = kube::api::ListParams::default().labels(&selector);
+    let jobs: Api<k8s_openapi::api::batch::v1::Job> = Api::namespaced(client.clone(), central_ns);
+    for job in jobs.list(&params).await?.items {
+        match jobs
+            .delete(
+                &kube::ResourceExt::name_any(&job),
+                &delete_exactly(&job.metadata),
+            )
+            .await
+        {
+            Ok(_) => {}
+            // Gone already, or replaced by another object of the same name.
+            Err(kube::Error::Api(e)) if e.code == 404 || e.code == 409 => {}
+            Err(e) => return Err(Error::Kube(e)),
+        }
+    }
+    let claims: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), central_ns);
+    for claim in claims.list(&params).await?.items {
+        match claims
+            .delete(
+                &kube::ResourceExt::name_any(&claim),
+                &delete_exactly(&claim.metadata),
+            )
+            .await
+        {
+            Ok(_) => {}
+            Err(kube::Error::Api(e)) if e.code == 404 || e.code == 409 => {}
+            Err(e) => return Err(Error::Kube(e)),
+        }
+    }
+    Ok(())
+}
+
+/// Delete parameters that remove exactly the object `meta` describes: its UID
+/// is a precondition, so an object that replaced it under the same name is left
+/// alone. Background propagation, so a Job's pods go with it.
+pub fn delete_exactly(meta: &kube::core::ObjectMeta) -> kube::api::DeleteParams {
+    kube::api::DeleteParams {
+        propagation_policy: Some(kube::api::PropagationPolicy::Background),
+        preconditions: Some(kube::api::Preconditions {
+            uid: meta.uid.clone(),
+            resource_version: None,
+        }),
+        ..Default::default()
     }
 }
 
@@ -1629,6 +1846,163 @@ mod tests {
         assert!(!within_release_window(1_000, 5_000));
         // A deletion timestamp ahead of this clock still counts as recent.
         assert!(within_release_window(1_000, 990));
+    }
+
+    fn restore_status(pin: Option<&str>) -> kopiur_api::RestoreStatus {
+        kopiur_api::RestoreStatus {
+            execution: pin.map(|ns| kopiur_api::RestoreExecutionStatus {
+                namespace: ns.to_string(),
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_restore_site_is_central_only_when_its_status_pins_a_namespace() {
+        assert_eq!(RestoreSite::pinned(None), RestoreSite::InNamespace);
+        assert_eq!(
+            RestoreSite::pinned(Some(&restore_status(None))),
+            RestoreSite::InNamespace
+        );
+        let central = RestoreSite::pinned(Some(&restore_status(Some("kopiur-system"))));
+        assert_eq!(
+            central,
+            RestoreSite::Central {
+                namespace: "kopiur-system".into()
+            }
+        );
+        // The Restore's own namespace is where its claims are; the pin is where
+        // the prime PVCs and mover Jobs are.
+        assert_eq!(central.namespace("billing"), "kopiur-system");
+        assert_eq!(RestoreSite::InNamespace.namespace("billing"), "billing");
+    }
+
+    #[test]
+    fn a_populator_restore_goes_central_only_before_it_creates_anything_in_namespace() {
+        use ExecutionMode::{Central, InNamespace};
+        let pinned = RestoreSite::Central {
+            namespace: "kopiur-system".into(),
+        };
+        assert!(restore_wants_central(
+            &RestoreSite::InNamespace,
+            Central,
+            false
+        ));
+        // A prime PVC or mover Job already stands beside the claims: the
+        // repository was switched afterwards, and moving would strand them.
+        assert!(!restore_wants_central(
+            &RestoreSite::InNamespace,
+            Central,
+            true
+        ));
+        assert!(!restore_wants_central(
+            &RestoreSite::InNamespace,
+            InNamespace,
+            false
+        ));
+        // A pinned restore stays central after the repository drops `execution`.
+        assert!(restore_wants_central(&pinned, InNamespace, false));
+        assert!(restore_wants_central(&pinned, Central, true));
+    }
+
+    /// Backup and restore movers of every namespace share the operator
+    /// namespace. Each run owns only what carries ITS mark, and an in-namespace
+    /// run owns nothing that carries any central mark.
+    #[test]
+    fn central_restore_objects_are_foreign_to_every_other_run() {
+        let central = RestoreSite::Central {
+            namespace: "kopiur-system".into(),
+        };
+        let mut restore_obj = ObjectMeta {
+            owner_references: Some(vec![owner("restore-uid-1")]),
+            ..Default::default()
+        };
+        mark_central_restore(&mut restore_obj, "billing", "restore-pg", "restore-uid-1");
+        // A cross-namespace owner reference would get it garbage collected.
+        assert_eq!(restore_obj.owner_references, None);
+        assert_eq!(
+            restore_obj.annotations.as_ref().unwrap()[CENTRAL_RESTORE_ANNOTATION],
+            "billing/restore-pg"
+        );
+        assert!(has_central_mark(&restore_obj));
+
+        assert!(!central.is_foreign(&restore_obj, "restore-uid-1"));
+        assert!(central.is_foreign(&restore_obj, "restore-uid-2"));
+        // An in-namespace restore, and an in-namespace or central BACKUP, that
+        // happen to derive the same name.
+        assert!(RestoreSite::InNamespace.is_foreign(&restore_obj, "restore-uid-1"));
+        assert!(MoverSite::InNamespace.is_foreign(&restore_obj, "restore-uid-1"));
+        let backup_site = MoverSite::Central(CentralSite {
+            namespace: "kopiur-system".into(),
+            job_name: "j".into(),
+        });
+        assert!(backup_site.is_foreign(&restore_obj, "restore-uid-1"));
+
+        // And the reverse: a central backup's object is not a restore's.
+        let mut backup_obj = ObjectMeta::default();
+        mark_central(&mut backup_obj, "billing", "nightly", "snap-uid-1");
+        assert!(central.is_foreign(&backup_obj, "snap-uid-1"));
+        assert!(RestoreSite::InNamespace.is_foreign(&backup_obj, "snap-uid-1"));
+
+        // An unmarked object belongs to an in-namespace run only.
+        let plain = ObjectMeta::default();
+        assert!(!RestoreSite::InNamespace.is_foreign(&plain, "restore-uid-1"));
+        assert!(central.is_foreign(&plain, "restore-uid-1"));
+    }
+
+    /// A central mover takes Secrets and volumes from the operator namespace by
+    /// name. A tenant-authored namespaced Repository must never supply those
+    /// names, also after the run was pinned central against a ClusterRepository.
+    #[test]
+    fn a_central_run_refuses_a_namespaced_repository() {
+        use kopiur_api::common::RepositoryKind;
+        let central = RestoreSite::Central {
+            namespace: "kopiur-system".into(),
+        };
+        assert_eq!(
+            central_repository_refusal(
+                &central,
+                RepositoryKind::ClusterRepository,
+                "Restore",
+                "restore-pg"
+            ),
+            None
+        );
+        let msg = central_repository_refusal(
+            &central,
+            RepositoryKind::Repository,
+            "Restore",
+            "restore-pg",
+        )
+        .expect("a namespaced Repository must be refused centrally");
+        assert!(msg.contains("Restore `restore-pg`"), "{msg}");
+        assert!(msg.contains("kopiur-system"), "{msg}");
+        assert!(msg.contains("ClusterRepository"), "{msg}");
+        assert!(msg.contains("Fix:"), "{msg}");
+        // In its own namespace a run uses whatever repository it resolves.
+        for kind in [
+            RepositoryKind::Repository,
+            RepositoryKind::ClusterRepository,
+        ] {
+            assert_eq!(
+                central_repository_refusal(&RestoreSite::InNamespace, kind, "Restore", "r"),
+                None
+            );
+        }
+    }
+
+    /// One namespace cannot opt another into privileged pods: a central mover
+    /// runs in the operator namespace, so both must consent.
+    #[test]
+    fn an_elevated_central_mover_needs_consent_from_both_namespaces() {
+        assert_eq!(
+            privileged_consent_namespaces("billing", "billing"),
+            vec!["billing"]
+        );
+        assert_eq!(
+            privileged_consent_namespaces("billing", "kopiur-system"),
+            vec!["billing", "kopiur-system"]
+        );
     }
 
     #[test]

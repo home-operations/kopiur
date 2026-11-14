@@ -45,6 +45,57 @@ pub fn newest_job_owned_by(jobs: Vec<Job>, uid: &str) -> Option<Job> {
         })
 }
 
+/// The newest mover Job of `restore`, and the namespace it runs in.
+///
+/// Ordinarily that is the Restore's own namespace, where the Job carries an
+/// owner reference to it. A centrally executed populator restore pins the
+/// operator namespace in `status.execution`; its Jobs carry the Restore's UID
+/// as a label there, because an owner reference cannot cross namespaces.
+async fn newest_restore_job(
+    client: &kube::Client,
+    restore: &Restore,
+    ns: &str,
+) -> Result<Option<JobAt>, kube::Error> {
+    let uid = restore.uid().unwrap_or_default();
+    // Only a populator restore runs centrally. The pin outlives an edit of the
+    // target, and a direct restore's Job is always in the Restore's namespace.
+    let central = match &restore.spec.target {
+        kopiur_api::restore::RestoreTarget::Populator(_) => restore
+            .status
+            .as_ref()
+            .and_then(|s| s.execution.as_ref())
+            .map(|e| e.namespace.clone()),
+        kopiur_api::restore::RestoreTarget::Pvc(_)
+        | kopiur_api::restore::RestoreTarget::PvcRef(_)
+        | kopiur_api::restore::RestoreTarget::StreamExec(_) => None,
+    };
+    let (job_ns, selector) = match &central {
+        Some(central_ns) => (
+            central_ns.as_str(),
+            format!("{}={uid}", kopiur_api::consts::CENTRAL_RESTORE_UID_LABEL),
+        ),
+        None => (ns, format!("{OP_LABEL}={OP_RESTORE}")),
+    };
+    let jobs: Api<Job> = Api::namespaced(client.clone(), job_ns);
+    let listed = jobs
+        .list(&ListParams::default().labels(&selector))
+        .await?
+        .items;
+    let newest = match central {
+        // Already selected by the UID label.
+        Some(_) => listed.into_iter().max_by(|a, b| {
+            a.metadata
+                .creation_timestamp
+                .cmp(&b.metadata.creation_timestamp)
+        }),
+        None => newest_job_owned_by(listed, &uid),
+    };
+    Ok(newest.map(|job| JobAt {
+        name: job.name_any(),
+        namespace: job_ns.to_string(),
+    }))
+}
+
 /// Newest pod of the list (a retried Job leaves several; the newest is the
 /// current/last attempt). Pure.
 pub fn newest_pod(pods: Vec<Pod>) -> Option<Pod> {
@@ -200,17 +251,11 @@ async fn resolve_job(
             let restore = api.get(name).await.map_err(|e| {
                 classify_kube("get", "Restore", "restores", Some(ns), Some(name), e)
             })?;
-            let uid = restore.uid().unwrap_or_default();
-            let jobs: Api<Job> = Api::namespaced(ctx.client.clone(), ns);
-            let listed = jobs
-                .list(&ListParams::default().labels(&format!("{OP_LABEL}={OP_RESTORE}")))
+            let job = newest_restore_job(&ctx.client, &restore, ns)
                 .await
                 .map_err(|e| classify_kube("list", "Job", "jobs", Some(ns), None, e))?;
-            match newest_job_owned_by(listed.items, &uid) {
-                Some(job) => Ok(Ok(JobAt {
-                    name: job.name_any(),
-                    namespace: ns.to_string(),
-                })),
+            match job {
+                Some(job) => Ok(Ok(job)),
                 // Per claim for a fanned-out populator (#443, wave 2 finding 8).
                 None => Ok(Err(gone_fallback(
                     "restore",
@@ -379,18 +424,10 @@ async fn observe(
             let Some(restore) = api.get_opt(name).await? else {
                 return Ok(Observation::Gone);
             };
-            let uid = restore.uid().unwrap_or_default();
-            let jobs: Api<Job> = Api::namespaced(ctx.client.clone(), ns);
             // A list ERROR must propagate (caller retries) — treating it as
             // "no job" while terminal would end the stream before the final
             // pod is drained.
-            let listed = jobs
-                .list(&ListParams::default().labels(&format!("{OP_LABEL}={OP_RESTORE}")))
-                .await?;
-            let job = newest_job_owned_by(listed.items, &uid).map(|j| JobAt {
-                name: j.name_any(),
-                namespace: ns.to_string(),
-            });
+            let job = newest_restore_job(&ctx.client, &restore, ns).await?;
             Ok(Observation::Alive {
                 terminal: restore_terminal(&restore),
                 job,

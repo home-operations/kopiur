@@ -119,11 +119,12 @@ rules:
 # (deploy/rbac/mover-clusterrole.yaml, fourth document): that xtask is the
 # SOURCE OF TRUTH; edit it and re-run, then re-sync these rules.
 #
-# A central backup mover runs in the operator namespace and patches the status
-# of a Snapshot in a workload namespace. The controller mints the same-named
-# ServiceAccount in the operator namespace and a RoleBinding to THIS role in each
-# centrally backed-up namespace. One ServiceAccount is therefore bound in many
-# namespaces, so the role holds `snapshots/status` and nothing else.
+# A central mover runs in the operator namespace and patches the status of the
+# Snapshot it backs up, or of the Restore it populates, in a workload namespace.
+# The controller mints the same-named ServiceAccount in the operator namespace
+# and a RoleBinding to THIS role in each namespace that uses central execution.
+# One ServiceAccount is therefore bound in many namespaces, so the role holds
+# those two status subresources and nothing else.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -135,5 +136,6 @@ rules:
       - kopiur.home-operations.com
     resources:
       - snapshots/status
+      - restores/status
     verbs: [get, patch]
 {{- end }}

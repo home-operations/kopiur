@@ -13,6 +13,19 @@
 /// CR lifecycle").
 pub const SNAPSHOT_CLEANUP_FINALIZER: &str = "kopiur.home-operations.com/snapshot-cleanup";
 
+/// The finalizer a populator `Restore` carries once it runs centrally
+/// (`ClusterRepository.spec.execution.mode: Central`). Its prime PVCs and mover
+/// Jobs then live in the operator namespace, where no owner reference can reach
+/// them, so the operator deletes them before the `Restore` is removed.
+pub const RESTORE_CENTRAL_CLEANUP_FINALIZER: &str =
+    "kopiur.home-operations.com/central-restore-cleanup";
+
+/// Label on every object a central populator `Restore` creates in the operator
+/// namespace (its prime PVCs and mover Jobs), carrying the `Restore`'s UID. It
+/// stands in for the owner reference those objects cannot have, and it is how
+/// `kubectl kopiur logs restore` finds the mover Job there.
+pub const CENTRAL_RESTORE_UID_LABEL: &str = "kopiur.home-operations.com/restore-uid";
+
 /// Repo-offline escape hatch: when present, the finalizer is removed *without*
 /// contacting the repository, the snapshot is recorded orphaned, and a
 /// `SnapshotOrphaned` event is emitted (ADR §4.5).

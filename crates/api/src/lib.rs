@@ -66,8 +66,8 @@ pub use repository_replication::{
 };
 pub use restore::{
     OnMissingSnapshot, PathSelection, PopulatorTarget, ResolutionOutcome, Restore,
-    RestoreClaimPhase, RestoreClaimStatus, RestorePhase, RestoreSource, RestoreSpec, RestoreStatus,
-    RestoreTarget,
+    RestoreClaimPhase, RestoreClaimStatus, RestoreExecutionStatus, RestorePhase, RestoreSource,
+    RestoreSpec, RestoreStatus, RestoreTarget,
 };
 pub use seed::{
     SeedMigrateOptions, SeedMode, SeedSource, SeedSpec, SeedStatus, SeedSyncOptions,

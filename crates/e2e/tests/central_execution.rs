@@ -29,7 +29,7 @@ use kube::{Api, Client, ResourceExt};
 use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Pod, Secret};
 use k8s_openapi::api::rbac::v1::RoleBinding;
-use kopiur_api::{ClusterRepository, Snapshot, SnapshotPolicy};
+use kopiur_api::{ClusterRepository, Restore, Snapshot, SnapshotPolicy};
 use kopiur_e2e::{
     E2E_NAMESPACE, Need, World, default_timeout, ensure_namespace, poll_interval, wait_until,
 };
@@ -193,6 +193,28 @@ async fn central_backup_runs_in_the_operator_namespace_and_cleans_up() {
     .await
     .expect("a previous Snapshot must clear");
     let _ = policies.delete(policy, &DeleteParams::default()).await;
+    // A retry of this test finds the previous attempt's restore objects.
+    let stale_restores: Api<Restore> = Api::namespaced(client.clone(), WORKLOAD_NS);
+    let _ = stale_restores
+        .delete("e2e-central-restore", &DeleteParams::default())
+        .await;
+    wait_until(
+        "previous Restore gone",
+        default_timeout(),
+        poll_interval(),
+        || async {
+            Ok(stale_restores
+                .get_opt("e2e-central-restore")
+                .await?
+                .is_none()
+                .then_some(()))
+        },
+    )
+    .await
+    .expect("a previous Restore must clear");
+    kopiur_e2e::pvc::delete_pvc_and_consumers(&client, WORKLOAD_NS, "e2e-central-restored")
+        .await
+        .expect("clear a previous restored PVC");
 
     csi_source_with_marker(&client, WORKLOAD_NS, src).await;
     let crepos = central_repository(&client, "e2e-central-repo", "central").await;
@@ -397,6 +419,152 @@ async fn central_backup_runs_in_the_operator_namespace_and_cleans_up() {
     )
     .await
     .expect("the ReferenceGrant should be cleaned up");
+
+    // --- Restore, also from outside the workload namespace -------------------
+    //
+    // A populator Restore: the mover fills a prime PVC in the OPERATOR
+    // namespace, and its volume is then handed to the PVC that claims the
+    // Restore. The workload namespace still holds no credentials, so a mover
+    // there could not have read the repository at all.
+    let restore = "e2e-central-restore";
+    let claim = "e2e-central-restored";
+    let reader = "e2e-central-restored-reader";
+    let restores: Api<Restore> = Api::namespaced(client.clone(), WORKLOAD_NS);
+    let workload_pvcs: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), WORKLOAD_NS);
+    restores
+        .create(
+            &PostParams::default(),
+            &cr(serde_json::json!({
+                "apiVersion": "kopiur.home-operations.com/v1alpha1",
+                "kind": "Restore",
+                "metadata": { "name": restore, "namespace": WORKLOAD_NS },
+                "spec": {
+                    "repository": { "kind": "ClusterRepository", "name": "e2e-central-repo" },
+                    "source": { "snapshotRef": { "name": backup } },
+                    "target": { "populator": {} },
+                },
+            })),
+        )
+        .await
+        .expect("create Restore");
+    workload_pvcs
+        .create(
+            &PostParams::default(),
+            &cr(serde_json::json!({
+                "apiVersion": "v1", "kind": "PersistentVolumeClaim",
+                "metadata": { "name": claim, "namespace": WORKLOAD_NS },
+                "spec": {
+                    "accessModes": ["ReadWriteOnce"],
+                    "storageClassName": CSI_STORAGE_CLASS,
+                    "resources": { "requests": { "storage": "64Mi" } },
+                    "dataSourceRef": {
+                        "apiGroup": "kopiur.home-operations.com",
+                        "kind": "Restore",
+                        "name": restore,
+                    },
+                },
+            })),
+        )
+        .await
+        .expect("create the claiming PVC");
+
+    wait_phase(&restores, restore, "Completed")
+        .await
+        .expect("the centrally executed Restore should Complete");
+    let restore_status = status_json(&restores, restore).await;
+    assert_eq!(
+        restore_status["execution"]["namespace"].as_str(),
+        Some(E2E_NAMESPACE),
+        "status.execution.namespace must name the operator namespace: {restore_status}"
+    );
+    let restore_obj = restores.get(restore).await.expect("get Restore");
+    assert!(
+        restore_obj
+            .finalizers()
+            .iter()
+            .any(|f| f == kopiur_api::consts::RESTORE_CENTRAL_CLEANUP_FINALIZER),
+        "a central Restore must carry the cleanup finalizer"
+    );
+    let restore_uid = restore_obj.uid().unwrap();
+
+    // The restore mover never ran here, and still no Secret was copied in.
+    assert!(
+        workload_jobs
+            .list(&ListParams::default())
+            .await
+            .expect("list jobs")
+            .items
+            .is_empty(),
+        "no restore Job may be created in the workload namespace"
+    );
+    assert!(
+        workload_secrets
+            .list(&ListParams::default())
+            .await
+            .expect("list secrets")
+            .items
+            .is_empty(),
+        "no Secret may be projected into the workload namespace for the restore"
+    );
+
+    // The claiming PVC holds the data that was backed up.
+    let workload_pod_api: Api<Pod> = Api::namespaced(client.clone(), WORKLOAD_NS);
+    workload_pod_api
+        .create(
+            &PostParams::default(),
+            &kopiur_e2e::builders::one_shot_pod(
+                WORKLOAD_NS,
+                reader,
+                &[
+                    "sh",
+                    "-c",
+                    &format!("test \"$(cat /mnt/marker.txt)\" = '{MARKER}'"),
+                ],
+                &[(claim, "/mnt")],
+            ),
+        )
+        .await
+        .expect("create the reader pod");
+    kopiur_e2e::wait::pod_succeeded(&client, WORKLOAD_NS, reader)
+        .await
+        .expect("the restored PVC must hold the marker file");
+
+    // The prime PVC and the mover Job were in the operator namespace, marked
+    // with the Restore's UID, and are gone once the volume is handed over.
+    let restore_selector = format!("kopiur.home-operations.com/restore-uid={restore_uid}");
+    let by_restore = ListParams::default().labels(&restore_selector);
+    wait_until(
+        "central restore artifacts reaped",
+        default_timeout(),
+        poll_interval(),
+        || async {
+            let jobs = central_jobs.list(&by_restore).await?.items.len();
+            let primes = central_pvcs.list(&by_restore).await?.items.len();
+            Ok((jobs == 0 && primes == 0).then_some(()))
+        },
+    )
+    .await
+    .expect("the central prime PVC and mover Job should be cleaned up");
+
+    // Deleting the Restore runs its finalizer and releases it.
+    let _ = workload_pod_api
+        .delete(reader, &DeleteParams::default())
+        .await;
+    restores
+        .delete(restore, &DeleteParams::default())
+        .await
+        .expect("delete Restore");
+    wait_until(
+        "Restore gone",
+        default_timeout(),
+        poll_interval(),
+        || async { Ok(restores.get_opt(restore).await?.is_none().then_some(())) },
+    )
+    .await
+    .expect("the Restore's cleanup finalizer should release it");
+    kopiur_e2e::pvc::delete_pvc_and_consumers(&client, WORKLOAD_NS, claim)
+        .await
+        .expect("delete the restored PVC");
 
     // Deleting the Snapshot deletes the central Job: nothing else would, since
     // it has no owner reference.

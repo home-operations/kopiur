@@ -570,6 +570,22 @@ pub struct RestoreStatus {
     /// `claims.<pvc>` must exist on `RestoreClaimStatus`.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub claims: std::collections::BTreeMap<String, RestoreClaimStatus>,
+    /// Where this populator restore's prime PVCs and mover Jobs live when that
+    /// is not the `Restore`'s own namespace: set under the repository's
+    /// `execution.mode: Central`, absent otherwise. Pinned before anything is
+    /// created there, so cleanup finds the objects even after the repository's
+    /// `execution` is edited or the repository is deleted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution: Option<RestoreExecutionStatus>,
+}
+
+/// The pinned location of a centrally executed populator restore.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct RestoreExecutionStatus {
+    /// The namespace holding the prime PVCs and mover Jobs (the operator
+    /// namespace).
+    pub namespace: String,
 }
 
 /// The state of ONE claiming PVC of a `target.populator` restore (#443).

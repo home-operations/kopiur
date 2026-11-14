@@ -840,8 +840,12 @@ spec:
                       `VolumeSnapshot`), and the mover reads that PVC. No mover pod and no
                       repository credential then enters the workload namespace.
                       
-                      `Central` applies to backups only (restores, verification, and browse
-                      sessions still run in the consumer's namespace) and serves only a
+                      `Central` applies to backups and to populator restores
+                      (`Restore.spec.target.populator`): the restore mover fills a temporary
+                      PVC in the operator namespace, and its volume is then handed to the PVC
+                      that claims the `Restore`. Restores into a named PVC, verification, pins
+                      and browse sessions still run in the consumer's namespace. A backup is
+                      served only for a
                       single-PVC source under `copyMethod: Snapshot` with no
                       `sourcePathOverride` (the override is also the mount path inside the
                       mover pod, which holds the repository credentials); any other source or

@@ -1551,12 +1551,18 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
     // `kopiur.home-operations.com/privileged-movers` annotation — a tenant there could
     // otherwise reuse the minted mover SA at that privilege. Refuse with a clear
     // `MoverPermitted=False` condition + Event otherwise.
-    if kopiur_api::common::requires_privilege_resolved(
+    let unpermitted = if kopiur_api::common::requires_privilege_resolved(
         Some(&resolved_mover.security_context),
         resolved_mover.pod_security_context.as_ref(),
         privileged_mode,
-    ) && !io::namespace_allows_privileged_movers(&ctx.client, &namespace).await?
-    {
+    ) {
+        // A central mover pod runs in the operator namespace, so that namespace
+        // must opt in as well: the workload namespace cannot consent for it.
+        io::privileged_opt_in_missing(&ctx.client, &namespace, site.namespace(&namespace)).await?
+    } else {
+        None
+    };
+    if let Some(gate_ns) = unpermitted.as_deref() {
         let sa = ctx
             .mover_service_account
             .as_deref()
@@ -1600,7 +1606,7 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
             ),
         };
         let msg =
-            io::privileged_mover_message(carrier_kind, carrier_name, carrier_field, &namespace, sa);
+            io::privileged_mover_message(carrier_kind, carrier_name, carrier_field, gate_ns, sa);
         // LIVE base for the array AND the no-op comparison: the #464 inherit heal
         // wrote to this same array moments ago and a `conditions` patch REPLACES
         // it, so the reconcile-start copy would resurrect the hold onto a run
@@ -2337,6 +2343,25 @@ fn launch_site(
         io::central_source_refusal(config.spec.copy_method, central_source, &repo_ref.name)
     {
         return Err(refusal);
+    }
+    // A central mover takes the repository's Secrets and volumes from the
+    // operator namespace by name, so only a ClusterRepository may name them. A
+    // pin outlives an edit of the policy's repository, hence the check here.
+    match repo.kind {
+        kopiur_api::common::RepositoryKind::ClusterRepository => {}
+        kopiur_api::common::RepositoryKind::Repository => {
+            return Err((
+                io::REASON_CENTRAL_UNSUPPORTED,
+                format!(
+                    "this backup was started centrally, but its repository now resolves to the \
+                     namespaced Repository `{}`. Central execution only serves a \
+                     ClusterRepository, because the mover takes the repository's Secrets and \
+                     volumes from the operator namespace. Fix: point the SnapshotPolicy back at \
+                     the ClusterRepository. The next scheduled run (or a new Snapshot) retries",
+                    repo_ref.name
+                ),
+            ));
+        }
     }
     match pinned {
         io::MoverSite::Central(_) => Ok(pinned.clone()),
