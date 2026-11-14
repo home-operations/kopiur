@@ -659,6 +659,336 @@ pub async fn delete_central_job(
     }
 }
 
+/// The finalizer the CSI external-provisioner (v6.3 and later) puts on a
+/// `VolumeSnapshot` while a claim is being provisioned from it.
+pub const PROVISIONER_SOURCE_PROTECTION_FINALIZER: &str =
+    "provisioner.storage.kubernetes.io/volumesnapshot-as-source-protection";
+
+/// Annotation Kopiur puts on a run's `VolumeSnapshot` once it has SEEN the run's
+/// staged claim bound, i.e. the restore from that snapshot finished. It is the
+/// evidence [`source_protection_decision`] requires, recorded on the object so
+/// it outlives the claim.
+pub const STAGE_RESTORED_ANNOTATION: &str = "kopiur.home-operations.com/stage-restored";
+
+/// The most one release attempt may take. The attempt runs inside the terminal
+/// and deletion paths of a Snapshot, and its API calls otherwise inherit the
+/// client's long read timeout.
+const RELEASE_ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// How long a deleted `VolumeSnapshot` that cannot be released yet is polled
+/// before cleanup stops waiting on it. Past this, whatever holds the snapshot is
+/// not something Kopiur can settle, and the provisioner's own sweep is left to.
+const SOURCE_PROTECTION_RETRY_WINDOW_SECS: i64 = 60;
+
+/// Page size for the cluster-wide claim list in [`release_source_protection`].
+const CLAIM_LIST_PAGE_SIZE: u32 = 500;
+
+/// Whether the staged-source cleanup has anything left to come back for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StageCleanup {
+    /// Everything this run staged is deleted, or is being deleted with nothing
+    /// left for Kopiur to do.
+    Complete,
+    /// The `VolumeSnapshot` is deleted but still held; look again shortly.
+    Retry,
+}
+
+/// What to do about the provisioner's finalizer on a run's `VolumeSnapshot`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceProtection {
+    /// Nothing to release: the finalizer is absent, or the snapshot is not
+    /// being deleted (a finalizer on a live snapshot is doing its job).
+    NotHeld,
+    /// Held, but Kopiur never saw the run's restore finish (the backup was
+    /// aborted while the staged claim was still provisioning). The provisioner
+    /// may still be creating a volume from the snapshot, so the finalizer is
+    /// left to it.
+    Unproven,
+    /// The run's restore finished, but another claim is still being provisioned
+    /// from the snapshot.
+    Wait,
+    /// The finalizer is stale: remove it so the deletion can finish.
+    Release,
+}
+
+/// Decide [`SourceProtection`] for a `VolumeSnapshot`.
+///
+/// After a cross-namespace restore the external-provisioner does not remove its
+/// finalizer (kubernetes-csi/external-provisioner#1613), so the snapshot Kopiur
+/// deletes stays `Terminating` until the provisioner's orphan sweep runs, or for
+/// good where that sweep is off.
+///
+/// Kopiur removes it only when all of these hold:
+/// - Kopiur requested the deletion (`deleting`);
+/// - Kopiur saw the run's own staged claim bound (`restored`). A claim that is
+///   merely gone proves nothing: the provisioner keeps creating the volume of a
+///   deleted claim, and that still reads the snapshot;
+/// - no other claim anywhere is still being provisioned from the snapshot
+///   (`pending_claims`), which is the provisioner sweep's own test.
+pub fn source_protection_decision(
+    finalizers: &[String],
+    deleting: bool,
+    restored: bool,
+    pending_claims: bool,
+) -> SourceProtection {
+    let held = finalizers
+        .iter()
+        .any(|f| f == PROVISIONER_SOURCE_PROTECTION_FINALIZER);
+    match (deleting && held, restored, pending_claims) {
+        (false, _, _) => SourceProtection::NotHeld,
+        (true, false, _) => SourceProtection::Unproven,
+        (true, true, true) => SourceProtection::Wait,
+        (true, true, false) => SourceProtection::Release,
+    }
+}
+
+/// Whether a staged claim shows that its restore from the `VolumeSnapshot`
+/// `vs_ns/vs_name` finished: it still names that snapshot as its data source
+/// and it is bound to a volume. Only then is the provisioner done reading the
+/// snapshot on this claim's behalf. A bound claim that lost its reference (the
+/// feature gate is off) restored nothing and proves nothing.
+pub fn stage_restore_finished(staged: &PersistentVolumeClaim, vs_ns: &str, vs_name: &str) -> bool {
+    if !cross_namespace_ref_survived(staged, vs_ns, vs_name) {
+        return false;
+    }
+    let bound_phase = staged
+        .status
+        .as_ref()
+        .and_then(|s| s.phase.as_deref())
+        .is_some_and(|phase| phase == "Bound");
+    let has_volume = staged
+        .spec
+        .as_ref()
+        .and_then(|s| s.volume_name.as_deref())
+        .is_some_and(|v| !v.is_empty());
+    bound_phase && has_volume
+}
+
+/// Whether `pvc` is still being provisioned from the `VolumeSnapshot`
+/// `vs_ns/vs_name`: it names that snapshot as its data source and has not bound.
+/// The external-provisioner's own test for "this snapshot is still in use"
+/// (`buildPendingSnapshotIndex` in its `snapshot_finalizer_controller.go`).
+pub fn claim_pending_from_snapshot(
+    pvc: &PersistentVolumeClaim,
+    vs_ns: &str,
+    vs_name: &str,
+) -> bool {
+    let pending = pvc
+        .status
+        .as_ref()
+        .and_then(|s| s.phase.as_deref())
+        .is_none_or(|phase| phase.is_empty() || phase == "Pending");
+    if !pending {
+        return false;
+    }
+    let Some(spec) = pvc.spec.as_ref() else {
+        return false;
+    };
+    let is_snapshot = |kind: &str, group: Option<&str>| {
+        kind == "VolumeSnapshot" && group.is_none_or(|g| g == SNAPSHOT_GROUP)
+    };
+    let claim_ns = pvc.metadata.namespace.as_deref().unwrap_or_default();
+    // `dataSource` is namespace-local; `dataSourceRef` may name another namespace.
+    if let Some(source) = &spec.data_source
+        && is_snapshot(&source.kind, source.api_group.as_deref())
+    {
+        return claim_ns == vs_ns && source.name == vs_name;
+    }
+    if let Some(source) = &spec.data_source_ref
+        && is_snapshot(&source.kind, source.api_group.as_deref())
+    {
+        let source_ns = source
+            .namespace
+            .as_deref()
+            .filter(|ns| !ns.is_empty())
+            .unwrap_or(claim_ns);
+        return source_ns == vs_ns && source.name == vs_name;
+    }
+    false
+}
+
+/// Whether a snapshot whose deletion was requested at `deleted_at` (Unix
+/// seconds) is still worth polling at `now`.
+pub fn within_release_window(deleted_at: i64, now: i64) -> bool {
+    now.saturating_sub(deleted_at) < SOURCE_PROTECTION_RETRY_WINDOW_SECS
+}
+
+/// Record on the run's `VolumeSnapshot` that its restore finished (see
+/// [`STAGE_RESTORED_ANNOTATION`]). Best effort: a failure only means the
+/// finalizer is left to the provisioner.
+pub async fn mark_stage_restored(client: &kube::Client, ns: &str, vs_name: &str) {
+    let patch = serde_json::json!({
+        "metadata": { "annotations": { STAGE_RESTORED_ANNOTATION: "true" } }
+    });
+    let result = super::staging::volume_snapshot_api(client, ns)
+        .patch(
+            vs_name,
+            &kube::api::PatchParams::default(),
+            &kube::api::Patch::Merge(&patch),
+        )
+        .await;
+    match result {
+        Ok(_) => {}
+        Err(kube::Error::Api(e)) if e.code == 404 => {}
+        Err(e) => tracing::debug!(
+            namespace = ns,
+            volume_snapshot = vs_name,
+            error = %e,
+            "could not record that the staged restore finished"
+        ),
+    }
+}
+
+/// Whether any claim in the cluster is still being provisioned from the
+/// `VolumeSnapshot` `ns/vs_name`. Cluster-wide, like the provisioner's sweep: a
+/// `ReferenceGrant` Kopiur did not write can let any namespace restore from it.
+/// Paginated, because an incomplete list would read as "nobody is restoring".
+async fn any_claim_pending_from(client: &kube::Client, ns: &str, vs_name: &str) -> Result<bool> {
+    let claims: Api<PersistentVolumeClaim> = Api::all(client.clone());
+    let mut token: Option<String> = None;
+    loop {
+        let mut params = kube::api::ListParams::default().limit(CLAIM_LIST_PAGE_SIZE);
+        if let Some(t) = &token {
+            params = params.continue_token(t);
+        }
+        let page = claims.list(&params).await?;
+        if page
+            .items
+            .iter()
+            .any(|pvc| claim_pending_from_snapshot(pvc, ns, vs_name))
+        {
+            return Ok(true);
+        }
+        token = page.metadata.continue_.filter(|t| !t.is_empty());
+        if token.is_none() {
+            return Ok(false);
+        }
+    }
+}
+
+/// What one attempt at the release found.
+enum ReleaseAttempt {
+    /// Nothing more to do: gone, not held, unproven, or released.
+    Settled,
+    /// Not releasable right now; `deleted_at` (Unix seconds) bounds the wait.
+    Blocked { deleted_at: i64 },
+}
+
+/// One attempt to release `ns/vs_name` (see [`release_source_protection`]).
+async fn attempt_release(client: &kube::Client, ns: &str, vs_name: &str) -> Result<ReleaseAttempt> {
+    let vs_api = super::staging::volume_snapshot_api(client, ns);
+    let Some(vs) = vs_api.get_opt(vs_name).await? else {
+        return Ok(ReleaseAttempt::Settled);
+    };
+    let finalizers = vs.metadata.finalizers.clone().unwrap_or_default();
+    let deleted_at = vs
+        .metadata
+        .deletion_timestamp
+        .as_ref()
+        .map(|t| t.0.as_second());
+    let restored = vs.metadata.annotations.as_ref().is_some_and(|a| {
+        a.get(STAGE_RESTORED_ANNOTATION)
+            .is_some_and(|v| v == "true")
+    });
+    // The claim list is cluster-wide; skip it unless it can change the answer.
+    match source_protection_decision(&finalizers, deleted_at.is_some(), restored, false) {
+        SourceProtection::NotHeld | SourceProtection::Unproven => {
+            return Ok(ReleaseAttempt::Settled);
+        }
+        SourceProtection::Wait | SourceProtection::Release => {}
+    }
+    let blocked = ReleaseAttempt::Blocked {
+        deleted_at: deleted_at.unwrap_or_default(),
+    };
+    if any_claim_pending_from(client, ns, vs_name).await? {
+        return Ok(blocked);
+    }
+    let remaining: Vec<&String> = finalizers
+        .iter()
+        .filter(|f| *f != PROVISIONER_SOURCE_PROTECTION_FINALIZER)
+        .collect();
+    // The resourceVersion makes this a compare-and-swap: a finalizer list that
+    // changed since the read is re-evaluated, not overwritten.
+    let patch = serde_json::json!({
+        "metadata": {
+            "resourceVersion": vs.metadata.resource_version,
+            "finalizers": remaining,
+        }
+    });
+    match vs_api
+        .patch(
+            vs_name,
+            &kube::api::PatchParams::default(),
+            &kube::api::Patch::Merge(&patch),
+        )
+        .await
+    {
+        Ok(_) => {
+            tracing::info!(
+                namespace = ns,
+                volume_snapshot = vs_name,
+                "removed the CSI provisioner's stale source-protection finalizer"
+            );
+            Ok(ReleaseAttempt::Settled)
+        }
+        Err(kube::Error::Api(e)) if e.code == 404 => Ok(ReleaseAttempt::Settled),
+        Err(kube::Error::Api(e)) if e.code == 409 => Ok(blocked),
+        Err(e) => Err(Error::Kube(e)),
+    }
+}
+
+/// Release a central run's deleted `VolumeSnapshot` from the provisioner's stale
+/// finalizer (see [`source_protection_decision`]).
+///
+/// This is an optional workaround, so it never fails the reconcile and never
+/// holds it for long: one attempt is cut off at [`RELEASE_ATTEMPT_TIMEOUT`], an
+/// API error or a cut-off is logged and read as "not released", and
+/// [`StageCleanup::Retry`] is returned only inside the bounded window after the
+/// deletion. Past it the finalizer is left to the provisioner; the next
+/// terminal reconcile of the Snapshot tries again.
+pub async fn release_source_protection(
+    client: &kube::Client,
+    ns: &str,
+    vs_name: &str,
+) -> StageCleanup {
+    let attempt = tokio::time::timeout(
+        RELEASE_ATTEMPT_TIMEOUT,
+        attempt_release(client, ns, vs_name),
+    )
+    .await;
+    let attempt = match attempt {
+        Ok(attempt) => attempt,
+        Err(_) => {
+            tracing::warn!(
+                namespace = ns,
+                volume_snapshot = vs_name,
+                "timed out checking the CSI provisioner's source-protection finalizer; leaving \
+                 it to the provisioner"
+            );
+            return StageCleanup::Complete;
+        }
+    };
+    match attempt {
+        Ok(ReleaseAttempt::Settled) => StageCleanup::Complete,
+        Ok(ReleaseAttempt::Blocked { deleted_at })
+            if within_release_window(deleted_at, chrono::Utc::now().timestamp()) =>
+        {
+            StageCleanup::Retry
+        }
+        Ok(ReleaseAttempt::Blocked { .. }) => StageCleanup::Complete,
+        Err(e) => {
+            tracing::warn!(
+                namespace = ns,
+                volume_snapshot = vs_name,
+                error = %e,
+                "could not check the CSI provisioner's source-protection finalizer; leaving it \
+                 to the provisioner"
+            );
+            StageCleanup::Complete
+        }
+    }
+}
+
 /// Whether the Job `job_name` in `namespace` is a central mover Job, which an
 /// in-namespace run of that name must not delete. Central Jobs exist only in the
 /// operator namespace, so every other namespace answers `false` without a read.
@@ -1114,6 +1444,191 @@ mod tests {
             assert!(!is_safe_central_mount(bad), "{bad:?} must be refused");
         }
         assert!(!is_safe_central_mount(&format!("/pvc/{}", "a".repeat(254))));
+    }
+
+    fn finalizers(names: &[&str]) -> Vec<String> {
+        names.iter().map(|n| n.to_string()).collect()
+    }
+
+    /// kubernetes-csi/external-provisioner#1613: the provisioner's finalizer is
+    /// left on the VolumeSnapshot after a cross-namespace restore. It is removed
+    /// only when Kopiur asked for the deletion, saw the restore finish, and
+    /// nothing else is still restoring.
+    #[test]
+    fn the_stale_provisioner_finalizer_is_released_only_with_proof_the_restore_finished() {
+        use SourceProtection::{NotHeld, Release, Unproven, Wait};
+        let held = finalizers(&[
+            "snapshot.storage.kubernetes.io/volumesnapshot-bound-protection",
+            PROVISIONER_SOURCE_PROTECTION_FINALIZER,
+        ]);
+        assert_eq!(
+            source_protection_decision(&held, true, true, false),
+            Release
+        );
+        // Another claim is still being provisioned from it.
+        assert_eq!(source_protection_decision(&held, true, true, true), Wait);
+        // The run was aborted while its claim was provisioning. The claim being
+        // gone proves nothing: the provisioner still creates a deleted claim's
+        // volume, and that reads the snapshot. Never release on absence alone.
+        assert_eq!(
+            source_protection_decision(&held, true, false, false),
+            Unproven
+        );
+        assert_eq!(
+            source_protection_decision(&held, true, false, true),
+            Unproven
+        );
+        // Not being deleted: never strip a finalizer from a live snapshot.
+        assert_eq!(
+            source_protection_decision(&held, false, true, false),
+            NotHeld
+        );
+        // Held by someone else's finalizer only: not Kopiur's to release.
+        let others =
+            finalizers(&["snapshot.storage.kubernetes.io/volumesnapshot-as-source-protection"]);
+        assert_eq!(
+            source_protection_decision(&others, true, true, false),
+            NotHeld
+        );
+        assert_eq!(source_protection_decision(&[], true, true, false), NotHeld);
+    }
+
+    #[test]
+    fn a_restore_counts_as_finished_only_for_a_bound_claim_of_that_snapshot() {
+        let pvc = |phase: Option<&str>, volume: Option<&str>| -> PersistentVolumeClaim {
+            serde_json::from_value(serde_json::json!({
+                "metadata": { "name": "c", "namespace": "kopiur-system" },
+                "spec": {
+                    "volumeName": volume,
+                    "dataSourceRef": {
+                        "apiGroup": SNAPSHOT_GROUP, "kind": "VolumeSnapshot",
+                        "name": "snap", "namespace": "billing",
+                    },
+                },
+                "status": { "phase": phase },
+            }))
+            .unwrap()
+        };
+        let finished = |pvc: &PersistentVolumeClaim| stage_restore_finished(pvc, "billing", "snap");
+        assert!(finished(&pvc(Some("Bound"), Some("pvc-1"))));
+        // Still provisioning, in every spelling of it.
+        assert!(!finished(&pvc(Some("Pending"), None)));
+        assert!(!finished(&pvc(None, None)));
+        assert!(!finished(&pvc(Some("Pending"), Some("pvc-1"))));
+        assert!(!finished(&pvc(Some("Bound"), None)));
+        assert!(!finished(&pvc(Some("Bound"), Some(""))));
+        assert!(!finished(&pvc(Some("Lost"), Some("pvc-1"))));
+        assert!(!finished(&PersistentVolumeClaim::default()));
+
+        // Bound, but not from this snapshot: the feature gate was off and the
+        // API server dropped the reference, so the claim is an empty volume.
+        let mut unreferenced = pvc(Some("Bound"), Some("pvc-1"));
+        unreferenced.spec.as_mut().unwrap().data_source_ref = None;
+        assert!(!finished(&unreferenced));
+        let bound = pvc(Some("Bound"), Some("pvc-1"));
+        assert!(!stage_restore_finished(&bound, "billing", "other"));
+        assert!(!stage_restore_finished(&bound, "payments", "snap"));
+    }
+
+    fn claim(
+        ns: &str,
+        phase: Option<&str>,
+        data_source: Option<&str>,
+        data_source_ref: Option<(&str, Option<&str>)>,
+    ) -> PersistentVolumeClaim {
+        serde_json::from_value(serde_json::json!({
+            "metadata": { "name": "c", "namespace": ns },
+            "spec": {
+                "dataSource": data_source.map(|name| serde_json::json!({
+                    "apiGroup": SNAPSHOT_GROUP, "kind": "VolumeSnapshot", "name": name,
+                })),
+                "dataSourceRef": data_source_ref.map(|(name, namespace)| serde_json::json!({
+                    "apiGroup": SNAPSHOT_GROUP, "kind": "VolumeSnapshot",
+                    "name": name, "namespace": namespace,
+                })),
+            },
+            "status": { "phase": phase },
+        }))
+        .unwrap()
+    }
+
+    /// The external-provisioner's own "still in use" test: a claim that names
+    /// the snapshot and has not bound.
+    #[test]
+    fn only_an_unbound_claim_of_that_snapshot_holds_it() {
+        let cross = |phase| {
+            claim(
+                "kopiur-system",
+                phase,
+                None,
+                Some(("snap", Some("billing"))),
+            )
+        };
+        assert!(claim_pending_from_snapshot(
+            &cross(Some("Pending")),
+            "billing",
+            "snap"
+        ));
+        // No status yet is as unbound as `Pending`.
+        assert!(claim_pending_from_snapshot(&cross(None), "billing", "snap"));
+        assert!(claim_pending_from_snapshot(
+            &cross(Some("")),
+            "billing",
+            "snap"
+        ));
+        // Provisioning finished: the snapshot is no longer needed.
+        assert!(!claim_pending_from_snapshot(
+            &cross(Some("Bound")),
+            "billing",
+            "snap"
+        ));
+        assert!(!claim_pending_from_snapshot(
+            &cross(Some("Lost")),
+            "billing",
+            "snap"
+        ));
+
+        // A namespace-local `dataSource`, and a `dataSourceRef` without a namespace.
+        let local = claim("billing", Some("Pending"), Some("snap"), None);
+        assert!(claim_pending_from_snapshot(&local, "billing", "snap"));
+        let local_ref = claim("billing", Some("Pending"), None, Some(("snap", None)));
+        assert!(claim_pending_from_snapshot(&local_ref, "billing", "snap"));
+        let empty_ns = claim("billing", Some("Pending"), None, Some(("snap", Some(""))));
+        assert!(claim_pending_from_snapshot(&empty_ns, "billing", "snap"));
+
+        // Another snapshot, or the same name in another namespace.
+        assert!(!claim_pending_from_snapshot(&local, "billing", "other"));
+        assert!(!claim_pending_from_snapshot(&local, "payments", "snap"));
+        let elsewhere = claim(
+            "kopiur-system",
+            Some("Pending"),
+            None,
+            Some(("snap", Some("payments"))),
+        );
+        assert!(!claim_pending_from_snapshot(&elsewhere, "billing", "snap"));
+
+        // Not a snapshot restore at all.
+        let plain = claim("billing", Some("Pending"), None, None);
+        assert!(!claim_pending_from_snapshot(&plain, "billing", "snap"));
+        let clone: PersistentVolumeClaim = serde_json::from_value(serde_json::json!({
+            "metadata": { "name": "c", "namespace": "billing" },
+            "spec": { "dataSource": { "kind": "PersistentVolumeClaim", "name": "snap" } },
+            "status": { "phase": "Pending" },
+        }))
+        .unwrap();
+        assert!(!claim_pending_from_snapshot(&clone, "billing", "snap"));
+    }
+
+    /// The wait on a held snapshot is bounded, so a claim Kopiur does not own
+    /// cannot keep a terminal Snapshot polling (or its deletion waiting) forever.
+    #[test]
+    fn a_held_snapshot_is_polled_for_a_bounded_time() {
+        assert!(within_release_window(1_000, 1_000));
+        assert!(within_release_window(1_000, 1_059));
+        assert!(!within_release_window(1_000, 1_060));
+        assert!(!within_release_window(1_000, 5_000));
+        // A deletion timestamp ahead of this clock still counts as recent.
+        assert!(within_release_window(1_000, 990));
     }
 
     #[test]

@@ -459,7 +459,7 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
                     // Complete; the requeue is a backstop for a missed event.
                     return Ok(Action::requeue(Duration::from_secs(15)));
                 }
-                io::cleanup_staged_source(
+                let stage = io::cleanup_staged_source(
                     &ctx.client,
                     &namespace,
                     &name,
@@ -468,6 +468,9 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
                     &uid,
                 )
                 .await?;
+                if stage == io::StageCleanup::Retry {
+                    return Ok(Action::requeue(STAGE_CLEANUP_RETRY));
+                }
             }
             // The credential copies die with the mover Job, not with this CR (#240).
             // Self-gated by its stamp, so this costs nothing once it has run; if the
@@ -576,7 +579,7 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
                 if !staged_teardown_ready(job.as_ref()) {
                     return Ok(Action::requeue(Duration::from_secs(15)));
                 }
-                io::cleanup_staged_source(
+                let stage = io::cleanup_staged_source(
                     &ctx.client,
                     &namespace,
                     &name,
@@ -585,6 +588,9 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
                     &uid,
                 )
                 .await?;
+                if stage == io::StageCleanup::Retry {
+                    return Ok(Action::requeue(STAGE_CLEANUP_RETRY));
+                }
             }
             // The credential copies die with the mover Job, not with this CR (#240).
             // Unlike the Succeeded arm this one has no steady-state timer, so keep a
@@ -2266,6 +2272,12 @@ pub(super) fn pin_may_be_unseen(phase: Option<&SnapshotPhase>) -> bool {
     }
 }
 
+/// How soon to look again while a central run's deleted `VolumeSnapshot` is
+/// still held by the CSI provisioner's finalizer (see
+/// [`io::release_source_protection`]). The wait is bounded there, so this
+/// cadence cannot turn into a standing poll.
+const STAGE_CLEANUP_RETRY: Duration = Duration::from_secs(5);
+
 /// How soon to look again when the cached Snapshot lags this run's own writes
 /// (its central pin, or the Job the previous pass created).
 const STALE_PIN_REQUEUE: Duration = Duration::from_secs(2);
@@ -3462,11 +3474,18 @@ async fn handle_deletion(
         }
         io::MoverSite::InNamespace | io::MoverSite::Central(_) => cached_site,
     };
+    // A central mover Job has no owner reference for the garbage collector to
+    // follow, so it goes here (its pods cascade with it). It goes BEFORE the
+    // stage: a Job that still exists would replace the pod the stage cleanup
+    // deletes, and the stage cleanup may return early to come back.
+    if let io::MoverSite::Central(central) = &site {
+        io::delete_central_job(&ctx.client, central, &uid).await?;
+    }
     // Reap any CSI staging objects (with the Retain→Delete PV patch) before the kopia
     // snapshot-deletion plan runs. OwnerRef GC removes the staged PVC/VolumeSnapshot when
     // the CR is deleted, but it can't flip a Retain PV's reclaim policy — so do it here.
     if has_stage(backup, &site) {
-        io::cleanup_staged_source(
+        let stage = io::cleanup_staged_source(
             &ctx.client,
             namespace,
             name,
@@ -3475,11 +3494,9 @@ async fn handle_deletion(
             &uid,
         )
         .await?;
-    }
-    // A central mover Job has no owner reference for the garbage collector to
-    // follow, so it goes here (its pods cascade with it).
-    if let io::MoverSite::Central(central) = &site {
-        io::delete_central_job(&ctx.client, central, &uid).await?;
+        if stage == io::StageCleanup::Retry {
+            return Ok(Action::requeue(STAGE_CLEANUP_RETRY));
+        }
     }
 
     // Namespace-deletion cascade (ADR-0005 §5): if the owning namespace is being torn

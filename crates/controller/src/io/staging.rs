@@ -38,7 +38,7 @@ use kube::{Api, ResourceExt};
 use kopiur_api::{CopyMethod, SnapshotPolicy, StagingSpec};
 
 use super::apply::{FIELD_MANAGER, apply};
-use super::central::{CentralSite, MoverSite};
+use super::central::{CentralSite, MoverSite, StageCleanup};
 use super::child_labels;
 use crate::error::{Error, Result};
 
@@ -106,7 +106,7 @@ pub(crate) fn fmt_go_duration_pub(d: std::time::Duration) -> String {
     fmt_go_duration(d)
 }
 
-fn volume_snapshot_api(client: &kube::Client, ns: &str) -> Api<DynamicObject> {
+pub(super) fn volume_snapshot_api(client: &kube::Client, ns: &str) -> Api<DynamicObject> {
     Api::namespaced_with(client.clone(), ns, &volume_snapshot_ar())
 }
 
@@ -1987,6 +1987,11 @@ fn staged_class_of(staged: &PersistentVolumeClaim) -> Option<String> {
 /// deleted only when its label names `snapshot_uid`; the `ReferenceGrant` beside
 /// the `VolumeSnapshot` is deleted with it. A claim that belongs to another run
 /// ([`MoverSite::is_foreign`]) is never touched, on either site.
+///
+/// Returns [`StageCleanup::Retry`] only for a central run whose deleted
+/// `VolumeSnapshot` is still held by the CSI provisioner's finalizer (see
+/// [`super::central::release_source_protection`]); in-namespace cleanup is
+/// always [`StageCleanup::Complete`].
 pub async fn cleanup_staged_source(
     client: &kube::Client,
     ns: &str,
@@ -1994,7 +1999,7 @@ pub async fn cleanup_staged_source(
     group: Option<&kopiur_api::SnapshotSourceGroup>,
     site: &MoverSite,
     snapshot_uid: &str,
-) -> Result<()> {
+) -> Result<StageCleanup> {
     let staged_pvc = site.staged_pvc_name(snapshot_cr);
     let stage_ns = site.namespace(ns);
     let vs_name = volume_snapshot_name(snapshot_cr);
@@ -2011,6 +2016,14 @@ pub async fn cleanup_staged_source(
         .await?
         .filter(|pvc| !site.is_foreign(&pvc.metadata, snapshot_uid));
     if let Some(pvc) = staged {
+        // The claim is about to go, and with it the only proof that the restore
+        // from the VolumeSnapshot finished. Record it first (central runs only:
+        // see `central::source_protection_decision`).
+        if let MoverSite::Central(_) = site
+            && super::central::stage_restore_finished(&pvc, ns, &vs_name)
+        {
+            super::central::mark_stage_restored(client, ns, &vs_name).await;
+        }
         // Release pvc-protection: delete the finished mover pod(s) (the backup Job is
         // named after the Snapshot CR). The Job object itself is preserved. Use
         // list + delete-by-name (not delete_collection), since the controller is granted
@@ -2063,22 +2076,25 @@ pub async fn cleanup_staged_source(
             &group.volume_group_snapshot_name,
         )
         .await?;
-        return Ok(());
+        return Ok(StageCleanup::Complete);
     }
 
     let vs_api = volume_snapshot_api(client, ns);
     if vs_api.get_opt(&vs_name).await?.is_some() {
         delete_ignore_404(&vs_api, &vs_name).await?;
     }
-    if let MoverSite::Central(_) = site {
-        // 404-tolerant on both counts: already gone, or the kind is not served.
-        delete_ignore_404(
-            &super::central::reference_grant_api(client, ns),
-            &super::central::reference_grant_name(snapshot_cr),
-        )
-        .await?;
+    match site {
+        MoverSite::InNamespace => Ok(StageCleanup::Complete),
+        MoverSite::Central(_) => {
+            // 404-tolerant on both counts: already gone, or the kind is not served.
+            delete_ignore_404(
+                &super::central::reference_grant_api(client, ns),
+                &super::central::reference_grant_name(snapshot_cr),
+            )
+            .await?;
+            Ok(super::central::release_source_protection(client, ns, &vs_name).await)
+        }
     }
-    Ok(())
 }
 
 async fn delete_ignore_404<K>(api: &Api<K>, name: &str) -> Result<()>

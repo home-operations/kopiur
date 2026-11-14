@@ -207,11 +207,26 @@ their location in `status.job`.
 Deleting a `Snapshot` at any point, also while its stage is still being
 prepared, removes all of these objects.
 
-Some versions of the CSI external-provisioner do not remove their protection
-finalizer from the `VolumeSnapshot` after a cross-namespace restore. The
-`VolumeSnapshot` then stays `Terminating` until the periodic sweep of the
-provisioner removes the finalizer (5 minutes by default). See
+The CSI external-provisioner (v6.3 and later) does not remove its protection
+finalizer from the `VolumeSnapshot` after a cross-namespace restore. See
 [external-provisioner issue 1613](https://github.com/kubernetes-csi/external-provisioner/issues/1613).
+Without help, the deleted `VolumeSnapshot` stays `Terminating` until the
+periodic sweep of the provisioner runs (5 minutes by default), or for good where
+that sweep is off.
+
+Kopiur therefore tries to remove that finalizer itself, when all of these are
+true:
+
+- Kopiur already deleted the `VolumeSnapshot`.
+- Kopiur saw the staged PVC of the backup bound. That proves the restore from
+  the `VolumeSnapshot` finished.
+- No unbound PVC in the cluster restores from the `VolumeSnapshot`. The sweep
+  of the provisioner uses the same test.
+
+This step is best effort. If a backup stops while its staged PVC is still being
+provisioned, Kopiur cannot prove that the restore finished. If an API call for
+this step fails, Kopiur does not retry it for long. In both cases Kopiur leaves
+the finalizer to the provisioner.
 
 If you remove the finalizer of a `Snapshot` by hand, Kopiur does not run this
 cleanup. Find leftovers with:
