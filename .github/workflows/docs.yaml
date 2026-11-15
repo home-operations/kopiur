@@ -30,7 +30,7 @@ jobs:
       # Only Rust, for the rustdoc the site publishes under /rustdoc/; the Astro
       # action below brings its own node and pnpm.
       - name: Setup Mise
-        uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b # v5.2.7
+        uses: jdx/mise-action@d5574b52816a478f9d4e6529a3f6ff17a8a36785 # v5.2.8
         with:
           experimental: true
           install_args: --locked rust
