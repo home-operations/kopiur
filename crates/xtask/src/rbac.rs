@@ -69,12 +69,13 @@ const STREAM_MOVER_NAME: &str = "kopiur-stream-mover";
 /// Central`).
 ///
 /// A central mover runs in the operator namespace and patches the status of the
-/// `Snapshot` it backs up, or of the `Restore` it populates, in a workload
-/// namespace. Its ONE ServiceAccount is therefore bound in every namespace that
-/// uses central execution. It holds those two status subresources and nothing
-/// else: the generic mover role's `configmaps` verbs and its other status
-/// kinds, summed over every such namespace, would hand one pod a cluster-wide
-/// write the in-namespace model never grants.
+/// object it works for in a workload namespace: the `Snapshot` it backs up or
+/// pins, the `Restore` it populates, or the `SnapshotPolicy` it verifies. Its
+/// ONE ServiceAccount is therefore bound in every namespace that uses central
+/// execution. It holds those three status subresources and nothing else: the
+/// generic mover role's `configmaps` verbs and its other status kinds, summed
+/// over every such namespace, would hand one pod a cluster-wide write the
+/// in-namespace model never grants.
 ///
 /// Cluster install only: central execution spans two namespaces, which a
 /// namespaced install's Role cannot.
@@ -456,13 +457,18 @@ fn stream_mover_rules(cluster: bool) -> Vec<PolicyRule> {
     rules
 }
 
-/// Rules for the dedicated central mover: the status of the two kinds it runs
-/// for (a backup's `Snapshot`, a populator `Restore`). See
-/// [`CENTRAL_MOVER_NAME`] for why nothing else belongs here.
+/// Rules for the dedicated central mover: the status of the three kinds it
+/// runs for (a backup's or a pin's `Snapshot`, a populator `Restore`, a
+/// verification's `SnapshotPolicy`). See [`CENTRAL_MOVER_NAME`] for why nothing
+/// else belongs here.
 fn central_mover_rules() -> Vec<PolicyRule> {
     vec![rule(
         &[KOPIA_GROUP],
-        &["snapshots/status".into(), "restores/status".into()],
+        &[
+            "snapshots/status".into(),
+            "restores/status".into(),
+            "snapshotpolicies/status".into(),
+        ],
         &["get", "patch"],
     )]
 }

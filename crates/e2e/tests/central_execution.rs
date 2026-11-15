@@ -6,7 +6,9 @@
 //! 1. **Central backup**: a CSI PVC in a workload namespace that holds neither the
 //!    repository credentials nor the repository volume is backed up by a mover Job
 //!    in the operator namespace. Nothing runs in, and no Secret enters, the
-//!    workload namespace; every transient object is reaped afterwards.
+//!    workload namespace; every transient object is reaped afterwards. The same
+//!    scenario then restores, verifies and pins the snapshot, all from the
+//!    operator namespace.
 //! 2. **Refusal**: a policy the central path cannot serve (`copyMethod: Direct`)
 //!    fails with the reason, instead of quietly running a mover beside the source.
 //!
@@ -22,7 +24,7 @@
 mod common;
 use common::*;
 
-use kube::api::{DeleteParams, ListParams, PostParams};
+use kube::api::{DeleteParams, ListParams, Patch, PatchParams, PostParams};
 use kube::core::{ApiResource, DynamicObject, GroupVersionKind};
 use kube::{Api, Client, ResourceExt};
 
@@ -282,6 +284,35 @@ async fn central_backup_runs_in_the_operator_namespace_and_cleans_up() {
         stats["sizeBytes"].as_i64().unwrap_or(0) >= MARKER.len() as i64,
         "the snapshot must contain the marker's bytes: {status}"
     );
+
+    // Verification and a pin read only the repository. Start both now, so they
+    // run while the rest of the scenario does; they are checked further down.
+    policies
+        .patch(
+            policy,
+            &PatchParams::default(),
+            &Patch::Merge(&serde_json::json!({
+                "spec": { "verification": {
+                    "quick": { "schedule": { "cron": "* * * * *" } }
+                } }
+            })),
+        )
+        .await
+        .expect("patch verification onto the SnapshotPolicy");
+    backups
+        .patch(
+            backup,
+            &PatchParams::default(),
+            &Patch::Merge(&serde_json::json!({ "spec": { "pin": true } })),
+        )
+        .await
+        .expect("pin the Snapshot");
+    let policy_uid = policies
+        .get(policy)
+        .await
+        .expect("get SnapshotPolicy")
+        .uid()
+        .expect("policy uid");
 
     // The run pinned where its Job lives: the operator namespace.
     assert_eq!(
@@ -566,6 +597,73 @@ async fn central_backup_runs_in_the_operator_namespace_and_cleans_up() {
         .await
         .expect("delete the restored PVC");
 
+    // --- Verification and pin, also from the operator namespace --------------
+    // The workload namespace holds no credentials, so a verify or pin mover
+    // there could not even start: these two results prove the central site.
+    wait_until(
+        "SnapshotPolicy.status.lastVerified is stamped by a central quick verify",
+        default_timeout(),
+        poll_interval(),
+        || async {
+            let s = status_json(&policies, policy).await;
+            Ok(s.get("lastVerified")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(|_| ()))
+        },
+    )
+    .await
+    .expect("a central quick verify must stamp status.lastVerified");
+    let policy_selector = format!("kopiur.home-operations.com/policy-uid={policy_uid}");
+    let by_policy = ListParams::default().labels(&policy_selector);
+    let verify_jobs = central_jobs
+        .list(&by_policy)
+        .await
+        .expect("list verify Jobs");
+    assert!(
+        !verify_jobs.items.is_empty(),
+        "the verify Job must be in the operator namespace, labelled with the policy UID"
+    );
+    for job in &verify_jobs.items {
+        assert!(
+            job.metadata.owner_references.is_none(),
+            "a central verify Job must carry no owner reference: {:?}",
+            job.metadata.owner_references
+        );
+    }
+    wait_until(
+        "Snapshot.status.pinned is recorded by a central pin",
+        default_timeout(),
+        poll_interval(),
+        || async {
+            let s = status_json(&backups, backup).await;
+            Ok((s.get("pinned").and_then(|v| v.as_bool()) == Some(true)).then_some(()))
+        },
+    )
+    .await
+    .expect("a central pin mover must record status.pinned");
+    let stray: Vec<String> = workload_jobs
+        .list(&ListParams::default())
+        .await
+        .expect("list workload Jobs")
+        .items
+        .iter()
+        .map(|j| j.name_any())
+        .collect();
+    assert!(
+        stray.is_empty(),
+        "no verify or pin Job may run in the workload namespace: {stray:?}"
+    );
+    assert!(
+        workload_secrets
+            .list(&ListParams::default())
+            .await
+            .expect("list workload Secrets")
+            .items
+            .is_empty(),
+        "verification and the pin must not copy a Secret into the workload namespace"
+    );
+
     // Deleting the Snapshot deletes the central Job: nothing else would, since
     // it has no owner reference.
     backups
@@ -587,7 +685,23 @@ async fn central_backup_runs_in_the_operator_namespace_and_cleans_up() {
     .await
     .expect("the central mover Job should be deleted with its Snapshot");
 
+    // Deleting the policy deletes its central verify Jobs, for the same reason.
     let _ = policies.delete(policy, &DeleteParams::default()).await;
+    wait_until(
+        "central verify Jobs deleted with their SnapshotPolicy",
+        default_timeout(),
+        poll_interval(),
+        || async {
+            Ok(central_jobs
+                .list(&by_policy)
+                .await?
+                .items
+                .is_empty()
+                .then_some(()))
+        },
+    )
+    .await
+    .expect("the central verify Jobs should be deleted with their SnapshotPolicy");
     let _ = crepos
         .delete("e2e-central-repo", &DeleteParams::default())
         .await;

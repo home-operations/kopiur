@@ -58,6 +58,13 @@ pub use kopiur_api::consts::CENTRAL_RESTORE_UID_LABEL;
 /// belongs to.
 pub const CENTRAL_RESTORE_ANNOTATION: &str = "kopiur.home-operations.com/restore";
 
+/// The policy-side counterpart of [`CENTRAL_SNAPSHOT_UID_LABEL`]: the UID of the
+/// `SnapshotPolicy` a central verification Job serves.
+pub const CENTRAL_POLICY_UID_LABEL: &str = "kopiur.home-operations.com/policy-uid";
+/// Annotation naming the `SnapshotPolicy` (`<namespace>/<name>`) a central
+/// object belongs to.
+pub const CENTRAL_POLICY_ANNOTATION: &str = "kopiur.home-operations.com/policy";
+
 /// The source cannot be backed up centrally (wrong copy method or source shape).
 pub const REASON_CENTRAL_UNSUPPORTED: &str = "CentralExecutionUnsupported";
 /// This install cannot run movers centrally (no operator namespace, or a
@@ -218,30 +225,167 @@ pub fn central_site_for(
     snapshot_ns: &str,
     snapshot_name: &str,
 ) -> std::result::Result<CentralSite, (&'static str, String)> {
+    let namespace = central_namespace(operator_namespace, namespaced_install).map_err(
+        |(reason, message)| {
+            (
+                reason,
+                format!("{message}. The next scheduled run (or a new Snapshot) retries"),
+            )
+        },
+    )?;
+    Ok(CentralSite {
+        namespace,
+        job_name: central_job_name(snapshot_ns, snapshot_name),
+    })
+}
+
+/// The namespace central movers run in, or why this install has none. The
+/// message is a full sentence without its final period, so a caller can append
+/// what happens next.
+pub fn central_namespace(
+    operator_namespace: Option<&str>,
+    namespaced_install: bool,
+) -> std::result::Result<String, (&'static str, String)> {
     if namespaced_install {
         return Err((
             REASON_CENTRAL_UNAVAILABLE,
             "the repository sets `execution.mode: Central`, but this is a namespaced install \
-             (`installScope: namespace`), whose Role cannot create objects in a second namespace. \
-             Fix: use a cluster-scoped install, or remove `execution` from the ClusterRepository. \
-             The next scheduled run (or a new Snapshot) retries"
+             (`installScope: namespaced`), whose Role cannot create objects in a second \
+             namespace. Fix: use a cluster-scoped install, or remove `execution` from the \
+             ClusterRepository"
                 .to_string(),
         ));
     }
-    let Some(namespace) = operator_namespace.filter(|ns| !ns.is_empty()) else {
-        return Err((
+    match operator_namespace.filter(|ns| !ns.is_empty()) {
+        Some(namespace) => Ok(namespace.to_string()),
+        None => Err((
             REASON_CENTRAL_UNAVAILABLE,
             "the repository sets `execution.mode: Central`, but the operator does not know its own \
              namespace. Fix: set the `KOPIUR_NAMESPACE` environment variable on the controller \
-             (the Helm chart sets it), or remove `execution` from the ClusterRepository. The next \
-             scheduled run (or a new Snapshot) retries"
+             (the Helm chart sets it), or remove `execution` from the ClusterRepository"
                 .to_string(),
-        ));
-    };
-    Ok(CentralSite {
-        namespace: namespace.to_string(),
-        job_name: central_job_name(snapshot_ns, snapshot_name),
-    })
+        )),
+    }
+}
+
+/// Where a mover Job that reads only the repository runs: a verification or a
+/// pin. Such a Job mounts no workload volume, so under `execution.mode:
+/// Central` it needs nothing from the workload namespace, and the repository
+/// credentials stay out of it.
+///
+/// Unlike a backup, the site is not pinned in status. These Jobs hold no data:
+/// if the repository's `execution` changes while one runs, the Job left at the
+/// old site finishes or expires by its TTL, and the next reconcile starts the
+/// work again at the new site.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RepoJobSite {
+    /// In the owning CR's namespace, with an owner reference to it.
+    InNamespace,
+    /// In the operator namespace, marked with the owner's UID.
+    Central {
+        /// The operator namespace.
+        namespace: String,
+    },
+}
+
+impl RepoJobSite {
+    /// The site the repository asks for. Only a `ClusterRepository` can ask for
+    /// `Central` (a namespaced `Repository` has no `execution` field).
+    pub fn of(
+        kind: kopiur_api::common::RepositoryKind,
+        mode: ExecutionMode,
+        operator_namespace: Option<&str>,
+        namespaced_install: bool,
+    ) -> std::result::Result<Self, (&'static str, String)> {
+        use kopiur_api::common::RepositoryKind;
+        match (kind, mode) {
+            (RepositoryKind::ClusterRepository, ExecutionMode::Central) => {
+                central_namespace(operator_namespace, namespaced_install)
+                    .map(|namespace| RepoJobSite::Central { namespace })
+            }
+            (RepositoryKind::ClusterRepository, ExecutionMode::InNamespace)
+            | (RepositoryKind::Repository, _) => Ok(RepoJobSite::InNamespace),
+        }
+    }
+
+    /// The namespace the Job lives in, given its owner's namespace.
+    pub fn namespace<'a>(&'a self, owner_ns: &'a str) -> &'a str {
+        match self {
+            RepoJobSite::InNamespace => owner_ns,
+            RepoJobSite::Central { namespace } => namespace,
+        }
+    }
+
+    /// Whether the mover runs outside its owner's namespace.
+    pub fn is_central(&self) -> bool {
+        matches!(self, RepoJobSite::Central { .. })
+    }
+
+    /// Whether a Job found under this run's name, or by its selector, belongs
+    /// to someone else. `carries_owner_uid` is whether it carries this owner's
+    /// UID label. Central and in-namespace Jobs share the operator namespace,
+    /// so an in-namespace owner must never act on a central Job, and a central
+    /// owner only on a Job that names it.
+    pub fn is_foreign(&self, meta: &kube::core::ObjectMeta, carries_owner_uid: bool) -> bool {
+        match self {
+            RepoJobSite::InNamespace => has_central_mark(meta),
+            RepoJobSite::Central { .. } => !carries_owner_uid,
+        }
+    }
+}
+
+/// Mark `meta` as a central object of the `SnapshotPolicy`
+/// `policy_ns/policy_name` (UID `uid`), and drop the owner reference a
+/// cross-namespace object must not carry. See [`mark_central`].
+pub fn mark_central_policy(
+    meta: &mut kube::core::ObjectMeta,
+    policy_ns: &str,
+    policy_name: &str,
+    uid: &str,
+) {
+    meta.owner_references = None;
+    meta.labels
+        .get_or_insert_with(BTreeMap::new)
+        .insert(CENTRAL_POLICY_UID_LABEL.to_string(), uid.to_string());
+    meta.annotations.get_or_insert_with(BTreeMap::new).insert(
+        CENTRAL_POLICY_ANNOTATION.to_string(),
+        format!("{policy_ns}/{policy_name}"),
+    );
+}
+
+/// Whether a central object belongs to the `SnapshotPolicy` with UID `uid`.
+pub fn is_policys(meta: &kube::core::ObjectMeta, uid: &str) -> bool {
+    meta.labels
+        .as_ref()
+        .and_then(|l| l.get(CENTRAL_POLICY_UID_LABEL))
+        .is_some_and(|v| v == uid)
+}
+
+/// Delete every central Job of the `SnapshotPolicy` with UID `policy_uid` (its
+/// verification Jobs; their pods cascade). Called from the policy's finalizer,
+/// because no owner reference reaches these Jobs. Idempotent and 404-tolerant.
+pub async fn reap_central_policy_jobs(
+    client: &kube::Client,
+    central_ns: &str,
+    policy_uid: &str,
+) -> Result<()> {
+    let selector = format!("{CENTRAL_POLICY_UID_LABEL}={policy_uid}");
+    let params = kube::api::ListParams::default().labels(&selector);
+    let jobs: Api<k8s_openapi::api::batch::v1::Job> = Api::namespaced(client.clone(), central_ns);
+    for job in jobs.list(&params).await?.items {
+        match jobs
+            .delete(
+                &kube::ResourceExt::name_any(&job),
+                &delete_exactly(&job.metadata),
+            )
+            .await
+        {
+            Ok(_) => {}
+            Err(kube::Error::Api(e)) if e.code == 404 || e.code == 409 => {}
+            Err(e) => return Err(Error::Kube(e)),
+        }
+    }
+    Ok(())
 }
 
 /// The shape of the source one run backs up, as far as central execution cares.
@@ -421,7 +565,9 @@ pub fn is_ours(meta: &kube::core::ObjectMeta, uid: &str) -> bool {
 /// in-namespace run owns such an object, whatever its name.
 pub fn has_central_mark(meta: &kube::core::ObjectMeta) -> bool {
     meta.labels.as_ref().is_some_and(|l| {
-        l.contains_key(CENTRAL_SNAPSHOT_UID_LABEL) || l.contains_key(CENTRAL_RESTORE_UID_LABEL)
+        l.contains_key(CENTRAL_SNAPSHOT_UID_LABEL)
+            || l.contains_key(CENTRAL_RESTORE_UID_LABEL)
+            || l.contains_key(CENTRAL_POLICY_UID_LABEL)
     })
 }
 
@@ -2003,6 +2149,98 @@ mod tests {
             privileged_consent_namespaces("billing", "kopiur-system"),
             vec!["billing", "kopiur-system"]
         );
+    }
+
+    #[test]
+    fn a_repo_only_job_runs_centrally_only_for_a_central_cluster_repository() {
+        use kopiur_api::common::RepositoryKind;
+        let central = RepoJobSite::Central {
+            namespace: "kopiur-system".into(),
+        };
+        assert_eq!(
+            RepoJobSite::of(
+                RepositoryKind::ClusterRepository,
+                ExecutionMode::Central,
+                Some("kopiur-system"),
+                false
+            ),
+            Ok(central.clone())
+        );
+        assert_eq!(central.namespace("billing"), "kopiur-system");
+        assert!(central.is_central());
+
+        // Every other combination stays beside its owner.
+        for (kind, mode) in [
+            (
+                RepositoryKind::ClusterRepository,
+                ExecutionMode::InNamespace,
+            ),
+            (RepositoryKind::Repository, ExecutionMode::InNamespace),
+            // A namespaced Repository has no `execution` field; a `Central`
+            // here could only be a caller's mistake, and must not move the Job.
+            (RepositoryKind::Repository, ExecutionMode::Central),
+        ] {
+            let site = RepoJobSite::of(kind, mode, Some("kopiur-system"), false).unwrap();
+            assert_eq!(site, RepoJobSite::InNamespace, "{kind:?} {mode:?}");
+            assert_eq!(site.namespace("billing"), "billing");
+        }
+
+        // A Central repository on an install that cannot run movers centrally
+        // is an error, never a quiet fall back to the workload namespace.
+        let (reason, message) = RepoJobSite::of(
+            RepositoryKind::ClusterRepository,
+            ExecutionMode::Central,
+            Some("kopiur-system"),
+            true,
+        )
+        .unwrap_err();
+        assert_eq!(reason, REASON_CENTRAL_UNAVAILABLE);
+        assert!(message.contains("namespaced install"), "{message}");
+        let (reason, message) = RepoJobSite::of(
+            RepositoryKind::ClusterRepository,
+            ExecutionMode::Central,
+            None,
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(reason, REASON_CENTRAL_UNAVAILABLE);
+        assert!(message.contains("KOPIUR_NAMESPACE"), "{message}");
+        // The shared message carries no trailing period: callers append theirs.
+        assert!(!message.ends_with('.'), "{message}");
+    }
+
+    #[test]
+    fn a_central_policy_job_is_foreign_to_every_owner_but_its_policy() {
+        let central = RepoJobSite::Central {
+            namespace: "kopiur-system".into(),
+        };
+        let mut marked = ObjectMeta {
+            owner_references: Some(vec![owner("uid-1")]),
+            ..Default::default()
+        };
+        mark_central_policy(&mut marked, "billing", "postgres", "uid-1");
+        assert_eq!(marked.owner_references, None);
+        assert_eq!(
+            marked
+                .annotations
+                .as_ref()
+                .and_then(|a| a.get(CENTRAL_POLICY_ANNOTATION))
+                .map(String::as_str),
+            Some("billing/postgres")
+        );
+        let plain = ObjectMeta::default();
+
+        // Its own policy.
+        assert!(!central.is_foreign(&marked, is_policys(&marked, "uid-1")));
+        // A same-named policy from another namespace, and an in-namespace
+        // policy of the operator namespace: neither may count or use it.
+        assert!(central.is_foreign(&marked, is_policys(&marked, "uid-2")));
+        assert!(RepoJobSite::InNamespace.is_foreign(&marked, is_policys(&marked, "uid-1")));
+        // An unmarked Job is an in-namespace owner's, never a central owner's.
+        assert!(!RepoJobSite::InNamespace.is_foreign(&plain, false));
+        assert!(central.is_foreign(&plain, false));
+        // A central backup's or restore's object is not an in-namespace Job either.
+        assert!(has_central_mark(&marked));
     }
 
     #[test]

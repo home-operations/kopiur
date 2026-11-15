@@ -278,6 +278,45 @@ fn mover_role_is_least_privilege() {
     }
 }
 
+/// The central mover's ONE ServiceAccount is bound in every namespace that uses
+/// central execution, so its role is pinned EXACTLY: the status of the three
+/// kinds a central mover reports to, `get` and `patch`, and nothing else. Any
+/// extra rule here is multiplied by the number of tenant namespaces.
+#[test]
+fn central_mover_role_is_exactly_three_status_subresources() {
+    let artifacts = xtask::rbac::artifacts().expect("generate RBAC artifacts");
+    let a = artifact(&artifacts, "rbac/mover-clusterrole.yaml");
+    let rules = named_role_rules(&a.content, "kopiur-central-mover");
+    assert_eq!(rules.len(), 1, "one rule only: {rules:?}");
+    let rule = &rules[0];
+    assert_eq!(
+        rule.api_groups.as_deref(),
+        Some(&["kopiur.home-operations.com".to_string()][..])
+    );
+    assert_eq!(
+        rule.resources.as_deref(),
+        Some(
+            &[
+                // A backup's or a pin's Snapshot.
+                "snapshots/status".to_string(),
+                // A populator Restore.
+                "restores/status".to_string(),
+                // A verification's SnapshotPolicy.
+                "snapshotpolicies/status".to_string(),
+            ][..]
+        )
+    );
+    assert_eq!(rule.verbs, vec!["get".to_string(), "patch".to_string()]);
+    assert_eq!(rule.resource_names, None);
+
+    // A namespaced install has no central execution, so no such role.
+    let namespaced = artifact(&artifacts, "rbac/mover-role.yaml");
+    assert!(
+        !namespaced.content.contains("kopiur-central-mover"),
+        "the namespaced mover artifact must not ship the central mover role"
+    );
+}
+
 /// The dedicated snapshot-replication mover role (issue #368): ships in both
 /// install modes, grants the copy-CR lifecycle (get/list/create/patch/delete
 /// on `snapshots` — SSA needs `patch`+`create`, m:217cd0be) plus the status

@@ -36,7 +36,7 @@ use crate::consts::{
     VERIFY_INSTANCE_LABEL, VERIFY_MEMBER_LABEL, VERIFY_REPO_LABEL, VERIFY_SLOT_ANNOTATION,
 };
 use crate::context::Context;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::io::{self, ResolvedRepository};
 use crate::jobs::{
     self, CacheVolume, DEEP_SCRATCH_PATH, JobLimits, MoverJobInputs, VolumeMountSpec,
@@ -824,9 +824,23 @@ pub async fn verify_step(
         });
     }
 
-    let job_name = verify_job_name(&name, tier, slot, repo6.as_deref(), target.member_tag);
-    let job_api: Api<Job> = Api::namespaced(ctx.client.clone(), namespace);
+    let site = verify_site(ctx, repo)?;
+    let uid = config.uid().unwrap_or_default();
+    let job_name = verify_job_name(
+        &verify_name_key(&site, namespace, &name),
+        tier,
+        slot,
+        repo6.as_deref(),
+        target.member_tag,
+    );
+    let job_api: Api<Job> = Api::namespaced(ctx.client.clone(), site.namespace(namespace));
     match job_api.get_opt(&job_name).await? {
+        Some(job) if site.is_foreign(&job.metadata, io::is_policys(&job.metadata, &uid)) => {
+            Err(Error::MissingDependency(verify_job_conflict_message(
+                site.namespace(namespace),
+                &job_name,
+            )))
+        }
         Some(job) => match job_terminal_state(&job) {
             // Success: the mover stamped lastVerified; sleep until the next slot.
             // The terminal Job (its env carries the whole run spec) self-reaps
@@ -848,7 +862,7 @@ pub async fn verify_step(
                 config,
                 ctx,
                 target,
-                namespace,
+                (namespace, &site),
                 &job_api,
                 (&name, &job_name),
                 verification,
@@ -869,7 +883,7 @@ async fn spawn_if_slot_free(
     config: &SnapshotPolicy,
     ctx: &Context,
     target: &VerifyTarget<'_>,
-    namespace: &str,
+    place: (&str, &io::RepoJobSite),
     job_api: &Api<Job>,
     names: (&str, &str),
     verification: &Verification,
@@ -878,6 +892,8 @@ async fn spawn_if_slot_free(
     repo6: Option<&str>,
 ) -> Result<VerifyStepResult> {
     let (policy_name, job_name) = names;
+    let (namespace, site) = place;
+    let uid = config.uid().unwrap_or_default();
     let held = VerifyStepResult {
         requeue: Some(REQUEUE_RUNNING),
         deep_active: tier == VerifyTierKind::Deep,
@@ -886,14 +902,23 @@ async fn spawn_if_slot_free(
     // ([`job_blocks_cell`]): that is what makes deep members sequential ACROSS
     // reconciles and operator restarts rather than only within one pass, while
     // an unrelated member's short QUICK run never defers the drill.
-    if has_active_verify_job(job_api, policy_name, repo6, tier, target.member_tag).await? {
+    if has_active_verify_job(
+        job_api,
+        (site, &uid),
+        policy_name,
+        repo6,
+        tier,
+        target.member_tag,
+    )
+    .await?
+    {
         return Ok(held);
     }
     spawn_verify_job(
         config,
         ctx,
         target,
-        namespace,
+        (namespace, site),
         policy_name,
         job_name,
         verification,
@@ -919,13 +944,18 @@ async fn spawn_verify_job(
     config: &SnapshotPolicy,
     ctx: &Context,
     target: &VerifyTarget<'_>,
-    namespace: &str,
+    place: (&str, &io::RepoJobSite),
     policy_name: &str,
     job_name: &str,
     verification: &Verification,
     tier: VerifyTierKind,
     slot: DateTime<Utc>,
 ) -> Result<()> {
+    // `namespace` is the policy's: the identity and the status the mover
+    // patches live there. `job_ns` is where the Job, its ServiceAccount and the
+    // repository credentials are.
+    let (namespace, site) = place;
+    let job_ns = site.namespace(namespace);
     let repo = target.repo;
     let work_spec = build_verify_work_spec(
         config,
@@ -969,15 +999,7 @@ async fn spawn_verify_job(
         });
     let owner = io::owner_ref_for(config, "SnapshotPolicy")?;
 
-    let mover_identity = io::ensure_mover_identity(
-        &ctx.client,
-        namespace,
-        &[&repo.backend],
-        ctx.mover_service_account.as_deref(),
-        ctx.mover_role_kind.as_str(),
-        &ctx.mover_clusterrole,
-    )
-    .await?;
+    let mover_identity = crate::snapshot::repo_job_identity(ctx, site, namespace, repo).await?;
     mover_identity.decorate_labels(&mut labels);
 
     // Per-repo creds prefix for multi (`<policy>-vfy-<r6>`): N concurrent
@@ -988,24 +1010,29 @@ async fn spawn_verify_job(
         Some(r6) => io::CredsPrefix::verification_for_repo(policy_name, &r6),
         None => io::CredsPrefix::verification(policy_name),
     };
+    // A central mover reads the Secret(s) in the operator namespace, where a
+    // ClusterRepository keeps them. Projection is off there: a projected copy
+    // must be owned by a CR in the Job's namespace.
     let creds = io::resolve_mover_creds_for(
         &ctx.client,
-        namespace,
+        job_ns,
         &creds_prefix,
         &owner,
         repo,
-        config
-            .spec
-            .credential_projection
-            .as_ref()
-            .is_some_and(|p| p.enabled),
+        match site {
+            io::RepoJobSite::InNamespace => config
+                .spec
+                .credential_projection
+                .as_ref()
+                .is_some_and(|p| p.enabled),
+            io::RepoJobSite::Central { .. } => false,
+        },
         io::repo_kind_str(target.rref.kind),
         &target.rref.name,
     )
     .await?;
     if creds.projected > 0 {
-        ctx.metrics
-            .inc_secrets_projected(namespace, creds.projected);
+        ctx.metrics.inc_secrets_projected(job_ns, creds.projected);
     }
     let creds_secrets = io::repo_creds(creds.names, &repo.encryption);
 
@@ -1043,10 +1070,11 @@ async fn spawn_verify_job(
             .or(Some(VERIFY_JOB_TTL_SECS)),
         ..JobLimits::default()
     };
+    central_privilege_gate(ctx, config, &resolved_mover, namespace, site).await?;
 
     let inputs = MoverJobInputs {
         name: job_name,
-        namespace,
+        namespace: job_ns,
         owner,
         work_spec: &work_spec,
         image: &ctx.mover_image,
@@ -1094,9 +1122,97 @@ async fn spawn_verify_job(
         },
         readiness_exec: None,
     };
-    let job = jobs::build_job(&inputs)?;
-    io::apply_mover_objects(&ctx.client, namespace, job_name, None, &job).await?;
+    let mut job = jobs::build_job(&inputs)?;
+    match site {
+        io::RepoJobSite::InNamespace => {}
+        // No owner reference can cross namespaces: the policy's UID label
+        // stands in for it, and the policy's finalizer deletes the Job.
+        io::RepoJobSite::Central { .. } => io::mark_central_policy(
+            &mut job.metadata,
+            namespace,
+            policy_name,
+            &config.uid().unwrap_or_default(),
+        ),
+    }
+    io::apply_mover_objects(&ctx.client, job_ns, job_name, None, &job).await?;
     Ok(())
+}
+
+/// Where this repository's verification Jobs run. A `Central` repository on an
+/// install that cannot run movers centrally parks the policy with the reason:
+/// verification never falls back to the workload namespace, which is where a
+/// `Central` repository promises to keep its credentials out of.
+fn verify_site(ctx: &Context, repo: &ResolvedRepository) -> Result<io::RepoJobSite> {
+    io::RepoJobSite::of(
+        repo.kind,
+        repo.execution,
+        ctx.operator_namespace.as_deref(),
+        matches!(ctx.watch_scope, crate::config::WatchScope::Namespaced(_)),
+    )
+    .map_err(|(_, message)| {
+        Error::Validation(format!(
+            "verification cannot run: {message}. Verification retries on the next reconcile"
+        ))
+    })
+}
+
+/// **Pure.** The policy segment of a verify Job's name. A central Job shares
+/// the operator namespace with the Jobs of every other namespace, so its
+/// segment also carries a hash of the policy's namespace and name: two
+/// same-named policies then never share a slot's Job.
+fn verify_name_key(site: &io::RepoJobSite, namespace: &str, policy: &str) -> String {
+    match site {
+        io::RepoJobSite::InNamespace => policy.to_string(),
+        io::RepoJobSite::Central { .. } => {
+            format!("{policy}-{}", short_hash(&format!("{namespace}/{policy}")))
+        }
+    }
+}
+
+/// The message for a verify Job name that another owner already holds.
+fn verify_job_conflict_message(namespace: &str, job: &str) -> String {
+    format!(
+        "Job `{namespace}/{job}` already exists and belongs to a different SnapshotPolicy, so \
+         this verification will not use it. It is usually the remains of a deleted policy of \
+         the same name, and it expires by its TTL. Fix: wait for it to be deleted, or delete it"
+    )
+}
+
+/// A central verify pod runs in the operator namespace with the security
+/// context the policy authored. An elevated one needs the opt-in of both
+/// namespaces, exactly as a central backup does: the workload namespace cannot
+/// consent to a privileged pod in the operator namespace.
+async fn central_privilege_gate(
+    ctx: &Context,
+    config: &SnapshotPolicy,
+    resolved_mover: &kopiur_api::common::ResolvedMover,
+    namespace: &str,
+    site: &io::RepoJobSite,
+) -> Result<()> {
+    let io::RepoJobSite::Central { namespace: central } = site else {
+        return Ok(());
+    };
+    let privileged_mode = config.spec.mover.as_ref().and_then(|m| m.privileged_mode);
+    if !kopiur_api::common::requires_privilege_resolved(
+        Some(&resolved_mover.security_context),
+        resolved_mover.pod_security_context.as_ref(),
+        privileged_mode,
+    ) {
+        return Ok(());
+    }
+    match io::privileged_opt_in_missing(&ctx.client, namespace, central).await? {
+        None => Ok(()),
+        Some(gate_ns) => Err(Error::BlockedOnGrant(format!(
+            "verification of SnapshotPolicy `{namespace}/{}` asks for an elevated mover, and \
+             namespace `{gate_ns}` has not opted in to privileged movers. Under \
+             `execution.mode: Central` the verify pod runs in the operator namespace, so that \
+             namespace must opt in as well as the policy's. Fix: remove the elevated \
+             `securityContext` or `privilegedMode` from the mover, or annotate namespace \
+             `{gate_ns}` with `{}: \"true\"`",
+            config.name_any(),
+            kopiur_api::consts::PRIVILEGED_MOVERS_ANNOTATION,
+        ))),
+    }
 }
 
 /// Build the verify mover work spec for a tier. Pure (no IO) so the tier→work-spec
@@ -1600,18 +1716,24 @@ pub async fn discovered_identity_index(
 /// unlabelled Job invisible and spawn N new Jobs alongside it.
 async fn has_active_verify_job(
     job_api: &Api<Job>,
+    owner: (&io::RepoJobSite, &str),
     policy_name: &str,
     repo6: Option<&str>,
     tier: VerifyTierKind,
     member_tag: Option<&str>,
 ) -> Result<bool> {
+    let (site, uid) = owner;
     let jobs = job_api
         .list(&ListParams::default().labels(&verify_flight_selector(policy_name, repo6)))
         .await?;
-    Ok(jobs
-        .items
-        .iter()
-        .any(|j| job_terminal_state(j).is_none() && job_blocks_cell(j, tier, member_tag)))
+    // The selector is by policy NAME. In the operator namespace it also matches
+    // the central Jobs of same-named policies from other namespaces, which must
+    // not hold this policy's slot.
+    Ok(jobs.items.iter().any(|j| {
+        !site.is_foreign(&j.metadata, io::is_policys(&j.metadata, uid))
+            && job_terminal_state(j).is_none()
+            && job_blocks_cell(j, tier, member_tag)
+    }))
 }
 
 #[cfg(test)]
@@ -2025,6 +2147,50 @@ mod tests {
         // Long names truncate+hash within budget.
         let long = "a-very-long-snapshot-policy-name-that-blows-the-dns-label-budget";
         assert!(verify_job_name(long, VerifyTierKind::Deep, slot, None, None).len() <= 52);
+    }
+
+    #[test]
+    fn a_central_verify_job_name_tells_same_named_policies_apart() {
+        let slot = DateTime::parse_from_rfc3339("2026-06-09T04:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let central = io::RepoJobSite::Central {
+            namespace: "kopiur-system".into(),
+        };
+        let name = |site: &io::RepoJobSite, ns: &str, policy: &str| {
+            verify_job_name(
+                &verify_name_key(site, ns, policy),
+                VerifyTierKind::Deep,
+                slot,
+                Some("abc123"),
+                Some("0123456789ab"),
+            )
+        };
+
+        // In-namespace: the key is the policy name, so the Job name is
+        // byte-identical to every earlier release (slot continuity).
+        assert_eq!(
+            verify_name_key(&io::RepoJobSite::InNamespace, "billing", "postgres"),
+            "postgres"
+        );
+
+        // Central: the operator namespace holds the Jobs of every namespace, so
+        // two policies named alike must not share a slot's Job. Also true when
+        // the policy name is long enough to be truncated.
+        let long = "a-very-long-snapshot-policy-name-that-blows-the-dns-label-budget";
+        for policy in ["postgres", long] {
+            let a = name(&central, "billing", policy);
+            let b = name(&central, "payments", policy);
+            assert_ne!(a, b, "{policy}");
+            assert_ne!(a, name(&io::RepoJobSite::InNamespace, "billing", policy));
+            for n in [&a, &b] {
+                assert!(n.len() <= 52, "{n}");
+                // Still the shape `job_tier` parses.
+                assert!(n.contains("-vfy-d-"), "{n}");
+            }
+            // Deterministic: the slot's Job is found again by name.
+            assert_eq!(a, name(&central, "billing", policy));
+        }
     }
 
     #[test]

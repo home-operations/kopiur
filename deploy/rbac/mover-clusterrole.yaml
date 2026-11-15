@@ -116,6 +116,7 @@ rules:
   resources:
   - snapshots/status
   - restores/status
+  - snapshotpolicies/status
   verbs:
   - get
   - patch

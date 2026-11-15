@@ -120,11 +120,12 @@ rules:
 # SOURCE OF TRUTH; edit it and re-run, then re-sync these rules.
 #
 # A central mover runs in the operator namespace and patches the status of the
-# Snapshot it backs up, or of the Restore it populates, in a workload namespace.
+# object it works for in a workload namespace: the Snapshot it backs up or pins,
+# the Restore it populates, or the SnapshotPolicy it verifies.
 # The controller mints the same-named ServiceAccount in the operator namespace
 # and a RoleBinding to THIS role in each namespace that uses central execution.
 # One ServiceAccount is therefore bound in many namespaces, so the role holds
-# those two status subresources and nothing else.
+# those three status subresources and nothing else.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -137,5 +138,6 @@ rules:
     resources:
       - snapshots/status
       - restores/status
+      - snapshotpolicies/status
     verbs: [get, patch]
 {{- end }}

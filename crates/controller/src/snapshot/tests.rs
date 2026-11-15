@@ -5719,6 +5719,32 @@ fn an_uncreatable_legacy_pin_name_is_not_looked_up() {
     assert_eq!(legacy, None);
 }
 
+#[test]
+fn a_central_pin_job_name_is_unique_per_namespace_and_never_the_backup_jobs() {
+    // The operator namespace holds the Jobs of every namespace. Two Snapshots
+    // named alike must get different pin Jobs, and a Snapshot's pin Job must
+    // not share a name with its own central backup Job.
+    for snapshot in ["db-1", &format!("{}-20260101000000", "s".repeat(40))] {
+        let pin = central_pin_job_name("billing", snapshot);
+        assert!(pin.len() + "-pgt-0".len() <= 63, "{pin}");
+        assert_eq!(
+            pin,
+            central_pin_job_name("billing", snapshot),
+            "deterministic"
+        );
+        assert_ne!(pin, central_pin_job_name("payments", snapshot));
+        assert_ne!(pin, io::central_job_name("billing", snapshot));
+        assert_ne!(pin, pin_job_names(snapshot).0);
+        // Nor with the backup Job of a Snapshot that is itself named
+        // `<snapshot>-pin`: that is no hash collision, it is the same input
+        // unless the pin's hash has its own domain.
+        assert_ne!(
+            pin,
+            io::central_job_name("billing", &format!("{snapshot}-pin"))
+        );
+    }
+}
+
 /// Both repository kinds, as a backup's repository reference (#689 was
 /// reported against a `ClusterRepository`; the namespaced kind is the same bug).
 fn both_repo_kinds() -> [kopiur_api::common::RepositoryRef; 2] {
