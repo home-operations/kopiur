@@ -4,10 +4,17 @@ The `snapshot-stack` mise task installs the CSI stack into the throwaway kind cl
 It supports the `copyMethod: Snapshot`/`Clone` and group snapshot scenarios.
 The snapshot controller and all six snapshot CRDs come from
 `oci://ghcr.io/home-operations/charts/snapshot-controller`, pinned to chart `0.1.2`
-(appVersion `v8.7.0`). The host-path driver, its sidecars, and the classes use the manifests in this directory.
+(appVersion `v8.7.0`). The `snapshot-manifests` dependency uses vendir to fetch the
+host-path driver manifests and sidecar RBAC into `target/e2e/csi-snapshot`.
+The committed `vendir.yml` selects the upstream files and release tags.
+The committed `vendir.lock.yml` pins their exact Git commits.
+Normal setup uses `vendir sync --locked`.
+CI caches the fetched directory using a key derived from `vendir.lock.yml` and `vendir.yml`.
+An exact cache hit skips the fetch; changing either file creates a new cache entry.
+Only the local storage class with delayed binding (`32-*`) and group snapshot class (`33-*`) stay in this directory as manifests.
 
 The task caches the chart archive under `target/e2e/charts` and preloads the pinned
-container images into the kind node. An uncached chart or image requires network access.
+container images into the kind node. Fetching the manifests and uncached charts or images requires network access.
 If image preload fails, the pods can pull their images from the registry.
 
 The task applies the chart's CRDs and waits for establishment before installing the
@@ -22,21 +29,27 @@ The old deployment lacks Helm ownership metadata and uses a different immutable 
 
 ## Provenance
 
-| Files                                                                       | Source                                                                                                                                                                                                              | Pinned version |
-| --------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------- |
-| `10-hostpath-driverinfo`, `29-hostpath-plugin`, `30-hostpath-snapshotclass` | [kubernetes-csi/csi-driver-host-path](https://github.com/kubernetes-csi/csi-driver-host-path) `deploy/kubernetes-latest/hostpath` (→ `kubernetes-1.35`)                                                             | `v1.19.0`      |
-| `31-hostpath-storageclass`                                                  | csi-driver-host-path `examples/csi-storageclass.yaml`                                                                                                                                                               | `v1.19.0`      |
-| `20-23-rbac-*`                                                              | external-provisioner `v6.4.0`, external-attacher `v4.13.0` and external-resizer `v2.3.0` `deploy/kubernetes/rbac.yaml`; external-snapshotter `v8.7.0` `deploy/kubernetes/csi-snapshotter/rbac-csi-snapshotter.yaml` | per-sidecar    |
-| `32-hostpath-storageclass-wffc`, `33-hostpath-groupsnapshotclass`           | local, not vendored                                                                                                                                                                                                 | n/a            |
+Paths below are relative to `target/e2e/csi-snapshot`.
+The Helm chart supplies RBAC for the snapshot controller.
+The host-path driver's provisioner, attacher, snapshotter, and resizer sidecars need the separate RBAC files listed here.
 
-The vendored files are copies of the upstream files, reformatted by `oxfmt`.
+| Generated files                                                                                                                           | Upstream source                       | Release   |
+| ----------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------- | --------- |
+| `hostpath/deploy/kubernetes-1.35/hostpath/csi-hostpath-{driverinfo,plugin,snapshotclass}.yaml`, `hostpath/examples/csi-storageclass.yaml` | `kubernetes-csi/csi-driver-host-path` | `v1.19.0` |
+| `provisioner/rbac.yaml`                                                                                                                   | `kubernetes-csi/external-provisioner` | `v6.4.0`  |
+| `attacher/rbac.yaml`                                                                                                                      | `kubernetes-csi/external-attacher`    | `v4.13.0` |
+| `snapshotter/rbac-csi-snapshotter.yaml`                                                                                                   | `kubernetes-csi/external-snapshotter` | `v8.7.0`  |
+| `resizer/rbac.yaml`                                                                                                                       | `kubernetes-csi/external-resizer`     | `v2.3.0`  |
 
-`29-hostpath-plugin` binds the plugin's ServiceAccount to a ClusterRole named
+vendir copies the upstream files without local changes. The generated directory is
+covered by the repository's `target/` ignore rule.
+
+`csi-hostpath-plugin.yaml` binds the plugin's ServiceAccount to a ClusterRole named
 `external-snapshot-metadata-runner`. That role belongs to the optional snapshot-metadata
 sidecar, which this stack does not install, so the binding grants nothing. It stays
 because upstream ships it in the same file.
 
-After the chart is installed, filename prefixes set the `kubectl apply` order:
+After the chart is installed, the task applies the files in this order:
 driverinfo → sidecar RBAC → plugin → snapshot class → storage class → group snapshot class.
 
 ## Group snapshots
@@ -57,7 +70,7 @@ uses the upstream default.
 kopiur's `groupBy: VolumeGroupSnapshot` path is testable in kind at all.
 
 The image tags preloaded by the `snapshot-stack` task must match the chart's controller
-image and the `image:` refs in these files.
+image and the `image:` refs in the generated plugin manifest.
 
 ## Refreshing
 
@@ -66,7 +79,16 @@ Make sure that the controller preload tag matches the chart's appVersion.
 Update the CSI snapshotter sidecar image, its preload tag, and its RBAC with the same upstream release.
 Keep the chart version and appVersion in this document current.
 
-To update the host-path driver, copy the manifests from the selected upstream release.
-Refresh the sidecar RBAC at the versions used by that release.
-Format the vendored YAML with `oxfmt`, then update the preload tags in the `snapshot-stack` task.
-The storage class with delayed binding (`32-*`) and group snapshot class (`33-*`) remain local fixtures.
+To update the host-path driver or a sidecar, change its release tag in `vendir.yml`.
+If the release changes manifest locations, update `includePaths` and the paths used by the task.
+From the repository root, regenerate the lock and fetched files:
+
+```sh
+mise exec -- vendir sync --file crates/e2e/manifests/csi-snapshot/vendir.yml \
+  --lock-file crates/e2e/manifests/csi-snapshot/vendir.lock.yml
+```
+
+Review and commit the configuration and lock changes, then update the image preload tags in `snapshot-stack`.
+Run `mise run //crates/e2e:snapshot-manifests` to test fetching from the lock alone.
+Run `mise run //crates/e2e:snapshot-stack` against the throwaway kind cluster to test installation.
+Do not commit the generated files under `target/`.

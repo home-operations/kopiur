@@ -207,14 +207,25 @@ docker save "$BUSYBOX" | docker exec -i "$NODE" ctr --namespace=k8s.io images im
   && echo "   preloaded $BUSYBOX" || echo "   warn: could not preload $BUSYBOX (will pull in-cluster)"
 '''
 
+[tasks.snapshot-manifests]
+description = "Fetch the host-path CSI driver and sidecar RBAC at the commits pinned by vendir"
+dir = "{{config_root}}/../.."
+run = """
+vendir sync --locked --file crates/e2e/manifests/csi-snapshot/vendir.yml \\
+  --lock-file crates/e2e/manifests/csi-snapshot/vendir.lock.yml
+"""
+
 [tasks.snapshot-stack]
 description = "Install the pinned snapshot-controller OCI chart and vendored host-path CSI driver, with preloaded images, for Snapshot/Clone and group snapshot e2e tests"
+depends = ["snapshot-manifests"]
 dir = "{{config_root}}/../.."
 env = { KUBECONFIG = "{{config_root}}/../../target/e2e/kubeconfig" }
 run = """
 set -eu
 NODE=kopiur-e2e-control-plane
-MANIFESTS=crates/e2e/manifests/csi-snapshot
+MANIFESTS=target/e2e/csi-snapshot
+HOSTPATH="$MANIFESTS/hostpath/deploy/kubernetes-1.35/hostpath"
+FIXTURES=crates/e2e/manifests/csi-snapshot
 CHART_VERSION=0.1.2
 CHART_DIR=target/e2e/charts
 CHART="$CHART_DIR/snapshot-controller-$CHART_VERSION.tgz"
@@ -263,7 +274,16 @@ helm upgrade --install snapshot-controller "$CHART" --namespace kube-system \\
   --skip-crds --set controller.verbosity=5 --wait --timeout=150s
 
 echo "==> applying csi-driver-host-path + classes (vendored)"
-kubectl apply -f "$MANIFESTS"
+kubectl apply -f "$HOSTPATH/csi-hostpath-driverinfo.yaml" \\
+  -f "$MANIFESTS/provisioner/rbac.yaml" \\
+  -f "$MANIFESTS/attacher/rbac.yaml" \\
+  -f "$MANIFESTS/snapshotter/rbac-csi-snapshotter.yaml" \\
+  -f "$MANIFESTS/resizer/rbac.yaml" \\
+  -f "$HOSTPATH/csi-hostpath-plugin.yaml" \\
+  -f "$HOSTPATH/csi-hostpath-snapshotclass.yaml" \\
+  -f "$MANIFESTS/hostpath/examples/csi-storageclass.yaml" \\
+  -f "$FIXTURES/32-hostpath-storageclass-wffc.yaml" \\
+  -f "$FIXTURES/33-hostpath-groupsnapshotclass.yaml"
 
 # Make the hostpath snapshot class the default so an unset volumeSnapshotClassName
 # resolves it via the default-for-driver path.

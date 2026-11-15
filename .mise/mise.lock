@@ -322,6 +322,29 @@ checksum = "sha256:56affdd8de5527894dca6dc3d7e0a99a873b0f004d7aabc30ae407d3f48b0
 url = "https://github.com/koalaman/shellcheck/releases/download/v0.11.0/shellcheck-v0.11.0.darwin.aarch64.tar.xz"
 url_api = "https://api.github.com/repos/koalaman/shellcheck/releases/assets/279056932"
 
+[[tools.vendir]]
+version = "0.46.3"
+backend = "aqua:carvel-dev/vendir"
+specifiers = ["0.46.3"]
+
+[tools.vendir."platforms.linux-arm64"]
+checksum = "sha256:821a9da837a017270743597a2e9b796d2d256385ad85450d6c5d89f05dd5aac9"
+checksum_source = "mise-versions"
+url = "https://github.com/carvel-dev/vendir/releases/download/v0.46.3/vendir-linux-arm64"
+url_api = "https://api.github.com/repos/carvel-dev/vendir/releases/assets/655447804"
+
+[tools.vendir."platforms.linux-x64"]
+checksum = "sha256:5af8823ecc67b3ce2359bb0b70e72a5dbd765135722ca0ff42c16bc4d7409847"
+checksum_source = "mise-versions"
+url = "https://github.com/carvel-dev/vendir/releases/download/v0.46.3/vendir-linux-amd64"
+url_api = "https://api.github.com/repos/carvel-dev/vendir/releases/assets/655447795"
+
+[tools.vendir."platforms.macos-arm64"]
+checksum = "sha256:52b3c224329c11f7189847fc9687a7e9f319626f893dd9a8bcc3704dbc89cc25"
+checksum_source = "mise-versions"
+url = "https://github.com/carvel-dev/vendir/releases/download/v0.46.3/vendir-darwin-arm64"
+url_api = "https://api.github.com/repos/carvel-dev/vendir/releases/assets/655447796"
+
 [[tools.yq]]
 version = "4.54.3"
 backend = "aqua:mikefarah/yq"

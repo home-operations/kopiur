@@ -427,7 +427,7 @@ jobs:
         with:
           persist-credentials: false
 
-      # Only what a shard runs: kind, kubectl and helm for the cluster, nextest
+      # Only what a shard runs: kind, kubectl, helm and vendir for the cluster, nextest
       # for the prebuilt tests, and kopia because the cli suite's `--local`
       # browse runs it on the host. No Rust toolchain — `Rust Build` compiled
       # every shard's test binaries once, and `E2E Image` every image binary.
@@ -435,7 +435,7 @@ jobs:
         uses: jdx/mise-action@b44d12e7d0d8ee7461bb893e1b1993500433185b # v5.2.7
         with:
           experimental: true
-          install_args: kind kubectl helm kopia aqua:nextest-rs/nextest/cargo-nextest lefthook
+          install_args: kind kubectl helm vendir kopia aqua:nextest-rs/nextest/cargo-nextest lefthook
 
       # Booting the node container and fetching the artifacts share no inputs,
       # so they overlap: the cluster is not needed until the images are in the
@@ -492,9 +492,22 @@ jobs:
       # copyMethod Snapshot/Clone tests; those tests SKIP without it, so a shard that
       # runs them must opt in via `csi: true`. Installed before the chart, matching
       # scripts/with-kind.sh's ordering.
+      - name: Cache CSI driver manifests
+        if: matrix.csi
+        id: csi-manifests
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target/e2e/csi-snapshot
+          key: csi-manifests-v1-${{ hashFiles('crates/e2e/manifests/csi-snapshot/vendir.lock.yml', 'crates/e2e/manifests/csi-snapshot/vendir.yml') }}
+
+      - name: Fetch CSI driver manifests
+        if: matrix.csi && steps.csi-manifests.outputs.cache-hit != 'true'
+        run: mise run //crates/e2e:snapshot-manifests
+
       - name: Install CSI snapshot stack
         if: matrix.csi
-        run: mise run //crates/e2e:snapshot-stack
+        # The manifest dependency is already restored or fetched above.
+        run: mise run --skip-deps //crates/e2e:snapshot-stack
 
       - name: Install chart
         env:
