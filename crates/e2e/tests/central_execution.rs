@@ -1,7 +1,7 @@
 //! e2e: `ClusterRepository.spec.execution.mode: Central`: the backup mover runs
 //! in the OPERATOR namespace and reads a cross-namespace CSI snapshot restore.
 //!
-//! Two scenarios:
+//! Three scenarios:
 //!
 //! 1. **Central backup**: a CSI PVC in a workload namespace that holds neither the
 //!    repository credentials nor the repository volume is backed up by a mover Job
@@ -14,6 +14,10 @@
 //!    mover beside the source. A `copyMethod: Clone` policy with a
 //!    `sourcePathOverride` then runs centrally: the override is what kopia
 //!    records, never where the volume is mounted.
+//!
+//! 3. **Central group**: a `groupBy: VolumeGroupSnapshot` policy over two PVCs.
+//!    One shared capture in the workload namespace, each member staged and
+//!    backed up in the operator namespace.
 //!
 //! Needs the alpha `CrossNamespaceVolumeDataSource` feature on kube-apiserver and
 //! kube-controller-manager (`crates/e2e/kind-config.yaml`) and on the CSI
@@ -75,6 +79,16 @@ fn reference_grants(client: &Client, ns: &str) -> Api<DynamicObject> {
         "gateway.networking.k8s.io",
         "v1beta1",
         "ReferenceGrant",
+    )
+}
+
+fn volume_group_snapshots(client: &Client, ns: &str) -> Api<DynamicObject> {
+    dynamic_api(
+        client,
+        ns,
+        "groupsnapshot.storage.k8s.io",
+        "v1",
+        "VolumeGroupSnapshot",
     )
 }
 
@@ -985,4 +999,251 @@ async fn central_repository_refuses_a_source_it_cannot_carry_across_namespaces()
     kopiur_e2e::pvc::delete_pvc_and_consumers(&client, WORKLOAD_NS, clone_src)
         .await
         .expect("delete the clone source PVC");
+}
+
+/// A consistency group under central execution: ONE `VolumeGroupSnapshot` in the
+/// workload namespace captures both PVCs, and each member is staged and backed
+/// up in the operator namespace from its own member snapshot. Afterwards the
+/// group, its member snapshots (released from the CSI provisioner's stale
+/// source-protection finalizer) and every central object are gone.
+#[tokio::test]
+#[ignore = "requires the e2e harness (mise run //crates/e2e:test): kind + built images + helm install"]
+async fn central_group_members_are_staged_in_the_operator_namespace_from_one_capture() {
+    let Some(world) = World::connect().await else {
+        return;
+    };
+    world.ensure(&[Need::Filesystem]).await.expect("fixtures");
+    let client = world.client().clone();
+    if !csi_class_present_or_skip(&client, CSI_STORAGE_CLASS).await {
+        return;
+    }
+    ensure_namespace(&client, WORKLOAD_NS)
+        .await
+        .expect("workload namespace");
+
+    let sources = ["e2e-central-grp-a", "e2e-central-grp-b"];
+    let policy = "e2e-central-group-policy";
+    let schedule = "e2e-central-group-schedule";
+    let label_value = "central-group";
+    let policies: Api<SnapshotPolicy> = Api::namespaced(client.clone(), WORKLOAD_NS);
+    let schedules: Api<kopiur_api::SnapshotSchedule> = Api::namespaced(client.clone(), WORKLOAD_NS);
+    let backups: Api<Snapshot> = Api::namespaced(client.clone(), WORKLOAD_NS);
+    let by_policy =
+        ListParams::default().labels(&format!("kopiur.home-operations.com/config={policy}"));
+
+    // A retry of this test finds the previous attempt's objects; start clean.
+    let _ = schedules.delete(schedule, &DeleteParams::default()).await;
+    for child in backups
+        .list(&by_policy)
+        .await
+        .expect("list Snapshots")
+        .items
+    {
+        let _ = backups
+            .delete(&child.name_any(), &DeleteParams::default())
+            .await;
+    }
+    wait_until(
+        "previous grouped Snapshots gone",
+        default_timeout(),
+        poll_interval(),
+        || async {
+            Ok(backups
+                .list(&by_policy)
+                .await?
+                .items
+                .is_empty()
+                .then_some(()))
+        },
+    )
+    .await
+    .expect("previous grouped Snapshots must clear");
+    let _ = policies.delete(policy, &DeleteParams::default()).await;
+
+    let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), WORKLOAD_NS);
+    for src in sources {
+        csi_source_with_marker(&client, WORKLOAD_NS, src).await;
+        pvcs.patch(
+            src,
+            &PatchParams::default(),
+            &Patch::Merge(&serde_json::json!({
+                "metadata": { "labels": { BACKUP_LABEL_KEY: label_value } }
+            })),
+        )
+        .await
+        .expect("label the source PVC");
+    }
+    let crepos = central_repository(&client, "e2e-central-repo", "central").await;
+
+    create_idempotent(
+        &policies,
+        &cr(snapshot_policy_json(
+            WORKLOAD_NS,
+            policy,
+            "ClusterRepository",
+            "e2e-central-repo",
+            serde_json::json!({
+                "sources": [ {
+                    "pvcSelector": {
+                        "labelSelector": { "matchLabels": { BACKUP_LABEL_KEY: label_value } }
+                    }
+                } ],
+                "groupBy": "VolumeGroupSnapshot",
+                "copyMethod": "Snapshot",
+                "identity": { "username": "central-grouped", "hostname": "e2e" }
+            }),
+        )),
+        "create grouped SnapshotPolicy",
+    )
+    .await;
+    create_idempotent(
+        &schedules,
+        &cr(serde_json::json!({
+            "apiVersion": "kopiur.home-operations.com/v1alpha1",
+            "kind": "SnapshotSchedule",
+            "metadata": { "name": schedule, "namespace": WORKLOAD_NS },
+            "spec": {
+                "policyRef": { "name": policy },
+                "schedule": { "cron": "0 3 * * *", "runOnCreate": true }
+            }
+        })),
+        "create SnapshotSchedule",
+    )
+    .await;
+
+    wait_until(
+        "both central group members Succeeded",
+        default_timeout(),
+        poll_interval(),
+        || async {
+            let kids = backups.list(&by_policy).await?.items;
+            let done = kids
+                .iter()
+                .filter(|k| {
+                    k.status.as_ref().and_then(|s| s.phase.as_ref())
+                        == Some(&kopiur_api::SnapshotPhase::Succeeded)
+                })
+                .count();
+            Ok((kids.len() == 2 && done == 2).then_some(()))
+        },
+    )
+    .await
+    .expect("both members of a central group capture should succeed");
+
+    let children = backups
+        .list(&by_policy)
+        .await
+        .expect("list Snapshots")
+        .items;
+    let mut groups = std::collections::BTreeSet::new();
+    let mut uids = Vec::new();
+    for child in &children {
+        let name = child.name_any();
+        let pinned = child
+            .spec
+            .source
+            .as_ref()
+            .and_then(|s| s.group.as_ref())
+            .unwrap_or_else(|| panic!("child {name} must pin the shared group"));
+        groups.insert(pinned.volume_group_snapshot_name.clone());
+        let status = status_json(&backups, &name).await;
+        assert_eq!(
+            status["job"]["namespace"].as_str(),
+            Some(E2E_NAMESPACE),
+            "member {name} must run in the operator namespace: {status}"
+        );
+        let files: i64 = ["filesNew", "filesModified", "filesUnchanged"]
+            .iter()
+            .map(|k| status["stats"][*k].as_i64().unwrap_or(0))
+            .sum();
+        assert!(files >= 1, "member {name} must hold its marker: {status}");
+        uids.push(child.uid().expect("uid"));
+    }
+    assert_eq!(
+        groups.len(),
+        1,
+        "every member must pin the SAME group object: {groups:?}"
+    );
+
+    // Nothing ran in the workload namespace, and no Secret was copied into it.
+    let workload_jobs: Api<Job> = Api::namespaced(client.clone(), WORKLOAD_NS);
+    let workload_secrets: Api<Secret> = Api::namespaced(client.clone(), WORKLOAD_NS);
+    assert!(
+        workload_jobs
+            .list(&ListParams::default())
+            .await
+            .expect("list jobs")
+            .items
+            .is_empty(),
+        "no group member may run a Job in the workload namespace"
+    );
+    assert!(
+        workload_secrets
+            .list(&ListParams::default())
+            .await
+            .expect("list secrets")
+            .items
+            .is_empty(),
+        "no Secret may be projected into the workload namespace"
+    );
+
+    // Everything transient is reaped: the shared group, its member snapshots
+    // (which the CSI provisioner would otherwise hold with its stale
+    // finalizer), the grants, and each member's staged PVC.
+    let vgs = volume_group_snapshots(&client, WORKLOAD_NS);
+    let vs = volume_snapshots(&client, WORKLOAD_NS);
+    let grants = reference_grants(&client, WORKLOAD_NS);
+    let central_pvcs: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    wait_until(
+        "central group artifacts reaped",
+        default_timeout(),
+        poll_interval(),
+        || async {
+            let mut left = vgs.list(&ListParams::default()).await?.items.len()
+                + vs.list(&ListParams::default()).await?.items.len()
+                + grants.list(&ListParams::default()).await?.items.len();
+            for uid in &uids {
+                let selector = format!("kopiur.home-operations.com/snapshot-uid={uid}");
+                left += central_pvcs
+                    .list(&ListParams::default().labels(&selector))
+                    .await?
+                    .items
+                    .len();
+            }
+            Ok((left == 0).then_some(()))
+        },
+    )
+    .await
+    .expect("the group, its member snapshots, the grants and the staged PVCs should all go");
+
+    let _ = schedules.delete(schedule, &DeleteParams::default()).await;
+    for child in &children {
+        let _ = backups
+            .delete(&child.name_any(), &DeleteParams::default())
+            .await;
+    }
+    wait_until(
+        "grouped Snapshots gone",
+        default_timeout(),
+        poll_interval(),
+        || async {
+            Ok(backups
+                .list(&by_policy)
+                .await?
+                .items
+                .is_empty()
+                .then_some(()))
+        },
+    )
+    .await
+    .expect("the grouped Snapshots should be deleted");
+    let _ = policies.delete(policy, &DeleteParams::default()).await;
+    let _ = crepos
+        .delete("e2e-central-repo", &DeleteParams::default())
+        .await;
+    for src in sources {
+        kopiur_e2e::pvc::delete_pvc_and_consumers(&client, WORKLOAD_NS, src)
+            .await
+            .expect("delete the source PVC");
+    }
 }

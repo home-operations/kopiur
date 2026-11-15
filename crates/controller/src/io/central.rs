@@ -486,7 +486,10 @@ pub fn central_source_refusal(
     repository: &str,
 ) -> Option<(&'static str, String)> {
     let why = match (source, copy_method) {
-        (CentralSource::Pvc, CopyMethod::Snapshot | CopyMethod::Clone) => return None,
+        (
+            CentralSource::Pvc | CentralSource::GroupMember,
+            CopyMethod::Snapshot | CopyMethod::Clone,
+        ) => return None,
         // Technically a pod in any namespace can mount an NFS export. That is
         // the problem: the workload namespace's Pod Security level may forbid
         // `nfs` volumes (the `restricted` level does), and a mover pod in the
@@ -499,9 +502,6 @@ pub fn central_source_refusal(
         (CentralSource::Pvc | CentralSource::GroupMember, CopyMethod::Direct) => {
             "`copyMethod: Direct` mounts the live source PVC, and a pod can only mount a PVC of \
              its own namespace"
-        }
-        (CentralSource::GroupMember, CopyMethod::Snapshot | CopyMethod::Clone) => {
-            "`groupBy: VolumeGroupSnapshot` is not supported centrally yet"
         }
         (CentralSource::Stream, _) => {
             "a `stream` source runs a command inside a workload pod, which a central mover does \
@@ -1175,6 +1175,15 @@ pub fn stage_restore_finished(staged: &PersistentVolumeClaim, vs_ns: &str, vs_na
     bound_phase && has_volume
 }
 
+/// The `VolumeSnapshot` in `vs_ns` that a central staged claim is restored
+/// from, read off the claim's cross-namespace `dataSourceRef`. `None` for a
+/// clone (it names a PVC) and for a claim whose reference was dropped.
+pub fn staged_from_snapshot(staged: &PersistentVolumeClaim, vs_ns: &str) -> Option<String> {
+    let source = staged.spec.as_ref()?.data_source_ref.as_ref()?;
+    (source.kind == "VolumeSnapshot" && source.namespace.as_deref() == Some(vs_ns))
+        .then(|| source.name.clone())
+}
+
 /// Whether `pvc` is still being provisioned from the `VolumeSnapshot`
 /// `vs_ns/vs_name`: it names that snapshot as its data source and has not bound.
 /// The external-provisioner's own test for "this snapshot is still in use"
@@ -1534,10 +1543,13 @@ mod tests {
     #[test]
     fn a_source_runs_centrally_only_when_it_can_leave_the_workload_namespace() {
         use CentralSource::{GroupMember, Nfs, Nothing, Pvc, Stream};
-        // A PVC crosses as a CSI snapshot or a CSI clone.
+        // A PVC crosses as a CSI snapshot or a CSI clone, alone or as a member
+        // of a consistency group.
         for (method, source) in [
             (CopyMethod::Snapshot, Pvc),
             (CopyMethod::Clone, Pvc),
+            (CopyMethod::Snapshot, GroupMember),
+            (CopyMethod::Clone, GroupMember),
         ] {
             assert_eq!(
                 central_source_refusal(method, source, "shared"),
@@ -1548,8 +1560,6 @@ mod tests {
         for (method, source, needle) in [
             (CopyMethod::Direct, Pvc, "copyMethod: Direct"),
             (CopyMethod::Direct, GroupMember, "copyMethod: Direct"),
-            (CopyMethod::Snapshot, GroupMember, "VolumeGroupSnapshot"),
-            (CopyMethod::Clone, GroupMember, "VolumeGroupSnapshot"),
             // A central pod would mount the export outside the reach of the
             // workload namespace's Pod Security rules, under every copy method.
             (CopyMethod::Snapshot, Nfs, "Pod Security"),
@@ -1659,6 +1669,41 @@ mod tests {
                 "kind": "PersistentVolumeClaim",
                 "name": "data",
             }])
+        );
+    }
+
+    /// A group member restores from a member snapshot, whose name only its
+    /// staged claim records. Cleanup reads it from there.
+    #[test]
+    fn the_snapshot_a_central_stage_restores_from_is_read_off_the_claim() {
+        let mut from_snapshot = in_namespace_staged_pvc();
+        centralize_staged_pvc(
+            &mut from_snapshot,
+            "billing",
+            CrossNamespaceSource::VolumeSnapshot("snapshot-4f2a"),
+            "nightly",
+            "uid-1",
+        );
+        assert_eq!(
+            staged_from_snapshot(&from_snapshot, "billing").as_deref(),
+            Some("snapshot-4f2a")
+        );
+        // Another namespace's snapshot of that name is not it.
+        assert_eq!(staged_from_snapshot(&from_snapshot, "payments"), None);
+
+        // A clone names a PVC: there is no snapshot to mark or release.
+        let mut clone = in_namespace_staged_pvc();
+        centralize_staged_pvc(
+            &mut clone,
+            "billing",
+            CrossNamespaceSource::Pvc("data"),
+            "nightly",
+            "uid-1",
+        );
+        assert_eq!(staged_from_snapshot(&clone, "billing"), None);
+        assert_eq!(
+            staged_from_snapshot(&PersistentVolumeClaim::default(), "billing"),
+            None
         );
     }
 

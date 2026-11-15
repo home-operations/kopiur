@@ -1485,13 +1485,16 @@ pub async fn resolve_staging(
     site: &MoverSite,
 ) -> Result<StagingOutcome> {
     let copy_method = policy.spec.copy_method;
-    // The reconciler refuses a group before it resolves a central site;
-    // reaching here with one would stage in the wrong namespace.
+    // A central stage is granted access to an object in `ns`, by a
+    // ReferenceGrant this Snapshot owns. A group pinned to another namespace
+    // would need a grant there, which the Snapshot cannot own.
     if let MoverSite::Central(_) = site
-        && pin.and_then(|p| p.group.as_ref()).is_some()
+        && pin
+            .and_then(|p| p.group.as_ref())
+            .is_some_and(|g| g.namespace != ns)
     {
         return Err(Error::Invariant(
-            "central execution reached staging with a `groupBy: VolumeGroupSnapshot` member".into(),
+            "central execution reached staging with a group in another namespace".into(),
         ));
     }
     // The source THIS run covers. Without the pin a fanned-out child would
@@ -1662,7 +1665,28 @@ pub async fn resolve_staging(
                     owner.clone(),
                 );
                 mark_staged_class_inferred(&mut staged, class_inferred);
-                apply(&stage_api, &staged_pvc, &staged).await?;
+                // Each member restores from its OWN member snapshot, so a
+                // central member is granted that one snapshot.
+                let from = super::central::CrossNamespaceSource::VolumeSnapshot(
+                    &member.volume_snapshot_name,
+                );
+                if let Some(outcome) = apply_stage(
+                    client,
+                    &stage_api,
+                    &StageTarget {
+                        site,
+                        source_ns: ns,
+                        source: from,
+                        snapshot_cr,
+                        owner,
+                    },
+                    &staged_pvc,
+                    &mut staged,
+                )
+                .await?
+                {
+                    return Ok(outcome);
+                }
                 if let Some(outcome) = staged_pvc_bind_gate(
                     client,
                     &stage_api,
@@ -1673,7 +1697,7 @@ pub async fn resolve_staging(
                 )
                 .await?
                 {
-                    return Ok(outcome);
+                    return Ok(central_bind_hint(site, outcome));
                 }
                 return Ok(StagingOutcome::Ready(StagedSource {
                     storage_class_name: staged_class_of(&staged),
@@ -1789,25 +1813,22 @@ pub async fn resolve_staging(
             owner.clone(),
         );
         mark_staged_class_inferred(&mut staged, class_inferred);
-        match site {
-            MoverSite::InNamespace => {
-                apply(&stage_api, &staged_pvc, &staged).await?;
-            }
-            MoverSite::Central(central) => {
-                let stage = CentralStage {
-                    site: central,
-                    source_ns: ns,
-                    source: super::central::CrossNamespaceSource::VolumeSnapshot(&vs_name),
-                    snapshot_cr,
-                    owner,
-                };
-                if let Some(outcome) =
-                    apply_central_stage(client, &stage_api, &stage, &staged_pvc, &mut staged)
-                        .await?
-                {
-                    return Ok(outcome);
-                }
-            }
+        if let Some(outcome) = apply_stage(
+            client,
+            &stage_api,
+            &StageTarget {
+                site,
+                source_ns: ns,
+                source: super::central::CrossNamespaceSource::VolumeSnapshot(&vs_name),
+                snapshot_cr,
+                owner,
+            },
+            &staged_pvc,
+            &mut staged,
+        )
+        .await?
+        {
+            return Ok(outcome);
         }
         // Gate on the bind for Immediate classes: minting the Job while the CSI
         // restore is in flight is exactly the wedge-then-delete-the-VS race.
@@ -1839,26 +1860,24 @@ pub async fn resolve_staging(
         owner.clone(),
     );
     mark_staged_class_inferred(&mut staged, class_inferred);
-    match site {
-        MoverSite::InNamespace => {
-            apply(&stage_api, &staged_pvc, &staged).await?;
-        }
-        // A CSI clone crosses namespaces the same way a snapshot restore does:
-        // a cross-namespace `dataSourceRef`, here to the source PVC itself.
-        MoverSite::Central(central) => {
-            let stage = CentralStage {
-                site: central,
-                source_ns: ns,
-                source: super::central::CrossNamespaceSource::Pvc(source_name),
-                snapshot_cr,
-                owner,
-            };
-            if let Some(outcome) =
-                apply_central_stage(client, &stage_api, &stage, &staged_pvc, &mut staged).await?
-            {
-                return Ok(outcome);
-            }
-        }
+    // A CSI clone crosses namespaces the same way a snapshot restore does: a
+    // cross-namespace `dataSourceRef`, here to the source PVC itself.
+    if let Some(outcome) = apply_stage(
+        client,
+        &stage_api,
+        &StageTarget {
+            site,
+            source_ns: ns,
+            source: super::central::CrossNamespaceSource::Pvc(source_name),
+            snapshot_cr,
+            owner,
+        },
+        &staged_pvc,
+        &mut staged,
+    )
+    .await?
+    {
+        return Ok(outcome);
     }
     // Same bind gate as the Snapshot tail — a CSI full clone is the SLOWEST staging
     // method there is, so skipping the gate here would reproduce the original bug
@@ -1901,9 +1920,9 @@ fn foreign_stage_outcome(
     }
 }
 
-/// What [`apply_central_stage`] needs beyond the staged PVC itself.
-struct CentralStage<'a> {
-    site: &'a CentralSite,
+/// Where a staged PVC goes and what it is filled from.
+struct StageTarget<'a> {
+    site: &'a MoverSite,
     /// The workload namespace holding the source PVC and its `VolumeSnapshot`.
     source_ns: &'a str,
     /// What the staged PVC is filled from, in `source_ns`.
@@ -1913,6 +1932,28 @@ struct CentralStage<'a> {
     owner: &'a k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference,
 }
 
+/// Apply the staged PVC at its site. In the Snapshot's own namespace that is
+/// the claim as built. Under central execution it is
+/// [`apply_central_stage`]. Returns `Some(outcome)` to surface instead of
+/// continuing, `None` when the claim is in place.
+async fn apply_stage(
+    client: &kube::Client,
+    stage_api: &Api<PersistentVolumeClaim>,
+    stage: &StageTarget<'_>,
+    staged_pvc: &str,
+    staged: &mut PersistentVolumeClaim,
+) -> Result<Option<StagingOutcome>> {
+    match stage.site {
+        MoverSite::InNamespace => {
+            apply(stage_api, staged_pvc, staged).await?;
+            Ok(None)
+        }
+        MoverSite::Central(central) => {
+            apply_central_stage(client, stage_api, stage, central, staged_pvc, staged).await
+        }
+    }
+}
+
 /// Create the central staged PVC: grant the operator namespace access to the
 /// source object, apply the claim with its cross-namespace `dataSourceRef`,
 /// and prove the API server kept that reference. Returns `Some(outcome)` to
@@ -1920,7 +1961,8 @@ struct CentralStage<'a> {
 async fn apply_central_stage(
     client: &kube::Client,
     stage_api: &Api<PersistentVolumeClaim>,
-    stage: &CentralStage<'_>,
+    stage: &StageTarget<'_>,
+    site: &CentralSite,
     staged_pvc: &str,
     staged: &mut PersistentVolumeClaim,
 ) -> Result<Option<StagingOutcome>> {
@@ -1930,7 +1972,7 @@ async fn apply_central_stage(
     let grant = super::central::build_reference_grant(
         &grant_name,
         stage.source_ns,
-        &stage.site.namespace,
+        &site.namespace,
         stage.source,
         stage.owner.clone(),
     );
@@ -1960,10 +2002,7 @@ async fn apply_central_stage(
         // already provisioned for it) before anything can mount it.
         return Ok(Some(StagingOutcome::Failed {
             reason: super::central::REASON_CROSS_NAMESPACE_DISABLED,
-            message: super::central::cross_namespace_disabled_message(
-                &stage.site.namespace,
-                staged_pvc,
-            ),
+            message: super::central::cross_namespace_disabled_message(&site.namespace, staged_pvc),
         }));
     }
     Ok(None)
@@ -2038,10 +2077,13 @@ pub async fn cleanup_staged_source(
         // The claim is about to go, and with it the only proof that the restore
         // from the VolumeSnapshot finished. Record it first (central runs only:
         // see `central::source_protection_decision`).
+        // The snapshot is read off the claim: a group member restores from a
+        // member snapshot, whose name only the claim records.
         if let MoverSite::Central(_) = site
-            && super::central::stage_restore_finished(&pvc, ns, &vs_name)
+            && let Some(restored_from) = super::central::staged_from_snapshot(&pvc, ns)
+            && super::central::stage_restore_finished(&pvc, ns, &restored_from)
         {
-            super::central::mark_stage_restored(client, ns, &vs_name).await;
+            super::central::mark_stage_restored(client, ns, &restored_from).await;
         }
         // Release pvc-protection: delete the finished mover pod(s) (the backup Job is
         // named after the Snapshot CR). The Job object itself is preserved. Use
@@ -2089,13 +2131,29 @@ pub async fn cleanup_staged_source(
     // Instead try to reap the group itself; that is a no-op unless every
     // sibling is done, and fails closed if the sibling list cannot be read.
     if let Some(group) = group {
-        super::group_staging::cleanup_group_if_unused(
+        let reaped = super::group_staging::cleanup_group_if_unused(
             client,
             &group.namespace,
             &group.volume_group_snapshot_name,
         )
         .await?;
-        return Ok(StageCleanup::Complete);
+        return match site {
+            MoverSite::InNamespace => Ok(StageCleanup::Complete),
+            MoverSite::Central(_) => {
+                delete_ignore_404(
+                    &super::central::reference_grant_api(client, ns),
+                    &super::central::reference_grant_name(snapshot_cr),
+                )
+                .await?;
+                Ok(super::group_staging::release_group_source_protection(
+                    client,
+                    &group.namespace,
+                    &group.volume_group_snapshot_name,
+                    reaped,
+                )
+                .await)
+            }
+        };
     }
 
     let vs_api = volume_snapshot_api(client, ns);
