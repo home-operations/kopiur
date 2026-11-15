@@ -234,6 +234,26 @@ async fn central_backup_runs_in_the_operator_namespace_and_cleans_up() {
     kopiur_e2e::pvc::delete_pvc_and_consumers(&client, WORKLOAD_NS, "e2e-central-restored")
         .await
         .expect("clear a previous restored PVC");
+    let _ = stale_restores
+        .delete("e2e-central-restore-new", &DeleteParams::default())
+        .await;
+    wait_until(
+        "previous target.pvc Restore gone",
+        default_timeout(),
+        poll_interval(),
+        || async {
+            Ok(stale_restores
+                .get_opt("e2e-central-restore-new")
+                .await?
+                .is_none()
+                .then_some(()))
+        },
+    )
+    .await
+    .expect("a previous Restore must clear");
+    kopiur_e2e::pvc::delete_pvc_and_consumers(&client, WORKLOAD_NS, "e2e-central-restored-new")
+        .await
+        .expect("clear a previous restored PVC");
 
     csi_source_with_marker(&client, WORKLOAD_NS, src).await;
     let crepos = central_repository(&client, "e2e-central-repo", "central").await;
@@ -611,6 +631,121 @@ async fn central_backup_runs_in_the_operator_namespace_and_cleans_up() {
     .await
     .expect("the Restore's cleanup finalizer should release it");
     kopiur_e2e::pvc::delete_pvc_and_consumers(&client, WORKLOAD_NS, claim)
+        .await
+        .expect("delete the restored PVC");
+
+    // --- Restore into a NEW named PVC (`target.pvc`) --------------------------
+    //
+    // Nobody authors a claim here. The operator creates the target PVC as a
+    // claim on the Restore, and the same handover fills it. The class binds
+    // late (WaitForFirstConsumer) and no pod uses the PVC yet: the central
+    // mover pod is the first consumer of the temporary volume, exactly as an
+    // in-namespace `target.pvc` restore's mover is of the target.
+    let new_restore = "e2e-central-restore-new";
+    let new_pvc = "e2e-central-restored-new";
+    let new_reader = "e2e-central-restored-new-reader";
+    restores
+        .create(
+            &PostParams::default(),
+            &cr(serde_json::json!({
+                "apiVersion": "kopiur.home-operations.com/v1alpha1",
+                "kind": "Restore",
+                "metadata": { "name": new_restore, "namespace": WORKLOAD_NS },
+                "spec": {
+                    "repository": { "kind": "ClusterRepository", "name": "e2e-central-repo" },
+                    "source": { "snapshotRef": { "name": backup } },
+                    "target": { "pvc": {
+                        "name": new_pvc,
+                        "storageClassName": CSI_STORAGE_CLASS_WFFC,
+                        "capacity": "64Mi",
+                    } },
+                },
+            })),
+        )
+        .await
+        .expect("create the target.pvc Restore");
+    wait_phase(&restores, new_restore, "Completed")
+        .await
+        .expect("the central target.pvc Restore should Complete");
+    let new_status = status_json(&restores, new_restore).await;
+    assert_eq!(
+        new_status["execution"]["namespace"].as_str(),
+        Some(E2E_NAMESPACE),
+        "a target.pvc restore of a Central repository must run centrally: {new_status}"
+    );
+    let created = workload_pvcs
+        .get(new_pvc)
+        .await
+        .expect("the operator creates the target PVC");
+    let claim_ref = created
+        .spec
+        .as_ref()
+        .and_then(|s| s.data_source_ref.as_ref())
+        .expect("the target PVC is created as a claim on the Restore");
+    assert_eq!(claim_ref.kind, "Restore");
+    assert_eq!(claim_ref.name, new_restore);
+    assert!(
+        workload_jobs
+            .list(&ListParams::default())
+            .await
+            .expect("list jobs")
+            .items
+            .is_empty(),
+        "no restore Job may be created in the workload namespace for target.pvc"
+    );
+    assert!(
+        workload_secrets
+            .list(&ListParams::default())
+            .await
+            .expect("list secrets")
+            .items
+            .is_empty(),
+        "no Secret may be projected into the workload namespace for target.pvc"
+    );
+    workload_pod_api
+        .create(
+            &PostParams::default(),
+            &kopiur_e2e::builders::one_shot_pod(
+                WORKLOAD_NS,
+                new_reader,
+                &[
+                    "sh",
+                    "-c",
+                    &format!("test \"$(cat /mnt/marker.txt)\" = '{MARKER}'"),
+                ],
+                &[(new_pvc, "/mnt")],
+            ),
+        )
+        .await
+        .expect("create the reader pod");
+    kopiur_e2e::wait::pod_succeeded(&client, WORKLOAD_NS, new_reader)
+        .await
+        .expect("the new PVC must hold the marker file");
+    let _ = workload_pod_api
+        .delete(new_reader, &DeleteParams::default())
+        .await;
+    restores
+        .delete(new_restore, &DeleteParams::default())
+        .await
+        .expect("delete the target.pvc Restore");
+    wait_until(
+        "target.pvc Restore gone",
+        default_timeout(),
+        poll_interval(),
+        || async { Ok(restores.get_opt(new_restore).await?.is_none().then_some(())) },
+    )
+    .await
+    .expect("the Restore's cleanup finalizer should release it");
+    // The restored data outlives its Restore.
+    assert!(
+        workload_pvcs
+            .get_opt(new_pvc)
+            .await
+            .expect("read the restored PVC")
+            .is_some(),
+        "deleting the Restore must not delete the PVC it restored"
+    );
+    kopiur_e2e::pvc::delete_pvc_and_consumers(&client, WORKLOAD_NS, new_pvc)
         .await
         .expect("delete the restored PVC");
 

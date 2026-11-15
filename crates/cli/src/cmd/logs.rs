@@ -57,18 +57,7 @@ async fn newest_restore_job(
     ns: &str,
 ) -> Result<Option<JobAt>, kube::Error> {
     let uid = restore.uid().unwrap_or_default();
-    // Only a populator restore runs centrally. The pin outlives an edit of the
-    // target, and a direct restore's Job is always in the Restore's namespace.
-    let central = match &restore.spec.target {
-        kopiur_api::restore::RestoreTarget::Populator(_) => restore
-            .status
-            .as_ref()
-            .and_then(|s| s.execution.as_ref())
-            .map(|e| e.namespace.clone()),
-        kopiur_api::restore::RestoreTarget::Pvc(_)
-        | kopiur_api::restore::RestoreTarget::PvcRef(_)
-        | kopiur_api::restore::RestoreTarget::StreamExec(_) => None,
-    };
+    let central = central_restore_namespace(restore);
     let (job_ns, selector) = match &central {
         Some(central_ns) => (
             central_ns.as_str(),
@@ -94,6 +83,26 @@ async fn newest_restore_job(
         name: job.name_any(),
         namespace: job_ns.to_string(),
     }))
+}
+
+/// The operator namespace a restore's mover Jobs run in, if it runs centrally.
+/// Pure.
+///
+/// Only a restore that fills volumes through the populator handshake runs
+/// centrally: a `populator` target, or a `pvc` target that was created as a
+/// claim (it then tracks that claim in `status.claims`). The pin alone does
+/// not decide: it outlives an edit of the target, and a direct restore's Job
+/// is always in the Restore's own namespace.
+pub fn central_restore_namespace(restore: &Restore) -> Option<String> {
+    let status = restore.status.as_ref()?;
+    let pinned = || status.execution.as_ref().map(|e| e.namespace.clone());
+    match &restore.spec.target {
+        kopiur_api::restore::RestoreTarget::Populator(_) => pinned(),
+        kopiur_api::restore::RestoreTarget::Pvc(_) if !status.claims.is_empty() => pinned(),
+        kopiur_api::restore::RestoreTarget::Pvc(_)
+        | kopiur_api::restore::RestoreTarget::PvcRef(_)
+        | kopiur_api::restore::RestoreTarget::StreamExec(_) => None,
+    }
 }
 
 /// Newest pod of the list (a retried Job leaves several; the newest is the
@@ -604,6 +613,66 @@ mod tests {
 
         let empty = gone_fallback("restore", "r", &top(None, None));
         assert!(empty.contains("no logTail recorded"));
+    }
+
+    /// `logs restore` follows the central pin only for a restore that hands
+    /// its volume over: a populator, or a `target.pvc` created as a claim.
+    #[test]
+    fn only_a_handover_restore_is_looked_up_in_the_operator_namespace() {
+        let restore = |target: serde_json::Value, status: serde_json::Value| -> Restore {
+            serde_json::from_value(serde_json::json!({
+                "apiVersion": "kopiur.home-operations.com/v1alpha1",
+                "kind": "Restore",
+                "metadata": { "name": "r", "namespace": "billing" },
+                "spec": {
+                    "source": { "snapshotRef": { "name": "nightly" } },
+                    "target": target,
+                },
+                "status": status,
+            }))
+            .unwrap()
+        };
+        let pinned = serde_json::json!({ "execution": { "namespace": "kopiur-system" } });
+        let pinned_with_claim = serde_json::json!({
+            "execution": { "namespace": "kopiur-system" },
+            "claims": { "restored": { "phase": "Populated" } },
+        });
+        let pvc = serde_json::json!({ "pvc": { "name": "restored", "capacity": "1Gi" } });
+
+        assert_eq!(
+            central_restore_namespace(&restore(
+                serde_json::json!({ "populator": {} }),
+                pinned.clone()
+            ))
+            .as_deref(),
+            Some("kopiur-system")
+        );
+        // `target.pvc` handed over: it tracks its claim.
+        assert_eq!(
+            central_restore_namespace(&restore(pvc.clone(), pinned_with_claim.clone())).as_deref(),
+            Some("kopiur-system")
+        );
+        // A direct `target.pvc` restore that still carries a pin from before a
+        // target edit: its Job is beside the Restore.
+        assert_eq!(
+            central_restore_namespace(&restore(pvc, pinned.clone())),
+            None
+        );
+        assert_eq!(
+            central_restore_namespace(&restore(
+                serde_json::json!({ "pvcRef": { "name": "existing" } }),
+                pinned_with_claim
+            )),
+            None
+        );
+        // No pin: in the Restore's own namespace.
+        assert_eq!(
+            central_restore_namespace(&restore(
+                serde_json::json!({ "populator": {} }),
+                serde_json::json!({})
+            )),
+            None
+        );
     }
 
     /// Review wave 2, finding 8: `kubectl kopiur logs restore X` falls back to

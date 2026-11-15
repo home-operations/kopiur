@@ -381,52 +381,242 @@ fn a_cleared_referent_condition_survives_a_downstream_gate_park() {
     assert_eq!(same.get().status, untouched.status);
 }
 
+fn pvc_template(name: &str) -> kopiur_api::restore::PvcTemplate {
+    kopiur_api::restore::PvcTemplate {
+        name: name.into(),
+        storage_class_name: Some("fast".into()),
+        capacity: Some("10Gi".into()),
+        access_modes: vec![],
+    }
+}
+
 #[test]
-fn populator_state_depends_on_target_variant() {
+fn populator_state_depends_on_target_variant_and_pvc_delivery() {
     use kopiur_api::PopulatorTarget;
     use kopiur_api::common::ObjectRef;
-    use kopiur_api::restore::PvcTemplate;
-    // populator target → passive AwaitingClaim.
+    use plan::PvcDelivery::{Handover, Mount};
+    let stream = RestoreTarget::StreamExec(kopiur_api::restore::StreamExecTarget {
+        file_name: "postgres.sql".into(),
+        workload_exec: kopiur_api::snapshot_policy::StreamExec {
+            pod_selector: Default::default(),
+            container: None,
+            command: vec!["psql".into()],
+            timeout: None,
+        },
+    });
+    let pvc_ref = RestoreTarget::PvcRef(ObjectRef {
+        name: "data".into(),
+        namespace: None,
+    });
+    for delivery in [Mount, Handover] {
+        // populator target → passive AwaitingClaim.
+        assert_eq!(
+            populator_state(&RestoreTarget::Populator(PopulatorTarget {}), delivery),
+            PopulatorState::AwaitingClaim
+        );
+        // An existing volume is written in place: operator-driven.
+        assert_eq!(
+            populator_state(&pvc_ref, delivery),
+            PopulatorState::DirectTarget
+        );
+        // `streamExec` is operator-driven too: the mover reads one virtual file
+        // and pipes it into a command, and nothing ever claims the Restore.
+        // Pinned here because the OTHER classification would be silently
+        // catastrophic — an `AwaitingClaim` streamExec restore would sit
+        // passive forever waiting for a `dataSourceRef` that can never arrive,
+        // since it writes no PVC to claim.
+        assert_eq!(
+            populator_state(&stream, delivery),
+            PopulatorState::DirectTarget
+        );
+    }
+    // `target.pvc` is the one target with two ways in: the mover mounts the
+    // PVC it created, or the PVC is created as a claim and filled by handover.
+    let created = RestoreTarget::Pvc(pvc_template("created"));
     assert_eq!(
-        populator_state(&RestoreTarget::Populator(PopulatorTarget {})),
+        populator_state(&created, Mount),
+        PopulatorState::DirectTarget
+    );
+    assert_eq!(
+        populator_state(&created, Handover),
         PopulatorState::AwaitingClaim
     );
-    // explicit pvc/pvcRef → operator-driven DirectTarget.
+}
+
+/// A handover is recognised by the claim, or by what the restore recorded
+/// about itself. Neither changes when the repository's `execution` does, so
+/// the answer is the same on every reconcile.
+#[test]
+fn a_target_pvc_is_handed_over_only_as_a_claim_or_once_a_handover_started() {
+    use plan::PvcDelivery::{Handover, Mount};
+    use plan::TargetPvcState::{Absent, ClaimsRestore, Plain};
+    for started in [false, true] {
+        assert_eq!(pvc_delivery(ClaimsRestore, started), Handover);
+    }
+    // No handover yet: a direct restore. With no PVC, the direct pipeline
+    // resolves the source first and then decides what PVC to create.
+    assert_eq!(pvc_delivery(Plain, false), Mount);
+    assert_eq!(pvc_delivery(Absent, false), Mount);
+    // A handover under way keeps handing over. Its claim was deleted (it is
+    // re-created), or replaced by an ordinary PVC: switching to a direct
+    // restore then would abandon the central Job and its volume, and could
+    // start a second mover beside the replacement.
+    assert_eq!(pvc_delivery(Absent, true), Handover);
+    assert_eq!(pvc_delivery(Plain, true), Handover);
+}
+
+#[test]
+fn a_new_target_pvc_becomes_a_claim_only_with_data_under_a_central_repository() {
+    assert!(creates_claim(true, false, true));
+    // Deploy-or-restore with no snapshot: an ordinary empty PVC, as without
+    // central execution. A claim on a WaitForFirstConsumer class would stay
+    // unbound until the workload starts, and a workflow that waits for the
+    // Restore before it starts the workload would then wait for ever.
+    assert!(!creates_claim(false, false, true));
+    // A restore that already ran directly is never switched.
+    assert!(!creates_claim(true, true, true));
+    // Any repository that does not ask for central execution.
+    assert!(!creates_claim(true, false, false));
+}
+
+/// The direct pass pins the source before the claim exists. The claim must
+/// inherit that pin, or it would resolve again and could restore a different
+/// snapshot than the one the Restore already committed to.
+#[test]
+fn a_handover_claim_inherits_the_pin_of_the_direct_pass_bound_to_its_uid() {
+    let pinned: kopiur_api::RestoreStatus = serde_json::from_value(serde_json::json!({
+        "phase": "Resolving",
+        "waitStartedAt": "2026-01-01T00:00:00Z",
+        "resolved": {
+            "resolution": "Snapshot",
+            "kopiaSnapshotID": "k111",
+            "identity": { "username": "u", "hostname": "h", "sourcePath": "/pvc/data" },
+        },
+    }))
+    .unwrap();
+    let record = handover_claim_seed(Some(&pinned), Some("pvc-uid-1".into())).unwrap();
+    assert_eq!(record.uid.as_deref(), Some("pvc-uid-1"));
     assert_eq!(
-        populator_state(&RestoreTarget::PvcRef(ObjectRef {
-            name: "data".into(),
-            namespace: None,
-        })),
-        PopulatorState::DirectTarget
+        record.wait_started_at.as_deref(),
+        Some("2026-01-01T00:00:00Z")
     );
+    assert_eq!(record.source_path.as_deref(), Some("/pvc/data"));
+    // The claim reads it exactly as a pin of its own: never re-resolved.
     assert_eq!(
-        populator_state(&RestoreTarget::Pvc(PvcTemplate {
-            name: "created".into(),
-            storage_class_name: None,
-            capacity: None,
-            access_modes: vec![],
-        })),
-        PopulatorState::DirectTarget
+        claim_pinned_decision(&record),
+        Some(Resolution::Snapshot("k111".into()))
     );
-    // `streamExec` is operator-driven too: the mover reads one virtual file and
-    // pipes it into a command, and nothing ever claims the Restore. Pinned here
-    // because the OTHER classification would be silently catastrophic — an
-    // `AwaitingClaim` streamExec restore would sit passive forever waiting for a
-    // `dataSourceRef` that can never arrive, since it writes no PVC to claim.
+    // Not started: the handover may still choose the central site.
+    assert_eq!(record.phase, None);
+
+    // Nothing pinned (the mover resolves in-Job): nothing to carry.
+    let unpinned = kopiur_api::RestoreStatus::default();
+    assert!(handover_claim_seed(Some(&unpinned), Some("pvc-uid-1".into())).is_none());
+    assert!(handover_claim_seed(None, Some("pvc-uid-1".into())).is_none());
+    // No claim PVC to bind the pin to: a pin with no UID would be inherited
+    // by whatever claim came next.
+    assert!(handover_claim_seed(Some(&pinned), None).is_none());
+}
+
+#[test]
+fn a_handover_has_started_once_the_restore_is_pinned_or_tracks_a_claim() {
+    assert!(!handover_started(None));
+    assert!(!handover_started(Some(
+        &kopiur_api::RestoreStatus::default()
+    )));
+    let pinned = kopiur_api::RestoreStatus {
+        execution: Some(kopiur_api::RestoreExecutionStatus {
+            namespace: "kopiur-system".into(),
+        }),
+        ..Default::default()
+    };
+    assert!(handover_started(Some(&pinned)));
+    let mut claimed = kopiur_api::RestoreStatus::default();
+    claimed.claims.insert("restored".into(), Default::default());
+    assert!(handover_started(Some(&claimed)));
+}
+
+#[test]
+fn a_handover_target_pvc_is_created_as_a_claim_on_the_restore() {
+    let template = pvc_template("restored");
+    let plain = build_restore_target_pvc("billing", &template, None).unwrap();
+    let spec = plain.spec.as_ref().unwrap();
+    assert_eq!(spec.data_source_ref, None);
+    assert_eq!(spec.storage_class_name.as_deref(), Some("fast"));
     assert_eq!(
-        populator_state(&RestoreTarget::StreamExec(
-            kopiur_api::restore::StreamExecTarget {
-                file_name: "postgres.sql".into(),
-                workload_exec: kopiur_api::snapshot_policy::StreamExec {
-                    pod_selector: Default::default(),
-                    container: None,
-                    command: vec!["psql".into()],
-                    timeout: None,
-                },
-            }
-        )),
-        PopulatorState::DirectTarget
+        spec.access_modes.as_deref(),
+        Some(&["ReadWriteOnce".to_string()][..])
     );
+    assert!(!pvc_claims_restore(&plain, "nightly-restore"));
+
+    let claim = build_restore_target_pvc("billing", &template, Some("nightly-restore")).unwrap();
+    // The populator handshake finds its claims by exactly this predicate.
+    assert!(pvc_claims_restore(&claim, "nightly-restore"));
+    assert!(!pvc_claims_restore(&claim, "another-restore"));
+    // Everything else is the PVC a direct restore creates.
+    let mut without_ref = claim.clone();
+    without_ref.spec.as_mut().unwrap().data_source_ref = None;
+    assert_eq!(without_ref, plain);
+    // The restored data must outlive the Restore.
+    assert_eq!(claim.metadata.owner_references, None);
+
+    // A missing capacity is refused for both, with the fix.
+    let mut no_capacity = pvc_template("restored");
+    no_capacity.capacity = None;
+    for claims in [None, Some("nightly-restore")] {
+        let err = build_restore_target_pvc("billing", &no_capacity, claims)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("target.pvc.capacity"), "{err}");
+    }
+}
+
+#[test]
+fn only_the_pvc_a_target_names_is_a_handover_claim() {
+    use kopiur_api::PopulatorTarget;
+    let created = RestoreTarget::Pvc(pvc_template("restored"));
+    assert!(is_handover_claim(&created, "restored"));
+    // Another PVC that claims the same Restore is a user's claim: it waits for
+    // its consumer pod like any populator claim.
+    assert!(!is_handover_claim(&created, "someone-elses"));
+    assert!(!is_handover_claim(
+        &RestoreTarget::Populator(PopulatorTarget {}),
+        "restored"
+    ));
+}
+
+#[test]
+fn a_restore_started_directly_only_once_it_left_resolving_with_no_claim() {
+    let status = |phase: Option<RestorePhase>, claimed: bool| {
+        let mut s = kopiur_api::RestoreStatus {
+            phase,
+            ..Default::default()
+        };
+        if claimed {
+            s.claims.insert("restored".into(), Default::default());
+        }
+        s
+    };
+    assert!(!direct_restore_started(None));
+    for phase in [
+        None,
+        Some(RestorePhase::Pending),
+        Some(RestorePhase::Resolving),
+    ] {
+        assert!(!direct_restore_started(Some(&status(phase, false))));
+    }
+    for phase in [
+        RestorePhase::Restoring,
+        RestorePhase::Completed,
+        RestorePhase::Failed,
+    ] {
+        assert!(direct_restore_started(Some(&status(
+            Some(phase.clone()),
+            false
+        ))));
+        // A restore that tracks a claim is a handover, not a direct restore.
+        assert!(!direct_restore_started(Some(&status(Some(phase), true))));
+    }
 }
 
 #[test]

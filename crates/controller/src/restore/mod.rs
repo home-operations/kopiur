@@ -176,7 +176,8 @@ async fn reconcile_inner(restore: &Restore, ctx: &Context) -> Result<Action> {
         return Err(Error::Validation(populator_needs_cluster_scope_message()));
     }
 
-    let state = populator_state(&restore.spec.target);
+    let delivery = target_pvc_delivery(ctx, restore, &namespace, &name).await?;
+    let state = populator_state(&restore.spec.target, delivery);
 
     // Already terminal: a Restore is one-shot. Once Completed/Failed there is
     // nothing left to do until the spec changes, so don't re-resolve, re-pin a
@@ -253,7 +254,16 @@ async fn reconcile_inner(restore: &Restore, ctx: &Context) -> Result<Action> {
     // the two writes on every requeue, forever. See `restore_with_conditions`.
     let gated;
     let suspended_repository;
-    let restore = match gate_on_repository_readiness(ctx, restore, &api, &namespace, &name).await? {
+    let restore = match gate_on_repository_readiness(
+        ctx,
+        restore,
+        &api,
+        &namespace,
+        &name,
+        state == PopulatorState::AwaitingClaim,
+    )
+    .await?
+    {
         RepositoryGate::Proceed(carried, suspended) => {
             gated = carried;
             suspended_repository = suspended;
@@ -273,6 +283,26 @@ async fn reconcile_inner(restore: &Restore, ctx: &Context) -> Result<Action> {
     // [`PopulatorState`].
     match state {
         PopulatorState::AwaitingClaim => {
+            // `target.pvc` by handover: the operator is the author of the claim,
+            // and the claim inherits what the direct pass already decided.
+            let seeded;
+            let restore = match &restore.spec.target {
+                RestoreTarget::Pvc(template) => {
+                    ensure_restore_target_pvc(ctx, &namespace, template, Some(&name)).await?;
+                    match carry_handover_pin(ctx, restore, &api, &namespace, &name, template)
+                        .await?
+                    {
+                        Some(carried) => {
+                            seeded = carried;
+                            &*seeded
+                        }
+                        None => restore,
+                    }
+                }
+                RestoreTarget::PvcRef(_)
+                | RestoreTarget::Populator(_)
+                | RestoreTarget::StreamExec(_) => restore,
+            };
             // ONE namespaced PVC LIST for the pass: every claimant, plus the
             // prime PVCs this Restore owns (which is what lets a settled claim's
             // "is my prime really gone?" check cost no extra GET).
@@ -2374,7 +2404,16 @@ async fn claim_populate(
         .annotations
         .as_ref()
         .and_then(|a| a.get(SELECTED_NODE_ANNOTATION).cloned());
-    if selected_node.is_none() && cache.storage_class_is_wffc(ctx, cc.consumer).await? {
+    // The exception is a claim the operator created for `target.pvc`: nothing
+    // schedules it before the restore, exactly as with a direct restore, so
+    // the mover pod is the prime's first consumer and decides the node. With
+    // no mover to run (an empty volume) nothing would, so that case waits.
+    let mover_schedules_prime =
+        selection.is_some() && is_handover_claim(&restore.spec.target, &cc.consumer_name);
+    if selected_node.is_none()
+        && !mover_schedules_prime
+        && cache.storage_class_is_wffc(ctx, cc.consumer).await?
+    {
         let mut record = cc.record(
             RestoreClaimPhase::Pending,
             ClaimReason::AwaitingPodSchedule,
@@ -3190,7 +3229,15 @@ async fn drive_direct_restore(
         // forever (FailedScheduling: persistentvolumeclaim not found). This also
         // provisions the empty volume for the deploy-or-restore (no-snapshot) case.
         RestoreTarget::Pvc(t) => {
-            ensure_restore_target_pvc(ctx, namespace, t).await?;
+            // Under a Central repository a restore WITH data gets its PVC as a
+            // claim on this Restore. The next pass sees the claim and hands the
+            // restored volume over from the operator namespace.
+            let as_claim =
+                target_pvc_becomes_claim(ctx, restore, namespace, t, selection.is_some()).await?;
+            ensure_restore_target_pvc(ctx, namespace, t, as_claim.then_some(name)).await?;
+            if as_claim {
+                return Ok(Action::requeue(std::time::Duration::from_secs(1)));
+            }
             DirectDestination::Pvc(t.name.clone())
         }
         // A stream target creates nothing: the mover reads one virtual file out of
@@ -4928,21 +4975,64 @@ async fn assess_restore_security_context(
     }
 }
 
+/// **Pure.** Whether the claiming PVC `consumer` is the one this restore's
+/// `target.pvc` names, i.e. a claim the operator authored. Exhaustive over
+/// [`RestoreTarget`].
+fn is_handover_claim(target: &RestoreTarget, consumer: &str) -> bool {
+    match target {
+        RestoreTarget::Pvc(template) => template.name == consumer,
+        RestoreTarget::PvcRef(_) | RestoreTarget::Populator(_) | RestoreTarget::StreamExec(_) => {
+            false
+        }
+    }
+}
+
 /// Create the `target.pvc` PVC if it doesn't exist (idempotent). Deliberately
 /// NOT owner-referenced to the `Restore`: the restored data must survive
 /// `kubectl delete restore` — GC'ing the target PVC with the CR would destroy
 /// what the user just recovered. Missing `capacity` is rejected (webhook + here,
 /// defensively): a silently-defaulted size could truncate the restored data.
+///
+/// `claims` is `Some(restore name)` for a handover ([`PvcDelivery::Handover`]):
+/// the PVC is then created as a claim on that `Restore`.
 async fn ensure_restore_target_pvc(
     ctx: &Context,
     namespace: &str,
     template: &kopiur_api::restore::PvcTemplate,
+    claims: Option<&str>,
 ) -> Result<()> {
     use k8s_openapi::api::core::v1::PersistentVolumeClaim;
     let pvc_api: Api<PersistentVolumeClaim> = Api::namespaced(ctx.client.clone(), namespace);
     if pvc_api.get_opt(&template.name).await?.is_some() {
         return Ok(());
     }
+    let pvc = build_restore_target_pvc(namespace, template, claims)?;
+    match pvc_api
+        .create(&kube::api::PostParams::default(), &pvc)
+        .await
+    {
+        Ok(_) => {
+            tracing::info!(pvc = %template.name, %namespace, handover = claims.is_some(), "created restore target PVC");
+            Ok(())
+        }
+        // Lost a create race with another reconcile — the PVC exists, which is
+        // all this function guarantees.
+        Err(kube::Error::Api(e)) if e.code == 409 => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// **Pure.** The PVC a `target.pvc` restore creates.
+///
+/// With `claims: Some(restore)` its `dataSourceRef` names that `Restore`. No
+/// provisioner fills such a claim: it stays unbound until the populator
+/// handshake binds the restored volume to it. The reference is immutable, so
+/// the PVC records for good which way it was filled.
+fn build_restore_target_pvc(
+    namespace: &str,
+    template: &kopiur_api::restore::PvcTemplate,
+    claims: Option<&str>,
+) -> Result<k8s_openapi::api::core::v1::PersistentVolumeClaim> {
     let capacity = template.capacity.as_deref().ok_or_else(|| {
         Error::Validation(format!(
             "restore target.pvc {:?} has no capacity. Fix: set target.pvc.capacity (e.g. \
@@ -4961,33 +5051,234 @@ async fn ensure_restore_target_pvc(
             .map(|m| m.mode_str().to_string())
             .collect()
     };
-    let pvc: PersistentVolumeClaim = serde_json::from_value(serde_json::json!({
-        "apiVersion": "v1",
-        "kind": "PersistentVolumeClaim",
-        "metadata": {
-            "name": template.name,
-            "namespace": namespace,
-            "labels": io::child_labels(&[(crate::consts::OP_LABEL, crate::consts::OP_RESTORE_TARGET)]),
-        },
-        "spec": {
-            "accessModes": access_modes,
-            "resources": { "requests": { "storage": capacity } },
-            "storageClassName": template.storage_class_name,
-        },
-    }))?;
-    match pvc_api
-        .create(&kube::api::PostParams::default(), &pvc)
-        .await
-    {
-        Ok(_) => {
-            tracing::info!(pvc = %template.name, %namespace, "created restore target PVC");
-            Ok(())
-        }
-        // Lost a create race with another reconcile — the PVC exists, which is
-        // all this function guarantees.
-        Err(kube::Error::Api(e)) if e.code == 409 => Ok(()),
-        Err(e) => Err(e.into()),
+    let mut pvc: k8s_openapi::api::core::v1::PersistentVolumeClaim = serde_json::from_value(
+        serde_json::json!({
+            "apiVersion": "v1",
+            "kind": "PersistentVolumeClaim",
+            "metadata": {
+                "name": template.name,
+                "namespace": namespace,
+                "labels": io::child_labels(&[(crate::consts::OP_LABEL, crate::consts::OP_RESTORE_TARGET)]),
+            },
+            "spec": {
+                "accessModes": access_modes,
+                "resources": { "requests": { "storage": capacity } },
+                "storageClassName": template.storage_class_name,
+            },
+        }),
+    )?;
+    if let (Some(restore), Some(spec)) = (claims, pvc.spec.as_mut()) {
+        spec.data_source_ref = Some(k8s_openapi::api::core::v1::TypedObjectReference {
+            api_group: Some(kopiur_api::GROUP.to_string()),
+            kind: "Restore".to_string(),
+            name: restore.to_string(),
+            namespace: None,
+        });
     }
+    Ok(pvc)
+}
+
+/// Decide how this restore delivers data to a `target.pvc` PVC (see
+/// [`pvc_delivery`]). Every other target answers [`PvcDelivery::Mount`]
+/// without a read: the question is not asked of them.
+///
+/// The answer depends only on the PVC and on what this restore recorded in its
+/// own status, never on the repository's current `execution`: it must be the
+/// same on every reconcile.
+async fn target_pvc_delivery(
+    ctx: &Context,
+    restore: &Restore,
+    namespace: &str,
+    name: &str,
+) -> Result<PvcDelivery> {
+    use k8s_openapi::api::core::v1::PersistentVolumeClaim;
+    let template = match &restore.spec.target {
+        RestoreTarget::Pvc(template) => template,
+        RestoreTarget::PvcRef(_) | RestoreTarget::Populator(_) | RestoreTarget::StreamExec(_) => {
+            return Ok(PvcDelivery::Mount);
+        }
+    };
+    let pvc_api: Api<PersistentVolumeClaim> = Api::namespaced(ctx.client.clone(), namespace);
+    let target = match pvc_api.get_opt(&template.name).await? {
+        None => TargetPvcState::Absent,
+        Some(pvc) if pvc_claims_restore(&pvc, name) => TargetPvcState::ClaimsRestore,
+        Some(_) => TargetPvcState::Plain,
+    };
+    Ok(pvc_delivery(
+        target,
+        handover_started(restore.status.as_ref()),
+    ))
+}
+
+/// Give the claim of a `target.pvc` handover the source the direct pass pinned.
+///
+/// The direct pipeline resolves the source and pins it in the top-level
+/// `status.resolved` BEFORE it creates the claim. The populator pipeline pins
+/// per claim, in `status.claims.<pvc>`, and reads nothing else. Without this
+/// step the claim would resolve a second time, and could pick a newer snapshot
+/// than the one already pinned, or find none where one was found (ADR §4.6: a
+/// restore never retargets).
+///
+/// The pin, and the open `waitTimeout` window, are copied into the claim's
+/// record once, bound to the UID of the claim PVC. A replacement claim has
+/// another UID, so its record is stale and it resolves afresh: the copied pin
+/// is never a fallback for a later claim. A crash between creating the PVC and
+/// writing the record is harmless, because this runs on every pass until the
+/// record exists.
+///
+/// Returns the `Restore` the rest of the pass must use when the record is not
+/// in the cached copy: the live object, with the record in it.
+async fn carry_handover_pin(
+    ctx: &Context,
+    restore: &Restore,
+    api: &Api<Restore>,
+    namespace: &str,
+    name: &str,
+    template: &kopiur_api::restore::PvcTemplate,
+) -> Result<Option<Box<Restore>>> {
+    use k8s_openapi::api::core::v1::PersistentVolumeClaim;
+    let has_record = |r: &Restore| {
+        r.status
+            .as_ref()
+            .is_some_and(|s| s.claims.contains_key(&template.name))
+    };
+    if has_record(restore) {
+        return Ok(None);
+    }
+    let Some(mut live) = api.get_opt(name).await? else {
+        return Ok(None);
+    };
+    if has_record(&live) {
+        return Ok(Some(Box::new(live)));
+    }
+    let pvc_api: Api<PersistentVolumeClaim> = Api::namespaced(ctx.client.clone(), namespace);
+    let claim_uid = pvc_api
+        .get_opt(&template.name)
+        .await?
+        .filter(|pvc| pvc_claims_restore(pvc, name))
+        .and_then(|pvc| pvc.metadata.uid);
+    let Some(record) = handover_claim_seed(live.status.as_ref(), claim_uid) else {
+        return Ok(None);
+    };
+    io::patch_status(
+        api,
+        name,
+        serde_json::json!({ "claims": { template.name.clone(): record } }),
+    )
+    .await?;
+    live.status
+        .get_or_insert_with(Default::default)
+        .claims
+        .insert(template.name.clone(), record);
+    Ok(Some(Box::new(live)))
+}
+
+/// **Pure.** The first record of a handover claim: the direct pass's pin and
+/// its wait anchor, bound to the claim PVC's UID. `None` when there is nothing
+/// to carry (the direct pass pinned nothing, as for a selection the mover
+/// resolves in-Job) or no claim to bind it to.
+fn handover_claim_seed(
+    status: Option<&kopiur_api::RestoreStatus>,
+    claim_uid: Option<String>,
+) -> Option<kopiur_api::RestoreClaimStatus> {
+    let status = status?;
+    let resolved = status.resolved.clone()?;
+    Some(kopiur_api::RestoreClaimStatus {
+        uid: Some(claim_uid?),
+        source_path: resolved
+            .identity
+            .as_ref()
+            .and_then(|i| i.source_path.clone()),
+        resolved: Some(resolved),
+        wait_started_at: status.wait_started_at.clone(),
+        ..Default::default()
+    })
+}
+
+/// **Pure.** Whether this restore already hands a volume over: it is pinned to
+/// the operator namespace, or it tracks a claim.
+fn handover_started(status: Option<&kopiur_api::RestoreStatus>) -> bool {
+    matches!(
+        io::RestoreSite::pinned(status),
+        io::RestoreSite::Central { .. }
+    ) || status.is_some_and(|s| !s.claims.is_empty())
+}
+
+/// Whether the PVC a direct `target.pvc` restore is about to create should be
+/// a claim on the Restore (see [`creates_claim`]). `false` whenever a PVC of
+/// that name already exists: the restore then writes into it in place.
+async fn target_pvc_becomes_claim(
+    ctx: &Context,
+    restore: &Restore,
+    namespace: &str,
+    template: &kopiur_api::restore::PvcTemplate,
+    has_snapshot: bool,
+) -> Result<bool> {
+    use k8s_openapi::api::core::v1::PersistentVolumeClaim;
+    let started_direct = direct_restore_started(restore.status.as_ref());
+    // The repository and the PVC are only read when their answer can decide.
+    if !has_snapshot || started_direct {
+        return Ok(false);
+    }
+    let central = restore_repository_is_central(ctx, restore, namespace).await?;
+    if !creates_claim(has_snapshot, started_direct, central) {
+        return Ok(false);
+    }
+    let pvc_api: Api<PersistentVolumeClaim> = Api::namespaced(ctx.client.clone(), namespace);
+    Ok(pvc_api.get_opt(&template.name).await?.is_none())
+}
+
+/// **Pure.** Whether this restore already ran, or is running, as a direct
+/// restore: it left `Pending`/`Resolving` and tracks no claim. Exhaustive over
+/// [`RestorePhase`].
+fn direct_restore_started(status: Option<&kopiur_api::RestoreStatus>) -> bool {
+    let Some(status) = status else {
+        return false;
+    };
+    status.claims.is_empty()
+        && match status.phase.as_ref() {
+            None | Some(RestorePhase::Pending | RestorePhase::Resolving) => false,
+            Some(
+                RestorePhase::Restoring
+                | RestorePhase::Completed
+                | RestorePhase::Failed
+                | RestorePhase::Unknown(_),
+            ) => true,
+        }
+}
+
+/// Whether this restore's repository asks for central execution, on an install
+/// that can provide it. A repository that cannot be resolved decides nothing:
+/// the restore then proceeds as a direct restore, which reports it.
+async fn restore_repository_is_central(
+    ctx: &Context,
+    restore: &Restore,
+    namespace: &str,
+) -> Result<bool> {
+    if io::central_namespace(
+        ctx.operator_namespace.as_deref(),
+        matches!(ctx.watch_scope, crate::config::WatchScope::Namespaced(_)),
+    )
+    .is_err()
+    {
+        return Ok(false);
+    }
+    let mode = match restore_repository_ref(ctx, restore, namespace).await? {
+        RepoRefLookup::Derived(rref, base_ns) => {
+            match io::repository_execution_cached(ctx, &rref, &base_ns).await {
+                Ok(mode) => mode,
+                Err(Error::MissingDependency(_)) => kopiur_api::ExecutionMode::InNamespace,
+                Err(e) => return Err(e),
+            }
+        }
+        RepoRefLookup::SnapshotRowMissing
+        | RepoRefLookup::ReferentMissing { .. }
+        | RepoRefLookup::NotDerivable => kopiur_api::ExecutionMode::InNamespace,
+    };
+    Ok(match mode {
+        kopiur_api::ExecutionMode::Central => true,
+        kopiur_api::ExecutionMode::InNamespace => false,
+    })
 }
 
 /// The policy's OWN kopia source path, for a restore whose target is not a PVC
@@ -5567,13 +5858,16 @@ async fn gate_on_repository_readiness<'a>(
     api: &Api<Restore>,
     namespace: &str,
     name: &str,
+    // Whether this restore fills volumes through the populator handshake: the
+    // one shape whose claims launch movers AFTER the Restore-level gate.
+    serves_claims: bool,
 ) -> Result<RepositoryGate<'a>> {
     let awaiting = restore_awaiting_launch(restore.status.as_ref().and_then(|s| s.phase.as_ref()));
     // A launched DIRECT restore's live Job is tracked to terminal and never
     // re-gated. A launched POPULATOR still reads its repository's availability
     // (PR #706 review): its NEW claims each launch their own mover, and a
     // suspension must hold those — and pause any claim's open wait window.
-    if !awaiting && !targets_populator(&restore.spec.target) {
+    if !awaiting && !serves_claims {
         return proceed_past_gate(CarriedRestore::Unchanged(restore), api, name, None).await;
     }
     let (rref, base_ns) = match restore_repository_ref(ctx, restore, namespace).await? {
@@ -5666,16 +5960,6 @@ async fn gate_on_repository_readiness<'a>(
                 std::time::Duration::from_secs(15),
             )))
         }
-    }
-}
-
-/// Whether a restore fills volumes through the populator handshake — the one
-/// target whose claims launch movers AFTER the Restore-level gate. Exhaustive
-/// over [`RestoreTarget`].
-fn targets_populator(target: &RestoreTarget) -> bool {
-    match target {
-        RestoreTarget::Populator(_) => true,
-        RestoreTarget::Pvc(_) | RestoreTarget::PvcRef(_) | RestoreTarget::StreamExec(_) => false,
     }
 }
 
