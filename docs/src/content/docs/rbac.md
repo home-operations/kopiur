@@ -6,13 +6,13 @@ Everything Kopiur is allowed to do in your cluster, in one place. Use it for sec
 
 Kopiur runs as **five principals**:
 
-| ServiceAccount                      | Who uses it                                                                                                                                     | Bound to                                                                   |
-| ----------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------- |
-| `kopiur-controller`                 | The controller Deployment **and** the admission webhook Deployment (they share one ServiceAccount)                                              | `kopiur-controller` ClusterRole (cluster scope) or Role (namespaced scope) |
-| `kopiur-mover`                      | Every ordinary mover `Job` (snapshot, restore, bootstrap, maintenance, verify, replicate, pin, delete)                                          | `kopiur-mover` ClusterRole/Role                                            |
-| `kopiur-snapshot-replication-mover` | Only `SnapshotReplication` mover Jobs                                                                                                           | `kopiur-snapshot-replication-mover` ClusterRole/Role                       |
-| `kopiur-stream-mover`               | Only mover Jobs for a [`stream` source](/stream-sources/) or a `streamExec` restore target. **The only mover principal that holds `pods/exec`** | `kopiur-stream-mover` ClusterRole/Role                                     |
-| `kopiur-central-mover`              | Only backup and populator-restore mover Jobs of a `ClusterRepository` with [`execution.mode: Central`](/central-execution/). Cluster scope only | `kopiur-central-mover` ClusterRole                                         |
+| ServiceAccount                      | Who uses it                                                                                                                                             | Bound to                                                                   |
+| ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------- |
+| `kopiur-controller`                 | The controller Deployment **and** the admission webhook Deployment (they share one ServiceAccount)                                                      | `kopiur-controller` ClusterRole (cluster scope) or Role (namespaced scope) |
+| `kopiur-mover`                      | Every ordinary mover `Job` (snapshot, restore, bootstrap, maintenance, verify, replicate, pin, delete)                                                  | `kopiur-mover` ClusterRole/Role                                            |
+| `kopiur-snapshot-replication-mover` | Only `SnapshotReplication` mover Jobs                                                                                                                   | `kopiur-snapshot-replication-mover` ClusterRole/Role                       |
+| `kopiur-stream-mover`               | Only mover Jobs for a [`stream` source](/stream-sources/) or a `streamExec` restore target. **The only mover principal that holds `pods/exec`**         | `kopiur-stream-mover` ClusterRole/Role                                     |
+| `kopiur-central-mover`              | Only the mover Jobs that a `ClusterRepository` with [`execution.mode: Central`](/central-execution/) runs in the operator namespace. Cluster scope only | `kopiur-central-mover` ClusterRole                                         |
 
 The authoritative definitions are **generated** by `cargo xtask gen-rbac` into `deploy/rbac/`, as `operator-clusterrole.yaml`, `operator-role.yaml`, `mover-clusterrole.yaml` and `mover-role.yaml`.
 
@@ -99,16 +99,16 @@ Substitute your release's prefix if `fullnameOverride`/the release name is not `
 
 ### The central mover (`kopiur-central-mover`)
 
-A backup or a populator restore under [`execution.mode: Central`](/central-execution/) runs its mover Job in the operator namespace. The mover still reports to the `Snapshot` or `Restore` object, which lives in the workload namespace. Its identity therefore spans two namespaces:
+A backup, a restore that hands its volume over, a verification, and a snapshot pin under [`execution.mode: Central`](/central-execution/) each run their mover Job in the operator namespace. The mover still reports to the `Snapshot`, `Restore` or `SnapshotPolicy` object, which lives in the workload namespace. Its identity therefore spans two namespaces:
 
 - the `kopiur-central-mover` ServiceAccount lives in the operator namespace, and
 - a `kopiur-central-mover` RoleBinding in each namespace that uses central execution names that ServiceAccount.
 
 One ServiceAccount is bound in many namespaces, so its role is the smallest of all the movers:
 
-| API group → resources                                                | Verbs      | Why                                                                              |
-| -------------------------------------------------------------------- | ---------- | -------------------------------------------------------------------------------- |
-| `kopiur.home-operations.com` → `snapshots/status`, `restores/status` | get, patch | Report progress and the terminal result onto the `Snapshot` or `Restore` object. |
+| API group → resources                                                                           | Verbs      | Why                                                                                                                                                              |
+| ----------------------------------------------------------------------------------------------- | ---------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `kopiur.home-operations.com` → `snapshots/status`, `restores/status`, `snapshotpolicies/status` | get, patch | Report progress and the result onto the object the mover works for: the `Snapshot` (a backup or a pin), the `Restore`, or the `SnapshotPolicy` (a verification). |
 
 It holds no `configmaps` verbs and no other status kind. The generic mover role holds both, and a ServiceAccount that carried them in every tenant namespace at once would be a cluster-wide write.
 
@@ -153,6 +153,8 @@ There is deliberately **no `secrets` access**. The session pod loads the reposit
 Be honest about the binding's blast radius, though: `pods/exec` and `jobs delete` are namespace-wide once bound. RBAC cannot scope exec to session pods only, so bind this role only where that is acceptable.
 
 The `--local` flag is the exception. It copies the credentials to the user's machine and therefore also needs `get` on `secrets`. Grant that separately and deliberately.
+
+A session for a `ClusterRepository` with [`execution.mode: Central`](/central-execution/) runs in the **operator namespace**, where that repository keeps its credentials. To browse its snapshots, bind this role for the user in the operator namespace as well as in the namespace of the `Snapshot`. Grant that only to administrators: a user who can create Jobs in the operator namespace can reach every Secret in it.
 
 ## The web console (`ui.enabled`)
 

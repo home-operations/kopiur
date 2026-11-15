@@ -10,8 +10,7 @@ import examples49CentralExecution from "@repo/deploy/examples/49-central-executi
 
 By default, Kopiur runs each mover Job in the namespace of the `Snapshot` or the
 `Restore`, beside the PVC. **Central execution** moves the Job to the operator
-namespace, for backups and for populator restores. You turn it on with one field
-on a `ClusterRepository`.
+namespace. You turn it on with one field on a `ClusterRepository`.
 
 :::caution[Experimental: central backups depend on an alpha Kubernetes feature]
 
@@ -20,7 +19,8 @@ is alpha in Kubernetes and off by default. A cluster administrator must turn it
 on in three places. Kubernetes can change or remove an alpha feature, so do not
 make this your only backup path.
 
-A central restore does not use that feature. It needs no feature gate.
+A central restore, a verification, a pin, and a browse session do not use that
+feature. They need no feature gate.
 
 :::
 
@@ -33,12 +33,38 @@ A mover in the workload namespace has two costs:
 - A pod that holds those credentials runs beside tenant workloads.
 
 With central execution, the workload namespace holds no repository credentials
-and runs no mover pod, for a backup and for a populator restore. Tenants do not
-change their `SnapshotPolicy`.
+and runs no mover pod. Tenants do not change their `SnapshotPolicy`.
 
-Do not use it when your storage has no CSI snapshot support, or when you cannot
-change the feature gates of the cluster. The default placement works on any
-storage.
+Do not use it for PVC backups when your storage has no CSI snapshot or clone
+support, or when you cannot change the feature gates of the cluster. The default
+placement works on any storage.
+
+## What runs where
+
+| Work                                                               | Under `execution.mode: Central`                                           |
+| ------------------------------------------------------------------ | ------------------------------------------------------------------------- |
+| Backup of a PVC, `copyMethod: Snapshot` or `Clone`                 | Operator namespace                                                        |
+| Backup of a `groupBy: VolumeGroupSnapshot` group                   | Operator namespace, one mover for each member                             |
+| Backup of an NFS source                                            | Refused. See [Limits](#limits).                                           |
+| Backup of a PVC, `copyMethod: Direct`                              | Refused. A pod can only mount a PVC from its own namespace.               |
+| Backup of a `stream` source                                        | Refused. The mover must run a command in a pod of the workload namespace. |
+| Restore, `target.populator`                                        | Operator namespace                                                        |
+| Restore, `target.pvc`, when the PVC does not exist yet             | Operator namespace                                                        |
+| Restore into an existing PVC (`target.pvcRef`, or an existing PVC) | Workload namespace. The mover must mount that PVC.                        |
+| Restore, `target.streamExec`                                       | Workload namespace. The mover must run a command in a pod there.          |
+| Verification (`spec.verification`)                                 | Operator namespace                                                        |
+| Snapshot pin (`spec.pin`)                                          | Operator namespace                                                        |
+| Browse session (`kubectl kopiur browse`, the web console)          | Operator namespace. You need your own access to that namespace.           |
+| Maintenance, snapshot deletion                                     | Operator namespace, as for every `ClusterRepository`                      |
+| Hooks                                                              | Workload namespace. See [Limits](#limits).                                |
+
+"Refused" means that the `Snapshot` fails with the reason
+`CentralExecutionUnsupported`. Kopiur never falls back to a mover in the
+workload namespace for a backup.
+
+The two restores that stay in the workload namespace need the repository
+credentials there, by a Secret that you create or by
+[credential projection](/restores/#credentials-in-a-fresh-namespace--credentialprojection).
 
 ## How it works
 
@@ -70,15 +96,53 @@ workload namespace (billing)             operator namespace (kopiur-system)
 The `Snapshot` object stays in the workload namespace. Its status, events, and
 retention work as before.
 
+The other sources cross in a similar way:
+
+- **`copyMethod: Clone`.** There is no `VolumeSnapshot`. The `dataSourceRef` of
+  the staged PVC points at the source PVC, and the `ReferenceGrant` names that
+  one PVC. The CSI driver clones the volume into the operator namespace.
+- **`groupBy: VolumeGroupSnapshot`.** One `VolumeGroupSnapshot` captures all
+  the PVCs in the workload namespace. Each member then gets its own staged PVC
+  and its own mover in the operator namespace, with a `ReferenceGrant` for its
+  own member snapshot.
+
+### Where the source is mounted
+
+A central mover pod mounts every source at the fixed path `/source`. The pod
+holds the repository credentials, so a tenant must not choose a path in it. A
+volume mounted over the mover binaries would run tenant code with those
+credentials.
+
+The path that kopia **records** does not change. It is `/pvc/<name>` by default,
+or the `sourcePathOverride`. A central backup and a backup in the workload
+namespace record the same path, so both belong to the same snapshot history.
+
+A filesystem repository must not keep its files at `/source`, or at a path
+inside or above it. The mover pod mounts the repository volume at the path of
+the repository, and two mounts cannot overlap. Kopiur refuses such a backup
+with the reason `CentralExecutionUnsupported`.
+
 ### How a restore works
 
-A central restore uses the populator target (`target.populator`). A PVC in the
-workload namespace claims the `Restore` through its `spec.dataSourceRef`.
+A central restore hands a finished volume to a PVC in the workload namespace.
+That PVC claims the `Restore` through its `spec.dataSourceRef`. There are two
+ways to get such a PVC:
+
+- **`target.populator`.** You write the PVC, with a `dataSourceRef` to the
+  `Restore`.
+- **`target.pvc`.** Kopiur creates the PVC for you, with that `dataSourceRef`.
+  This applies when no PVC of that name exists and there is a snapshot to
+  restore. If a PVC of that name exists, the restore writes into it in place,
+  from a mover in the workload namespace. If there is no snapshot and
+  `onMissingSnapshot` is `Continue`, Kopiur creates an ordinary empty PVC, and
+  no mover runs anywhere.
 
 1. Kopiur creates a temporary **prime PVC** in the operator namespace. It copies
    the size, the StorageClass, and the access modes of the claiming PVC. If the
-   StorageClass uses `WaitForFirstConsumer`, Kopiur first waits until a pod
-   that uses the claiming PVC is scheduled, as for every populator restore.
+   StorageClass uses `WaitForFirstConsumer`, a `target.populator` restore first
+   waits until a pod that uses the claiming PVC is scheduled, as for every
+   populator restore. A `target.pvc` restore does not wait: the mover pod is the
+   first consumer, and the volume is created on the node where the mover runs.
 2. The mover Job runs in the operator namespace and restores the snapshot into
    the prime PVC.
 3. Kopiur hands the volume to the claiming PVC. A `PersistentVolume` is not
@@ -92,7 +156,8 @@ workload namespace.
 ## What the cluster needs
 
 A cluster administrator must provide all of these. Kopiur cannot set them up.
-A central restore needs only the last two rows.
+Only a central backup of a PVC needs the first five rows. Everything else needs
+only the last two.
 
 | Requirement                                                                         | Where                                                                  |
 | ----------------------------------------------------------------------------------- | ---------------------------------------------------------------------- |
@@ -142,7 +207,9 @@ The tenant policy is an ordinary one. `copyMethod: Snapshot` is the default.
   title="deploy/examples/49-central-execution.yaml"
 />
 
-To restore, write a `Restore` with `target.populator` and a PVC that claims it:
+To restore, write a `Restore` with `target.populator` and a PVC that claims it.
+Or write a `Restore` with `target.pvc` and the name of a PVC that does not exist
+yet.
 
 <Code
   code={region(examples49CentralExecution, "restore")}
@@ -186,40 +253,47 @@ Without that access, read the recorded log tail: `status.logTail` on a
 
 ## Limits
 
-- **Restores: populator only.** A restore into a named PVC (`target.pvc`,
-  `target.pvcRef`) and a `target.streamExec` restore still run in the workload
-  namespace. Such a mover must mount a PVC there, or exec into a pod there. They
-  need the repository credentials in that namespace, by a Secret that you create
-  or by
-  [credential projection](/restores/#credentials-in-a-fresh-namespace--credentialprojection).
-- **Verification, snapshot pins, and browse sessions** also still run in the
-  workload namespace, with the same need.
+- **A restore into an existing PVC runs in the workload namespace.** This is
+  `target.pvcRef`, and `target.pvc` when a PVC of that name exists. The mover
+  must mount that PVC, and a pod can only mount a PVC from its own namespace. A
+  `target.streamExec` restore also runs there, because the mover runs a command
+  in a pod of that namespace. See [What runs where](#what-runs-where).
+- **`copyMethod: Direct` and `stream` sources are refused**, for the same two
+  reasons. The `Snapshot` fails with `CentralExecutionUnsupported`.
+- **Do not delete the source PVC during a `copyMethod: Clone` backup.** The
+  CSI provisioner protects a PVC from deletion while a clone of it is in
+  progress. That protection only sees clones in the namespace of the source. A
+  central clone is in the operator namespace, so the provisioner lets the
+  deletion go ahead, and the backup then fails. `copyMethod: Snapshot` has no
+  such limit.
+- **NFS sources are refused.** The mover pod itself mounts an NFS export. A
+  namespace can forbid `nfs` volumes for its pods (the `restricted` Pod Security
+  level does). A mover pod in the operator namespace does not obey that rule of
+  the workload namespace. A tenant could then make it mount any export that the
+  nodes can reach. Back up an NFS source with a repository that does not set
+  `execution.mode: Central`.
+- **Browsing needs access to the operator namespace.** You create the session
+  Job and exec into its pod as yourself. A user with no rights in the operator
+  namespace cannot browse a snapshot of a central repository. Such a user can
+  still restore it.
 - **A restore does not change site in the middle of its work.** A central
   `Restore` stays central if you remove the field. A `Restore` that has claims
   in progress or finished in its own namespace stays there if you set
   `execution.mode: Central` later. It moves to central execution only when none
   of its claims is in progress or finished, for example after you re-create its
   claiming PVC.
-- **One PVC, `copyMethod: Snapshot`.** A policy with `copyMethod: Clone` or
-  `Direct`, an NFS source, a `stream` source, or `groupBy: VolumeGroupSnapshot`
-  fails with the reason `CentralExecutionUnsupported`. Kopiur does not fall back
-  to a mover in the workload namespace.
-- **No `sourcePathOverride`.** That field also sets the path where Kopiur
-  mounts the source volume inside the mover pod. A central mover pod holds the
-  repository credentials, so a tenant must not choose a path there. A volume
-  mounted over the mover binaries would run tenant code with those credentials.
-  Kopiur mounts every central source under `/pvc/`.
 - **No persistent cache.** A `mover.cache` with `mode: Persistent` becomes a
   per-run volume of the same capacity. The persistent cache PVC belongs to the
   `SnapshotPolicy` and lives in the workload namespace.
 - **Hooks still act in the workload namespace.** The controller runs
   `workloadExec` hooks through the API server. A `runJob` hook creates its Job
-  in the workload namespace.
+  in the workload namespace. Neither one uses the repository credentials.
 - **A privileged mover needs the opt-in on both namespaces.** A mover that
   needs root requires the `kopiur.home-operations.com/privileged-movers`
   annotation on the workload namespace, as always. The pod runs in the operator
   namespace, so that namespace needs the annotation too. The pod must also pass
-  the Pod Security level of the operator namespace.
+  the Pod Security level of the operator namespace. This applies to backups,
+  restores, and verification.
 - **A `ClusterRepository` only.** A central mover takes the credential Secrets,
   and the PVC of a filesystem backend, from the operator namespace by name. Only
   a `ClusterRepository` can name them. If you point a central backup or restore
@@ -236,14 +310,14 @@ Each of these appears as the reason of the `SourceStaged` condition on the
 `Snapshot`, with a message that states the fix. The `Snapshot` is `Failed`. The
 next scheduled run, or a new `Snapshot`, tries again.
 
-| Reason                             | Meaning                                                                                                  |
-| ---------------------------------- | -------------------------------------------------------------------------------------------------------- |
-| `CentralExecutionUnsupported`      | The policy uses a source or copy method that cannot cross namespaces.                                    |
-| `CentralExecutionUnavailable`      | The install is namespace-scoped, or the controller has no `KOPIUR_NAMESPACE`.                            |
-| `ReferenceGrantCRDMissing`         | The `ReferenceGrant` CRD is not installed.                                                               |
-| `CrossNamespaceDataSourceDisabled` | The feature gate is off on kube-apiserver. Kopiur deleted the empty claim.                               |
-| `StagedPvcBindTimeout`             | The staged PVC did not bind. The usual cause is the provisioner flag or its `referencegrants` RBAC rule. |
-| `CentralObjectNameConflict`        | A PVC with the derived name belongs to another `Snapshot`. Kopiur does not use or delete it.             |
+| Reason                             | Meaning                                                                                                                                                                            |
+| ---------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `CentralExecutionUnsupported`      | The policy uses `copyMethod: Direct` on a PVC, a `stream` source, or an NFS source.                                                                                                |
+| `CentralExecutionUnavailable`      | The install is namespace-scoped, or the controller has no `KOPIUR_NAMESPACE`.                                                                                                      |
+| `ReferenceGrantCRDMissing`         | The `ReferenceGrant` CRD is not installed.                                                                                                                                         |
+| `CrossNamespaceDataSourceDisabled` | The feature gate is off on kube-apiserver. Kopiur deleted the empty claim.                                                                                                         |
+| `StagedPvcBindTimeout`             | The staged PVC did not bind. The usual cause is the provisioner flag or its `referencegrants` RBAC rule. For `copyMethod: Clone`, the CSI driver must also support volume cloning. |
+| `CentralObjectNameConflict`        | A PVC with the derived name belongs to another `Snapshot`. Kopiur does not use or delete it.                                                                                       |
 
 A missing credential Secret in the operator namespace appears as
 `CredentialsAvailable=False`, as it does for any mover.
@@ -293,6 +367,28 @@ cleanup. Find leftovers with:
 $ kubectl get jobs,pvc -n kopiur-system -l kopiur.home-operations.com/snapshot-uid
 ```
 
+After a `copyMethod: Clone` backup, the CSI external-provisioner leaves its
+`provisioner.storage.kubernetes.io/cloning-protection` finalizer on the source
+PVC. This is how the provisioner works for every clone, also in the workload
+namespace. The provisioner removes the finalizer when you delete the PVC.
+
+### After a group backup
+
+Kopiur deletes the shared `VolumeGroupSnapshot` when every member of the group
+finished and released its staged PVC. It then deletes the member
+`VolumeSnapshot` objects and removes the provisioner finalizer from each one, by
+the rule above.
+
+### After a verification or a pin
+
+A central verification Job is labelled with the UID of the `SnapshotPolicy`
+(`kopiur.home-operations.com/policy-uid`). It expires by its
+`ttlSecondsAfterFinished`. Kopiur deletes the Jobs that remain when you delete
+the policy.
+
+A central pin Job is labelled with the UID of the `Snapshot`. Kopiur deletes it
+when it has recorded the result, or when you delete the `Snapshot`.
+
 ### After a restore
 
 The prime PVC and the mover Job also cannot carry an owner reference to the
@@ -309,3 +405,7 @@ The prime PVC and the mover Job also cannot carry an owner reference to the
 
 Central execution adds one mover identity and one controller rule. See
 [RBAC reference](/rbac/#the-central-mover-kopiur-central-mover).
+
+To browse a snapshot of a central repository, a user needs the browse
+permissions in the operator namespace. See
+[RBAC reference](/rbac/#browsing-snapshots-rbacbrowserole).

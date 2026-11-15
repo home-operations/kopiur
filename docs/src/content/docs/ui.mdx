@@ -424,6 +424,19 @@ Reads never start a session. `GET …/tree` on a snapshot with no session answer
 `409` and tells you to start one — creating a pod is a real cost and takes a
 deliberate action.
 
+### Browsing a ClusterRepository with central execution
+
+A `ClusterRepository` with
+[`execution.mode: Central`](/central-execution/) keeps its credentials in the
+operator namespace. Its session pod runs there too, and the operator writes no
+copy of the Secret.
+
+The console creates the `Job` and execs into its pod as you. You therefore need
+the browse permissions in the operator namespace, as well as in the namespace of
+the snapshot. The **Start session** button checks your access in the namespace
+of the snapshot only. If you have no access in the operator namespace, the
+request fails and the console shows the refusal.
+
 ### Browsing a ClusterRepository from another namespace
 
 The session pod loads the repository's credentials from its own namespace,

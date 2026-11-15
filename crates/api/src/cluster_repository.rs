@@ -134,40 +134,53 @@ pub struct ClusterRepositorySpec {
     pub parameters: Option<RepositoryParameters>,
 }
 
-/// `ClusterRepository.spec.execution`: where a consumer's backup mover Job runs.
+/// `ClusterRepository.spec.execution`: where the mover Jobs of this
+/// repository's consumers run.
 /// A sub-object so placement knobs slot in without API breakage.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ExecutionSpec {
-    /// `InNamespace` runs each backup mover beside its source PVC, in the
-    /// `Snapshot`'s namespace. `Central` runs it in the operator namespace: the
-    /// operator cuts the CSI `VolumeSnapshot` in the workload namespace, restores
-    /// it into a temporary PVC in the operator namespace through a cross-namespace
-    /// `dataSourceRef` (authorized by a `ReferenceGrant` it creates beside the
-    /// `VolumeSnapshot`), and the mover reads that PVC. No mover pod and no
-    /// repository credential then enters the workload namespace.
+    /// `InNamespace` runs each mover beside the object it works for, in the
+    /// consumer's namespace. `Central` runs it in the operator namespace, so
+    /// that no mover pod and no repository credential enters the workload
+    /// namespace.
     ///
-    /// `Central` applies to backups and to populator restores
-    /// (`Restore.spec.target.populator`): the restore mover fills a temporary
-    /// PVC in the operator namespace, and its volume is then handed to the PVC
-    /// that claims the `Restore`. Restores into a named PVC, verification, pins
-    /// and browse sessions still run in the consumer's namespace. A backup is
-    /// served only for a
-    /// single-PVC source under `copyMethod: Snapshot` with no
-    /// `sourcePathOverride` (the override is also the mount path inside the
-    /// mover pod, which holds the repository credentials); any other source or
-    /// copy method fails the `Snapshot` with the reason. It needs, on the
-    /// cluster: the `CrossNamespaceVolumeDataSource` feature gate on
+    /// A central backup of a PVC crosses namespaces through CSI: the operator
+    /// creates a temporary PVC in the operator namespace whose cross-namespace
+    /// `dataSourceRef` names a `VolumeSnapshot` of the source
+    /// (`copyMethod: Snapshot`, also for each member of a
+    /// `groupBy: VolumeGroupSnapshot` group) or the source PVC itself
+    /// (`copyMethod: Clone`), authorized by a `ReferenceGrant` it creates
+    /// beside that object. The mover mounts every source at a fixed path; the
+    /// path kopia records (`sourcePathOverride` included) is unchanged.
+    /// `copyMethod: Direct` on a PVC and a `stream` source cannot leave the
+    /// workload namespace, and an NFS source would be mounted outside the
+    /// reach of that namespace's Pod Security rules: all three fail the
+    /// `Snapshot` with the reason.
+    ///
+    /// A central restore fills a temporary PVC in the operator namespace, and
+    /// its volume is then handed to the PVC that claims the `Restore`: one the
+    /// user wrote (`target.populator`), or one the operator creates
+    /// (`target.pvc`, when no PVC of that name exists). A restore into an
+    /// existing PVC and a `target.streamExec` restore still run in the
+    /// consumer's namespace.
+    ///
+    /// Verification, pins and browse sessions read only the repository and
+    /// run in the operator namespace. A browse session is created by its user,
+    /// who therefore needs access to that namespace.
+    ///
+    /// It needs, on the cluster: the repository's credential Secret(s) (and a
+    /// filesystem backend's PVC) in the operator namespace; and, for a backup
+    /// of a PVC, the `CrossNamespaceVolumeDataSource` feature gate on
     /// kube-apiserver and kube-controller-manager, the same gate on the CSI
-    /// driver's external-provisioner, the Gateway API `ReferenceGrant` CRD, and
-    /// the repository's credential Secret(s) (and a filesystem backend's PVC)
-    /// in the operator namespace. A `mover.cache` of `mode: Persistent` is
-    /// provisioned per run instead, because the persistent cache PVC lives in
-    /// the workload namespace.
+    /// driver's external-provisioner, and the Gateway API `ReferenceGrant`
+    /// CRD. A `mover.cache` of `mode: Persistent` is provisioned per run
+    /// instead, because the persistent cache PVC lives in the workload
+    /// namespace.
     pub mode: ExecutionMode,
 }
 
-/// Where a backup mover Job runs. Closed enum.
+/// Where a repository's mover Jobs run. Closed enum.
 ///
 /// ```
 /// use kopiur_api::ExecutionMode;
