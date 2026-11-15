@@ -11,9 +11,9 @@
 //! * fan-out with `groupBy: None` over plain hostPath PVCs — no CSI, so it runs
 //!   wherever the harness does and guards the reported bug directly;
 //! * group staging with `groupBy: VolumeGroupSnapshot` — needs the CSI stack
-//!   *and* the `groupsnapshot.storage.k8s.io` CRDs plus the
-//!   `--feature-gates=CSIVolumeGroupSnapshot=true` the vendored manifests now
-//!   set on both the snapshot-controller and the csi-snapshotter sidecar.
+//!   *and* the `groupsnapshot.storage.k8s.io` CRDs. The vendored
+//!   external-snapshotter enables group snapshots by default, so neither the
+//!   snapshot-controller nor the csi-snapshotter sidecar needs a feature gate.
 
 #![cfg(all(unix, feature = "e2e"))]
 
@@ -41,11 +41,7 @@ const GROUP_LABEL_VALUE: &str = "group";
 
 fn volume_group_snapshots(client: &kube::Client) -> Api<DynamicObject> {
     let ar = ApiResource::from_gvk_with_plural(
-        &GroupVersionKind::gvk(
-            "groupsnapshot.storage.k8s.io",
-            "v1beta1",
-            "VolumeGroupSnapshot",
-        ),
+        &GroupVersionKind::gvk("groupsnapshot.storage.k8s.io", "v1", "VolumeGroupSnapshot"),
         "volumegroupsnapshots",
     );
     Api::namespaced_with(client.clone(), E2E_NAMESPACE, &ar)

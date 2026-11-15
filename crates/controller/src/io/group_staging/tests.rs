@@ -1,7 +1,7 @@
 //! Unit tests for VolumeGroupSnapshot staging.
 //!
 //! Everything decision-shaped here is pure: readiness (which must not fail on a
-//! transient error), the three-hop member→PVC reconstruction `v1beta1` forces,
+//! transient error), the three-hop member→PVC reconstruction the API forces,
 //! and the reap gate that must fail closed.
 
 use super::*;
@@ -211,7 +211,7 @@ fn member(name: &str, group: &str, content: &str) -> MemberVs {
 
 #[test]
 fn members_map_back_to_their_pvcs_through_content_and_pv() {
-    // v1beta1's group status carries NO member list, so this three-hop
+    // The group status carries NO member list, so this three-hop
     // reconstruction is the only way: member VS -> its content -> the CSI
     // volumeHandle -> the PV with that handle -> its claimRef.
     let members = vec![

@@ -6,6 +6,12 @@ sidebar:
 
 This page covers upgrading the operator across releases. Most upgrades are a routine `helm upgrade`, or a Flux or Argo reconcile: bump the chart version, roll the Deployments, done. The one exception so far is **0.5.x → 0.6.0**, which moves the CustomResourceDefinitions (CRDs) between two Helm mechanisms and needs one deliberate step to avoid data loss. Read that section before you cross it.
 
+## Group snapshots need the `v1` API: only if you use `groupBy: VolumeGroupSnapshot`
+
+Kopiur now uses the `groupsnapshot.storage.k8s.io/v1` API for group snapshots, and no longer uses `v1beta1`. external-snapshotter serves `v1` from release 8.6. `groupBy: VolumeGroupSnapshot` is the default for a `pvcSelector` source. On a cluster with an older release, each `Snapshot` of such a policy fails with reason `NoVolumeGroupSnapshotClass`. The `SnapshotPolicy` itself can stay `Ready`. Single-PVC backups and `groupBy: None` are not affected. Per-volume snapshots already used `snapshot.storage.k8s.io/v1`.
+
+**Action:** before you upgrade Kopiur, run `kubectl api-versions | grep groupsnapshot`. If the output does not include `groupsnapshot.storage.k8s.io/v1`, upgrade the `snapshot-controller`, its CRDs, and your CSI driver's `csi-snapshotter` sidecar to 8.6 or later. If you cannot upgrade them, set `groupBy: None`. See [Copy methods → Multi-PVC and consistency groups](/copy-methods/#multi-pvc-and-consistency-groups).
+
 ## `privilegedMode` grants capabilities to a root mover; it never changes the UID
 
 `privilegedMode: true` now adds the capabilities a backup or restore needs (backup `DAC_OVERRIDE`; restore `CHOWN`, `DAC_OVERRIDE`, `FOWNER`, `FSETID`), but **only when the mover already runs as root** (`runAsUser: 0`). It never sets or changes the UID. A mover with `privilegedMode: true` and no `runAsUser` keeps running as `65532`, exactly as before, and gets a `PrivilegedModeInert` warning. See [Security context → What `privilegedMode` grants](/security-context/#what-privilegedmode-grants).

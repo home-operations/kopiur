@@ -36,24 +36,6 @@ metadata:
     app.kubernetes.io/instance: hostpath.csi.k8s.io
     app.kubernetes.io/part-of: csi-driver-host-path
     app.kubernetes.io/name: csi-hostpathplugin
-    app.kubernetes.io/component: health-monitor-controller-cluster-role
-  name: csi-hostpathplugin-health-monitor-controller-cluster-role
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: ClusterRole
-  name: external-health-monitor-controller-runner
-subjects:
-  - kind: ServiceAccount
-    name: csi-hostpathplugin-sa
-    namespace: default
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
-metadata:
-  labels:
-    app.kubernetes.io/instance: hostpath.csi.k8s.io
-    app.kubernetes.io/part-of: csi-driver-host-path
-    app.kubernetes.io/name: csi-hostpathplugin
     app.kubernetes.io/component: provisioner-cluster-role
   name: csi-hostpathplugin-provisioner-cluster-role
 roleRef:
@@ -102,6 +84,24 @@ subjects:
     namespace: default
 ---
 apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  labels:
+    app.kubernetes.io/instance: hostpath.csi.k8s.io
+    app.kubernetes.io/part-of: csi-driver-host-path
+    app.kubernetes.io/name: csi-hostpathplugin
+    app.kubernetes.io/component: snapshot-metadata-cluster-role
+  name: csi-hostpathplugin-snapshot-metadata-cluster-role
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: external-snapshot-metadata-runner
+subjects:
+  - kind: ServiceAccount
+    name: csi-hostpathplugin-sa
+    namespace: default
+---
+apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
   labels:
@@ -114,23 +114,6 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
   name: external-attacher-cfg
-subjects:
-  - kind: ServiceAccount
-    name: csi-hostpathplugin-sa
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  labels:
-    app.kubernetes.io/instance: hostpath.csi.k8s.io
-    app.kubernetes.io/part-of: csi-driver-host-path
-    app.kubernetes.io/name: csi-hostpathplugin
-    app.kubernetes.io/component: health-monitor-controller-role
-  name: csi-hostpathplugin-health-monitor-controller-role
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: Role
-  name: external-health-monitor-controller-cfg
 subjects:
   - kind: ServiceAccount
     name: csi-hostpathplugin-sa
@@ -219,12 +202,13 @@ spec:
       serviceAccountName: csi-hostpathplugin-sa
       containers:
         - name: hostpath
-          image: registry.k8s.io/sig-storage/hostpathplugin:v1.14.1
+          image: registry.k8s.io/sig-storage/hostpathplugin:v1.18.0
           args:
             - "--drivername=hostpath.csi.k8s.io"
             - "--v=5"
             - "--endpoint=$(CSI_ENDPOINT)"
             - "--nodeid=$(KUBE_NODE_NAME)"
+            # end hostpath args
           env:
             - name: CSI_ENDPOINT
               value: unix:///csi/csi.sock
@@ -261,26 +245,13 @@ spec:
             - mountPath: /dev
               name: dev-dir
 
-        - name: csi-external-health-monitor-controller
-          image: registry.k8s.io/sig-storage/csi-external-health-monitor-controller:v0.13.0
-          args:
-            - "--v=5"
-            - "--csi-address=$(ADDRESS)"
-            - "--leader-election"
-          env:
-            - name: ADDRESS
-              value: /csi/csi.sock
-          imagePullPolicy: "IfNotPresent"
-          volumeMounts:
-            - name: socket-dir
-              mountPath: /csi
-
         - name: node-driver-registrar
-          image: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.12.0
+          image: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.18.0
           args:
             - --v=5
             - --csi-address=/csi/csi.sock
             - --kubelet-registration-path=/var/lib/kubelet/plugins/csi-hostpath/csi.sock
+            - --http-endpoint=:9809
           securityContext:
             # This is necessary only for systems with SELinux, where
             # non-privileged sidecar containers cannot access unix domain socket
@@ -292,6 +263,18 @@ spec:
                 fieldRef:
                   apiVersion: v1
                   fieldPath: spec.nodeName
+          ports:
+            - containerPort: 9809
+              name: healthz
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: healthz
+            initialDelaySeconds: 30
+            timeoutSeconds: 15
+            periodSeconds: 10
+            failureThreshold: 3
           volumeMounts:
             - mountPath: /csi
               name: socket-dir
@@ -304,13 +287,13 @@ spec:
           volumeMounts:
             - mountPath: /csi
               name: socket-dir
-          image: registry.k8s.io/sig-storage/livenessprobe:v2.14.0
+          image: registry.k8s.io/sig-storage/livenessprobe:v2.20.0
           args:
             - --csi-address=/csi/csi.sock
             - --health-port=9898
 
         - name: csi-attacher
-          image: registry.k8s.io/sig-storage/csi-attacher:v4.7.0
+          image: registry.k8s.io/sig-storage/csi-attacher:v4.13.0
           args:
             - --v=5
             - --csi-address=/csi/csi.sock
@@ -324,7 +307,7 @@ spec:
               name: socket-dir
 
         - name: csi-provisioner
-          image: registry.k8s.io/sig-storage/csi-provisioner:v5.1.0
+          image: registry.k8s.io/sig-storage/csi-provisioner:v6.4.0
           args:
             - -v=5
             - --csi-address=/csi/csi.sock
@@ -340,7 +323,7 @@ spec:
               name: socket-dir
 
         - name: csi-resizer
-          image: registry.k8s.io/sig-storage/csi-resizer:v1.12.0
+          image: registry.k8s.io/sig-storage/csi-resizer:v2.3.0
           args:
             - -v=5
             - -csi-address=/csi/csi.sock
@@ -354,21 +337,10 @@ spec:
               name: socket-dir
 
         - name: csi-snapshotter
-          image: registry.k8s.io/sig-storage/csi-snapshotter:v8.2.0
+          image: registry.k8s.io/sig-storage/csi-snapshotter:v8.7.0
           args:
             - -v=5
             - --csi-address=/csi/csi.sock
-            # Makes the sidecar watch VolumeGroupSnapshotContent and drive the
-            # driver's CreateVolumeGroupSnapshot / Delete / Get RPCs.
-            # hostpathplugin implements the GroupController service and
-            # advertises CREATE_DELETE_GET_VOLUME_GROUP_SNAPSHOT, so this is
-            # all that is needed to exercise kopiur's group staging in kind.
-            #
-            # Same gate, same spelling, same reason as the snapshot-controller
-            # (see 05-setup-snapshot-controller.yaml): csi-snapshotter 8.2 has
-            # no `--enable-volume-group-snapshots` flag, only
-            # `--feature-gates`, and an unknown flag kills the container.
-            - --feature-gates=CSIVolumeGroupSnapshot=true
           securityContext:
             # This is necessary only for systems with SELinux, where
             # non-privileged sidecar containers cannot access unix domain socket
@@ -377,6 +349,8 @@ spec:
           volumeMounts:
             - mountPath: /csi
               name: socket-dir
+
+        # end csi containers
 
       volumes:
         - hostPath:
@@ -405,3 +379,4 @@ spec:
             path: /dev
             type: Directory
           name: dev-dir
+        # end csi volumes
