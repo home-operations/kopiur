@@ -1,0 +1,47 @@
+apiVersion: vendir.k14s.io/v1alpha1
+kind: Config
+directories:
+  - path: target/e2e/csi-snapshot
+    contents:
+      - path: hostpath
+        git:
+          url: https://github.com/kubernetes-csi/csi-driver-host-path
+          ref: v1.19.0
+          depth: 1
+        includePaths:
+          - deploy/kubernetes-1.35/hostpath/csi-hostpath-driverinfo.yaml
+          - deploy/kubernetes-1.35/hostpath/csi-hostpath-plugin.yaml
+          - deploy/kubernetes-1.35/hostpath/csi-hostpath-snapshotclass.yaml
+          - examples/csi-storageclass.yaml
+      - path: provisioner
+        git:
+          url: https://github.com/kubernetes-csi/external-provisioner
+          ref: v6.4.0
+          depth: 1
+        includePaths:
+          - deploy/kubernetes/rbac.yaml
+        newRootPath: deploy/kubernetes
+      - path: attacher
+        git:
+          url: https://github.com/kubernetes-csi/external-attacher
+          ref: v4.13.0
+          depth: 1
+        includePaths:
+          - deploy/kubernetes/rbac.yaml
+        newRootPath: deploy/kubernetes
+      - path: snapshotter
+        git:
+          url: https://github.com/kubernetes-csi/external-snapshotter
+          ref: v8.7.0
+          depth: 1
+        includePaths:
+          - deploy/kubernetes/csi-snapshotter/rbac-csi-snapshotter.yaml
+        newRootPath: deploy/kubernetes/csi-snapshotter
+      - path: resizer
+        git:
+          url: https://github.com/kubernetes-csi/external-resizer
+          ref: v2.3.0
+          depth: 1
+        includePaths:
+          - deploy/kubernetes/rbac.yaml
+        newRootPath: deploy/kubernetes

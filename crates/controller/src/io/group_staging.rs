@@ -59,11 +59,12 @@ use crate::error::Result;
 /// The `groupsnapshot.storage.k8s.io` API group.
 pub const GROUP_SNAPSHOT_GROUP: &str = "groupsnapshot.storage.k8s.io";
 
-/// The served version kopiur targets.
+/// The served version kopiur targets, and the only one.
 ///
-/// `v1beta1` is what external-snapshotter 8.2 (the release that made group
-/// snapshots **Beta**, alongside Kubernetes 1.32) serves.
-pub const GROUP_SNAPSHOT_VERSION: &str = "v1beta1";
+/// `v1` is the GA version. external-snapshotter serves it from 8.6. A cluster
+/// that serves only `v1beta1` or `v1beta2` answers 404 here, which every caller
+/// reports as "not served".
+pub const GROUP_SNAPSHOT_VERSION: &str = "v1";
 
 /// `app.kubernetes.io/component` value on a shared group object.
 pub const GROUP_COMPONENT: &str = "staged-source-group";
@@ -391,11 +392,10 @@ pub struct GroupMember {
 
 /// **Pure.** Map each member `VolumeSnapshot` of `group` to the PVC it captured.
 ///
-/// `v1beta1`'s `VolumeGroupSnapshotStatus` carries only
+/// `VolumeGroupSnapshotStatus` carries only
 /// `boundVolumeGroupSnapshotContentName`, `creationTime`, `readyToUse` and
-/// `error` — there is **no member list** (and `v1beta2` does not add one; it
-/// moves the information onto the *content*). So the mapping is reconstructed
-/// in three hops:
+/// `error` — there is **no member list** (the information lives on the
+/// *content*). So the mapping is reconstructed in three hops:
 ///
 /// 1. member `VolumeSnapshot`s, by `status.volumeGroupSnapshotName`;
 /// 2. each one's bound `VolumeSnapshotContent` → `spec.source.volumeHandle`
@@ -818,9 +818,10 @@ pub async fn resolve_group_stage(
         return Ok(GroupStage::Failed {
             reason: crate::consts::REASON_NO_GROUP_CLASS,
             message: format!(
-                "`groupBy: VolumeGroupSnapshot` needs the {GROUP_SNAPSHOT_GROUP} API group, which \
-                 this cluster does not serve. Fix: install external-snapshotter 8.2+, or set \
-                 `groupBy: None`."
+                "`groupBy: VolumeGroupSnapshot` needs the \
+                 {GROUP_SNAPSHOT_GROUP}/{GROUP_SNAPSHOT_VERSION} API, which this cluster does not \
+                 serve. Fix: install or upgrade to external-snapshotter 8.6+ (the first release \
+                 that serves {GROUP_SNAPSHOT_VERSION}), or set `groupBy: None`."
             ),
         });
     };

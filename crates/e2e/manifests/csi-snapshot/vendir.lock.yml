@@ -1,0 +1,35 @@
+apiVersion: vendir.k14s.io/v1alpha1
+directories:
+- contents:
+  - git:
+      commitTitle: 'Merge pull request #701 from xing-yang/changelog_1.19...'
+      sha: 6fab18ae4fc4f486193b618114eeb817d9929242
+      tags:
+      - v1.19.0
+    path: hostpath
+  - git:
+      commitTitle: 'Merge pull request #1595 from jsafrane/changelog-6.4...'
+      sha: 72f13ee46fb93c11a72ef91549e70158283c03af
+      tags:
+      - v6.4.0
+    path: provisioner
+  - git:
+      commitTitle: 'Merge pull request #760 from jsafrane/changelog-4.13...'
+      sha: 40d44ae14961a415348180a0e666651e82e44eb7
+      tags:
+      - v4.13.0
+    path: attacher
+  - git:
+      commitTitle: 'Merge pull request #1510 from xing-yang/changelog_8.7.0_on_8.7...'
+      sha: 9cc6050ab00a0c56d84ba0279e518a00367363e7
+      tags:
+      - client/v8.7.0
+    path: snapshotter
+  - git:
+      commitTitle: 'Merge pull request #618 from gnufied/add-2.3-release-note...'
+      sha: baa08e6d8773f167dbddce36579f36d84bbe3fde
+      tags:
+      - v2.3.0
+    path: resizer
+  path: target/e2e/csi-snapshot
+kind: LockConfig

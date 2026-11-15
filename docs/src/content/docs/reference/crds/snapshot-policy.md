@@ -77,7 +77,7 @@ Whether the PVCs a [`pvcSelector`](#sources) expands to are captured **together*
 
 `VolumeGroupSnapshot`, the default, takes one CSI `VolumeGroupSnapshot` across every matched PVC, so they all share one instant. That is what you want for an application whose volumes must agree with each other. `None` captures each PVC independently.
 
-Group capture needs four things: the `groupsnapshot.storage.k8s.io` API group, from external-snapshotter 8.2 or later; a `VolumeGroupSnapshotClass` for your driver; a driver that advertises `CREATE_DELETE_GET_VOLUME_GROUP_SNAPSHOT`; and `installScope: cluster`. If a piece is missing, Kopiur fails and names it rather than quietly downgrading to independent capture. See [copy methods](/copy-methods/#multi-pvc-and-consistency-groups).
+Group capture needs four things: the `groupsnapshot.storage.k8s.io/v1` API, from external-snapshotter 8.6 or later; a `VolumeGroupSnapshotClass` for your driver; a driver that advertises `CREATE_DELETE_GET_VOLUME_GROUP_SNAPSHOT`; and `installScope: cluster`. If a piece is missing, Kopiur fails and names it rather than quietly downgrading to independent capture. See [copy methods](/copy-methods/#multi-pvc-and-consistency-groups).
 
 ### `defaultDeletionPolicy`
 

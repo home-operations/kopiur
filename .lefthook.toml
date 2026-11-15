@@ -28,6 +28,9 @@ exclude = ["deploy/helm/kopiur/values.schema.json"]
 # now .tpl, so they no longer match the *.yaml glob and need no exclusion here.
 [pre-commit.commands.format-yaml]
 exclude = [
+  # Preserve vendir's generated lock format so a sync leaves the checkout clean.
+  "vendir.lock.yml",
+  "**/vendir.lock.yml",
   "deploy/crds/*.yaml",
   "deploy/helm/kopiur/crds/*.yaml",
   # Generated RBAC (`cargo xtask gen-rbac`), gated byte-for-byte by gen-check —

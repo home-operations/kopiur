@@ -33,8 +33,8 @@
 #   VolumeGroupSnapshot — one CSI VolumeGroupSnapshot captures every matched PVC
 #     at the SAME INSTANT, and each member stages from its own snapshot within
 #     that group. Use it when the volumes must agree with each other (a database
-#     and its write-ahead log). Requires: the groupsnapshot.storage.k8s.io API
-#     group (external-snapshotter 8.2+, Beta as of Kubernetes 1.32), a
+#     and its write-ahead log). Requires: the groupsnapshot.storage.k8s.io/v1
+#     API (external-snapshotter 8.6+), a
 #     VolumeGroupSnapshotClass for your CSI driver, a driver advertising
 #     CREATE_DELETE_GET_VOLUME_GROUP_SNAPSHOT, and installScope: cluster.
 #     Consistency is PER NAMESPACE — a VolumeGroupSnapshot is namespaced.

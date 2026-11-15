@@ -8,7 +8,7 @@
 //! 2. **Stage + cleanup**: `copyMethod: Snapshot` over a CSI-provisioned PVC creates a
 //!    VolumeSnapshot + staged PVC, the mover reads the stage, the Snapshot Succeeds, and
 //!    the staged objects are reaped. The harness installs the CSI snapshot stack (the
-//!    vendored, hermetic `snapshot-stack` mise task), so this is a hard requirement.
+//!    `snapshot-stack` mise task), so this is a hard requirement.
 //!
 //! Gated by `#[cfg(feature = "e2e")]` + `#[ignore]`; driven by
 //! `mise run //crates/e2e:test`. Skips gracefully without a cluster.
@@ -30,7 +30,7 @@ use kopiur_e2e::{E2E_NAMESPACE, Need, World, default_timeout, poll_interval, wai
 
 /// The storage class + snapshot class the `snapshot-stack` mise task installs.
 const CSI_STORAGE_CLASS: &str = "csi-hostpath-sc";
-/// The `VolumeSnapshotClass` from `manifests/csi-snapshot/30-hostpath-snapshotclass.yaml`
+/// The upstream `VolumeSnapshotClass` fetched by the `snapshot-manifests` mise task
 /// (driver `hostpath.csi.k8s.io`, annotated as the cluster default).
 const CSI_SNAPSHOT_CLASS: &str = "csi-hostpath-snapclass";
 
