@@ -13,7 +13,7 @@ deploy/rbac/
 docs/src/content/docs/field-reference.md
 
 # vendir rewrites its generated lock in its own format during sync.
-crates/e2e/manifests/csi-snapshot/vendir.lock.yml
+**/vendir.lock.yml
 
 # Helm chart templates are Go-templated YAML (a `{{- if -}}` guard isn't valid
 # standalone YAML), so oxfmt can't parse them — exclude the whole templates/ dir.
