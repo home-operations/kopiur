@@ -330,6 +330,10 @@ fn ui_fix(error: &OpsError) -> Option<&'static str> {
             ProjectionBlock::NotAClusterRepository => {
                 "keep the Repository and its credential Secret in the snapshot's namespace"
             }
+            ProjectionBlock::CentralExecution { .. } => {
+                "move the credential Secret into the operator namespace and point the \
+                 ClusterRepository at it there"
+            }
         }),
 
         OpsError::SelectorMatchedNothing { .. }

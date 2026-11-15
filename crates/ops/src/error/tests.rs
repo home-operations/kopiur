@@ -252,7 +252,7 @@ fn cluster_repo_secret_without_namespace_names_the_field() {
 fn operator_namespace_unresolvable_names_the_configmap_and_the_discovery_rule() {
     let msg = OpsError::OperatorNamespaceUnresolvable {
         repository: "nas".into(),
-        configmap: "internal-ca".into(),
+        needed_for: "its tls.caBundleRef ConfigMap \"internal-ca\"".into(),
         why: "no Deployment matches the controller labels".into(),
         fix: "is the kopiur operator installed?".into(),
     }

@@ -314,14 +314,19 @@ async fn end_session(
     let target = resolve_target(&app.cfg, &ctx, &namespace, &name).await?;
     if let Some(job) = find_session_job(
         &ctx,
-        &target.namespace,
+        &target.session_namespace,
         target.repo.kind,
         target.repo.namespace.as_deref(),
         &target.repo.name,
     )
     .await?
     {
-        delete_session(&ctx, &target.namespace, &kube::ResourceExt::name_any(&job)).await?;
+        delete_session(
+            &ctx,
+            &target.session_namespace,
+            &kube::ResourceExt::name_any(&job),
+        )
+        .await?;
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -866,7 +871,14 @@ async fn resolve_target(
         Some(ns) => OperatorNamespace::Known(ns.clone()),
         None => OperatorNamespace::DiscoverFromControllerDeployment,
     };
-    Ok(resolve_with(ctx, namespace, name, &operator_namespace).await?)
+    Ok(resolve_with(
+        ctx,
+        namespace,
+        name,
+        &operator_namespace,
+        kopiur_ops::browse::resolve::SessionTransport::Pod,
+    )
+    .await?)
 }
 
 /// Which mover image session pods run: the chart's value when it stamped one,
@@ -881,10 +893,11 @@ fn mover_image(cfg: &UiConfig) -> MoverImageSource {
     }
 }
 
-/// The session key for a target: one warm pod per repository per namespace.
+/// The session key for a target: one warm pod per repository per namespace
+/// the session runs in.
 fn session_key(target: &BrowseTarget) -> SessionKey {
     SessionKey {
-        namespace: target.namespace.clone(),
+        namespace: target.session_namespace.clone(),
         kind: target.repo.kind,
         repo_namespace: target.repo.namespace.clone(),
         repo_name: target.repo.name.clone(),
@@ -899,7 +912,7 @@ fn session_key(target: &BrowseTarget) -> SessionKey {
 async fn find_live_job(ctx: &OpsCtx, target: &BrowseTarget) -> Result<Option<Job>, OpsError> {
     Ok(find_session_job(
         ctx,
-        &target.namespace,
+        &target.session_namespace,
         target.repo.kind,
         target.repo.namespace.as_deref(),
         &target.repo.name,
@@ -944,7 +957,7 @@ async fn attach(
     // object is where both the UID and the expiry live.
     let job = find_session_job(
         ctx,
-        &target.namespace,
+        &target.session_namespace,
         target.repo.kind,
         target.repo.namespace.as_deref(),
         &target.repo.name,
@@ -1041,7 +1054,9 @@ async fn require_live_session(
                     |name| async move {
                         // Best-effort: the 409 stands either way, and a delete
                         // that failed leaves a pod the TTL still reaps.
-                        if let Err(error) = delete_session(ctx, &target.namespace, &name).await {
+                        if let Err(error) =
+                            delete_session(ctx, &target.session_namespace, &name).await
+                        {
                             tracing::warn!(
                                 job = %name,
                                 %error,

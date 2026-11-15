@@ -351,7 +351,7 @@ impl ExecSession {
         image: &MoverImageSource,
         progress: &dyn SessionProgress,
     ) -> Result<ExecSession, OpsError> {
-        let ns = target.namespace.clone();
+        let ns = target.session_namespace.clone();
         let jobs_api: Api<Job> = Api::namespaced(ctx.client.clone(), &ns);
         let labels = session_labels(target.repo.kind, &target.repo.name);
         let selector = labels
@@ -525,7 +525,7 @@ async fn create_session_job(
     image: &MoverImageSource,
     progress: &dyn SessionProgress,
 ) -> Result<String, OpsError> {
-    let ns = &target.namespace;
+    let ns = &target.session_namespace;
     let name = session_job_name(
         target.repo.kind,
         target.repo.namespace.as_deref(),
@@ -1370,12 +1370,14 @@ mod tests {
         let target = BrowseTarget {
             snapshot: "never-opted-in".into(),
             namespace: "vaultwarden".into(),
+            session_namespace: "vaultwarden".into(),
             kopia_snapshot_id: "kdead".into(),
             repo: RepoHandle {
                 kind: RepositoryKind::ClusterRepository,
                 name: "rustfs".into(),
                 uid: "u1".into(),
                 namespace: None,
+                execution: kopiur_api::ExecutionMode::InNamespace,
                 backend: Backend::S3(S3Backend {
                     bucket: "b".into(),
                     prefix: None,
@@ -1450,12 +1452,14 @@ mod tests {
         let target = BrowseTarget {
             snapshot: "db-1".into(),
             namespace: "media".into(),
+            session_namespace: "media".into(),
             kopia_snapshot_id: "kdead".into(),
             repo: RepoHandle {
                 kind: RepositoryKind::Repository,
                 name: "nas".into(),
                 uid: "u1".into(),
                 namespace: Some("media".into()),
+                execution: kopiur_api::ExecutionMode::InNamespace,
                 backend: Backend::Filesystem(FilesystemBackend {
                     path: "/repo".into(),
                     volume: None,

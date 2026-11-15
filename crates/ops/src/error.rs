@@ -21,6 +21,12 @@ pub enum ProjectionBlock {
         /// The `Snapshot`'s name.
         snapshot: String,
     },
+    /// The `ClusterRepository` sets `execution.mode: Central`: its session
+    /// runs in the operator namespace, and its Secrets are never copied.
+    CentralExecution {
+        /// The `ClusterRepository`'s name.
+        repository: String,
+    },
 }
 
 impl ProjectionBlock {
@@ -38,6 +44,10 @@ impl ProjectionBlock {
                  browse a snapshot it takes after that"
                     .to_string()
             }
+            ProjectionBlock::CentralExecution { repository } => format!(
+                "move the Secret into the operator namespace and point ClusterRepository \
+                 {repository} at it there"
+            ),
         }
     }
 }
@@ -57,6 +67,11 @@ impl std::fmt::Display for ProjectionBlock {
                 f,
                 "Snapshot {snapshot} was taken without credentialProjection, so its \
                  credentials are not copied for a session either"
+            ),
+            ProjectionBlock::CentralExecution { repository } => write!(
+                f,
+                "ClusterRepository {repository} sets execution.mode: Central, so its \
+                 credentials stay in the operator namespace and are never copied"
             ),
         }
     }
@@ -231,19 +246,20 @@ pub enum OpsError {
         fix: String,
     },
 
-    /// A ClusterRepository's `tls.caBundleRef` ConfigMap lives in the
-    /// operator's namespace, which could not be discovered (zero or several
-    /// controller Deployments matched the chart labels).
+    /// A ClusterRepository keeps its `tls.caBundleRef` ConfigMap, and runs a
+    /// Central repository's browse sessions, in the operator's namespace,
+    /// which could not be discovered (zero or several controller Deployments
+    /// matched the chart labels).
     #[error(
-        "cannot find the operator namespace for ClusterRepository {repository:?}'s \
-         tls.caBundleRef ConfigMap {configmap:?}: {why}. The bundle lives in the \
-         controller's namespace (KOPIUR_NAMESPACE). Fix: {fix}"
+        "cannot find the operator namespace, which ClusterRepository {repository:?} needs \
+         for {needed_for}: {why}. It is the controller's namespace (KOPIUR_NAMESPACE). \
+         Fix: {fix}"
     )]
     OperatorNamespaceUnresolvable {
-        /// The ClusterRepository whose CA bundle needs the namespace.
+        /// The ClusterRepository that needs the namespace.
         repository: String,
-        /// The `tls.caBundleRef` ConfigMap name.
-        configmap: String,
+        /// What it needs it for, as a phrase that completes "needs for …".
+        needed_for: String,
         /// What went wrong with the discovery.
         why: String,
         /// What to do about it.
