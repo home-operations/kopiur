@@ -388,134 +388,187 @@ pub async fn reap_central_policy_jobs(
     Ok(())
 }
 
+/// Where a central mover pod mounts its source volume, whatever the source is.
+///
+/// A central mover pod holds the shared repository credentials, so nothing a
+/// tenant writes may decide where a volume is mounted in it: a volume mounted
+/// over the mover's own binaries would run tenant code with those credentials.
+/// The path kopia RECORDS is separate (the identity's `sourcePath`, passed as
+/// `--override-source`), so a `sourcePathOverride` and the default
+/// `/pvc/<name>` are recorded exactly as an in-namespace run records them.
+pub const CENTRAL_SOURCE_MOUNT_PATH: &str = "/source";
+
+/// **Pure.** Whether two absolute mount paths overlap: they are the same
+/// directory, or one is inside the other. Compared by whole path segments, so
+/// `/source` and `/sources` do not overlap. Empty and `.` segments are
+/// dropped first (`/./source//repo` is `/source/repo`). A path with a `..`
+/// segment is not resolved: it is reported as overlapping, because what it
+/// names depends on the directories around it.
+pub fn mount_paths_overlap(a: &str, b: &str) -> bool {
+    let segments = |p: &str| -> Vec<String> {
+        p.split('/')
+            .filter(|s| !s.is_empty() && *s != ".")
+            .map(str::to_string)
+            .collect()
+    };
+    let (a, b) = (segments(a), segments(b));
+    if a.iter().chain(&b).any(|s| s == "..") {
+        return true;
+    }
+    let shared = a.len().min(b.len());
+    a[..shared] == b[..shared]
+}
+
+/// Why a filesystem repository mounted at `repo_path` cannot serve a central
+/// backup, if it cannot: the mover pod mounts the repository volume there and
+/// the source at [`CENTRAL_SOURCE_MOUNT_PATH`], and Kubernetes rejects a pod
+/// whose two mounts overlap.
+pub fn central_repo_mount_refusal(
+    repo_path: Option<&str>,
+    repository: &str,
+) -> Option<(&'static str, String)> {
+    let repo_path = repo_path.filter(|p| mount_paths_overlap(p, CENTRAL_SOURCE_MOUNT_PATH))?;
+    Some((
+        REASON_CENTRAL_UNSUPPORTED,
+        format!(
+            "ClusterRepository `{repository}` sets `execution.mode: Central` and keeps its \
+             filesystem repository at `{repo_path}`, which overlaps `{CENTRAL_SOURCE_MOUNT_PATH}`, \
+             the path a central mover pod mounts its source at. Fix: use a filesystem path \
+             outside `{CENTRAL_SOURCE_MOUNT_PATH}` for the repository, or remove `execution` \
+             from the ClusterRepository. The next scheduled run (or a new Snapshot) retries"
+        ),
+    ))
+}
+
 /// The shape of the source one run backs up, as far as central execution cares.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CentralSource {
-    /// A single PVC, mounted at Kopiur's default path.
+    /// A single PVC.
     Pvc,
-    /// A single PVC whose `sourcePathOverride` picks the mount path.
-    PathOverride,
-    /// A single PVC whose derived mount path is not one Kopiur would build from
-    /// Kubernetes object names (a forged `spec.source` pin).
-    UnsafeMountPath,
-    /// A member of a `groupBy: VolumeGroupSnapshot` consistency group.
+    /// A PVC that is a member of a `groupBy: VolumeGroupSnapshot` consistency
+    /// group.
     GroupMember,
+    /// An NFS export, which the mover pod itself would mount.
+    Nfs,
     /// A `stream` source (the mover execs into a workload pod).
     Stream,
-    /// Anything else with no PVC to snapshot (NFS, an empty `pvcSelector`).
-    NoPvc,
+    /// Nothing to back up: a `pvcSelector` source with no PVC pinned.
+    Nothing,
 }
 
 impl CentralSource {
     /// Classify the source one run covers. `grouped` is whether the `Snapshot`
-    /// is a member of a consistency group; `mount_path` is where the source
-    /// volume would be mounted in the mover pod.
-    pub fn of(
-        source: &kopiur_api::expand::EffectiveSource,
-        grouped: bool,
-        mount_path: Option<&str>,
-    ) -> CentralSource {
+    /// is a member of a consistency group.
+    pub fn of(source: &kopiur_api::expand::EffectiveSource, grouped: bool) -> CentralSource {
         if source.stream.is_some() {
             CentralSource::Stream
-        } else if source.pvc.is_none() {
-            CentralSource::NoPvc
-        } else if grouped {
-            CentralSource::GroupMember
-        } else if source.source_path_override.is_some() {
-            CentralSource::PathOverride
-        } else if !mount_path.is_some_and(is_safe_central_mount) {
-            CentralSource::UnsafeMountPath
+        } else if source.pvc.is_some() {
+            if grouped {
+                CentralSource::GroupMember
+            } else {
+                CentralSource::Pvc
+            }
+        } else if source.nfs_path.is_some() {
+            CentralSource::Nfs
         } else {
-            CentralSource::Pvc
+            CentralSource::Nothing
         }
     }
 }
 
-/// Whether `path` is a source mount path Kopiur derives itself: `/pvc/<name>` or
-/// `/pvc/<namespace>/<name>`, each segment a Kubernetes object name.
-///
-/// A central mover pod holds the shared repository credentials, so the source
-/// volume must not be mountable over anything else in it. A prefix test is not
-/// enough: `/pvc/../usr/local/bin` starts with `/pvc/` and resolves to the
-/// directory of the mover's own binaries. Object names cannot spell `.`, `..`,
-/// or an empty segment, so a path made only of them cannot leave `/pvc/`.
-pub fn is_safe_central_mount(path: &str) -> bool {
-    let Some(rest) = path.strip_prefix("/pvc/") else {
-        return false;
-    };
-    let segments: Vec<&str> = rest.split('/').collect();
-    (1..=2).contains(&segments.len()) && segments.iter().all(|s| is_object_name(s))
-}
-
-/// Whether `s` is an RFC 1123 subdomain, the form of a Kubernetes namespace or
-/// PVC name: dot-separated labels of `[a-z0-9-]`, each starting and ending with
-/// an alphanumeric character.
-fn is_object_name(s: &str) -> bool {
-    s.len() <= 253
-        && s.split('.').all(|label| {
-            let bytes = label.as_bytes();
-            let alnum = |b: &u8| b.is_ascii_lowercase() || b.is_ascii_digit();
-            bytes.first().is_some_and(alnum)
-                && bytes.last().is_some_and(alnum)
-                && bytes.iter().all(|b| alnum(b) || *b == b'-')
-        })
-}
-
-/// Why this source cannot be backed up centrally, if it cannot. Central execution
-/// moves data across namespaces through a CSI snapshot and nothing else, so only
-/// a single PVC under `copyMethod: Snapshot` qualifies; refusing the rest is what
-/// keeps a `Central` repository from quietly running a mover in the workload
-/// namespace after all.
+/// Why this source cannot be backed up centrally, if it cannot. A PVC crosses
+/// namespaces as a CSI snapshot or a CSI clone. What is left cannot leave the
+/// workload namespace, or must not, and refusing it is what keeps a `Central`
+/// repository from quietly running a mover there after all.
 pub fn central_source_refusal(
     copy_method: CopyMethod,
     source: CentralSource,
     repository: &str,
 ) -> Option<(&'static str, String)> {
     let why = match (source, copy_method) {
-        (CentralSource::Pvc, CopyMethod::Snapshot) => return None,
-        (CentralSource::Pvc, CopyMethod::Clone) => {
-            "`copyMethod: Clone` clones the source PVC, and a CSI clone cannot cross namespaces"
+        (CentralSource::Pvc, CopyMethod::Snapshot | CopyMethod::Clone) => return None,
+        // Technically a pod in any namespace can mount an NFS export. That is
+        // the problem: the workload namespace's Pod Security level may forbid
+        // `nfs` volumes (the `restricted` level does), and a mover pod in the
+        // operator namespace is not subject to it. A tenant could have it mount
+        // any export the nodes can reach, then restore that data to themselves.
+        (CentralSource::Nfs, _) => {
+            "an NFS source is mounted by the mover pod itself, and in the operator namespace \
+             that mount would bypass the Pod Security rules of the workload namespace"
         }
-        (CentralSource::Pvc, CopyMethod::Direct) => {
+        (CentralSource::Pvc | CentralSource::GroupMember, CopyMethod::Direct) => {
             "`copyMethod: Direct` mounts the live source PVC, and a pod can only mount a PVC of \
              its own namespace"
         }
-        // The override is also the path the volume is MOUNTED at, and a central
-        // mover pod holds the shared repository credentials: a tenant volume
-        // mounted over the mover's own binaries would run tenant code with them.
-        (CentralSource::PathOverride, _) => {
-            "`sourcePathOverride` chooses where the source volume is mounted inside the mover \
-             pod, and a central mover pod holds the repository credentials, so only the default \
-             mount path is accepted"
-        }
-        // The default path is built from the PVC's namespace and name. A
-        // `Snapshot` can pin those itself, and `/pvc/../usr/local/bin` is as much
-        // a mount over the mover's binaries as the override above.
-        (CentralSource::UnsafeMountPath, _) => {
-            "this Snapshot's `spec.source` names a PVC namespace or name that is not a valid \
-             Kubernetes object name, so it does not form a safe mount path inside the mover pod"
-        }
-        (CentralSource::GroupMember, _) => {
+        (CentralSource::GroupMember, CopyMethod::Snapshot | CopyMethod::Clone) => {
             "`groupBy: VolumeGroupSnapshot` is not supported centrally yet"
         }
         (CentralSource::Stream, _) => {
             "a `stream` source runs a command inside a workload pod, which a central mover does \
              not do"
         }
-        (CentralSource::NoPvc, _) => {
-            "the source is not a PVC, so there is no CSI snapshot to carry it across namespaces"
-        }
+        (CentralSource::Nothing, _) => "the source names no PVC and no NFS export",
     };
     Some((
         REASON_CENTRAL_UNSUPPORTED,
         format!(
             "ClusterRepository `{repository}` sets `execution.mode: Central`, which backs up a \
-             single PVC under `copyMethod: Snapshot` only; {why}. Fix: use `copyMethod: Snapshot` \
-             with a PVC source and no `sourcePathOverride`, or point this SnapshotPolicy at a \
-             repository without `execution.mode: Central`. The next scheduled run (or a new \
-             Snapshot) retries"
+             PVC under `copyMethod: Snapshot` or `Clone`; {why}. Fix: change \
+             the source or the copy method, or point this SnapshotPolicy at a repository \
+             without `execution.mode: Central`. The next scheduled run (or a new Snapshot) \
+             retries"
         ),
     ))
+}
+
+/// The object in the workload namespace that a central staged PVC is filled
+/// from, through a cross-namespace `dataSourceRef`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CrossNamespaceSource<'a> {
+    /// A CSI `VolumeSnapshot` of the source PVC (`copyMethod: Snapshot`).
+    VolumeSnapshot(&'a str),
+    /// The source PVC itself, as a CSI clone (`copyMethod: Clone`).
+    Pvc(&'a str),
+}
+
+impl CrossNamespaceSource<'_> {
+    /// The API group, as a `ReferenceGrant` writes it (`""` is the core group).
+    pub fn group(&self) -> &'static str {
+        match self {
+            CrossNamespaceSource::VolumeSnapshot(_) => SNAPSHOT_GROUP,
+            CrossNamespaceSource::Pvc(_) => "",
+        }
+    }
+
+    /// The kind.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            CrossNamespaceSource::VolumeSnapshot(_) => "VolumeSnapshot",
+            CrossNamespaceSource::Pvc(_) => "PersistentVolumeClaim",
+        }
+    }
+
+    /// The object's name.
+    pub fn name(&self) -> &str {
+        match self {
+            CrossNamespaceSource::VolumeSnapshot(name) | CrossNamespaceSource::Pvc(name) => name,
+        }
+    }
+
+    /// The `dataSourceRef` a claim in another namespace uses to name this
+    /// object in `source_ns`. The core group is written as an absent
+    /// `apiGroup`, which is how the API server and the CSI provisioner read it.
+    pub fn data_source_ref(&self, source_ns: &str) -> TypedObjectReference {
+        TypedObjectReference {
+            api_group: match self {
+                CrossNamespaceSource::VolumeSnapshot(_) => Some(SNAPSHOT_GROUP.to_string()),
+                CrossNamespaceSource::Pvc(_) => None,
+            },
+            kind: self.kind().to_string(),
+            name: self.name().to_string(),
+            namespace: Some(source_ns.to_string()),
+        }
+    }
 }
 
 /// The site a run that has not launched yet should use. A pinned site always
@@ -582,45 +635,40 @@ pub fn name_conflict_message(kind: &str, namespace: &str, name: &str) -> String 
 }
 
 /// Turn a staged PVC built for the `Snapshot`'s own namespace into its central
-/// form: the data source becomes a cross-namespace `dataSourceRef` to the
-/// `VolumeSnapshot` in `source_ns`, and ownership moves from an owner reference
-/// to the central marks. `dataSource` is cleared because the API server rejects a
-/// claim that sets it together with `dataSourceRef.namespace`.
+/// form: the data source becomes a cross-namespace `dataSourceRef` to `source`
+/// in `source_ns`, and ownership moves from an owner reference to the central
+/// marks. `dataSource` is cleared because the API server rejects a claim that
+/// sets it together with `dataSourceRef.namespace`.
 pub fn centralize_staged_pvc(
     pvc: &mut PersistentVolumeClaim,
     source_ns: &str,
-    volume_snapshot: &str,
+    source: CrossNamespaceSource<'_>,
     snapshot_name: &str,
     uid: &str,
 ) {
     mark_central(&mut pvc.metadata, source_ns, snapshot_name, uid);
     if let Some(spec) = pvc.spec.as_mut() {
         spec.data_source = None;
-        spec.data_source_ref = Some(TypedObjectReference {
-            api_group: Some(SNAPSHOT_GROUP.to_string()),
-            kind: "VolumeSnapshot".to_string(),
-            name: volume_snapshot.to_string(),
-            namespace: Some(source_ns.to_string()),
-        });
+        spec.data_source_ref = Some(source.data_source_ref(source_ns));
     }
 }
 
-/// Whether the claim the API server STORED still points at the `VolumeSnapshot`
-/// in `source_ns`. `false` means the `CrossNamespaceVolumeDataSource` feature
-/// gate is off on kube-apiserver, which clears the reference and leaves a claim
-/// for an empty volume.
+/// Whether the claim the API server STORED still points at `source` in
+/// `source_ns`. `false` means the `CrossNamespaceVolumeDataSource` feature gate
+/// is off on kube-apiserver, which clears the reference and leaves a claim for
+/// an empty volume.
 pub fn cross_namespace_ref_survived(
     stored: &PersistentVolumeClaim,
     source_ns: &str,
-    volume_snapshot: &str,
+    source: CrossNamespaceSource<'_>,
 ) -> bool {
     stored
         .spec
         .as_ref()
         .and_then(|s| s.data_source_ref.as_ref())
         .is_some_and(|r| {
-            r.kind == "VolumeSnapshot"
-                && r.name == volume_snapshot
+            r.kind == source.kind()
+                && r.name == source.name()
                 && r.namespace.as_deref() == Some(source_ns)
         })
 }
@@ -662,14 +710,14 @@ pub fn reference_grant_name(snapshot_cr: &str) -> String {
     staged_child_name(snapshot_cr, "grant")
 }
 
-/// Build the `ReferenceGrant` that lets PVCs of `central_ns` restore from the ONE
-/// `VolumeSnapshot` `volume_snapshot` in `ns`. It lives beside that snapshot,
-/// owner-referenced to the `Snapshot` CR so it is reaped with it.
+/// Build the `ReferenceGrant` that lets PVCs of `central_ns` be filled from the
+/// ONE object `source` in `ns`. It lives beside that object, owner-referenced
+/// to the `Snapshot` CR so it is reaped with it.
 pub fn build_reference_grant(
     name: &str,
     ns: &str,
     central_ns: &str,
-    volume_snapshot: &str,
+    source: CrossNamespaceSource<'_>,
     owner: OwnerReference,
 ) -> DynamicObject {
     let mut obj = DynamicObject::new(name, &reference_grant_ar())
@@ -682,9 +730,9 @@ pub fn build_reference_grant(
                     "namespace": central_ns,
                 }],
                 "to": [{
-                    "group": SNAPSHOT_GROUP,
-                    "kind": "VolumeSnapshot",
-                    "name": volume_snapshot,
+                    "group": source.group(),
+                    "kind": source.kind(),
+                    "name": source.name(),
                 }],
             }
         }));
@@ -1111,7 +1159,7 @@ pub fn source_protection_decision(
 /// snapshot on this claim's behalf. A bound claim that lost its reference (the
 /// feature gate is off) restored nothing and proves nothing.
 pub fn stage_restore_finished(staged: &PersistentVolumeClaim, vs_ns: &str, vs_name: &str) -> bool {
-    if !cross_namespace_ref_survived(staged, vs_ns, vs_name) {
+    if !cross_namespace_ref_survived(staged, vs_ns, CrossNamespaceSource::VolumeSnapshot(vs_name)) {
         return false;
     }
     let bound_phase = staged
@@ -1484,23 +1532,33 @@ mod tests {
     }
 
     #[test]
-    fn only_a_single_pvc_under_copy_method_snapshot_runs_centrally() {
-        use CentralSource::{GroupMember, NoPvc, PathOverride, Pvc, Stream, UnsafeMountPath};
-        assert_eq!(
-            central_source_refusal(CopyMethod::Snapshot, Pvc, "shared"),
-            None
-        );
+    fn a_source_runs_centrally_only_when_it_can_leave_the_workload_namespace() {
+        use CentralSource::{GroupMember, Nfs, Nothing, Pvc, Stream};
+        // A PVC crosses as a CSI snapshot or a CSI clone.
+        for (method, source) in [
+            (CopyMethod::Snapshot, Pvc),
+            (CopyMethod::Clone, Pvc),
+        ] {
+            assert_eq!(
+                central_source_refusal(method, source, "shared"),
+                None,
+                "{method:?}/{source:?} must run centrally"
+            );
+        }
         for (method, source, needle) in [
-            (CopyMethod::Clone, Pvc, "copyMethod: Clone"),
             (CopyMethod::Direct, Pvc, "copyMethod: Direct"),
+            (CopyMethod::Direct, GroupMember, "copyMethod: Direct"),
             (CopyMethod::Snapshot, GroupMember, "VolumeGroupSnapshot"),
-            // A tenant-chosen mount path could cover the mover's own binaries.
-            (CopyMethod::Snapshot, PathOverride, "sourcePathOverride"),
-            (CopyMethod::Snapshot, UnsafeMountPath, "not a valid"),
+            (CopyMethod::Clone, GroupMember, "VolumeGroupSnapshot"),
+            // A central pod would mount the export outside the reach of the
+            // workload namespace's Pod Security rules, under every copy method.
+            (CopyMethod::Snapshot, Nfs, "Pod Security"),
+            (CopyMethod::Clone, Nfs, "Pod Security"),
+            (CopyMethod::Direct, Nfs, "Pod Security"),
             (CopyMethod::Snapshot, Stream, "stream"),
-            (CopyMethod::Snapshot, NoPvc, "not a PVC"),
             // The source shape wins over the copy method in the explanation.
-            (CopyMethod::Direct, NoPvc, "not a PVC"),
+            (CopyMethod::Direct, Stream, "stream"),
+            (CopyMethod::Snapshot, Nothing, "no PVC and no NFS export"),
         ] {
             let (reason, message) = central_source_refusal(method, source, "shared")
                 .unwrap_or_else(|| panic!("{method:?}/{source:?} must be refused"));
@@ -1533,7 +1591,8 @@ mod tests {
     #[test]
     fn centralizing_a_staged_pvc_swaps_the_data_source_and_the_ownership() {
         let mut pvc = in_namespace_staged_pvc();
-        centralize_staged_pvc(&mut pvc, "billing", "nightly-snap", "nightly", "uid-1");
+        let snap = CrossNamespaceSource::VolumeSnapshot("nightly-snap");
+        centralize_staged_pvc(&mut pvc, "billing", snap, "nightly", "uid-1");
 
         let spec = pvc.spec.as_ref().unwrap();
         // The API server rejects `dataSource` beside `dataSourceRef.namespace`.
@@ -1560,27 +1619,60 @@ mod tests {
                 .unwrap()
                 .contains_key(crate::consts::MANAGED_BY_LABEL)
         );
-        assert!(cross_namespace_ref_survived(
+        assert!(cross_namespace_ref_survived(&pvc, "billing", snap));
+    }
+
+    /// `copyMethod: Clone` names the source PVC itself. The core group is an
+    /// ABSENT `apiGroup` on the claim and an empty `group` on the grant: that
+    /// pair is what the CSI provisioner's grant check matches.
+    #[test]
+    fn a_clone_stage_references_the_source_pvc_across_namespaces() {
+        let clone = CrossNamespaceSource::Pvc("data");
+        let mut pvc = in_namespace_staged_pvc();
+        centralize_staged_pvc(&mut pvc, "billing", clone, "nightly", "uid-1");
+        let spec = pvc.spec.as_ref().unwrap();
+        assert_eq!(spec.data_source, None);
+        let r = spec.data_source_ref.as_ref().unwrap();
+        assert_eq!(r.api_group, None);
+        assert_eq!(r.kind, "PersistentVolumeClaim");
+        assert_eq!(r.name, "data");
+        assert_eq!(r.namespace.as_deref(), Some("billing"));
+        assert!(cross_namespace_ref_survived(&pvc, "billing", clone));
+        // A snapshot of the same name is a different object.
+        assert!(!cross_namespace_ref_survived(
             &pvc,
             "billing",
-            "nightly-snap"
+            CrossNamespaceSource::VolumeSnapshot("data")
         ));
+
+        let grant = build_reference_grant(
+            "nightly-grant",
+            "billing",
+            "kopiur-system",
+            clone,
+            owner("uid-1"),
+        );
+        assert_eq!(
+            grant.data["spec"]["to"],
+            serde_json::json!([{
+                "group": "",
+                "kind": "PersistentVolumeClaim",
+                "name": "data",
+            }])
+        );
     }
 
     /// The data-loss guard: with the feature gate off, kube-apiserver stores the
     /// claim WITHOUT its `dataSourceRef`, i.e. as a request for an empty volume.
     #[test]
     fn a_stored_claim_without_the_cross_namespace_ref_is_detected() {
+        let snap = CrossNamespaceSource::VolumeSnapshot("nightly-snap");
         let mut pvc = in_namespace_staged_pvc();
-        centralize_staged_pvc(&mut pvc, "billing", "nightly-snap", "nightly", "uid-1");
+        centralize_staged_pvc(&mut pvc, "billing", snap, "nightly", "uid-1");
 
         let mut dropped = pvc.clone();
         dropped.spec.as_mut().unwrap().data_source_ref = None;
-        assert!(!cross_namespace_ref_survived(
-            &dropped,
-            "billing",
-            "nightly-snap"
-        ));
+        assert!(!cross_namespace_ref_survived(&dropped, "billing", snap));
 
         // Namespace stripped: it would resolve to a snapshot in the operator namespace.
         let mut local = pvc.clone();
@@ -1592,24 +1684,16 @@ mod tests {
             .as_mut()
             .unwrap()
             .namespace = None;
-        assert!(!cross_namespace_ref_survived(
-            &local,
-            "billing",
-            "nightly-snap"
-        ));
+        assert!(!cross_namespace_ref_survived(&local, "billing", snap));
 
+        assert!(!cross_namespace_ref_survived(&pvc, "payments", snap));
         assert!(!cross_namespace_ref_survived(
             &pvc,
-            "payments",
-            "nightly-snap"
-        ));
-        assert!(!cross_namespace_ref_survived(&pvc, "billing", "other-snap"));
-        let no_spec = PersistentVolumeClaim::default();
-        assert!(!cross_namespace_ref_survived(
-            &no_spec,
             "billing",
-            "nightly-snap"
+            CrossNamespaceSource::VolumeSnapshot("other-snap")
         ));
+        let no_spec = PersistentVolumeClaim::default();
+        assert!(!cross_namespace_ref_survived(&no_spec, "billing", snap));
 
         let message = cross_namespace_disabled_message("kopiur-system", "nightly-abc-src");
         assert!(
@@ -1625,7 +1709,7 @@ mod tests {
             "nightly-grant",
             "billing",
             "kopiur-system",
-            "nightly-snap",
+            CrossNamespaceSource::VolumeSnapshot("nightly-snap"),
             owner("uid-1"),
         );
         assert_eq!(grant.metadata.namespace.as_deref(), Some("billing"));
@@ -1725,88 +1809,92 @@ mod tests {
     }
 
     #[test]
-    fn a_path_override_is_classified_before_it_can_reach_a_mount() {
+    fn a_repository_path_that_overlaps_the_central_source_mount_is_refused() {
+        // Same directory, either one inside the other, trailing slashes.
+        for overlapping in [
+            "/source",
+            "/source/",
+            "/source/repo",
+            "/",
+            "//source//repo",
+            // Spelled around the comparison: still the same directory.
+            "/./source/repo",
+            "/source/./repo",
+            // Not resolved, so refused.
+            "/repo/../source",
+            "/data/..",
+        ] {
+            assert!(
+                mount_paths_overlap(overlapping, CENTRAL_SOURCE_MOUNT_PATH),
+                "{overlapping}"
+            );
+            let (reason, message) =
+                central_repo_mount_refusal(Some(overlapping), "shared").unwrap();
+            assert_eq!(reason, REASON_CENTRAL_UNSUPPORTED);
+            assert!(message.contains("Fix:"), "{message}");
+        }
+        // A shared name prefix is not a shared directory.
+        for apart in [
+            "/sources",
+            "/repo",
+            "/data/source",
+            "/source-repo",
+            "/./repo",
+        ] {
+            assert!(
+                !mount_paths_overlap(apart, CENTRAL_SOURCE_MOUNT_PATH),
+                "{apart}"
+            );
+            assert_eq!(central_repo_mount_refusal(Some(apart), "shared"), None);
+        }
+        // An object-store repository mounts nothing.
+        assert_eq!(central_repo_mount_refusal(None, "shared"), None);
+    }
+
+    #[test]
+    fn a_source_is_classified_by_what_it_mounts() {
         use kopiur_api::expand::EffectiveSource;
-        let pvc = || kopiur_api::PvcTargetRef {
-            namespace: "billing".into(),
-            name: "data".into(),
-        };
-        let source = |path: Option<&str>| EffectiveSource {
+        let source = |pvc: bool, nfs: bool, stream: bool| EffectiveSource {
             index: 0,
-            pvc: Some(pvc()),
-            nfs_path: None,
-            stream: None,
-            source_path_override: path.map(str::to_string),
+            pvc: pvc.then(|| kopiur_api::PvcTargetRef {
+                namespace: "billing".into(),
+                name: "data".into(),
+            }),
+            nfs_path: nfs.then(|| "/exports/data".to_string()),
+            stream: stream.then(|| kopiur_api::snapshot_policy::StreamSource {
+                file_name: "dump.sql".into(),
+                workload_exec: kopiur_api::StreamExec {
+                    pod_selector: Default::default(),
+                    container: None,
+                    command: vec!["pg_dump".into()],
+                    timeout: None,
+                },
+            }),
+            // An override changes the path kopia records, never the mount path
+            // of a central run, so it does not change the class.
+            source_path_override: Some("/usr/local/bin".into()),
             read_only: true,
         };
-        let default = Some("/pvc/data");
         assert_eq!(
-            CentralSource::of(&source(None), false, default),
+            CentralSource::of(&source(true, false, false), false),
             CentralSource::Pvc
         );
         assert_eq!(
-            CentralSource::of(
-                &source(Some("/usr/local/bin")),
-                false,
-                Some("/usr/local/bin")
-            ),
-            CentralSource::PathOverride
-        );
-        // Even a harmless-looking override: the rule is "no tenant-chosen path".
-        assert_eq!(
-            CentralSource::of(&source(Some("/data")), false, Some("/data")),
-            CentralSource::PathOverride
-        );
-        assert_eq!(
-            CentralSource::of(&source(None), true, default),
+            CentralSource::of(&source(true, false, false), true),
             CentralSource::GroupMember
         );
-        // A forged pin namespace under `sourcePathStrategy: PvcNamespacedName`.
         assert_eq!(
-            CentralSource::of(&source(None), false, Some("/pvc/../usr/local/bin")),
-            CentralSource::UnsafeMountPath
+            CentralSource::of(&source(false, true, false), false),
+            CentralSource::Nfs
         );
         assert_eq!(
-            CentralSource::of(&source(None), false, None),
-            CentralSource::UnsafeMountPath
+            CentralSource::of(&source(false, false, true), false),
+            CentralSource::Stream
         );
-    }
-
-    /// The mount path decides what a tenant volume can cover inside a pod that
-    /// holds the shared repository credentials, so only paths built from object
-    /// names pass. A `/pvc/` prefix alone does not make a path safe.
-    #[test]
-    fn only_paths_built_from_object_names_are_safe_central_mounts() {
-        for ok in [
-            "/pvc/data",
-            "/pvc/billing/postgres-data",
-            "/pvc/a.b-c/d0",
-            "/pvc/0",
-        ] {
-            assert!(is_safe_central_mount(ok), "{ok} must be accepted");
-        }
-        for bad in [
-            "/pvc/../usr/local/bin",
-            "/pvc/billing/../../usr/local/bin",
-            "/pvc/..",
-            "/pvc/.",
-            "/pvc/",
-            "/pvc",
-            "/pvc//data",
-            "/pvc/data/",
-            "/pvc/a/b/c",
-            "/usr/local/bin",
-            "pvc/data",
-            "/pvc/Data",
-            "/pvc/-data",
-            "/pvc/data-",
-            "/pvc/da ta",
-            "/pvc/a..b",
-            "/pvc/data\u{0}",
-        ] {
-            assert!(!is_safe_central_mount(bad), "{bad:?} must be refused");
-        }
-        assert!(!is_safe_central_mount(&format!("/pvc/{}", "a".repeat(254))));
+        assert_eq!(
+            CentralSource::of(&source(false, false, false), false),
+            CentralSource::Nothing
+        );
     }
 
     fn finalizers(names: &[&str]) -> Vec<String> {

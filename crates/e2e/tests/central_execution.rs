@@ -9,8 +9,11 @@
 //!    workload namespace; every transient object is reaped afterwards. The same
 //!    scenario then restores, verifies and pins the snapshot, all from the
 //!    operator namespace.
-//! 2. **Refusal**: a policy the central path cannot serve (`copyMethod: Direct`)
-//!    fails with the reason, instead of quietly running a mover beside the source.
+//! 2. **Refusal, then a clone**: a policy the central path cannot serve
+//!    (`copyMethod: Direct`) fails with the reason, instead of quietly running a
+//!    mover beside the source. A `copyMethod: Clone` policy with a
+//!    `sourcePathOverride` then runs centrally: the override is what kopia
+//!    records, never where the volume is mounted.
 //!
 //! Needs the alpha `CrossNamespaceVolumeDataSource` feature on kube-apiserver and
 //! kube-controller-manager (`crates/e2e/kind-config.yaml`) and on the CSI
@@ -798,10 +801,13 @@ async fn central_repository_refuses_a_source_it_cannot_carry_across_namespaces()
         "a Central repository must never fall back to a mover in the workload namespace"
     );
 
-    // A tenant-chosen mount path is refused too. `sourcePathOverride` is where
-    // the source volume is mounted in the mover pod, and a central mover pod
-    // holds the repository credentials: a volume over `/usr/local/bin` would
-    // replace the mover binary with whatever the tenant put on the volume.
+    // --- A CSI clone, with a `sourcePathOverride` ----------------------------
+    // A PVC also crosses namespaces as a CSI clone. And a `sourcePathOverride`
+    // is honoured for what kopia RECORDS, without ever becoming a mount path:
+    // a central mover pod holds the repository credentials, and a volume
+    // mounted over `/usr/local/bin` would replace the mover binary with
+    // whatever the tenant put on the volume.
+    let clone_src = "e2e-central-clone-src";
     let override_policy = "e2e-central-override-policy";
     let override_backup = "e2e-central-override-backup";
     let _ = backups
@@ -821,6 +827,10 @@ async fn central_repository_refuses_a_source_it_cannot_carry_across_namespaces()
     )
     .await
     .expect("a previous Snapshot must clear");
+    let _ = policies
+        .delete(override_policy, &DeleteParams::default())
+        .await;
+    csi_source_with_marker(&client, WORKLOAD_NS, clone_src).await;
     create_idempotent(
         &policies,
         &cr(snapshot_policy_json(
@@ -829,9 +839,9 @@ async fn central_repository_refuses_a_source_it_cannot_carry_across_namespaces()
             "ClusterRepository",
             "e2e-central-refuse-repo",
             serde_json::json!({
-                "copyMethod": "Snapshot",
+                "copyMethod": "Clone",
                 "sources": [ {
-                    "pvc": { "name": "does-not-matter" },
+                    "pvc": { "name": clone_src },
                     "sourcePathOverride": "/usr/local/bin",
                 } ],
             }),
@@ -851,37 +861,101 @@ async fn central_repository_refuses_a_source_it_cannot_carry_across_namespaces()
         )
         .await
         .expect("create Snapshot");
-    let condition = wait_condition(&backups, override_backup, "SourceStaged", "False")
+    wait_phase(&backups, override_backup, "Succeeded")
         .await
-        .expect("the Snapshot should be refused");
+        .expect("the central clone backup should Succeed");
+    let status = status_json(&backups, override_backup).await;
     assert_eq!(
-        condition["reason"].as_str(),
-        Some("CentralExecutionUnsupported"),
-        "{condition}"
+        status["job"]["namespace"].as_str(),
+        Some(E2E_NAMESPACE),
+        "the clone backup must run in the operator namespace: {status}"
     );
-    let message = condition["message"].as_str().unwrap_or("");
-    assert!(message.contains("sourcePathOverride"), "{message}");
+    let files: i64 = ["filesNew", "filesModified", "filesUnchanged"]
+        .iter()
+        .map(|k| status["stats"][*k].as_i64().unwrap_or(0))
+        .sum();
+    assert!(
+        files >= 1,
+        "the clone must hold the marker file, not an empty volume: {status}"
+    );
+    assert!(
+        status["staged"]["volumeSnapshotName"].is_null(),
+        "a clone cuts no VolumeSnapshot: {status}"
+    );
+
+    // The mover pod mounted the source at the fixed central path, and kopia
+    // recorded the snapshot under the overridden one.
+    let central_jobs: Api<Job> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let job = central_jobs
+        .get(status["job"]["name"].as_str().expect("status.job.name"))
+        .await
+        .expect("the central mover Job");
+    let container = job
+        .spec
+        .as_ref()
+        .and_then(|s| s.template.spec.as_ref())
+        .and_then(|p| p.containers.first())
+        .expect("the mover container");
+    let mounts: Vec<&str> = container
+        .volume_mounts
+        .iter()
+        .flatten()
+        .map(|m| m.mount_path.as_str())
+        .collect();
+    assert!(
+        mounts.contains(&"/source"),
+        "the source must be mounted at the fixed central path: {mounts:?}"
+    );
+    assert!(
+        !mounts.iter().any(|m| m.starts_with("/usr")),
+        "a tenant-chosen path must never be a mount path in a central mover: {mounts:?}"
+    );
+    let work_spec: serde_json::Value = container
+        .env
+        .iter()
+        .flatten()
+        .find(|e| e.name == "KOPIUR_WORK_SPEC")
+        .and_then(|e| e.value.as_deref())
+        .map(|raw| serde_json::from_str(raw).expect("the work spec parses"))
+        .expect("the Job carries the inline work spec");
+    assert_eq!(
+        work_spec["operation"]["snapshot"]["sourcePath"].as_str(),
+        Some("/source"),
+        "{work_spec}"
+    );
+    assert_eq!(
+        work_spec["identity"]["sourcePath"].as_str(),
+        Some("/usr/local/bin"),
+        "kopia must record the overridden path, as an in-namespace run does: {work_spec}"
+    );
+
+    // Cleanup after the clone: the staged PVC and the grant are gone. (The
+    // provisioner's `cloning-protection` finalizer stays on the source PVC, as
+    // after any CSI clone. The provisioner removes it when that PVC is deleted,
+    // which the end of this test does.)
     let override_uid = backups
         .get(override_backup)
         .await
         .expect("get Snapshot")
         .uid()
         .unwrap();
-    let central_jobs: Api<Job> = Api::namespaced(client.clone(), E2E_NAMESPACE);
-    let launched: Vec<String> = central_jobs
-        .list(&ListParams::default().labels(&format!(
-            "kopiur.home-operations.com/snapshot-uid={override_uid}"
-        )))
-        .await
-        .expect("list central jobs")
-        .items
-        .iter()
-        .map(ResourceExt::name_any)
-        .collect();
-    assert!(
-        launched.is_empty(),
-        "a refused Snapshot must not launch a central mover, found {launched:?}"
-    );
+    let central_pvcs: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let grants = reference_grants(&client, WORKLOAD_NS);
+    let by_snapshot = ListParams::default().labels(&format!(
+        "kopiur.home-operations.com/snapshot-uid={override_uid}"
+    ));
+    wait_until(
+        "central clone artifacts reaped",
+        default_timeout(),
+        poll_interval(),
+        || async {
+            let staged = central_pvcs.list(&by_snapshot).await?.items.len();
+            let granted = grants.list(&ListParams::default()).await?.items.len();
+            Ok((staged == 0 && granted == 0).then_some(()))
+        },
+    )
+    .await
+    .expect("the staged clone and its ReferenceGrant should go");
 
     let _ = backups
         .delete(override_backup, &DeleteParams::default())
@@ -891,7 +965,24 @@ async fn central_repository_refuses_a_source_it_cannot_carry_across_namespaces()
         .await;
     let _ = backups.delete(backup, &DeleteParams::default()).await;
     let _ = policies.delete(policy, &DeleteParams::default()).await;
+    wait_until(
+        "the clone Snapshot gone",
+        default_timeout(),
+        poll_interval(),
+        || async {
+            Ok(backups
+                .get_opt(override_backup)
+                .await?
+                .is_none()
+                .then_some(()))
+        },
+    )
+    .await
+    .expect("the clone Snapshot should be deleted");
     let _ = crepos
         .delete("e2e-central-refuse-repo", &DeleteParams::default())
         .await;
+    kopiur_e2e::pvc::delete_pvc_and_consumers(&client, WORKLOAD_NS, clone_src)
+        .await
+        .expect("delete the clone source PVC");
 }

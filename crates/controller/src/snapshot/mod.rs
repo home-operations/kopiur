@@ -1234,19 +1234,8 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
 
     let (mut work_spec, mut source_volume, repo_volume, _) =
         build_backup_run(backup, &config, &repo, &namespace, &name)?;
-    // A central mover pod holds the shared repository credentials, so nothing a
-    // tenant chooses may decide where a volume is mounted in it. `launch_site`
-    // already refused a `sourcePathOverride`; this catches any other way a
-    // mount path could become tenant-chosen, before anything is created.
-    if let io::MoverSite::Central(_) = &site
-        && let Some(mount) = &source_volume
-        && !io::is_safe_central_mount(&mount.mount_path)
-    {
-        return Err(Error::Invariant(format!(
-            "central execution would mount the source at `{}`, which is not a path built \
-             from the PVC's namespace and name",
-            mount.mount_path
-        )));
+    if let io::MoverSite::Central(_) = &site {
+        mount_source_centrally(&mut work_spec, source_volume.as_mut());
     }
 
     // The mover Job runs in THIS (workload) namespace, where the operator SA does
@@ -2300,6 +2289,29 @@ fn has_stage(backup: &Snapshot, site: &io::MoverSite) -> bool {
     )
 }
 
+/// Move a central run's source volume to [`io::CENTRAL_SOURCE_MOUNT_PATH`], and
+/// point the mover at it.
+///
+/// The path the volume is mounted at and the path kopia walks are one field
+/// pair that must agree. The path kopia RECORDS is a third, separate value:
+/// `identity.source_path`, which the mover passes as `--override-source` and
+/// keys the kopia policy on. It is left alone, so a central run records
+/// `sourcePathOverride` or the default `/pvc/<name>` byte-for-byte as an
+/// in-namespace run does. A stream source mounts nothing and is refused
+/// before this point.
+fn mount_source_centrally(
+    work_spec: &mut MoverWorkSpec,
+    source_volume: Option<&mut VolumeMountSpec>,
+) {
+    let Some(volume) = source_volume else {
+        return;
+    };
+    volume.mount_path = io::CENTRAL_SOURCE_MOUNT_PATH.to_string();
+    if let Operation::Snapshot(op) = &mut work_spec.operation {
+        op.source_path = io::CENTRAL_SOURCE_MOUNT_PATH.to_string();
+    }
+}
+
 /// Where this run's mover should run: the pinned site if the run already
 /// committed to one, else what the repository's `execution.mode` asks for.
 /// `Err((reason, message))` refuses a central run this install or this source
@@ -2323,25 +2335,19 @@ fn launch_site(
     // Re-checked for a pinned run too: the recipe may have been edited since.
     let source = backup.spec.source.as_ref();
     let central_source = match kopiur_api::expand::effective_source(config, source) {
-        Ok(eff) => {
-            // The same derivation `build_backup_run` mounts the volume at.
-            let mount = config
-                .spec
-                .sources
-                .get(eff.index)
-                .and_then(|s| eff.kopia_source_path(kopiur_api::expand::strategy_for(s)));
-            io::CentralSource::of(
-                &eff,
-                source.and_then(|s| s.group.as_ref()).is_some(),
-                mount.as_deref(),
-            )
-        }
+        Ok(eff) => io::CentralSource::of(&eff, source.and_then(|s| s.group.as_ref()).is_some()),
         // The launch path reports an unresolvable source itself, a few lines on.
-        Err(_) => io::CentralSource::NoPvc,
+        Err(_) => io::CentralSource::Nothing,
     };
     if let Some(refusal) =
         io::central_source_refusal(config.spec.copy_method, central_source, &repo_ref.name)
     {
+        return Err(refusal);
+    }
+    if let Some(refusal) = io::central_repo_mount_refusal(
+        io::filesystem_repo_path(&repo.backend).as_deref(),
+        &repo_ref.name,
+    ) {
         return Err(refusal);
     }
     // A central mover takes the repository's Secrets and volumes from the

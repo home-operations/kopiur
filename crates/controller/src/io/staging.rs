@@ -1485,14 +1485,13 @@ pub async fn resolve_staging(
     site: &MoverSite,
 ) -> Result<StagingOutcome> {
     let copy_method = policy.spec.copy_method;
-    // The reconciler refuses every other shape before it resolves a central
-    // site; reaching here with one would stage (or mount) in the wrong namespace.
+    // The reconciler refuses a group before it resolves a central site;
+    // reaching here with one would stage in the wrong namespace.
     if let MoverSite::Central(_) = site
-        && (copy_method != CopyMethod::Snapshot || pin.and_then(|p| p.group.as_ref()).is_some())
+        && pin.and_then(|p| p.group.as_ref()).is_some()
     {
         return Err(Error::Invariant(
-            "central execution reached staging without a single-PVC `copyMethod: Snapshot` source"
-                .into(),
+            "central execution reached staging with a `groupBy: VolumeGroupSnapshot` member".into(),
         ));
     }
     // The source THIS run covers. Without the pin a fanned-out child would
@@ -1514,8 +1513,11 @@ pub async fn resolve_staging(
         StagingApplicability::NotApplicable => {
             return match site {
                 MoverSite::InNamespace => Ok(StagingOutcome::NotApplicable),
+                // An unstaged source is mounted live by the mover pod: a PVC
+                // under `copyMethod: Direct`, or an NFS export. A central
+                // mover does neither, and the reconciler refuses both first.
                 MoverSite::Central(_) => Err(Error::Invariant(
-                    "central execution reached staging with no PVC source".into(),
+                    "central execution reached staging with a source that is not staged".into(),
                 )),
             };
         }
@@ -1795,7 +1797,7 @@ pub async fn resolve_staging(
                 let stage = CentralStage {
                     site: central,
                     source_ns: ns,
-                    volume_snapshot: &vs_name,
+                    source: super::central::CrossNamespaceSource::VolumeSnapshot(&vs_name),
                     snapshot_cr,
                     owner,
                 };
@@ -1837,14 +1839,34 @@ pub async fn resolve_staging(
         owner.clone(),
     );
     mark_staged_class_inferred(&mut staged, class_inferred);
-    apply(&stage_api, &staged_pvc, &staged).await?;
+    match site {
+        MoverSite::InNamespace => {
+            apply(&stage_api, &staged_pvc, &staged).await?;
+        }
+        // A CSI clone crosses namespaces the same way a snapshot restore does:
+        // a cross-namespace `dataSourceRef`, here to the source PVC itself.
+        MoverSite::Central(central) => {
+            let stage = CentralStage {
+                site: central,
+                source_ns: ns,
+                source: super::central::CrossNamespaceSource::Pvc(source_name),
+                snapshot_cr,
+                owner,
+            };
+            if let Some(outcome) =
+                apply_central_stage(client, &stage_api, &stage, &staged_pvc, &mut staged).await?
+            {
+                return Ok(outcome);
+            }
+        }
+    }
     // Same bind gate as the Snapshot tail — a CSI full clone is the SLOWEST staging
     // method there is, so skipping the gate here would reproduce the original bug
     // verbatim for `copyMethod: Clone`.
     if let Some(outcome) =
         staged_pvc_bind_gate(client, &stage_api, stage_ns, &staged, &staged_pvc, timeout).await?
     {
-        return Ok(outcome);
+        return Ok(central_bind_hint(site, outcome));
     }
     Ok(StagingOutcome::Ready(StagedSource {
         storage_class_name: staged_class_of(&staged),
@@ -1884,14 +1906,15 @@ struct CentralStage<'a> {
     site: &'a CentralSite,
     /// The workload namespace holding the source PVC and its `VolumeSnapshot`.
     source_ns: &'a str,
-    volume_snapshot: &'a str,
+    /// What the staged PVC is filled from, in `source_ns`.
+    source: super::central::CrossNamespaceSource<'a>,
     snapshot_cr: &'a str,
     /// The `Snapshot` CR, as an owner reference (its UID marks central objects).
     owner: &'a k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference,
 }
 
 /// Create the central staged PVC: grant the operator namespace access to the
-/// `VolumeSnapshot`, apply the claim with its cross-namespace `dataSourceRef`,
+/// source object, apply the claim with its cross-namespace `dataSourceRef`,
 /// and prove the API server kept that reference. Returns `Some(outcome)` to
 /// surface instead of continuing, `None` when the claim is in place.
 async fn apply_central_stage(
@@ -1908,7 +1931,7 @@ async fn apply_central_stage(
         &grant_name,
         stage.source_ns,
         &stage.site.namespace,
-        stage.volume_snapshot,
+        stage.source,
         stage.owner.clone(),
     );
     let grant_api = super::central::reference_grant_api(client, stage.source_ns);
@@ -1927,16 +1950,12 @@ async fn apply_central_stage(
     super::central::centralize_staged_pvc(
         staged,
         stage.source_ns,
-        stage.volume_snapshot,
+        stage.source,
         stage.snapshot_cr,
         uid,
     );
     let stored = apply(stage_api, staged_pvc, staged).await?;
-    if !super::central::cross_namespace_ref_survived(
-        &stored,
-        stage.source_ns,
-        stage.volume_snapshot,
-    ) {
+    if !super::central::cross_namespace_ref_survived(&stored, stage.source_ns, stage.source) {
         // The reconciler's failure path reaps the claim (and any empty volume
         // already provisioned for it) before anything can mount it.
         return Ok(Some(StagingOutcome::Failed {

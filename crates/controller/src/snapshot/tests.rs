@@ -685,6 +685,50 @@ fn build_backup_run_honors_source_path_override_for_nfs() {
     }
 }
 
+/// A central mover pod holds the shared repository credentials, so a tenant's
+/// `sourcePathOverride` must not choose where the volume is mounted in it. It
+/// still chooses what kopia RECORDS: that travels in the identity, which a
+/// central run leaves untouched.
+#[test]
+fn a_central_run_mounts_at_a_fixed_path_and_records_the_same_path_as_in_namespace() {
+    use kopiur_api::snapshot_policy::{PvcSource, Source};
+    let overridden = Source {
+        pvc: Some(PvcSource {
+            name: "app-data".into(),
+        }),
+        // Mounted here, the volume would cover the mover's own binaries.
+        source_path_override: Some("/usr/local/bin".into()),
+        ..Default::default()
+    };
+    let plain = Source {
+        pvc: Some(PvcSource {
+            name: "app-data".into(),
+        }),
+        ..Default::default()
+    };
+    for (source, recorded) in [(overridden, "/usr/local/bin"), (plain, "/pvc/app-data")] {
+        let cfg = config_with_source("media", source);
+        let repo = resolved_s3_repo();
+        let (in_ns, in_ns_volume, ..) =
+            build_backup_run(&dummy_backup(), &cfg, &repo, "ns", "media").unwrap();
+        assert_eq!(in_ns_volume.unwrap().mount_path, recorded);
+        assert_eq!(in_ns.identity.source_path, recorded);
+
+        let (mut central, mut volume, ..) =
+            build_backup_run(&dummy_backup(), &cfg, &repo, "ns", "media").unwrap();
+        mount_source_centrally(&mut central, volume.as_mut());
+        assert_eq!(volume.unwrap().mount_path, io::CENTRAL_SOURCE_MOUNT_PATH);
+        match &central.operation {
+            // kopia walks the directory the volume is mounted at...
+            Operation::Snapshot(op) => assert_eq!(op.source_path, io::CENTRAL_SOURCE_MOUNT_PATH),
+            other => panic!("expected a Snapshot operation, got {other:?}"),
+        }
+        // ...and records the snapshot under the same identity as in-namespace.
+        assert_eq!(central.identity, in_ns.identity);
+        assert_eq!(central.identity.source_path, recorded);
+    }
+}
+
 #[test]
 fn build_backup_run_honors_source_read_only_false() {
     // #254: kopia only reads the source, so read-only is the default — but the kubelet
