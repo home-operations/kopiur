@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.11.0](https://github.com/home-operations/kopiur/compare/0.10.21...0.11.0) (2026-11-15)
+
+
+### ⚠ BREAKING CHANGES
+
+* **controller:** use only the v1 group snapshot API (external-snapshotter 8.6+) ([#739](https://github.com/home-operations/kopiur/issues/739))
+
+### Features
+
+* **controller:** use only the v1 group snapshot API (external-snapshotter 8.6+) ([#739](https://github.com/home-operations/kopiur/issues/739)) ([71e3869](https://github.com/home-operations/kopiur/commit/71e3869935b4ce40d9a04945bf38f734e65577c3))
+
+
+### Miscellaneous Chores
+
+* **mise:** update tool pnpm (12.18.0 → 12.20.0) ([#737](https://github.com/home-operations/kopiur/issues/737)) ([0e347a9](https://github.com/home-operations/kopiur/commit/0e347a93cd49b327f3b53919b3dd92e2a3807c1a))
+* **mise:** update tool rust (1.99.1 → 1.100.0) ([#738](https://github.com/home-operations/kopiur/issues/738)) ([083d3e9](https://github.com/home-operations/kopiur/commit/083d3e9d05ce25e8ff9c1ebf7712e60827a3fd21))
+* **npm:** update dependency @astrojs/starlight (0.42.11 → 0.43.1) ([#735](https://github.com/home-operations/kopiur/issues/735)) ([3955fa0](https://github.com/home-operations/kopiur/commit/3955fa0f6f683542cf43bbf5d3d1578ef5d8f9c6))
+* **npm:** update dependency jsdom (31.0.0 → 31.0.1) ([#733](https://github.com/home-operations/kopiur/issues/733)) ([c447ef7](https://github.com/home-operations/kopiur/commit/c447ef7f54915306c560124b1af31fccb4e01bdb))
+* **npm:** update dependency lucide-react (1.72.0 → 1.73.0) ([#742](https://github.com/home-operations/kopiur/issues/742)) ([149f9db](https://github.com/home-operations/kopiur/commit/149f9dbff7785aa9d0fd0de507dc3ed1a0947ffe))
+* **npm:** update dependency pnpm (12.18.0 → 12.21.0) ([#741](https://github.com/home-operations/kopiur/issues/741)) ([d609190](https://github.com/home-operations/kopiur/commit/d6091905291dbf8c54fb5a1909b4a49c529e1a6f))
+* **npm:** update web ui dependencies ([#736](https://github.com/home-operations/kopiur/issues/736)) ([66a63b1](https://github.com/home-operations/kopiur/commit/66a63b17a36f95d8ad2e75936751ac9a07c38ac2))
+
 ## [0.10.21](https://github.com/home-operations/kopiur/compare/0.10.20...0.10.21) (2026-11-13)
 
 
