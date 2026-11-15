@@ -208,18 +208,27 @@ docker save "$BUSYBOX" | docker exec -i "$NODE" ctr --namespace=k8s.io images im
 '''
 
 [tasks.snapshot-stack]
-description = "Install the CSI snapshot stack (external-snapshotter + csi-driver-host-path + a default VolumeSnapshotClass) so copyMethod: Snapshot/Clone e2e tests run. HERMETIC: applies VENDORED pinned manifests (crates/e2e/manifests/csi-snapshot) and PRELOADS the pinned sidecar images into the node — no network at provision."
+description = "Install the pinned snapshot-controller OCI chart and vendored host-path CSI driver, with preloaded images, for Snapshot/Clone and group snapshot e2e tests"
 dir = "{{config_root}}/../.."
 env = { KUBECONFIG = "{{config_root}}/../../target/e2e/kubeconfig" }
 run = """
 set -eu
 NODE=kopiur-e2e-control-plane
 MANIFESTS=crates/e2e/manifests/csi-snapshot
+CHART_VERSION=0.1.2
+CHART_DIR=target/e2e/charts
+CHART="$CHART_DIR/snapshot-controller-$CHART_VERSION.tgz"
+
+if [ ! -f "$CHART" ]; then
+  mkdir -p "$CHART_DIR"
+  helm pull oci://ghcr.io/home-operations/charts/snapshot-controller \\
+    --version "$CHART_VERSION" --destination "$CHART_DIR"
+fi
 
 # Preload the pinned sidecar + controller images into the node's containerd (same
-# technique as minio-preload). Pinned to the VENDORED manifests' tags (sig-storage
-# release tags are immutable) — keep in lockstep with the `image:` refs under
-# $MANIFESTS. imagePullPolicy is IfNotPresent, so a preloaded image is never re-pulled.
+# technique as minio-preload). Keep the controller tag in lockstep with the chart's
+# appVersion and the sidecar tags with the `image:` refs under $MANIFESTS.
+# imagePullPolicy is IfNotPresent, so a preloaded image is never re-pulled.
 preload() {
   img="$1"
   for a in 1 2 3; do docker pull "$img" >/dev/null 2>&1 && break; echo "   (retry $a) $img"; sleep 3; done
@@ -236,13 +245,11 @@ preload registry.k8s.io/sig-storage/csi-resizer:v2.3.0
 preload registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.18.0
 preload registry.k8s.io/sig-storage/livenessprobe:v2.20.0
 
-echo "==> applying snapshot CRDs (vendored) + waiting for establishment"
-kubectl apply -f "$MANIFESTS/01-crd-volumesnapshotclasses.yaml" \\
-              -f "$MANIFESTS/02-crd-volumesnapshotcontents.yaml" \\
-              -f "$MANIFESTS/03-crd-volumesnapshots.yaml" \\
-              -f "$MANIFESTS/06-crd-volumegroupsnapshotclasses.yaml" \\
-              -f "$MANIFESTS/07-crd-volumegroupsnapshotcontents.yaml" \\
-              -f "$MANIFESTS/08-crd-volumegroupsnapshots.yaml"
+# Helm does not upgrade CRDs on an existing release. Apply them explicitly so a
+# reused kind cluster receives the CRDs from the pinned chart on every run.
+echo "==> applying snapshot CRDs from the chart + waiting for establishment"
+helm show crds "$CHART" > "$CHART_DIR/snapshot-crds.yaml"
+kubectl apply -f "$CHART_DIR/snapshot-crds.yaml"
 kubectl wait --for=condition=established --timeout=60s \\
   crd/volumesnapshotclasses.snapshot.storage.k8s.io \\
   crd/volumesnapshotcontents.snapshot.storage.k8s.io \\
@@ -251,7 +258,11 @@ kubectl wait --for=condition=established --timeout=60s \\
   crd/volumegroupsnapshotcontents.groupsnapshot.storage.k8s.io \\
   crd/volumegroupsnapshots.groupsnapshot.storage.k8s.io
 
-echo "==> applying snapshot-controller + csi-driver-host-path + classes (vendored)"
+echo "==> installing snapshot-controller from the pinned chart"
+helm upgrade --install snapshot-controller "$CHART" --namespace kube-system \\
+  --skip-crds --set controller.verbosity=5 --wait --timeout=150s
+
+echo "==> applying csi-driver-host-path + classes (vendored)"
 kubectl apply -f "$MANIFESTS"
 
 # Make the hostpath snapshot class the default so an unset volumeSnapshotClassName
@@ -612,7 +623,7 @@ mise run //crates/e2e:cluster-create
 mise run //crates/e2e:images-load
 mise run //crates/e2e:minio-preload
 mise run //crates/e2e:node-seed
-# CSI snapshot stack (vendored, hermetic) for the copyMethod: Snapshot/Clone tests — a
+# CSI snapshot stack (pinned chart + vendored driver) for the Snapshot/Clone tests: a
 # required step. Set KOPIUR_E2E_SKIP_SNAPSHOT_STACK=1 only for a shard that excludes
 # copy_methods.rs (the positive test then hard-fails with a "run snapshot-stack" hint).
 if [ "${KOPIUR_E2E_SKIP_SNAPSHOT_STACK:-0}" != "1" ]; then

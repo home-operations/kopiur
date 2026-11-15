@@ -43,7 +43,7 @@ use kopiur_e2e::{E2E_NAMESPACE, Need, World, default_timeout, poll_interval, wai
 
 /// The storage class the `snapshot-stack` mise task installs (see `copy_methods.rs`).
 const CSI_STORAGE_CLASS: &str = "csi-hostpath-sc";
-/// Where the vendored snapshot-stack manifests deploy the snapshot-controller.
+/// Where the snapshot-stack task installs the snapshot-controller Helm release.
 const SNAPSHOT_CONTROLLER_NS: &str = "kube-system";
 const SNAPSHOT_CONTROLLER: &str = "snapshot-controller";
 /// The exact transient error external-snapshotter reports during its benign

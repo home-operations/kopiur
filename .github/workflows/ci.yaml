@@ -487,7 +487,7 @@ jobs:
       - name: Seed node fixtures
         run: mise run //crates/e2e:node-seed
 
-      # CSI snapshot stack (vendored, hermetic): csi-hostpath-sc + a default
+      # CSI snapshot stack (pinned OCI chart + vendored driver): csi-hostpath-sc + a default
       # VolumeSnapshotClass. Required by the populator-restore handshake and the
       # copyMethod Snapshot/Clone tests; those tests SKIP without it, so a shard that
       # runs them must opt in via `csi: true`. Installed before the chart, matching

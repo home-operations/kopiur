@@ -8,7 +8,7 @@
 //! 2. **Stage + cleanup**: `copyMethod: Snapshot` over a CSI-provisioned PVC creates a
 //!    VolumeSnapshot + staged PVC, the mover reads the stage, the Snapshot Succeeds, and
 //!    the staged objects are reaped. The harness installs the CSI snapshot stack (the
-//!    vendored, hermetic `snapshot-stack` mise task), so this is a hard requirement.
+//!    `snapshot-stack` mise task), so this is a hard requirement.
 //!
 //! Gated by `#[cfg(feature = "e2e")]` + `#[ignore]`; driven by
 //! `mise run //crates/e2e:test`. Skips gracefully without a cluster.

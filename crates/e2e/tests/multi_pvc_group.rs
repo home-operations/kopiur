@@ -11,9 +11,9 @@
 //! * fan-out with `groupBy: None` over plain hostPath PVCs — no CSI, so it runs
 //!   wherever the harness does and guards the reported bug directly;
 //! * group staging with `groupBy: VolumeGroupSnapshot` — needs the CSI stack
-//!   *and* the `groupsnapshot.storage.k8s.io` CRDs. The vendored
-//!   external-snapshotter enables group snapshots by default, so neither the
-//!   snapshot-controller nor the csi-snapshotter sidecar needs a feature gate.
+//!   *and* the `groupsnapshot.storage.k8s.io` CRDs. The snapshot-controller chart
+//!   enables group snapshots, and the vendored csi-snapshotter sidecar enables
+//!   them by default.
 
 #![cfg(all(unix, feature = "e2e"))]
 
