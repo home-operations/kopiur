@@ -74,7 +74,7 @@ tower-http = { version = "0.7", features = [
     "timeout",
     "cors",
 ] }
-json-patch = "4"
+json-patch = "5"
 # Bare HTTP types (`HeaderName`, `StatusCode`, `Uri`) for code that must not drag
 # in a whole framework — e.g. `kopiur-ui`'s config, which parses and validates
 # identity header names long before a router exists.
