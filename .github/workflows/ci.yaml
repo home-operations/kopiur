@@ -57,7 +57,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup Mise
-        uses: jdx/mise-action@d5574b52816a478f9d4e6529a3f6ff17a8a36785 # v5.2.8
+        uses: jdx/mise-action@236a21c3b91f5db6d4e174b348674a0f0caac06d # v5.2.9
         with:
           experimental: true
           install_args: --locked
@@ -115,7 +115,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup Mise
-        uses: jdx/mise-action@d5574b52816a478f9d4e6529a3f6ff17a8a36785 # v5.2.8
+        uses: jdx/mise-action@236a21c3b91f5db6d4e174b348674a0f0caac06d # v5.2.9
         with:
           experimental: true
           install_args: --locked
@@ -432,7 +432,7 @@ jobs:
       # browse runs it on the host. No Rust toolchain — `Rust Build` compiled
       # every shard's test binaries once, and `E2E Image` every image binary.
       - name: Setup Mise
-        uses: jdx/mise-action@d5574b52816a478f9d4e6529a3f6ff17a8a36785 # v5.2.8
+        uses: jdx/mise-action@236a21c3b91f5db6d4e174b348674a0f0caac06d # v5.2.9
         with:
           experimental: true
           install_args: kind kubectl helm vendir kopia aqua:nextest-rs/nextest/cargo-nextest lefthook
@@ -578,7 +578,7 @@ jobs:
       # step needs it to fingerprint and prune the target dir. node + pnpm
       # build the SPA that kopiur-ui embeds.
       - name: Setup Mise
-        uses: jdx/mise-action@d5574b52816a478f9d4e6529a3f6ff17a8a36785 # v5.2.8
+        uses: jdx/mise-action@236a21c3b91f5db6d4e174b348674a0f0caac06d # v5.2.9
         with:
           experimental: true
           install_args: rust node pnpm lefthook
@@ -819,7 +819,7 @@ jobs:
 
       # Chart tooling only — no Rust or node to restore.
       - name: Setup Mise
-        uses: jdx/mise-action@d5574b52816a478f9d4e6529a3f6ff17a8a36785 # v5.2.8
+        uses: jdx/mise-action@236a21c3b91f5db6d4e174b348674a0f0caac06d # v5.2.9
         with:
           experimental: true
           install_args: helm yq lefthook
@@ -887,7 +887,7 @@ jobs:
 
       # Chart tooling only — no Rust or node to restore.
       - name: Setup Mise
-        uses: jdx/mise-action@d5574b52816a478f9d4e6529a3f6ff17a8a36785 # v5.2.8
+        uses: jdx/mise-action@236a21c3b91f5db6d4e174b348674a0f0caac06d # v5.2.9
         with:
           experimental: true
           install_args: helm helm-docs aqua:dadav/helm-schema lefthook
@@ -914,7 +914,7 @@ jobs:
 
       # Chart tooling only — no Rust or node to restore.
       - name: Setup Mise
-        uses: jdx/mise-action@d5574b52816a478f9d4e6529a3f6ff17a8a36785 # v5.2.8
+        uses: jdx/mise-action@236a21c3b91f5db6d4e174b348674a0f0caac06d # v5.2.9
         with:
           experimental: true
           install_args: helm promtool yq lefthook
@@ -943,7 +943,7 @@ jobs:
       # The integration tests shell out to kopia and kubectl; nextest runs them,
       # and kind is their cluster.
       - name: Setup Mise
-        uses: jdx/mise-action@d5574b52816a478f9d4e6529a3f6ff17a8a36785 # v5.2.8
+        uses: jdx/mise-action@236a21c3b91f5db6d4e174b348674a0f0caac06d # v5.2.9
         with:
           experimental: true
           install_args: kind kopia kubectl aqua:nextest-rs/nextest/cargo-nextest lefthook
@@ -991,7 +991,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup Mise
-        uses: jdx/mise-action@d5574b52816a478f9d4e6529a3f6ff17a8a36785 # v5.2.8
+        uses: jdx/mise-action@236a21c3b91f5db6d4e174b348674a0f0caac06d # v5.2.9
         with:
           experimental: true
           install_args: --locked
@@ -1072,7 +1072,7 @@ jobs:
         run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup
 
       - name: Setup Mise
-        uses: jdx/mise-action@d5574b52816a478f9d4e6529a3f6ff17a8a36785 # v5.2.8
+        uses: jdx/mise-action@236a21c3b91f5db6d4e174b348674a0f0caac06d # v5.2.9
         with:
           experimental: true
           install_args: rust aqua:nextest-rs/nextest/cargo-nextest lefthook
@@ -1129,7 +1129,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup Mise
-        uses: jdx/mise-action@d5574b52816a478f9d4e6529a3f6ff17a8a36785 # v5.2.8
+        uses: jdx/mise-action@236a21c3b91f5db6d4e174b348674a0f0caac06d # v5.2.9
         with:
           experimental: true
           install_args: aqua:nextest-rs/nextest/cargo-nextest lefthook
@@ -1158,7 +1158,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup Mise
-        uses: jdx/mise-action@d5574b52816a478f9d4e6529a3f6ff17a8a36785 # v5.2.8
+        uses: jdx/mise-action@236a21c3b91f5db6d4e174b348674a0f0caac06d # v5.2.9
         with:
           experimental: true
           install_args: --locked
