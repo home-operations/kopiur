@@ -42,7 +42,7 @@ node = "26.13.1"
 # signed binary rather than an npm install into the node above — so `ui-install`
 # needs no global npm state and the lock entry carries a per-platform checksum.
 pnpm = "12.21.0"
-"github:oxc-project/oxc" = { version = "0.75.0", version_prefix = "oxfmt_v", matching_regex = "^oxfmt-", rename_exe = "oxfmt" }
+"github:oxc-project/oxc" = { version = "0.78.0", version_prefix = "oxfmt_v", matching_regex = "^oxfmt-", rename_exe = "oxfmt" }
 zizmor = "1.32.0"
 helm = "4.3.2"
 vendir = "0.46.3"
