@@ -210,6 +210,8 @@ async fn run(cli: &MoverCli) -> Result<()> {
     // client (the rustls-tls backend panics without it). Idempotent.
     let _ = rustls::crypto::ring::default_provider().install_default();
 
+    scrub_legacy_cache_volume(&cache_root());
+
     let spec = resolve_work_spec(cli.work_spec.clone())?;
     let operation = spec.operation.kind_str().to_string();
     info!(
@@ -514,6 +516,76 @@ async fn apply_repository_throttle(client: &KopiaClient, throttle: &ThrottleSpec
 /// deliberately not granted RBAC to PATCH it.
 fn wants_log_only_reporter(op: &Operation) -> bool {
     matches!(op, Operation::SnapshotDeleteBatch(_))
+}
+
+/// The directory that holds this mover's kopia caches: the parent of the
+/// `KOPIA_CACHE_DIRECTORY` the controller stamped on the Job. That is the
+/// sized cache volume ([`kopiur_kopia::env::CACHE_VOLUME_DIR`]) when the run
+/// has one, and the pod-local `emptyDir` otherwise. Every extra kopia cache a
+/// flow opens (a seed or replication source, say) goes beside the main one, so
+/// the budgets that were sized for that volume hold.
+fn cache_root() -> PathBuf {
+    cache_root_of(std::env::var(kopiur_kopia::env::CACHE_DIRECTORY_ENV).ok())
+}
+
+/// [`cache_root`] for a given `KOPIA_CACHE_DIRECTORY`. Pure.
+fn cache_root_of(cache_directory: Option<String>) -> PathBuf {
+    cache_directory
+        .map(PathBuf::from)
+        .and_then(|dir| dir.parent().map(PathBuf::from))
+        .filter(|root| root.is_absolute() && root != std::path::Path::new("/"))
+        .unwrap_or_else(|| PathBuf::from(kopiur_kopia::env::DEFAULT_CACHE_DIR))
+}
+
+/// Remove what older movers left at the root of a sized cache volume, where
+/// they kept everything: kopia's config files (with the backend credentials
+/// in plain text), the staged credential files, and the logs. Only the cache
+/// directories belong there now, and a persistent cache PVC outlives every
+/// pod, so those files would stay on it for good.
+///
+/// Every regular file at the root is one of those (the caches are
+/// directories), plus the `creds` and `logs` directories. Best effort: a file
+/// that cannot be removed is logged, never fatal.
+///
+/// Only the mount the controller dedicates to a sized cache volume
+/// ([`kopiur_kopia::env::CACHE_VOLUME_DIR`]) is ever scrubbed. A mover started
+/// by hand with its own `KOPIA_CACHE_DIRECTORY` keeps its cache in a directory
+/// that may hold anything.
+fn scrub_legacy_cache_volume(root: &std::path::Path) {
+    if root != std::path::Path::new(kopiur_kopia::env::CACHE_VOLUME_DIR) {
+        return;
+    }
+    scrub_cache_volume_root(root);
+}
+
+/// [`scrub_legacy_cache_volume`] without the mount check, so it can be tested
+/// on a temporary directory.
+fn scrub_cache_volume_root(root: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        let removed = if kind.is_dir() {
+            match entry.file_name().to_str() {
+                Some("creds" | "logs") => std::fs::remove_dir_all(&path),
+                Some(_) | None => continue,
+            }
+        } else {
+            std::fs::remove_file(&path)
+        };
+        match removed {
+            Ok(()) => {
+                info!(path = %path.display(), "removed a file an older mover left on the cache volume")
+            }
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e, "could not remove a file an older mover left on the cache volume");
+            }
+        }
+    }
 }
 
 /// Directory under the writable kopia-cache `emptyDir` where the mover stages
@@ -1826,11 +1898,13 @@ struct SeedPaths {
 impl SeedPaths {
     fn new() -> Self {
         let base = kopiur_kopia::env::DEFAULT_CACHE_DIR;
+        let caches = cache_root();
+        let caches = caches.display();
         Self {
             source_config: format!("{base}/seed-source.config"),
-            source_cache: format!("{base}/seed-source-cache"),
+            source_cache: format!("{caches}/seed-source-cache"),
             local_config: format!("{base}/seed-local.config"),
-            local_xdg: format!("{base}/seed-local-xdg"),
+            local_xdg: format!("{caches}/seed-local-xdg"),
         }
     }
 }
@@ -3989,11 +4063,13 @@ struct SreplPaths {
 impl SreplPaths {
     fn new() -> Self {
         let base = kopiur_kopia::env::DEFAULT_CACHE_DIR;
+        let caches = cache_root();
+        let caches = caches.display();
         Self {
             source_config: format!("{base}/srepl-source.config"),
             dest_config: format!("{base}/srepl-dest.config"),
-            source_cache: format!("{base}/srepl-source-cache"),
-            dest_xdg: format!("{base}/srepl-dest-xdg"),
+            source_cache: format!("{caches}/srepl-source-cache"),
+            dest_xdg: format!("{caches}/srepl-dest-xdg"),
         }
     }
 }
@@ -4681,6 +4757,83 @@ fn build_client(spec: &MoverWorkSpec, kopia_binary: Option<&str>) -> KopiaClient
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- #760: a sized cache volume holds the kopia cache only ---------------
+
+    /// The extra caches of a seed or replication flow go beside the main
+    /// cache, wherever the controller put that: the sized volume when the run
+    /// has one, so the budgets sized for it hold.
+    #[test]
+    fn the_cache_root_is_the_parent_of_the_stamped_cache_directory() {
+        let base = kopiur_kopia::env::DEFAULT_CACHE_DIR;
+        let volume = kopiur_kopia::env::CACHE_VOLUME_DIR;
+        assert_eq!(
+            cache_root_of(Some(format!("{volume}/cache"))),
+            PathBuf::from(volume)
+        );
+        assert_eq!(
+            cache_root_of(Some(format!("{base}/cache"))),
+            PathBuf::from(base)
+        );
+        // Unset, relative, or at the filesystem root: the pod-local default.
+        for odd in [None, Some("cache".to_string()), Some("/cache".to_string())] {
+            assert_eq!(cache_root_of(odd.clone()), PathBuf::from(base), "{odd:?}");
+        }
+    }
+
+    /// kopia writes the backend credentials in plain text into its config file,
+    /// and older movers kept that file, the staged credential files and the
+    /// logs at the root of the cache volume. A persistent cache PVC outlives
+    /// every pod, so the first new mover that mounts one removes them. The
+    /// cache directories stay: the cache is still warm after the upgrade.
+    #[test]
+    fn the_scrub_removes_what_older_movers_left_and_keeps_the_caches() {
+        let root = tempfile::tempdir().unwrap();
+        let at = |p: &str| root.path().join(p);
+        for file in [
+            "repository.config",
+            "repository.config.update-info.json",
+            "srepl-source.config",
+            "srepl-source.config.kopia-password",
+            ".kopiur-session-ready",
+        ] {
+            std::fs::write(at(file), "secret").unwrap();
+        }
+        for dir in [
+            "creds",
+            "logs",
+            "cache/contents",
+            "srepl-source-cache",
+            "lost+found",
+        ] {
+            std::fs::create_dir_all(at(dir)).unwrap();
+        }
+        std::fs::write(at("creds/sftp_key"), "secret").unwrap();
+        std::fs::write(at("cache/contents/blob"), "cached").unwrap();
+
+        scrub_cache_volume_root(root.path());
+
+        let mut left: Vec<String> = std::fs::read_dir(root.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["cache", "lost+found", "srepl-source-cache"]);
+        assert!(at("cache/contents/blob").exists(), "the cache must survive");
+    }
+
+    /// Only the mount the controller dedicates to a sized cache volume is
+    /// scrubbed. A mover started by hand keeps its cache in a directory that
+    /// may hold anything.
+    #[test]
+    fn the_scrub_never_touches_a_directory_that_is_not_the_cache_volume_mount() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("repository.config");
+        std::fs::write(&file, "mine").unwrap();
+        scrub_legacy_cache_volume(root.path());
+        scrub_legacy_cache_volume(std::path::Path::new(kopiur_kopia::env::DEFAULT_CACHE_DIR));
+        assert!(file.exists());
+    }
 
     // --- #689: partial restore selection probe -------------------------------
 

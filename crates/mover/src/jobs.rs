@@ -638,15 +638,46 @@ pub fn build_job(inputs: &MoverJobInputs<'_>) -> Result<Job, BuildJobError> {
     // path is the shared default kopiur_kopia::env::DEFAULT_CACHE_DIR. The volume's
     // shape is resolved from the run's effective cache config (ADR §3.1) — match
     // exhaustively so a new `CacheVolume` variant must be handled here.
-    volumes.push(Volume {
-        name: "kopia-cache".to_string(),
-        ..cache_volume_source(&inputs.cache_volume)
-    });
-    volume_mounts.push(VolumeMount {
-        name: "kopia-cache".to_string(),
-        mount_path: kopiur_kopia::env::DEFAULT_CACHE_DIR.to_string(),
-        ..Default::default()
-    });
+    //
+    // kopia's config file and the staged credential files hold backend
+    // credentials in plain text, so they always live on a pod-local emptyDir. A
+    // sized cache volume is a second mount that holds the kopia cache only
+    // (see kopiur_kopia::env::CACHE_VOLUME_DIR).
+    let cache_root = match &inputs.cache_volume {
+        CacheVolume::EmptyDir => {
+            volumes.push(Volume {
+                name: "kopia-cache".to_string(),
+                ..cache_volume_source(&inputs.cache_volume)
+            });
+            volume_mounts.push(VolumeMount {
+                name: "kopia-cache".to_string(),
+                mount_path: kopiur_kopia::env::DEFAULT_CACHE_DIR.to_string(),
+                ..Default::default()
+            });
+            kopiur_kopia::env::DEFAULT_CACHE_DIR
+        }
+        CacheVolume::Ephemeral { .. } | CacheVolume::Pvc { .. } => {
+            volumes.push(Volume {
+                name: "kopia-state".to_string(),
+                ..cache_volume_source(&CacheVolume::EmptyDir)
+            });
+            volume_mounts.push(VolumeMount {
+                name: "kopia-state".to_string(),
+                mount_path: kopiur_kopia::env::DEFAULT_CACHE_DIR.to_string(),
+                ..Default::default()
+            });
+            volumes.push(Volume {
+                name: "kopia-cache".to_string(),
+                ..cache_volume_source(&inputs.cache_volume)
+            });
+            volume_mounts.push(VolumeMount {
+                name: "kopia-cache".to_string(),
+                mount_path: kopiur_kopia::env::CACHE_VOLUME_DIR.to_string(),
+                ..Default::default()
+            });
+            kopiur_kopia::env::CACHE_VOLUME_DIR
+        }
+    };
 
     // Deep-verify scratch: a writable volume at DEEP_SCRATCH_PATH the scratch-restore
     // writes into. Without it, kopia's `mkdir /scratch` under root-owned `/` is denied
@@ -707,11 +738,13 @@ pub fn build_job(inputs: &MoverJobInputs<'_>) -> Result<Job, BuildJobError> {
             value: Some(escape_env_value(&work_spec_json)),
             value_from: None,
         },
-        // Redirect kopia's cache/logs/config onto the writable emptyDir mounted
-        // above (one mover pod = one op, so a fixed config path is safe).
+        // Redirect kopia's cache/logs/config onto the writable volumes mounted
+        // above (one mover pod = one op, so a fixed config path is safe). The
+        // cache goes to the sized volume when there is one. Logs and the config
+        // always stay on the pod-local emptyDir.
         k8s_openapi::api::core::v1::EnvVar {
             name: kopiur_kopia::env::CACHE_DIRECTORY_ENV.to_string(),
-            value: Some(format!("{base}/cache")),
+            value: Some(format!("{cache_root}/cache")),
             value_from: None,
         },
         k8s_openapi::api::core::v1::EnvVar {
@@ -1945,6 +1978,104 @@ mod tests {
         assert_eq!(
             get(kopiur_kopia::env::CONFIG_PATH_ENV),
             format!("{base}/repository.config")
+        );
+    }
+
+    /// #760: kopia writes the backend credentials in plain text into its config
+    /// file, and the mover stages credential files beside it. A sized cache
+    /// volume (a persistent PVC outlives every pod, on a StorageClass a tenant
+    /// may have chosen) must hold the kopia cache and nothing else. So the
+    /// config, the credentials and the logs stay on a pod-local emptyDir, and
+    /// the sized volume is a second mount that only the cache directory is on.
+    #[test]
+    fn a_sized_cache_volume_holds_the_cache_only() {
+        let ws = sample_work_spec();
+        for cache_volume in [
+            CacheVolume::Pvc {
+                claim_name: "kopiur-cache-pg".into(),
+            },
+            CacheVolume::Ephemeral {
+                capacity: "8Gi".into(),
+                storage_class: None,
+            },
+        ] {
+            let mut i = inputs(&ws, JobLimits::default());
+            i.cache_volume = cache_volume.clone();
+            let pod = build_job(&i).unwrap().spec.unwrap().template.spec.unwrap();
+            let volumes = pod.volumes.as_ref().unwrap();
+            let volume = |name: &str| volumes.iter().find(|v| v.name == name);
+            let container = &pod.containers[0];
+            let mount_of = |name: &str| {
+                container
+                    .volume_mounts
+                    .as_ref()
+                    .unwrap()
+                    .iter()
+                    .find(|m| m.name == name)
+                    .map(|m| m.mount_path.clone())
+            };
+            let env = |name: &str| {
+                container
+                    .env
+                    .as_ref()
+                    .unwrap()
+                    .iter()
+                    .find(|e| e.name == name)
+                    .and_then(|e| e.value.clone())
+                    .unwrap_or_else(|| panic!("env {name} missing"))
+            };
+            let base = kopiur_kopia::env::DEFAULT_CACHE_DIR;
+            let sized = kopiur_kopia::env::CACHE_VOLUME_DIR;
+
+            // The sized volume keeps its name, on a mount of its own.
+            assert!(
+                volume("kopia-cache").is_some_and(|v| v.empty_dir.is_none()),
+                "{cache_volume:?}"
+            );
+            assert_eq!(mount_of("kopia-cache").as_deref(), Some(sized));
+            // The pod-local emptyDir is at the base path.
+            assert!(volume("kopia-state").is_some_and(|v| v.empty_dir.is_some()));
+            assert_eq!(mount_of("kopia-state").as_deref(), Some(base));
+            // Only the cache directory is on the sized volume.
+            assert_eq!(
+                env(kopiur_kopia::env::CACHE_DIRECTORY_ENV),
+                format!("{sized}/cache")
+            );
+            for secret_bearing in [
+                env(kopiur_kopia::env::CONFIG_PATH_ENV),
+                env(kopiur_kopia::env::LOG_DIR_ENV),
+            ] {
+                assert!(
+                    secret_bearing.starts_with(&format!("{base}/")),
+                    "{secret_bearing} must stay on the pod-local emptyDir"
+                );
+            }
+        }
+        // The two mounts are siblings: neither path is inside the other.
+        assert!(
+            !kopiur_kopia::env::CACHE_VOLUME_DIR
+                .starts_with(&format!("{}/", kopiur_kopia::env::DEFAULT_CACHE_DIR))
+        );
+    }
+
+    /// An emptyDir cache is deleted with the pod, so it keeps the single
+    /// volume it always had.
+    #[test]
+    fn an_emptydir_cache_keeps_its_single_volume() {
+        let ws = sample_work_spec();
+        let pod = build_job(&inputs(&ws, JobLimits::default()))
+            .unwrap()
+            .spec
+            .unwrap()
+            .template
+            .spec
+            .unwrap();
+        assert!(
+            !pod.volumes
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|v| v.name == "kopia-state")
         );
     }
 
