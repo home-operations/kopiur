@@ -114,6 +114,11 @@ pub struct ClusterRepositorySpec {
     /// Repository-owner gate for projecting credential Secrets into a foreign consumer namespace.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credential_projection: Option<ClusterRepoCredentialProjection>,
+    /// Where the backup movers of this repository's consumers run (absent =
+    /// each consumer's own namespace). **Experimental**: `mode: Central`
+    /// depends on the alpha Kubernetes `CrossNamespaceVolumeDataSource` feature.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution: Option<ExecutionSpec>,
     /// Access mode: `ReadWrite` (default) or `ReadOnly` (serves restores only).
     #[serde(default = "default_repository_mode")]
     #[schemars(default = "default_repository_mode")]
@@ -127,6 +132,69 @@ pub struct ClusterRepositorySpec {
     /// Mutable kopia repository parameters, re-applied on bootstrap whenever they drift.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parameters: Option<RepositoryParameters>,
+}
+
+/// `ClusterRepository.spec.execution`: where the mover Jobs of this
+/// repository's consumers run.
+/// A sub-object so placement knobs slot in without API breakage.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecutionSpec {
+    /// `InNamespace` runs each mover beside the object it works for, in the
+    /// consumer's namespace. `Central` runs it in the operator namespace, so
+    /// that no mover pod and no repository credential enters the workload
+    /// namespace.
+    ///
+    /// A central backup of a PVC crosses namespaces through CSI: the operator
+    /// creates a temporary PVC in the operator namespace whose cross-namespace
+    /// `dataSourceRef` names a `VolumeSnapshot` of the source
+    /// (`copyMethod: Snapshot`, also for each member of a
+    /// `groupBy: VolumeGroupSnapshot` group) or the source PVC itself
+    /// (`copyMethod: Clone`), authorized by a `ReferenceGrant` it creates
+    /// beside that object. The mover mounts every source at a fixed path; the
+    /// path kopia records (`sourcePathOverride` included) is unchanged.
+    /// `copyMethod: Direct` on a PVC and a `stream` source cannot leave the
+    /// workload namespace, and an NFS source would be mounted outside the
+    /// reach of that namespace's Pod Security rules: all three fail the
+    /// `Snapshot` with the reason.
+    ///
+    /// A central restore fills a temporary PVC in the operator namespace, and
+    /// its volume is then handed to the PVC that claims the `Restore`: one the
+    /// user wrote (`target.populator`), or one the operator creates
+    /// (`target.pvc`, when no PVC of that name exists). A restore into an
+    /// existing PVC and a `target.streamExec` restore still run in the
+    /// consumer's namespace.
+    ///
+    /// Verification, pins and browse sessions read only the repository and
+    /// run in the operator namespace. A browse session is created by its user,
+    /// who therefore needs access to that namespace.
+    ///
+    /// It needs, on the cluster: the repository's credential Secret(s) (and a
+    /// filesystem backend's PVC) in the operator namespace; and, for a backup
+    /// of a PVC, the `CrossNamespaceVolumeDataSource` feature gate on
+    /// kube-apiserver and kube-controller-manager, the same gate on the CSI
+    /// driver's external-provisioner, and the Gateway API `ReferenceGrant`
+    /// CRD. A `mover.cache` of `mode: Persistent` is provisioned per run
+    /// instead, because the persistent cache PVC lives in the workload
+    /// namespace.
+    pub mode: ExecutionMode,
+}
+
+/// Where a repository's mover Jobs run. Closed enum.
+///
+/// ```
+/// use kopiur_api::ExecutionMode;
+///
+/// assert_eq!(ExecutionMode::default(), ExecutionMode::InNamespace);
+/// assert_eq!(serde_json::to_value(ExecutionMode::Central).unwrap(), "Central");
+/// ```
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default, JsonSchema)]
+pub enum ExecutionMode {
+    /// In the `Snapshot`'s own namespace, beside the source PVC (the default).
+    #[default]
+    InNamespace,
+    /// In the operator namespace, reading a cross-namespace CSI snapshot restore.
+    Central,
 }
 
 /// The repository-owner side of credential projection on a `ClusterRepository`.
@@ -512,6 +580,70 @@ deletionProtection:
             "maxConcurrentJobs must NOT carry a schema default: {field}"
         );
         assert_eq!(crate::consts::effective_max_concurrent_jobs(None), None);
+    }
+
+    #[test]
+    fn execution_round_trips_and_is_absent_by_default() {
+        let head = "backend: { filesystem: { path: /repo } }\n\
+                    encryption: { passwordSecretRef: { name: s, namespace: kopia-system } }\n\
+                    allowedNamespaces: { all: true }\n";
+
+        // Absent: nothing is serialized, so existing manifests are unchanged.
+        let absent: ClusterRepositorySpec = from_yaml(head);
+        assert_eq!(absent.execution, None);
+        assert!(
+            serde_json::to_value(&absent)
+                .expect("serialize")
+                .get("execution")
+                .is_none()
+        );
+
+        let spec: ClusterRepositorySpec =
+            from_yaml(&format!("{head}execution:\n  mode: Central\n"));
+        assert_eq!(
+            spec.execution,
+            Some(ExecutionSpec {
+                mode: ExecutionMode::Central
+            })
+        );
+        let json = serde_json::to_value(&spec).expect("serialize");
+        assert_eq!(json["execution"], serde_json::json!({ "mode": "Central" }));
+        let reparsed: ClusterRepositorySpec = serde_json::from_value(json).expect("reparse");
+        assert_eq!(spec, reparsed);
+
+        let explicit: ClusterRepositorySpec =
+            from_yaml(&format!("{head}execution:\n  mode: InNamespace\n"));
+        assert_eq!(
+            explicit.execution.map(|e| e.mode),
+            Some(ExecutionMode::InNamespace)
+        );
+    }
+
+    #[test]
+    fn execution_rejects_an_unknown_mode_and_an_empty_block() {
+        let head = "backend: { filesystem: { path: /repo } }\n\
+                    encryption: { passwordSecretRef: { name: s, namespace: kopia-system } }\n\
+                    allowedNamespaces: { all: true }\n";
+        for bad in ["execution:\n  mode: Remote\n", "execution: {}\n"] {
+            let v: serde_json::Value =
+                serde_saphyr::from_str(&format!("{head}{bad}")).expect("yaml");
+            assert!(
+                serde_json::from_value::<ClusterRepositorySpec>(v).is_err(),
+                "`{bad}` must not deserialize"
+            );
+        }
+    }
+
+    #[test]
+    fn execution_mode_is_a_closed_enum_in_the_schema() {
+        let json = serde_json::to_value(ClusterRepository::crd()).unwrap();
+        let spec = &json["spec"]["versions"][0]["schema"]["openAPIV3Schema"]["properties"]["spec"];
+        let execution = &spec["properties"]["execution"];
+        assert_eq!(
+            execution["properties"]["mode"]["enum"],
+            serde_json::json!(["InNamespace", "Central"])
+        );
+        assert_eq!(execution["required"], serde_json::json!(["mode"]));
     }
 
     #[test]

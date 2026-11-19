@@ -31,5 +31,11 @@ directories:
       tags:
       - v2.3.0
     path: resizer
+  - git:
+      commitTitle: 'chore: Prep for v1.7.0 (#5433)'
+      sha: e26d183dbbc1bb782b78addbd26faba03955c152
+      tags:
+      - conformance/v1.7.0
+    path: gateway-api
   path: target/e2e/csi-snapshot
 kind: LockConfig

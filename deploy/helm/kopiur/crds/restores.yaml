@@ -1236,6 +1236,23 @@ spec:
                   - type
                   type: object
                 type: array
+              execution:
+                description: |-
+                  Where this populator restore's prime PVCs and mover Jobs live when that
+                  is not the `Restore`'s own namespace: set under the repository's
+                  `execution.mode: Central`, absent otherwise. Pinned before anything is
+                  created there, so cleanup finds the objects even after the repository's
+                  `execution` is edited or the repository is deleted.
+                nullable: true
+                properties:
+                  namespace:
+                    description: |-
+                      The namespace holding the prime PVCs and mover Jobs (the operator
+                      namespace).
+                    type: string
+                required:
+                - namespace
+                type: object
               failure:
                 description: Structured terminal-failure detail (kopia error class, stderr tail, retry hint).
                 nullable: true

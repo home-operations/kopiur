@@ -70,16 +70,85 @@ pub fn restore_job_duration_seconds(job: &k8s_openapi::api::batch::v1::Job) -> O
 /// Decide the populator state from the restore `target` (ADR-0005 §9). Pure +
 /// exhaustive over [`RestoreTarget`] (no `_ =>`), so a new target variant must be
 /// considered here before it compiles: `populator` awaits a PVC `dataSourceRef`
-/// claim; `pvc`/`pvcRef` is a direct, operator-driven restore.
-pub fn populator_state(target: &RestoreTarget) -> PopulatorState {
-    match target {
-        RestoreTarget::Populator(_) => PopulatorState::AwaitingClaim,
-        // `streamExec` is operator-driven like pvc/pvcRef — the mover reads one
-        // virtual file and pipes it into a command. Nothing claims it.
-        RestoreTarget::Pvc(_) | RestoreTarget::PvcRef(_) | RestoreTarget::StreamExec(_) => {
-            PopulatorState::DirectTarget
+/// claim; `pvcRef` is a direct, operator-driven restore; `pvc` is either,
+/// by its [`PvcDelivery`].
+pub fn populator_state(target: &RestoreTarget, delivery: PvcDelivery) -> PopulatorState {
+    match (target, delivery) {
+        (RestoreTarget::Populator(_), PvcDelivery::Mount | PvcDelivery::Handover) => {
+            PopulatorState::AwaitingClaim
         }
+        // The operator made the target PVC a claim on this Restore, so the
+        // populator handshake fills it like any other claim.
+        (RestoreTarget::Pvc(_), PvcDelivery::Handover) => PopulatorState::AwaitingClaim,
+        (RestoreTarget::Pvc(_), PvcDelivery::Mount) => PopulatorState::DirectTarget,
+        // `pvcRef` writes into an existing volume, which only a pod beside it
+        // can mount. `streamExec` is operator-driven too — the mover reads one
+        // virtual file and pipes it into a command. Nothing claims either.
+        (
+            RestoreTarget::PvcRef(_) | RestoreTarget::StreamExec(_),
+            PvcDelivery::Mount | PvcDelivery::Handover,
+        ) => PopulatorState::DirectTarget,
     }
+}
+
+/// How a `target.pvc` restore gets its data into the PVC it creates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PvcDelivery {
+    /// The mover pod mounts the target PVC and writes into it. The pod must run
+    /// beside the PVC, with the repository credentials there.
+    Mount,
+    /// The mover fills a temporary volume, which is then bound to the target
+    /// PVC: the populator handshake, with the operator as the author of the
+    /// claim. The mover can run in another namespace, so this is how a
+    /// `Central` repository restores into a new PVC.
+    Handover,
+}
+
+/// What the PVC a `target.pvc` restore names looks like right now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetPvcState {
+    /// No PVC of that name exists.
+    Absent,
+    /// It exists and its `dataSourceRef` names this `Restore`.
+    ClaimsRestore,
+    /// It exists and is an ordinary PVC: the restore writes into it in place.
+    Plain,
+}
+
+/// **Pure.** Decide how a `target.pvc` restore delivers its data.
+///
+/// A PVC that claims this Restore is filled by handover. So is a restore whose
+/// handover already started (`handover_started`: it is pinned to the operator
+/// namespace, or it tracks a claim), whatever its PVC looks like now: a claim
+/// that was deleted is re-created, and one that was replaced by an ordinary
+/// PVC leaves the restore waiting for its claim. Switching such a restore to a
+/// direct one would abandon its central Job and temporary volume, and could
+/// start a second mover beside the replacement.
+///
+/// Everything else is a direct restore. That includes a restore with no PVC
+/// yet: the direct pipeline resolves the source first, and only then decides
+/// what kind of PVC to create ([`creates_claim`]).
+pub fn pvc_delivery(target: TargetPvcState, handover_started: bool) -> PvcDelivery {
+    match (target, handover_started) {
+        (TargetPvcState::ClaimsRestore, _) => PvcDelivery::Handover,
+        (TargetPvcState::Plain | TargetPvcState::Absent, true) => PvcDelivery::Handover,
+        (TargetPvcState::Plain | TargetPvcState::Absent, false) => PvcDelivery::Mount,
+    }
+}
+
+/// **Pure.** Whether a direct `target.pvc` restore that is about to create its
+/// PVC creates it as a claim on the Restore, which turns the restore into a
+/// handover on the next pass.
+///
+/// Only when there is data to restore (`has_snapshot`). With none
+/// (deploy-or-restore), the PVC is an ordinary empty one, exactly as without
+/// central execution: a claim would stay unbound until the handover fills it,
+/// and on a `WaitForFirstConsumer` class with no mover to run, that is until
+/// the workload starts. A restore that already ran as a direct restore
+/// (`started_direct`) is never switched. `central` is whether the repository
+/// asks for central execution on an install that can provide it.
+pub fn creates_claim(has_snapshot: bool, started_direct: bool, central: bool) -> bool {
+    has_snapshot && !started_direct && central
 }
 
 /// Actionable refusal for a populator `Restore` under a namespaced install

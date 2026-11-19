@@ -2469,6 +2469,7 @@ fn cluster_repository_rejects_all_false() {
         deletion_protection: None,
         concurrency: None,
         credential_projection: None,
+        execution: None,
     };
     assert!(!validate_cluster_repository(&spec).is_empty());
 }
@@ -2513,6 +2514,7 @@ fn cluster_repository_rejects_bad_identity_expr() {
         deletion_protection: None,
         concurrency: None,
         credential_projection: None,
+        execution: None,
     };
     let errs = validate_cluster_repository(&spec);
     assert!(
@@ -2630,6 +2632,7 @@ fn cluster_repository_immutability_allows_changed_password_secret_ref() {
         deletion_protection: None,
         concurrency: None,
         credential_projection: None,
+        execution: None,
     };
     assert!(
         validate_cluster_repository_immutability(&mk("creds"), &mk("creds-renamed")).is_empty(),
@@ -2731,6 +2734,7 @@ fn cluster_repository_immutability_rejects_changed_splitter() {
         deletion_protection: None,
         concurrency: None,
         credential_projection: None,
+        execution: None,
     };
     let old = mk("FIXED-4M");
     let same = mk("FIXED-4M");
@@ -4675,6 +4679,7 @@ fn cluster_repository_rejects_bad_cluster_name() {
         deletion_protection: None,
         concurrency: None,
         credential_projection: None,
+        execution: None,
     };
     let errs = validate_cluster_repository(&spec);
     assert!(

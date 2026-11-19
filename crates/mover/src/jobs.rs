@@ -47,6 +47,20 @@ pub const WORK_SPEC_FILE: &str = "work-spec.json";
 /// Env var carrying the inline work-spec JSON. Sourced from the mover crate's
 /// single definition so the controller↔mover contract can't drift.
 pub const WORK_SPEC_ENV: &str = crate::env::WORK_SPEC;
+
+/// Escape a literal for a container env `value`, so the kubelet delivers it
+/// byte-for-byte.
+///
+/// Kubernetes expands `$(NAME)` in an env `value` from the variables defined
+/// before it, and those include everything `envFrom` loads: here, the
+/// repository password and backend keys. The work spec carries user-authored
+/// strings (a Snapshot's `description`, tags, kopia arguments), so an unescaped
+/// `$(KOPIA_PASSWORD)` in one of them would be replaced with the secret and then
+/// written wherever that string goes, such as the Snapshot's status. `$$` is the
+/// escape: the kubelet reduces it to one `$` and expands nothing after it.
+pub fn escape_env_value(literal: &str) -> String {
+    literal.replace('$', "$$")
+}
 /// Env var naming the ConfigMap the mover writes a bootstrap result into (set
 /// only for `BootstrapRepository` Jobs). Single definition shared with the mover.
 pub const RESULT_CONFIGMAP_ENV: &str = crate::env::RESULT_CONFIGMAP;
@@ -690,7 +704,7 @@ pub fn build_job(inputs: &MoverJobInputs<'_>) -> Result<Job, BuildJobError> {
     let mut env = vec![
         k8s_openapi::api::core::v1::EnvVar {
             name: WORK_SPEC_ENV.to_string(),
-            value: Some(work_spec_json),
+            value: Some(escape_env_value(&work_spec_json)),
             value_from: None,
         },
         // Redirect kopia's cache/logs/config onto the writable emptyDir mounted
@@ -1203,6 +1217,92 @@ mod tests {
             .unwrap()
             .service_account_name;
         assert_eq!(sa.as_deref(), Some("kopiur-operator"));
+    }
+
+    /// The kubelet's env-value expansion, ported from Kubernetes
+    /// `third_party/forked/golang/expansion/expand.go`: `$(NAME)` is replaced
+    /// when `NAME` is defined, `$$` becomes `$`, anything else is literal.
+    fn kubelet_expand(input: &str, vars: &BTreeMap<&str, &str>) -> String {
+        let bytes = input.as_bytes();
+        let mut out = String::new();
+        let mut checkpoint = 0;
+        let mut cursor = 0;
+        while cursor < bytes.len() {
+            if bytes[cursor] == b'$' && cursor + 1 < bytes.len() {
+                out.push_str(&input[checkpoint..cursor]);
+                let rest = &input[cursor + 1..];
+                let first = rest.chars().next().unwrap();
+                let advance = match first {
+                    '$' => {
+                        out.push('$');
+                        1
+                    }
+                    '(' => match rest.find(')') {
+                        Some(close) => {
+                            let name = &rest[1..close];
+                            match vars.get(name) {
+                                Some(value) => out.push_str(value),
+                                None => out.push_str(&format!("$({name})")),
+                            }
+                            close + 1
+                        }
+                        None => {
+                            out.push_str("$(");
+                            1
+                        }
+                    },
+                    other => {
+                        out.push('$');
+                        out.push(other);
+                        other.len_utf8()
+                    }
+                };
+                cursor += advance;
+                checkpoint = cursor + 1;
+            }
+            cursor += 1;
+        }
+        out.push_str(&input[checkpoint.min(input.len())..]);
+        out
+    }
+
+    /// A user-authored string in the work spec must never be expanded against
+    /// the credentials `envFrom` loads into the same container. Before the
+    /// escape, a Snapshot `description` of `$(KOPIA_PASSWORD)` reached kopia as
+    /// the repository password and was then written to the Snapshot's status.
+    #[test]
+    fn work_spec_env_survives_kubelet_expansion_without_reading_credentials() {
+        let secrets = BTreeMap::from([
+            ("KOPIA_PASSWORD", "hunter2"),
+            ("AWS_SECRET_ACCESS_KEY", "s3cr3t"),
+        ]);
+        // The port agrees with the kubelet on the cases that matter here.
+        assert_eq!(kubelet_expand("$(KOPIA_PASSWORD)", &secrets), "hunter2");
+        assert_eq!(
+            kubelet_expand("$$(KOPIA_PASSWORD)", &secrets),
+            "$(KOPIA_PASSWORD)"
+        );
+        assert_eq!(kubelet_expand("$(UNSET) $x $", &secrets), "$(UNSET) $x $");
+
+        let mut ws = sample_work_spec();
+        let Operation::Snapshot(op) = &mut ws.operation else {
+            panic!("sample is a snapshot op");
+        };
+        op.description = Some("leak $(KOPIA_PASSWORD) and $(AWS_SECRET_ACCESS_KEY)".into());
+        op.tags.insert("cost".into(), "$$5 $HOME $(".into());
+
+        let job = build_job(&inputs(&ws, JobLimits::default())).unwrap();
+        let pod = job.spec.unwrap().template.spec.unwrap();
+        let raw = pod.containers[0].env.as_ref().unwrap()[0]
+            .value
+            .clone()
+            .unwrap();
+        let delivered = kubelet_expand(&raw, &secrets);
+        assert!(!delivered.contains("hunter2"), "{delivered}");
+        assert!(!delivered.contains("s3cr3t"), "{delivered}");
+        // What the mover receives is exactly the spec the controller built.
+        let parsed: MoverWorkSpec = serde_json::from_str(&delivered).unwrap();
+        assert_eq!(parsed, ws);
     }
 
     #[test]

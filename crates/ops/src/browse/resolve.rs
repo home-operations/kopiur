@@ -28,6 +28,10 @@ pub struct RepoHandle {
     pub uid: String,
     /// The repository's own namespace (`None` for `ClusterRepository`).
     pub namespace: Option<String>,
+    /// Where the repository's movers run (`ClusterRepository.spec.execution`).
+    /// Always `InNamespace` for a namespaced `Repository`, which has no such
+    /// field.
+    pub execution: kopiur_api::ExecutionMode,
     /// The storage backend.
     pub backend: Backend,
     /// The encryption (password Secret) settings.
@@ -51,8 +55,12 @@ pub struct RepoHandle {
 pub struct BrowseTarget {
     /// The Snapshot CR name (for messages).
     pub snapshot: String,
-    /// The namespace the Snapshot lives in — and where the session pod runs.
+    /// The namespace the Snapshot lives in.
     pub namespace: String,
+    /// The namespace the session pod runs in ([`session_namespace_for`]): the
+    /// Snapshot's own, or the operator namespace for a `ClusterRepository`
+    /// with `execution.mode: Central`.
+    pub session_namespace: String,
     /// The kopia snapshot manifest id pinned in the Snapshot's status.
     pub kopia_snapshot_id: String,
     /// The repository holding the snapshot.
@@ -136,7 +144,7 @@ impl SessionCreds {
 /// refused, naming the gate. Pure.
 pub fn session_creds(target: &BrowseTarget, job_name: &str) -> Result<Vec<SessionCreds>, OpsError> {
     let repo = &target.repo;
-    let session_namespace = target.namespace.as_str();
+    let session_namespace = target.session_namespace.as_str();
     let refs = mover_creds_secret_refs(&repo.backend, &repo.encryption, repo.namespace.as_deref());
     let mut creds = Vec::with_capacity(refs.len());
     // Indexed by the ref's position, as the operator's copies are, so a
@@ -191,6 +199,16 @@ pub fn snapshot_opted_in(snap: &Snapshot) -> bool {
 fn projection_block(target: &BrowseTarget) -> Option<ProjectionBlock> {
     match target.repo.kind {
         RepositoryKind::Repository => Some(ProjectionBlock::NotAClusterRepository),
+        // A Central repository keeps its credentials in the operator
+        // namespace. The session already runs there, so a Secret that is
+        // somewhere else is a misplaced Secret, never one to copy.
+        RepositoryKind::ClusterRepository
+            if target.repo.execution == kopiur_api::ExecutionMode::Central =>
+        {
+            Some(ProjectionBlock::CentralExecution {
+                repository: target.repo.name.clone(),
+            })
+        }
         RepositoryKind::ClusterRepository if !target.projection.allowed => {
             Some(ProjectionBlock::OwnerNotAllowed {
                 repository: target.repo.name.clone(),
@@ -217,14 +235,29 @@ pub async fn resolve(
     ctx: &OpsCtx,
     namespace: &str,
     snapshot_name: &str,
+    transport: SessionTransport,
 ) -> Result<BrowseTarget, OpsError> {
     resolve_with(
         ctx,
         namespace,
         snapshot_name,
         &OperatorNamespace::DiscoverFromControllerDeployment,
+        transport,
     )
     .await
+}
+
+/// How the resolved snapshot will be read. It decides whether the session's
+/// namespace is worth finding out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionTransport {
+    /// Through a session pod in the cluster.
+    Pod,
+    /// By a kopia process on the caller's machine (`--local`). No session pod
+    /// exists, so nothing is looked up to place one: a Central repository's
+    /// session namespace would otherwise cost a cluster-wide Deployment LIST
+    /// that a `--local` caller may not be allowed to make.
+    Local,
 }
 
 /// Resolve `snapshot_name` in `namespace` into a [`BrowseTarget`]: fetch the
@@ -244,6 +277,7 @@ pub async fn resolve_with(
     namespace: &str,
     snapshot_name: &str,
     operator_namespace: &OperatorNamespace,
+    transport: SessionTransport,
 ) -> Result<BrowseTarget, OpsError> {
     let ns = namespace.to_string();
     let snaps: Api<Snapshot> = Api::namespaced(ctx.client.clone(), &ns);
@@ -297,6 +331,7 @@ pub async fn resolve_with(
                 name: r.name_any(),
                 uid: r.uid().unwrap_or_default(),
                 namespace: Some(repo_ns),
+                execution: kopiur_api::ExecutionMode::InNamespace,
                 backend: r.spec.backend.clone(),
                 encryption: r.spec.encryption.clone(),
                 mover_defaults: r.spec.mover_defaults.clone(),
@@ -326,6 +361,12 @@ pub async fn resolve_with(
                 name: r.name_any(),
                 uid: r.uid().unwrap_or_default(),
                 namespace: None,
+                execution: r
+                    .spec
+                    .execution
+                    .as_ref()
+                    .map(|e| e.mode)
+                    .unwrap_or_default(),
                 backend: r.spec.backend.clone(),
                 encryption: r.spec.encryption.clone(),
                 mover_defaults: r.spec.mover_defaults.clone(),
@@ -335,9 +376,15 @@ pub async fn resolve_with(
     };
 
     let ca_bundle_pem = resolve_ca_bundle(ctx, &repo, operator_namespace).await?;
+    let session_namespace = match transport {
+        SessionTransport::Pod => session_namespace_for(ctx, &repo, &ns, operator_namespace).await?,
+        // Never used: there is no session.
+        SessionTransport::Local => ns.clone(),
+    };
     Ok(BrowseTarget {
         snapshot: snapshot_name.to_string(),
         namespace: ns,
+        session_namespace,
         kopia_snapshot_id,
         repo,
         ca_bundle_pem,
@@ -346,6 +393,40 @@ pub async fn resolve_with(
             opted_in: snapshot_opted_in(&snap),
         },
     })
+}
+
+/// The namespace a browse session of `repo` runs in.
+///
+/// A session pod reads only the repository, so it does not have to run beside
+/// the Snapshot. For a `ClusterRepository` with `execution.mode: Central` it
+/// runs in the operator namespace, where that repository keeps its
+/// credentials: no Secret is then copied into the Snapshot's namespace. The
+/// caller creates the session Job and execs into its pod as themselves, so
+/// browsing such a repository needs their own access to the operator
+/// namespace. Every other repository's session runs in `snapshot_namespace`.
+pub async fn session_namespace_for(
+    ctx: &OpsCtx,
+    repo: &RepoHandle,
+    snapshot_namespace: &str,
+    operator_namespace: &OperatorNamespace,
+) -> Result<String, OpsError> {
+    match central_session(repo) {
+        false => Ok(snapshot_namespace.to_string()),
+        true => match known_operator_namespace(operator_namespace) {
+            Some(ns) => Ok(ns.to_string()),
+            None => discover_operator_namespace(ctx, &repo.name, "its browse sessions").await,
+        },
+    }
+}
+
+/// **Pure.** Whether `repo`'s browse sessions run in the operator namespace.
+/// Exhaustive over the repository kind and the execution mode.
+pub fn central_session(repo: &RepoHandle) -> bool {
+    match (repo.kind, repo.execution) {
+        (RepositoryKind::ClusterRepository, kopiur_api::ExecutionMode::Central) => true,
+        (RepositoryKind::ClusterRepository, kopiur_api::ExecutionMode::InNamespace)
+        | (RepositoryKind::Repository, _) => false,
+    }
 }
 
 /// Where a `ClusterRepository`'s `tls.caBundleRef` ConfigMap lives — the
@@ -402,7 +483,14 @@ pub async fn resolve_ca_bundle(
         Some(ns) => ns.clone(),
         None => match known_operator_namespace(operator_ns) {
             Some(ns) => ns.to_string(),
-            None => operator_namespace_for_ca(ctx, &repo.name, cm_name).await?,
+            None => {
+                discover_operator_namespace(
+                    ctx,
+                    &repo.name,
+                    &format!("its tls.caBundleRef ConfigMap {cm_name:?}"),
+                )
+                .await?
+            }
         },
     };
     let key = key_ref.key.as_deref().unwrap_or(DEFAULT_CA_BUNDLE_KEY);
@@ -468,13 +556,15 @@ pub async fn resolve_ca_bundle(
 }
 
 /// Discover the operator's namespace (where a `ClusterRepository`'s
-/// `tls.caBundleRef` ConfigMap lives) from the single controller Deployment —
-/// the same exactly-one-cluster-wide convention `resolve_mover_image` uses, so
-/// a spoofed kopiur-labeled Deployment cannot silently redirect the lookup.
-async fn operator_namespace_for_ca(
+/// `tls.caBundleRef` ConfigMap lives, and where a Central repository's browse
+/// sessions run) from the single controller Deployment — the same
+/// exactly-one-cluster-wide convention `resolve_mover_image` uses, so a
+/// spoofed kopiur-labeled Deployment cannot silently redirect the lookup.
+/// `needed_for` says, in the error, what the repository needs it for.
+async fn discover_operator_namespace(
     ctx: &OpsCtx,
     repository: &str,
-    configmap: &str,
+    needed_for: &str,
 ) -> Result<String, OpsError> {
     use k8s_openapi::api::apps::v1::Deployment;
     let selector = super::session::CONTROLLER_DEPLOYMENT_SELECTOR;
@@ -486,7 +576,7 @@ async fn operator_namespace_for_ca(
     match list.items.as_slice() {
         [] => Err(OpsError::OperatorNamespaceUnresolvable {
             repository: repository.to_string(),
-            configmap: configmap.to_string(),
+            needed_for: needed_for.to_string(),
             why: format!("no Deployment matches {selector} in any namespace"),
             fix: "check that the kopiur operator is installed".to_string(),
         }),
@@ -496,14 +586,14 @@ async fn operator_namespace_for_ca(
                 .clone()
                 .ok_or_else(|| OpsError::OperatorNamespaceUnresolvable {
                     repository: repository.to_string(),
-                    configmap: configmap.to_string(),
+                    needed_for: needed_for.to_string(),
                     why: "the controller Deployment carries no namespace".to_string(),
                     fix: "check the install; a namespaced Deployment always has one".to_string(),
                 })
         }
         many => Err(OpsError::OperatorNamespaceUnresolvable {
             repository: repository.to_string(),
-            configmap: configmap.to_string(),
+            needed_for: needed_for.to_string(),
             why: format!(
                 "{} Deployments match {selector}: {}, so the operator namespace is ambiguous",
                 many.len(),
@@ -549,6 +639,7 @@ pub async fn resolve_repo(
                 name: r.name_any(),
                 uid: r.uid().unwrap_or_default(),
                 namespace: Some(ns),
+                execution: kopiur_api::ExecutionMode::InNamespace,
                 backend: r.spec.backend.clone(),
                 encryption: r.spec.encryption.clone(),
                 mover_defaults: r.spec.mover_defaults.clone(),
@@ -571,6 +662,12 @@ pub async fn resolve_repo(
                 name: r.name_any(),
                 uid: r.uid().unwrap_or_default(),
                 namespace: None,
+                execution: r
+                    .spec
+                    .execution
+                    .as_ref()
+                    .map(|e| e.mode)
+                    .unwrap_or_default(),
                 backend: r.spec.backend.clone(),
                 encryption: r.spec.encryption.clone(),
                 mover_defaults: r.spec.mover_defaults.clone(),
@@ -635,6 +732,7 @@ mod tests {
             name: "nas".into(),
             uid: "u1".into(),
             namespace: ns.map(str::to_string),
+            execution: kopiur_api::ExecutionMode::InNamespace,
             backend: Backend::S3(S3Backend {
                 bucket: "b".into(),
                 prefix: None,
@@ -658,6 +756,7 @@ mod tests {
         BrowseTarget {
             snapshot: "db-1".into(),
             namespace: "media".into(),
+            session_namespace: "media".into(),
             kopia_snapshot_id: "kdead".into(),
             repo,
             ca_bundle_pem: None,
@@ -666,6 +765,59 @@ mod tests {
     }
 
     const JOB: &str = "kopiur-browse-nas-0123abcd";
+
+    /// A Central ClusterRepository's session runs in the operator namespace,
+    /// where its Secrets are: they load directly, and one that is anywhere
+    /// else is refused, never copied. Copying it is exactly what
+    /// `execution.mode: Central` promises not to do.
+    #[test]
+    fn a_central_repositorys_session_never_asks_for_a_copied_secret() {
+        let central = |secret_ns: &str| {
+            let mut repo = repo_handle(RepositoryKind::ClusterRepository, None, Some(secret_ns));
+            repo.execution = kopiur_api::ExecutionMode::Central;
+            assert!(central_session(&repo));
+            let mut t = target(
+                repo,
+                // Both projection gates open: they must not matter.
+                SessionProjection {
+                    allowed: true,
+                    opted_in: true,
+                },
+            );
+            t.session_namespace = "kopiur-system".into();
+            t
+        };
+        // The Secret is where the session runs.
+        assert_eq!(
+            session_creds(&central("kopiur-system"), JOB).unwrap(),
+            vec![SessionCreds::Direct("creds".into())]
+        );
+        // The Secret is in the Snapshot's namespace, or anywhere else.
+        for elsewhere in ["media", "secrets"] {
+            match session_creds(&central(elsewhere), JOB) {
+                Err(OpsError::CredsOutsideSessionNamespace {
+                    session_namespace,
+                    blocked_by: ProjectionBlock::CentralExecution { repository },
+                    ..
+                }) => {
+                    assert_eq!(session_namespace, "kopiur-system");
+                    assert_eq!(repository, "nas");
+                }
+                other => panic!("expected a CentralExecution refusal, got {other:?}"),
+            }
+        }
+
+        // Every other repository's session runs beside the Snapshot.
+        assert!(!central_session(&repo_handle(
+            RepositoryKind::ClusterRepository,
+            None,
+            Some("kopiur-system")
+        )));
+        let mut namespaced = repo_handle(RepositoryKind::Repository, Some("media"), None);
+        // A namespaced Repository has no `execution`; a stray value moves nothing.
+        namespaced.execution = kopiur_api::ExecutionMode::Central;
+        assert!(!central_session(&namespaced));
+    }
     const BOTH: SessionProjection = SessionProjection {
         allowed: true,
         opted_in: true,

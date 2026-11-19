@@ -546,6 +546,7 @@ fn resolved_s3_repo() -> io::ResolvedRepository {
         owner_ref: Default::default(),
         deletion_protection: None,
         concurrency: None,
+        execution: kopiur_api::ExecutionMode::InNamespace,
         mass_deletion_ack: None,
         catalog: None,
         ca_bundle_pem: None,
@@ -681,6 +682,50 @@ fn build_backup_run_honors_source_path_override_for_nfs() {
     match ws.operation {
         Operation::Snapshot(op) => assert_eq!(op.source_path, "/data"),
         other => panic!("expected a Snapshot operation, got {other:?}"),
+    }
+}
+
+/// A central mover pod holds the shared repository credentials, so a tenant's
+/// `sourcePathOverride` must not choose where the volume is mounted in it. It
+/// still chooses what kopia RECORDS: that travels in the identity, which a
+/// central run leaves untouched.
+#[test]
+fn a_central_run_mounts_at_a_fixed_path_and_records_the_same_path_as_in_namespace() {
+    use kopiur_api::snapshot_policy::{PvcSource, Source};
+    let overridden = Source {
+        pvc: Some(PvcSource {
+            name: "app-data".into(),
+        }),
+        // Mounted here, the volume would cover the mover's own binaries.
+        source_path_override: Some("/usr/local/bin".into()),
+        ..Default::default()
+    };
+    let plain = Source {
+        pvc: Some(PvcSource {
+            name: "app-data".into(),
+        }),
+        ..Default::default()
+    };
+    for (source, recorded) in [(overridden, "/usr/local/bin"), (plain, "/pvc/app-data")] {
+        let cfg = config_with_source("media", source);
+        let repo = resolved_s3_repo();
+        let (in_ns, in_ns_volume, ..) =
+            build_backup_run(&dummy_backup(), &cfg, &repo, "ns", "media").unwrap();
+        assert_eq!(in_ns_volume.unwrap().mount_path, recorded);
+        assert_eq!(in_ns.identity.source_path, recorded);
+
+        let (mut central, mut volume, ..) =
+            build_backup_run(&dummy_backup(), &cfg, &repo, "ns", "media").unwrap();
+        mount_source_centrally(&mut central, volume.as_mut());
+        assert_eq!(volume.unwrap().mount_path, io::CENTRAL_SOURCE_MOUNT_PATH);
+        match &central.operation {
+            // kopia walks the directory the volume is mounted at...
+            Operation::Snapshot(op) => assert_eq!(op.source_path, io::CENTRAL_SOURCE_MOUNT_PATH),
+            other => panic!("expected a Snapshot operation, got {other:?}"),
+        }
+        // ...and records the snapshot under the same identity as in-namespace.
+        assert_eq!(central.identity, in_ns.identity);
+        assert_eq!(central.identity.source_path, recorded);
     }
 }
 
@@ -5716,6 +5761,32 @@ fn an_uncreatable_legacy_pin_name_is_not_looked_up() {
     let (current, legacy) = pin_job_names(&"s".repeat(70));
     assert!(current.len() <= kopiur_api::consts::JOB_NAME_MAX);
     assert_eq!(legacy, None);
+}
+
+#[test]
+fn a_central_pin_job_name_is_unique_per_namespace_and_never_the_backup_jobs() {
+    // The operator namespace holds the Jobs of every namespace. Two Snapshots
+    // named alike must get different pin Jobs, and a Snapshot's pin Job must
+    // not share a name with its own central backup Job.
+    for snapshot in ["db-1", &format!("{}-20260101000000", "s".repeat(40))] {
+        let pin = central_pin_job_name("billing", snapshot);
+        assert!(pin.len() + "-pgt-0".len() <= 63, "{pin}");
+        assert_eq!(
+            pin,
+            central_pin_job_name("billing", snapshot),
+            "deterministic"
+        );
+        assert_ne!(pin, central_pin_job_name("payments", snapshot));
+        assert_ne!(pin, io::central_job_name("billing", snapshot));
+        assert_ne!(pin, pin_job_names(snapshot).0);
+        // Nor with the backup Job of a Snapshot that is itself named
+        // `<snapshot>-pin`: that is no hash collision, it is the same input
+        // unless the pin's hash has its own domain.
+        assert_ne!(
+            pin,
+            io::central_job_name("billing", &format!("{snapshot}-pin"))
+        );
+    }
 }
 
 /// Both repository kinds, as a backup's repository reference (#689 was

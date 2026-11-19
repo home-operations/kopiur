@@ -1133,6 +1133,7 @@ Externally tagged — set **exactly one** of: `generate` · `insecure` · `secre
 | `create` | [object](#clusterrepository-speccreate) | — | What to do when the repository does not yet exist (absent means it must already exist). |
 | `credentialProjection` | [object](#clusterrepository-speccredentialprojection) | — | Repository-owner gate for projecting credential Secrets into a foreign consumer namespace. |
 | `deletionProtection` | [object](#clusterrepository-specdeletionprotection) | — | Mass-deletion circuit breaker for this repository's Snapshots. |
+| `execution` | [object](#clusterrepository-specexecution) | — | Where the backup movers of this repository's consumers run (absent = each consumer's own namespace). **Experimental**: `mode: Central` depends on the alpha Kubernetes `CrossNamespaceVolumeDataSource` feature. |
 | `health` | [object](#clusterrepository-spechealth) | — | Repository health thresholds (tunes the index-blob-count warning). |
 | `identityDefaults` | [object](#clusterrepository-specidentitydefaults) | — | Identity defaults (CEL `*Expr`) applied when consumers don't override. |
 | `maintenance` | [object](#clusterrepository-specmaintenance) | — | Maintenance control; `maintenance.namespace` selects where the owned `Maintenance` CR lands. |
@@ -1484,6 +1485,12 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc`.
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `threshold` | integer | `10`<br><sub>min 0</sub> | Pending EXTERNAL destructive Snapshot deletions (deletionTimestamp set, effective deletionPolicy Delete, not operator-pruned) that trip the breaker for this repository: at or above this, those deletions are HELD (finalizers wait) until acknowledged via the `kopiur.home-operations.com/allow-mass-deletion` annotation. `0` disables the breaker. Default 10. |
+
+#### ClusterRepository `spec.execution`
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `mode` | enum: InNamespace \| Central | **required** | `InNamespace` runs each mover beside the object it works for, in the consumer's namespace. `Central` runs it in the operator namespace, so that no mover pod and no repository credential enters the workload namespace.<br>A central backup of a PVC crosses namespaces through CSI: the operator creates a temporary PVC in the operator namespace whose cross-namespace `dataSourceRef` names a `VolumeSnapshot` of the source (`copyMethod: Snapshot`, also for each member of a `groupBy: VolumeGroupSnapshot` group) or the source PVC itself (`copyMethod: Clone`), authorized by a `ReferenceGrant` it creates beside that object. The mover mounts every source at a fixed path; the path kopia records (`sourcePathOverride` included) is unchanged. `copyMethod: Direct` on a PVC and a `stream` source cannot leave the workload namespace, and an NFS source would be mounted outside the reach of that namespace's Pod Security rules: all three fail the `Snapshot` with the reason.<br>A central restore fills a temporary PVC in the operator namespace, and its volume is then handed to the PVC that claims the `Restore`: one the user wrote (`target.populator`), or one the operator creates (`target.pvc`, when no PVC of that name exists). A restore into an existing PVC and a `target.streamExec` restore still run in the consumer's namespace.<br>Verification, pins and browse sessions read only the repository and run in the operator namespace. A browse session is created by its user, who therefore needs access to that namespace.<br>It needs, on the cluster: the repository's credential Secret(s) (and a filesystem backend's PVC) in the operator namespace; and, for a backup of a PVC, the `CrossNamespaceVolumeDataSource` feature gate on kube-apiserver and kube-controller-manager, the same gate on the CSI driver's external-provisioner, and the Gateway API `ReferenceGrant` CRD. A `mover.cache` of `mode: Persistent` is provisioned per run instead, because the persistent cache PVC lives in the workload namespace. |
 
 #### ClusterRepository `spec.health`
 
@@ -2965,6 +2972,7 @@ Externally tagged — set **exactly one** of: `pvc`.
 | --- | --- | --- | --- |
 | `attempts` | integer | — | Number of attempts so far (bounded by `failurePolicy.backoffLimit`). |
 | `name` | string | — | Name of the mover `Job`. |
+| `namespace` | string | — | Namespace of the mover `Job` and its staged PVC when they are not in the `Snapshot`'s own namespace: set under the repository's `execution.mode: Central`, absent otherwise. Pinned before anything is created there, so cleanup finds the objects even after the repository's `execution` is edited or the repository is deleted. |
 
 #### Snapshot `status.recorded`
 
@@ -3405,6 +3413,7 @@ Externally tagged — set **exactly one** of: `pvcConsumer` · `snapshot` · `wo
 | --- | --- | --- | --- |
 | `claims` | map[string]object | — | Per-claimant state for a `target.populator` restore, keyed by the claiming PVC's name (#443).<br>A populator `Restore` is claimed by EVERY PVC whose `spec.dataSourceRef` names it, not just the first, and each claimant gets its own prime PVC, its own mover `Job` and its own kopia source path — so each needs its own state. A **map**, not a list, because an RFC-7386 merge patch merges map keys but REPLACES arrays: N concurrent populate movers each patch only their own key and can never clobber a sibling (the same reason as `SnapshotPolicyStatus.verificationStamps`).<br>Absent for a direct `target.pvc`/`target.pvcRef` restore, which keeps using the top-level `resolved`/`target`/`waitStartedAt`/`logTail`/`failure`.<br>The schema renders as an object with `additionalProperties`, which PRUNES unknown keys — so every field any writer (controller or mover) puts under `claims.&lt;pvc&gt;` must exist on `RestoreClaimStatus`. |
 | `conditions` | [][object](#restore-statusconditions) | — | Standard Kubernetes conditions carrying the human-readable status/reason. |
+| `execution` | [object](#restore-statusexecution) | — | Where this populator restore's prime PVCs and mover Jobs live when that is not the `Restore`'s own namespace: set under the repository's `execution.mode: Central`, absent otherwise. Pinned before anything is created there, so cleanup finds the objects even after the repository's `execution` is edited or the repository is deleted. |
 | `failure` | [object](#restore-statusfailure) | — | Structured terminal-failure detail (kopia error class, stderr tail, retry hint). |
 | `logTail` | string | — | The last lines of the run's output, written by the mover at the terminal transition. |
 | `observedGeneration` | integer | — | `metadata.generation` last reconciled, so stale status is detectable. |
@@ -3427,6 +3436,12 @@ Externally tagged — set **exactly one** of: `pvcConsumer` · `snapshot` · `wo
 | `status` | string | **required** | status of the condition, one of True, False, Unknown. |
 | `type` | string | **required** | type of condition in CamelCase or in foo.example.com/CamelCase. |
 | `observedGeneration` | integer | — | observedGeneration represents the .metadata.generation that the condition was set based upon. For instance, if .metadata.generation is currently 12, but the .status.conditionsx.observedGeneration is 9, the condition is out of date with respect to the current state of the instance. |
+
+#### Restore `status.execution`
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `namespace` | string | **required** | The namespace holding the prime PVCs and mover Jobs (the operator namespace). |
 
 #### Restore `status.failure`
 

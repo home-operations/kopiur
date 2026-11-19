@@ -11,7 +11,7 @@ The committed `vendir.lock.yml` pins their exact Git commits.
 Normal setup uses `vendir sync --locked`.
 CI caches the fetched directory using a key derived from `vendir.lock.yml` and `vendir.yml`.
 An exact cache hit skips the fetch; changing either file creates a new cache entry.
-Only the local storage class with delayed binding (`32-*`) and group snapshot class (`33-*`) stay in this directory as manifests.
+Only the local storage class with delayed binding (`32-*`), the group snapshot class (`33-*`) and the provisioner's `referencegrants` RBAC (`34-*`) stay in this directory as manifests.
 
 The task caches the chart archive under `target/e2e/charts` and preloads the pinned
 container images into the kind node. Fetching the manifests and uncached charts or images requires network access.
@@ -40,6 +40,7 @@ The host-path driver's provisioner, attacher, snapshotter, and resizer sidecars 
 | `attacher/rbac.yaml`                                                                                                                      | `kubernetes-csi/external-attacher`    | `v4.13.0` |
 | `snapshotter/rbac-csi-snapshotter.yaml`                                                                                                   | `kubernetes-csi/external-snapshotter` | `v8.7.0`  |
 | `resizer/rbac.yaml`                                                                                                                       | `kubernetes-csi/external-resizer`     | `v2.3.0`  |
+| `gateway-api/gateway.networking.k8s.io_referencegrants.yaml`                                                                              | `kubernetes-sigs/gateway-api`         | `v1.7.0`  |
 
 vendir copies the upstream files without local changes. The generated directory is
 covered by the repository's `target/` ignore rule.
@@ -51,6 +52,7 @@ because upstream ships it in the same file.
 
 After the chart is installed, the task applies the files in this order:
 driverinfo → sidecar RBAC → plugin → snapshot class → storage class → group snapshot class.
+It applies the `ReferenceGrant` CRD earlier, together with the chart's CRDs.
 
 ## Group snapshots
 
@@ -68,6 +70,23 @@ uses the upstream default.
 `hostpathplugin` implements the CSI `GroupController` service and advertises
 `CREATE_DELETE_GET_VOLUME_GROUP_SNAPSHOT`, so no driver change is needed — which is why
 kopiur's `groupBy: VolumeGroupSnapshot` path is testable in kind at all.
+
+## Cross-namespace data sources
+
+`tests/central_execution.rs` restores a `VolumeSnapshot` into a PVC in another
+namespace (kopiur `execution.mode: Central`). That is the alpha
+`CrossNamespaceVolumeDataSource` feature, and it needs all of:
+
+- the feature gate on kube-apiserver and kube-controller-manager
+  (`crates/e2e/kind-config.yaml`). With it off, the API server drops the PVC's
+  `dataSourceRef` and provisions an empty volume;
+- the same gate on the `csi-provisioner` sidecar. The `snapshot-stack` task adds it to a
+  copy of the fetched plugin manifest (`target/e2e/csi-hostpath-plugin.yaml`) and applies
+  that copy. The task fails if the upstream `--feature-gates` line changes;
+- the `ReferenceGrant` CRD (fetched by vendir from `kubernetes-sigs/gateway-api`) and the
+  provisioner's `referencegrants` RBAC rule (`34-provisioner-referencegrants-rbac.yaml`).
+  The provisioner syncs a `ReferenceGrant` informer at startup once the gate is on, so
+  without both it never becomes ready.
 
 The image tags preloaded by the `snapshot-stack` task must match the chart's controller
 image and the `image:` refs in the generated plugin manifest.

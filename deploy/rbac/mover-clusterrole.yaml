@@ -103,3 +103,20 @@ rules:
   verbs:
   - create
   - get
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    app.kubernetes.io/name: kopiur
+  name: kopiur-central-mover
+rules:
+- apiGroups:
+  - kopiur.home-operations.com
+  resources:
+  - snapshots/status
+  - restores/status
+  - snapshotpolicies/status
+  verbs:
+  - get
+  - patch

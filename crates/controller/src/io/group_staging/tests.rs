@@ -413,3 +413,29 @@ fn the_built_group_carries_its_type_meta_and_group_label() {
     );
     assert!(obj.data["spec"]["source"]["selector"]["matchLabels"]["backup"].is_string());
 }
+
+#[test]
+fn a_member_snapshot_is_recognised_by_its_group_back_pointer() {
+    let ar = crate::io::volume_snapshot_ar_pub();
+    let vs = |status: serde_json::Value| {
+        DynamicObject::new("snapshot-1", &ar).data(serde_json::json!({ "status": status }))
+    };
+    assert!(is_member_of(
+        &vs(serde_json::json!({ "volumeGroupSnapshotName": "nightly-grp" })),
+        "nightly-grp"
+    ));
+    // Another group's member, a plain VolumeSnapshot, and one with no status
+    // yet: none of them may be deleted or released with this group.
+    assert!(!is_member_of(
+        &vs(serde_json::json!({ "volumeGroupSnapshotName": "other-grp" })),
+        "nightly-grp"
+    ));
+    assert!(!is_member_of(
+        &vs(serde_json::json!({ "readyToUse": true })),
+        "nightly-grp"
+    ));
+    assert!(!is_member_of(
+        &DynamicObject::new("snapshot-1", &ar),
+        "nightly-grp"
+    ));
+}

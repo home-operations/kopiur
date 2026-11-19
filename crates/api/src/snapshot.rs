@@ -745,6 +745,13 @@ pub struct JobStatus {
     /// Name of the mover `Job`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// Namespace of the mover `Job` and its staged PVC when they are not in the
+    /// `Snapshot`'s own namespace: set under the repository's
+    /// `execution.mode: Central`, absent otherwise. Pinned before anything is
+    /// created there, so cleanup finds the objects even after the repository's
+    /// `execution` is edited or the repository is deleted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
     /// Number of attempts so far (bounded by `failurePolicy.backoffLimit`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub attempts: Option<i32>,

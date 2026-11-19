@@ -1,0 +1,8 @@
+# The e2e kind cluster. `execution.mode: Central` (tests/central_execution.rs)
+# restores a VolumeSnapshot into another namespace, which needs this alpha gate on
+# kube-apiserver and kube-controller-manager; the `snapshot-stack` task in
+# mise.toml sets the CSI provisioner side.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+featureGates:
+  CrossNamespaceVolumeDataSource: true

@@ -580,13 +580,24 @@ async fn sibling_states(
     group: &str,
     members: &[&Snapshot],
 ) -> Option<Vec<SiblingState>> {
-    let pvc_api: Api<k8s_openapi::api::core::v1::PersistentVolumeClaim> =
-        Api::namespaced(client.clone(), ns);
     let mut states = Vec::with_capacity(members.len());
     for m in members {
-        let staged = super::staging::staged_pvc_name(&m.name_any());
+        // A central member's stage is in the operator namespace, under a name
+        // that carries a hash. Looking only beside the group would read such a
+        // member as "no stage" and reap the group under its restore.
+        let site = super::central::MoverSite::pinned(
+            m.status.as_ref().and_then(|st| st.job.as_ref()),
+            ns,
+            &m.name_any(),
+        );
+        let pvc_api: Api<k8s_openapi::api::core::v1::PersistentVolumeClaim> =
+            Api::namespaced(client.clone(), site.namespace(ns));
+        let staged = site.staged_pvc_name(&m.name_any());
+        let uid = m.uid().unwrap_or_default();
         let staged_pvc_present = match pvc_api.get_opt(&staged).await {
-            Ok(p) => p.is_some(),
+            // A claim of that name that belongs to another run is not this
+            // member's stage.
+            Ok(p) => p.is_some_and(|pvc| !site.is_foreign(&pvc.metadata, &uid)),
             // Same fail-closed rule as the LIST: an unreadable PVC must never
             // read as "gone", or the group is deleted under a live restore.
             Err(e) => {
@@ -678,6 +689,70 @@ pub async fn cleanup_group_if_unused(client: &kube::Client, ns: &str, group: &st
         Err(kube::Error::Api(e)) if e.code == 404 => Ok(false),
         Err(e) => Err(e.into()),
     }
+}
+
+/// Release the member `VolumeSnapshot`s of a deleted group from the CSI
+/// provisioner's stale finalizer (see
+/// [`super::central::release_source_protection`]). Central runs only: an
+/// in-namespace restore does not leave that finalizer behind.
+///
+/// Every member is tried, because the group is shared: this run's own member
+/// and each sibling's go with the group. Each one is released only on its own
+/// proof, so a member whose restore was never seen to finish is left to the
+/// provisioner.
+///
+/// `reaped` is whether this pass deleted the group. The members then follow by
+/// garbage collection, at a moment nothing here observes. They are deleted
+/// directly as well, so that each carries its deletion timestamp NOW: that
+/// timestamp is what the release checks, and what bounds its retries. It is
+/// safe at this point and only at this point: the group was reapable, so no
+/// sibling is still restoring from a member.
+///
+/// Best effort, like the single-snapshot path: a read or a delete that fails
+/// is logged and reads as "nothing to release".
+pub async fn release_group_source_protection(
+    client: &kube::Client,
+    ns: &str,
+    group: &str,
+    reaped: bool,
+) -> super::central::StageCleanup {
+    let vs_api: Api<DynamicObject> = Api::namespaced_with(
+        client.clone(),
+        ns,
+        &super::staging::volume_snapshot_ar_pub(),
+    );
+    let members = match vs_api.list(&ListParams::default()).await {
+        Ok(list) => list.items,
+        Err(e) => {
+            tracing::warn!(group = %group, error = %e, "could not list the group's member VolumeSnapshots; leaving their finalizers to the provisioner");
+            return super::central::StageCleanup::Complete;
+        }
+    };
+    let mut outcome = super::central::StageCleanup::Complete;
+    for member in members.iter().filter(|vs| is_member_of(vs, group)) {
+        let name = member.name_any();
+        if reaped
+            && member.metadata.deletion_timestamp.is_none()
+            && let Err(e) = vs_api.delete(&name, &DeleteParams::background()).await
+        {
+            tracing::warn!(group = %group, volume_snapshot = %name, error = %e, "could not delete a member VolumeSnapshot of the deleted group; leaving it to the garbage collector");
+        }
+        match super::central::release_source_protection(client, ns, &name).await {
+            super::central::StageCleanup::Complete => {}
+            super::central::StageCleanup::Retry => outcome = super::central::StageCleanup::Retry,
+        }
+    }
+    outcome
+}
+
+/// **Pure.** Whether the `VolumeSnapshot` `vs` is a member of the group named
+/// `group`: its `status.volumeGroupSnapshotName` says so.
+fn is_member_of(vs: &DynamicObject, group: &str) -> bool {
+    vs.data
+        .get("status")
+        .and_then(|s| s.get("volumeGroupSnapshotName"))
+        .and_then(serde_json::Value::as_str)
+        == Some(group)
 }
 
 /// Create (or converge on) the shared group. Idempotent: N racing members

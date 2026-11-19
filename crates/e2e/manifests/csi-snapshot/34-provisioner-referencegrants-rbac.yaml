@@ -1,0 +1,28 @@
+# Lets the csi-provisioner sidecar read ReferenceGrants, which it needs once
+# the CrossNamespaceVolumeDataSource feature gate is on (kopiur
+# `execution.mode: Central`, tests/central_execution.rs).
+#
+# Upstream ships this rule commented out in external-provisioner's
+# `deploy/kubernetes/rbac.yaml`. vendir fetches that file unchanged, so the
+# rule lives here as a separate role bound to the plugin's ServiceAccount.
+kind: ClusterRole
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: kopiur-e2e-provisioner-referencegrants
+rules:
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources: ["referencegrants"]
+    verbs: ["get", "list", "watch"]
+---
+kind: ClusterRoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: kopiur-e2e-provisioner-referencegrants
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kopiur-e2e-provisioner-referencegrants
+subjects:
+  - kind: ServiceAccount
+    name: csi-hostpathplugin-sa
+    namespace: default

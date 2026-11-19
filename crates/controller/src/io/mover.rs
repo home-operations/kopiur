@@ -325,7 +325,7 @@ pub fn wi_rolebinding_name(wi_sa: &str) -> String {
 
 /// The [`wi_rolebinding_name`] scheme under an arbitrary prefix (shared with
 /// the snapshot-replication mover's distinct WI binding).
-fn wi_rolebinding_named(prefix: &str, wi_sa: &str) -> String {
+pub(super) fn wi_rolebinding_named(prefix: &str, wi_sa: &str) -> String {
     const MAX: usize = 253;
     let budget = MAX - prefix.len();
     if wi_sa.len() <= budget {
@@ -481,7 +481,7 @@ fn trunc_trim(name: &str, limit: usize) -> &str {
 /// and the length arithmetic makes it unable to collide with `base` itself. An
 /// operator on that path ships their own roles, so only mutual distinctness
 /// matters, not agreement with the chart.
-fn derived_mover_name(base: &str, suffix: &str) -> String {
+pub(super) fn derived_mover_name(base: &str, suffix: &str) -> String {
     let stem = base.strip_suffix("-mover").unwrap_or(base);
     let budget = DNS_LABEL_MAX - (suffix.len() + 1);
     if stem.len() <= budget {

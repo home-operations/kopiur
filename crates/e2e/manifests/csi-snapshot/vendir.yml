@@ -45,3 +45,11 @@ directories:
         includePaths:
           - deploy/kubernetes/rbac.yaml
         newRootPath: deploy/kubernetes
+      - path: gateway-api
+        git:
+          url: https://github.com/kubernetes-sigs/gateway-api
+          ref: v1.7.0
+          depth: 1
+        includePaths:
+          - config/crd/standard/gateway.networking.k8s.io_referencegrants.yaml
+        newRootPath: config/crd/standard

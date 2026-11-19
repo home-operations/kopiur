@@ -154,6 +154,19 @@ what guarantees that at every `fullname` length.
 {{- end }}
 
 {{/*
+Dedicated central mover identity (`ClusterRepository.spec.execution.mode:
+Central`). The controller DERIVES this name from KOPIUR_MOVER_CLUSTERROLE by
+replacing the `-mover` suffix (`io::central_mover_name`), so this helper MUST
+stay `<moverBaseName>-central-mover`: renaming either side alone breaks the
+runtime RoleBinding's roleRef. The controller mints the same-named SA in the
+operator namespace and a RoleBinding to this role in each centrally backed-up
+namespace.
+*/}}
+{{- define "kopiur.centralMoverName" -}}
+{{- printf "%s-central-mover" (include "kopiur.moverBaseName" .) }}
+{{- end }}
+
+{{/*
 Webhook component name.
 */}}
 {{- define "kopiur.webhook.fullname" -}}

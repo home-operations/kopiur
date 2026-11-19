@@ -290,6 +290,15 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
         .ok_or_else(|| Error::Invariant("Snapshot has no namespace".into()))?;
     let name = backup.name_any();
     let api: Api<Snapshot> = Api::namespaced(ctx.client.clone(), &namespace);
+    let uid = backup.uid().unwrap_or_default();
+    // Where this run's mover Job and staged PVC live, as the run pinned it. Every
+    // path that only observes or cleans up reads THIS, never the repository's
+    // live `execution`: the repository may have been edited or deleted since.
+    let pinned_site = io::MoverSite::pinned(
+        backup.status.as_ref().and_then(|s| s.job.as_ref()),
+        &namespace,
+        &name,
+    );
 
     if backup.metadata.deletion_timestamp.is_some() {
         // `policy` is already conservative for an unparseable origin
@@ -441,32 +450,33 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
             // still Active. Tearing the staged PVC + mover pod down now would
             // strand an unschedulable replacement pod (#103) — gate the reap on
             // the Job being terminal (or already gone).
-            if backup
-                .status
-                .as_ref()
-                .and_then(|s| s.staged.as_ref())
-                .is_some()
-            {
-                let job_api: Api<Job> = Api::namespaced(ctx.client.clone(), &namespace);
-                let job = capture_job(&job_api, &name).await?;
+            if has_stage(backup, &pinned_site) {
+                let job_api: Api<Job> =
+                    Api::namespaced(ctx.client.clone(), pinned_site.namespace(&namespace));
+                let job = capture_job(&job_api, &pinned_site, &name, &uid).await?;
                 if !staged_teardown_ready(job.as_ref()) {
                     // The owned-Job watch re-triggers us when the Job reaches
                     // Complete; the requeue is a backstop for a missed event.
                     return Ok(Action::requeue(Duration::from_secs(15)));
                 }
-                io::cleanup_staged_source(
+                let stage = io::cleanup_staged_source(
                     &ctx.client,
                     &namespace,
                     &name,
                     backup.spec.source.as_ref().and_then(|s| s.group.as_ref()),
+                    &pinned_site,
+                    &uid,
                 )
                 .await?;
+                if stage == io::StageCleanup::Retry {
+                    return Ok(Action::requeue(STAGE_CLEANUP_RETRY));
+                }
             }
             // The credential copies die with the mover Job, not with this CR (#240).
             // Self-gated by its stamp, so this costs nothing once it has run; if the
             // Job is not terminal yet, the owned-Job watch and the steady-state
             // requeue below both bring us back.
-            reap_backup_creds_once(backup, ctx, &api, &namespace, &name).await?;
+            reap_backup_creds_once(backup, ctx, &api, &namespace, &name, &pinned_site).await?;
             // A Snapshot that succeeded under an older operator carries no projection
             // pin, so its finalizer would strand once the recipe is deleted (#255).
             // This branch is the one every terminal Snapshot passes through on startup.
@@ -562,31 +572,32 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
             // terminal-or-gone (#103 — reaping under an Active Job strands an
             // unschedulable replacement pod), idempotent no-op once the objects
             // are gone.
-            if backup
-                .status
-                .as_ref()
-                .and_then(|s| s.staged.as_ref())
-                .is_some()
-            {
-                let job_api: Api<Job> = Api::namespaced(ctx.client.clone(), &namespace);
-                let job = capture_job(&job_api, &name).await?;
+            if has_stage(backup, &pinned_site) {
+                let job_api: Api<Job> =
+                    Api::namespaced(ctx.client.clone(), pinned_site.namespace(&namespace));
+                let job = capture_job(&job_api, &pinned_site, &name, &uid).await?;
                 if !staged_teardown_ready(job.as_ref()) {
                     return Ok(Action::requeue(Duration::from_secs(15)));
                 }
-                io::cleanup_staged_source(
+                let stage = io::cleanup_staged_source(
                     &ctx.client,
                     &namespace,
                     &name,
                     backup.spec.source.as_ref().and_then(|s| s.group.as_ref()),
+                    &pinned_site,
+                    &uid,
                 )
                 .await?;
+                if stage == io::StageCleanup::Retry {
+                    return Ok(Action::requeue(STAGE_CLEANUP_RETRY));
+                }
             }
             // The credential copies die with the mover Job, not with this CR (#240).
             // Unlike the Succeeded arm this one has no steady-state timer, so keep a
             // slow requeue alive until the reap settles rather than leaning on the
             // periodic sweep — which an operator may legitimately have disabled. Once
             // stamped, we go back to `await_change()` and stop polling entirely.
-            if !reap_backup_creds_once(backup, ctx, &api, &namespace, &name).await? {
+            if !reap_backup_creds_once(backup, ctx, &api, &namespace, &name, &pinned_site).await? {
                 return Ok(Action::requeue(TERMINAL_SNAPSHOT_STEADY_REQUEUE));
             }
             // `Failed` does NOT imply "no kopia snapshot to delete": a run can create the
@@ -623,8 +634,8 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
 
     // If the owned mover Job already reached a terminal state, copy phase/stats
     // into status (controller-as-source-of-truth for phase) and stop running.
-    let job_api: Api<Job> = Api::namespaced(ctx.client.clone(), &namespace);
-    if let Some(job) = capture_job(&job_api, &name).await? {
+    let job_api: Api<Job> = Api::namespaced(ctx.client.clone(), pinned_site.namespace(&namespace));
+    if let Some(job) = capture_job(&job_api, &pinned_site, &name, &uid).await? {
         match job_terminal_state(&job) {
             Some(true) => {
                 // ADR §4.8: afterSnapshot hooks (resume/notify) complete — once —
@@ -692,17 +703,14 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
                 // Reap the CSI staging objects (VolumeSnapshot + staged PVC) now the
                 // mover is done — frees backend storage promptly (ownerRef GC is the
                 // backstop). No-op for Direct (no staged objects recorded).
-                if backup
-                    .status
-                    .as_ref()
-                    .and_then(|s| s.staged.as_ref())
-                    .is_some()
-                {
+                if has_stage(backup, &pinned_site) {
                     io::cleanup_staged_source(
                         &ctx.client,
                         &namespace,
                         &name,
                         backup.spec.source.as_ref().and_then(|s| s.group.as_ref()),
+                        &pinned_site,
+                        &uid,
                     )
                     .await?;
                 }
@@ -773,17 +781,14 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
                 }
                 // The run is terminal (the Job exhausted its retries) — reap any CSI
                 // staging objects. No-op for Direct.
-                if backup
-                    .status
-                    .as_ref()
-                    .and_then(|s| s.staged.as_ref())
-                    .is_some()
-                {
+                if has_stage(backup, &pinned_site) {
                     io::cleanup_staged_source(
                         &ctx.client,
                         &namespace,
                         &name,
                         backup.spec.source.as_ref().and_then(|s| s.group.as_ref()),
+                        &pinned_site,
+                        &uid,
                     )
                     .await?;
                 }
@@ -798,11 +803,12 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
                 // was the forgejo/CephFS hourly hard-fail. Bound by the staging budget
                 // PINNED at stamp time (the policy may be edited/deleted mid-run), it
                 // fails with the same actionable reason as the pre-Job bind gate.
-                match staged_pvc_watchdog(backup, ctx, &namespace).await? {
+                match staged_pvc_watchdog(backup, ctx, pinned_site.namespace(&namespace)).await? {
                     StagedPvcWatch::Provisioning => {
                         return Ok(Action::requeue(Duration::from_secs(30)));
                     }
                     StagedPvcWatch::Expired { reason, message } => {
+                        let message = pinned_site.with_bind_hint(message);
                         io::patch_status(
                             &api,
                             &name,
@@ -824,6 +830,8 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
                             &namespace,
                             &name,
                             backup.spec.source.as_ref().and_then(|s| s.group.as_ref()),
+                            &pinned_site,
+                            &uid,
                         )
                         .await?;
                         return Ok(Action::requeue(Duration::from_secs(120)));
@@ -838,8 +846,13 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
                 let grace = kopiur_api::common::pod_startup_deadline_seconds(
                     backup.spec.failure_policy.as_ref(),
                 );
-                if let io::WedgedVerdict::Wedged { reason, message } =
-                    io::wedged_pod_verdict(&ctx.client, &namespace, &job.name_any(), grace).await?
+                if let io::WedgedVerdict::Wedged { reason, message } = io::wedged_pod_verdict(
+                    &ctx.client,
+                    pinned_site.namespace(&namespace),
+                    &job.name_any(),
+                    grace,
+                )
+                .await?
                 {
                     io::patch_status(
                         &api,
@@ -864,17 +877,14 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
                     let _ = job_api
                         .delete(&job.name_any(), &DeleteParams::background())
                         .await;
-                    if backup
-                        .status
-                        .as_ref()
-                        .and_then(|s| s.staged.as_ref())
-                        .is_some()
-                    {
+                    if has_stage(backup, &pinned_site) {
                         io::cleanup_staged_source(
                             &ctx.client,
                             &namespace,
                             &name,
                             backup.spec.source.as_ref().and_then(|s| s.group.as_ref()),
+                            &pinned_site,
+                            &uid,
                         )
                         .await?;
                     }
@@ -1161,14 +1171,72 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
     // with a name (not `_`) so it lives to the end of `reconcile_inner` rather
     // than dropping immediately; every exit from here on — including the `?`s —
     // releases it exactly once.
+    //
+    // The mover SITE is decided first, because the pool's ledger key is the Job's
+    // namespace/name, and a refusal here is as side-effect-free as a park.
+    //
+    // The cached Snapshot can predate this run's own pin, written a moment ago by
+    // a previous pass. Trusting it would skip the central Job lookup above and,
+    // if the repository's `execution` changed in between, launch a second mover
+    // beside the source. So an UNPINNED view is confirmed against the API server
+    // before anything is decided from it; a pin, once seen, never changes.
+    let live = match pinned_site {
+        io::MoverSite::Central(_) => None,
+        io::MoverSite::InNamespace => match api.get_opt(&name).await? {
+            Some(live) => Some(live),
+            // Deleted since this reconcile was queued.
+            None => return Ok(Action::await_change()),
+        },
+    };
+    if let Some(live) = &live {
+        // Being deleted since this reconcile was queued: start nothing. The
+        // deletion's own reconcile follows.
+        if live.metadata.deletion_timestamp.is_some() {
+            return Ok(Action::requeue(STALE_PIN_REQUEUE));
+        }
+        let live_site = io::MoverSite::pinned(
+            live.status.as_ref().and_then(|s| s.job.as_ref()),
+            &namespace,
+            &name,
+        );
+        if live_site != pinned_site {
+            // Come back once the cache has caught up with the pin.
+            return Ok(Action::requeue(STALE_PIN_REQUEUE));
+        }
+    }
+    let launch_view = live.as_ref().unwrap_or(backup);
+    let site = match launch_site(ctx, launch_view, &config, &repo, repo_ref, &pinned_site) {
+        Ok(site) => site,
+        Err((reason, message)) => {
+            return refuse_central_execution(
+                ctx, backup, &api, &namespace, &name, reason, &message,
+            )
+            .await;
+        }
+    };
+    // The pool's ledger key: the namespace/name `apply_mover_objects` creates the
+    // Job under below, which is what lets the ledger sweep recognize it.
+    let pool_job = crate::pool::job_key(site.namespace(&namespace), &site.job_name(&name));
     let (slot_heal, _slot) =
-        match pool_gate(ctx, &api, backup, &name, &namespace, repo_ref, &repo).await? {
+        match pool_gate(ctx, &api, backup, &name, &pool_job, repo_ref, &repo).await? {
             PoolGate::Parked(action) => return Ok(action),
             PoolGate::Admit { heal, reservation } => (heal, reservation),
         };
+    // Pin a central site BEFORE anything is created there: the pin is the only
+    // record of where this run's Job and staged PVC are (they cannot carry an
+    // owner reference), so cleanup must be able to find them from the first
+    // object on.
+    if site != pinned_site
+        && let Some(pin) = site.status_pin()
+    {
+        io::patch_status(&api, &name, serde_json::json!({ "job": pin })).await?;
+    }
 
     let (mut work_spec, mut source_volume, repo_volume, _) =
         build_backup_run(backup, &config, &repo, &namespace, &name)?;
+    if let io::MoverSite::Central(_) = &site {
+        mount_source_centrally(&mut work_spec, source_volume.as_mut());
+    }
 
     // The mover Job runs in THIS (workload) namespace, where the operator SA does
     // not exist. Resolve its run identity here — the user's workload-identity SA
@@ -1263,25 +1331,40 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
         return Err(Error::BlockedOnGrant(msg));
     }
 
-    let identity_result = if uses_stream {
-        io::ensure_stream_mover_identity(
-            &ctx.client,
-            &namespace,
-            &[&repo.backend],
-            &ctx.mover_clusterrole,
-            ctx.mover_role_kind.as_str(),
-        )
-        .await
-    } else {
-        io::ensure_mover_identity(
-            &ctx.client,
-            &namespace,
-            &[&repo.backend],
-            ctx.mover_service_account.as_deref(),
-            ctx.mover_role_kind.as_str(),
-            &ctx.mover_clusterrole,
-        )
-        .await
+    let identity_result = match (&site, uses_stream) {
+        // A central mover runs in the operator namespace and patches a Snapshot
+        // here, so its identity spans both (a stream source is refused centrally).
+        (io::MoverSite::Central(central), _) => {
+            io::ensure_central_mover_identity(
+                &ctx.client,
+                &central.namespace,
+                &namespace,
+                &[&repo.backend],
+                &ctx.mover_clusterrole,
+            )
+            .await
+        }
+        (io::MoverSite::InNamespace, true) => {
+            io::ensure_stream_mover_identity(
+                &ctx.client,
+                &namespace,
+                &[&repo.backend],
+                &ctx.mover_clusterrole,
+                ctx.mover_role_kind.as_str(),
+            )
+            .await
+        }
+        (io::MoverSite::InNamespace, false) => {
+            io::ensure_mover_identity(
+                &ctx.client,
+                &namespace,
+                &[&repo.backend],
+                ctx.mover_service_account.as_deref(),
+                ctx.mover_role_kind.as_str(),
+                &ctx.mover_clusterrole,
+            )
+            .await
+        }
     };
     let mover_identity = match identity_result {
         Ok(identity) => identity,
@@ -1457,12 +1540,18 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
     // `kopiur.home-operations.com/privileged-movers` annotation — a tenant there could
     // otherwise reuse the minted mover SA at that privilege. Refuse with a clear
     // `MoverPermitted=False` condition + Event otherwise.
-    if kopiur_api::common::requires_privilege_resolved(
+    let unpermitted = if kopiur_api::common::requires_privilege_resolved(
         Some(&resolved_mover.security_context),
         resolved_mover.pod_security_context.as_ref(),
         privileged_mode,
-    ) && !io::namespace_allows_privileged_movers(&ctx.client, &namespace).await?
-    {
+    ) {
+        // A central mover pod runs in the operator namespace, so that namespace
+        // must opt in as well: the workload namespace cannot consent for it.
+        io::privileged_opt_in_missing(&ctx.client, &namespace, site.namespace(&namespace)).await?
+    } else {
+        None
+    };
+    if let Some(gate_ns) = unpermitted.as_deref() {
         let sa = ctx
             .mover_service_account
             .as_deref()
@@ -1506,7 +1595,7 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
             ),
         };
         let msg =
-            io::privileged_mover_message(carrier_kind, carrier_name, carrier_field, &namespace, sa);
+            io::privileged_mover_message(carrier_kind, carrier_name, carrier_field, gate_ns, sa);
         // LIVE base for the array AND the no-op comparison: the #464 inherit heal
         // wrote to this same array moments ago and a `conditions` patch REPLACES
         // it, so the reconcile-start copy would resurrect the hold onto a run
@@ -1617,17 +1706,24 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
     // already present here. Either way a problem surfaces as a clear
     // `CredentialsAvailable=False` condition + Warning Event before we launch a Job
     // that would hang on a missing-Secret envFrom (ADR §4.12).
+    //
+    // A central mover reads the Secret(s) in the operator namespace, where a
+    // ClusterRepository normally keeps them; projection is off there because a
+    // projected copy must be owned by a CR in the Job's namespace.
     let creds = match io::resolve_mover_creds_for(
         &ctx.client,
-        &namespace,
+        site.namespace(&namespace),
         &io::CredsPrefix::snapshot_backup(&name),
         &owner,
         &repo,
-        config
-            .spec
-            .credential_projection
-            .as_ref()
-            .is_some_and(|p| p.enabled),
+        match &site {
+            io::MoverSite::InNamespace => config
+                .spec
+                .credential_projection
+                .as_ref()
+                .is_some_and(|p| p.enabled),
+            io::MoverSite::Central(_) => false,
+        },
         io::repo_kind_str(repo_ref.kind),
         &repo_ref.name,
     )
@@ -1751,6 +1847,7 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
         &namespace,
         &name,
         &owner,
+        &site,
     )
     .await?
     {
@@ -1893,7 +1990,7 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
                 // could never exist.
                 "volumeSnapshotName": (config.spec.copy_method != kopiur_api::CopyMethod::Clone)
                     .then(|| io::volume_snapshot_name(&name)),
-                "pvcName": io::staged_pvc_name(&name),
+                "pvcName": site.staged_pvc_name(&name),
                 "ready": false,
                 "stagingTimeoutSeconds": staging_timeout_seconds,
             });
@@ -1929,6 +2026,8 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
                 &namespace,
                 &name,
                 backup.spec.source.as_ref().and_then(|s| s.group.as_ref()),
+                &site,
+                &uid,
             )
             .await?;
             return Ok(Action::await_change());
@@ -1957,14 +2056,22 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
             .then_some(backup.spec.repository.as_ref())
             .flatten(),
     );
-    let resolved_volume = crate::cache::resolve_cache_volume(
-        ctx,
-        &namespace,
-        io::owner_ref_for(&config, "SnapshotPolicy")?,
-        &cache_pvc,
-        cache_volume_spec(&repo, &config, recipe_mover.as_ref()).as_ref(),
-    )
-    .await?;
+    let cache_spec = cache_volume_spec(&repo, &config, recipe_mover.as_ref());
+    let resolved_volume = match &site {
+        io::MoverSite::InNamespace => {
+            crate::cache::resolve_cache_volume(
+                ctx,
+                &namespace,
+                io::owner_ref_for(&config, "SnapshotPolicy")?,
+                &cache_pvc,
+                cache_spec.as_ref(),
+            )
+            .await?
+        }
+        // The persistent cache PVC belongs to the SnapshotPolicy and lives in its
+        // namespace, where a central mover cannot mount it.
+        io::MoverSite::Central(_) => crate::cache::per_run_cache_volume(cache_spec.as_ref()),
+    };
     // #613: kopia's cache budgets must fit the volume ACTUALLY mounted. For a
     // persistent claim that is its live capacity (a pending or refused resize can
     // leave it smaller than the spec), so re-resolve against it here; for per-run
@@ -2000,7 +2107,7 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
             // kind `claim` is (#382 M5).
             match io::resolve_source_colocation(
                 &ctx.client,
-                &namespace,
+                site.namespace(&namespace),
                 &claim,
                 resolved_mover.source_colocation,
             )
@@ -2043,10 +2150,11 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
             resolved_mover.tolerations.clone(),
         ),
     };
-    let job_name = crate::naming::capped_job_name(&name);
+    let job_name = site.job_name(&name);
+    let job_namespace = site.namespace(&namespace);
     let inputs = MoverJobInputs {
         name: &job_name,
-        namespace: &namespace,
+        namespace: job_namespace,
         owner,
         work_spec: &work_spec,
         image: &ctx.mover_image,
@@ -2078,8 +2186,21 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
         scratch_volume: None,
         readiness_exec: None,
     };
-    let job = jobs::build_job(&inputs)?;
-    io::apply_mover_objects(&ctx.client, &namespace, &job_name, None, &job).await?;
+    let mut job = jobs::build_job(&inputs)?;
+    if let io::MoverSite::Central(_) = &site {
+        // Never apply over a Job that belongs to another Snapshot. And this
+        // run's own Job can already exist when the pass that created it has
+        // not reached the cache yet: leave it, and let the next pass find it.
+        let central_jobs: Api<Job> = Api::namespaced(ctx.client.clone(), job_namespace);
+        if capture_job(&central_jobs, &site, &name, &uid)
+            .await?
+            .is_some()
+        {
+            return Ok(Action::requeue(STALE_PIN_REQUEUE));
+        }
+        io::mark_central(&mut job.metadata, &namespace, &name, &uid);
+    }
+    io::apply_mover_objects(&ctx.client, job_namespace, &job_name, None, &job).await?;
 
     let mut status = serde_json::json!({
         "phase": "Running",
@@ -2115,18 +2236,237 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
     Ok(Action::requeue(Duration::from_secs(30)))
 }
 
+/// Whether this run has begun staging its source. `status.staged` is stamped only
+/// once the stage is Ready; while the stage is still being cut, the `SourceStaged`
+/// condition is the evidence that one exists.
+pub(super) fn stage_started(status: Option<&kopiur_api::snapshot::SnapshotStatus>) -> bool {
+    status.is_some_and(|s| {
+        s.staged.is_some()
+            || s.conditions
+                .iter()
+                .any(|c| c.type_ == SOURCE_STAGED_CONDITION)
+    })
+}
+
+/// Whether a cached Snapshot in this phase can predate its own central pin.
+///
+/// The pin is written at launch, before the Job exists. Every later phase is
+/// written after it, so a cache that shows one of those also shows the pin. Only
+/// a run that had not visibly launched yet can be hiding one.
+pub(super) fn pin_may_be_unseen(phase: Option<&SnapshotPhase>) -> bool {
+    match phase {
+        None | Some(SnapshotPhase::Pending | SnapshotPhase::Unknown(_)) => true,
+        Some(
+            SnapshotPhase::Running
+            | SnapshotPhase::Succeeded
+            | SnapshotPhase::Failed
+            | SnapshotPhase::Deleting
+            | SnapshotPhase::Discovered
+            | SnapshotPhase::Unchanged,
+        ) => false,
+    }
+}
+
+/// How soon to look again while a central run's deleted `VolumeSnapshot` is
+/// still held by the CSI provisioner's finalizer (see
+/// [`io::release_source_protection`]). The wait is bounded there, so this
+/// cadence cannot turn into a standing poll.
+const STAGE_CLEANUP_RETRY: Duration = Duration::from_secs(5);
+
+/// How soon to look again when the cached Snapshot lags this run's own writes
+/// (its central pin, or the Job the previous pass created).
+const STALE_PIN_REQUEUE: Duration = Duration::from_secs(2);
+
+/// Whether this run may have staged objects to reap (see
+/// [`io::MoverSite::may_have_stage`]).
+fn has_stage(backup: &Snapshot, site: &io::MoverSite) -> bool {
+    site.may_have_stage(
+        backup
+            .status
+            .as_ref()
+            .and_then(|s| s.staged.as_ref())
+            .is_some(),
+    )
+}
+
+/// Move a central run's source volume to [`io::CENTRAL_SOURCE_MOUNT_PATH`], and
+/// point the mover at it.
+///
+/// The path the volume is mounted at and the path kopia walks are one field
+/// pair that must agree. The path kopia RECORDS is a third, separate value:
+/// `identity.source_path`, which the mover passes as `--override-source` and
+/// keys the kopia policy on. It is left alone, so a central run records
+/// `sourcePathOverride` or the default `/pvc/<name>` byte-for-byte as an
+/// in-namespace run does. A stream source mounts nothing and is refused
+/// before this point.
+fn mount_source_centrally(
+    work_spec: &mut MoverWorkSpec,
+    source_volume: Option<&mut VolumeMountSpec>,
+) {
+    let Some(volume) = source_volume else {
+        return;
+    };
+    volume.mount_path = io::CENTRAL_SOURCE_MOUNT_PATH.to_string();
+    if let Operation::Snapshot(op) = &mut work_spec.operation {
+        op.source_path = io::CENTRAL_SOURCE_MOUNT_PATH.to_string();
+    }
+}
+
+/// Where this run's mover should run: the pinned site if the run already
+/// committed to one, else what the repository's `execution.mode` asks for.
+/// `Err((reason, message))` refuses a central run this install or this source
+/// cannot serve: never a silent fall back to the workload namespace, which is
+/// the one place a `Central` repository promises not to run a mover.
+fn launch_site(
+    ctx: &Context,
+    backup: &Snapshot,
+    config: &SnapshotPolicy,
+    repo: &ResolvedRepository,
+    repo_ref: &RepositoryRef,
+    pinned: &io::MoverSite,
+) -> std::result::Result<io::MoverSite, (&'static str, String)> {
+    if !io::wants_central(
+        pinned,
+        repo.execution,
+        stage_started(backup.status.as_ref()),
+    ) {
+        return Ok(io::MoverSite::InNamespace);
+    }
+    // Re-checked for a pinned run too: the recipe may have been edited since.
+    let source = backup.spec.source.as_ref();
+    let central_source = match kopiur_api::expand::effective_source(config, source) {
+        Ok(eff) => io::CentralSource::of(&eff, source.and_then(|s| s.group.as_ref()).is_some()),
+        // The launch path reports an unresolvable source itself, a few lines on.
+        Err(_) => io::CentralSource::Nothing,
+    };
+    if let Some(refusal) =
+        io::central_source_refusal(config.spec.copy_method, central_source, &repo_ref.name)
+    {
+        return Err(refusal);
+    }
+    if let Some(refusal) = io::central_repo_mount_refusal(
+        io::filesystem_repo_path(&repo.backend).as_deref(),
+        &repo_ref.name,
+    ) {
+        return Err(refusal);
+    }
+    // A central mover takes the repository's Secrets and volumes from the
+    // operator namespace by name, so only a ClusterRepository may name them. A
+    // pin outlives an edit of the policy's repository, hence the check here.
+    match repo.kind {
+        kopiur_api::common::RepositoryKind::ClusterRepository => {}
+        kopiur_api::common::RepositoryKind::Repository => {
+            return Err((
+                io::REASON_CENTRAL_UNSUPPORTED,
+                format!(
+                    "this backup was started centrally, but its repository now resolves to the \
+                     namespaced Repository `{}`. Central execution only serves a \
+                     ClusterRepository, because the mover takes the repository's Secrets and \
+                     volumes from the operator namespace. Fix: point the SnapshotPolicy back at \
+                     the ClusterRepository. The next scheduled run (or a new Snapshot) retries",
+                    repo_ref.name
+                ),
+            ));
+        }
+    }
+    match pinned {
+        io::MoverSite::Central(_) => Ok(pinned.clone()),
+        io::MoverSite::InNamespace => io::central_site_for(
+            ctx.operator_namespace.as_deref(),
+            matches!(ctx.watch_scope, crate::config::WatchScope::Namespaced(_)),
+            &backup.namespace().unwrap_or_default(),
+            &backup.name_any(),
+        )
+        .map(io::MoverSite::Central),
+    }
+}
+
+/// Fail a Snapshot whose repository asks for central execution that cannot be
+/// provided. Terminal, like a staging failure: a new Snapshot (the next
+/// scheduled run) retries once the repository, the recipe, or the cluster is
+/// fixed. Nothing has been created yet, so there is nothing to reap.
+async fn refuse_central_execution(
+    ctx: &Context,
+    backup: &Snapshot,
+    api: &Api<Snapshot>,
+    namespace: &str,
+    name: &str,
+    reason: &'static str,
+    message: &str,
+) -> Result<Action> {
+    let status = snapshot_ready_status_with_condition(
+        backup,
+        SnapshotPhase::Failed,
+        reason,
+        message,
+        SOURCE_STAGED_CONDITION,
+        false,
+    );
+    let current = serde_json::to_value(&backup.status).ok();
+    if io::patch_status_if_changed(api, name, current.as_ref(), status).await? {
+        io::publish_warning_event(
+            ctx,
+            backup,
+            reason,
+            crate::consts::FIX_CENTRAL_EXECUTION_ACTION,
+            message,
+        )
+        .await;
+        tracing::warn!(backup = %name, reason, "central execution refused: {message}");
+        ctx.metrics
+            .inc_snapshot_completed("failed", namespace, backup_policy(backup));
+    }
+    Ok(Action::await_change())
+}
+
 /// Find the capture Job using the same bounded name as creation. Prefer an
 /// existing legacy Job for 58..=63-byte names so an upgrade never duplicates an
 /// in-flight capture or reaps its staging/credentials while it is still active.
 /// Longer raw names could not pass the API server's generated job-name labels.
-async fn capture_job(jobs: &Api<Job>, snapshot: &str) -> Result<Option<Job>> {
-    let current = crate::naming::capped_job_name(snapshot);
-    if let Some(legacy) = crate::naming::legacy_job_name(snapshot, &current)
-        && let Some(job) = jobs.get_opt(&legacy).await?
-    {
-        return Ok(Some(job));
+///
+/// A central Job has no legacy name and no owner reference, so it is looked up
+/// by its pinned name and must carry this Snapshot's UID label: a Job of that
+/// name belonging to another Snapshot is an error, never a Job to act on.
+async fn capture_job(
+    jobs: &Api<Job>,
+    site: &io::MoverSite,
+    snapshot: &str,
+    uid: &str,
+) -> Result<Option<Job>> {
+    match site {
+        io::MoverSite::InNamespace => {
+            let current = crate::naming::capped_job_name(snapshot);
+            if let Some(legacy) = crate::naming::legacy_job_name(snapshot, &current)
+                && let Some(job) = jobs.get_opt(&legacy).await?
+            {
+                return own_job(site, job, uid).map(Some);
+            }
+            jobs.get_opt(&current)
+                .await?
+                .map(|job| own_job(site, job, uid))
+                .transpose()
+        }
+        io::MoverSite::Central(central) => jobs
+            .get_opt(&central.job_name)
+            .await?
+            .map(|job| own_job(site, job, uid))
+            .transpose(),
     }
-    Ok(jobs.get_opt(&current).await?)
+}
+
+/// `job` if it is this run's, else the name-conflict error. Central and
+/// in-namespace Jobs share the operator namespace, so a Job found under this
+/// run's name can be another Snapshot's: acting on it would report that
+/// Snapshot's outcome as this one's, or let this run's watchdog delete it.
+fn own_job(site: &io::MoverSite, job: Job, uid: &str) -> Result<Job> {
+    if site.is_foreign(&job.metadata, uid) {
+        return Err(Error::MissingDependency(io::name_conflict_message(
+            "Job",
+            &job.namespace().unwrap_or_default(),
+            &job.name_any(),
+        )));
+    }
+    Ok(job)
 }
 
 // --- Repository mover-Job pool gate -----------------------------------------
@@ -2172,7 +2512,7 @@ async fn pool_gate(
     api: &Api<Snapshot>,
     backup: &Snapshot,
     name: &str,
-    namespace: &str,
+    job: &str,
     repo_ref: &RepositoryRef,
     repo: &ResolvedRepository,
 ) -> Result<PoolGate> {
@@ -2196,14 +2536,10 @@ async fn pool_gate(
         .as_ref()
         .map(|s| s.conditions.clone())
         .unwrap_or_default();
-    // A backup's mover Job is named after its `Snapshot` and lives in the
-    // Snapshot's namespace — the same identity `apply_mover_objects` creates it
-    // under below, which is what lets the ledger sweep recognize it.
-    let job = crate::pool::job_key(namespace, &crate::naming::capped_job_name(name));
     match crate::pool::admit_or_park(
         ctx,
         &crate::naming::repo_label(&pinned),
-        &job,
+        job,
         crate::pool::PoolClass::Backup,
         caps,
     )
@@ -3144,22 +3480,52 @@ async fn handle_deletion(
         return Ok(Action::await_change());
     }
 
+    let uid = backup.uid().unwrap_or_default();
+    let cached_site = io::MoverSite::pinned(
+        backup.status.as_ref().and_then(|s| s.job.as_ref()),
+        namespace,
+        name,
+    );
+    // The deletion can reach the cache before this run's own central pin does.
+    // Releasing the finalizer on that view would strand the central Job and
+    // staged PVC, which nothing else reaps, so an unpinned view of a run that
+    // could have been launching is confirmed against the API server first.
+    let site = match &cached_site {
+        io::MoverSite::InNamespace
+            if pin_may_be_unseen(backup.status.as_ref().and_then(|s| s.phase.as_ref())) =>
+        {
+            match api.get_opt(name).await? {
+                Some(live) => io::MoverSite::pinned(
+                    live.status.as_ref().and_then(|s| s.job.as_ref()),
+                    namespace,
+                    name,
+                ),
+                None => return Ok(Action::await_change()),
+            }
+        }
+        io::MoverSite::InNamespace | io::MoverSite::Central(_) => cached_site,
+    };
+    // A central mover Job has no owner reference for the garbage collector to
+    // follow, so it goes here (its pods cascade with it). It goes BEFORE the
+    // stage: a Job that still exists would replace the pod the stage cleanup
+    // deletes, and the stage cleanup may return early to come back.
+    delete_central_jobs(ctx, backup, &site, namespace, name, &uid).await?;
     // Reap any CSI staging objects (with the Retain→Delete PV patch) before the kopia
     // snapshot-deletion plan runs. OwnerRef GC removes the staged PVC/VolumeSnapshot when
     // the CR is deleted, but it can't flip a Retain PV's reclaim policy — so do it here.
-    if backup
-        .status
-        .as_ref()
-        .and_then(|s| s.staged.as_ref())
-        .is_some()
-    {
-        io::cleanup_staged_source(
+    if has_stage(backup, &site) {
+        let stage = io::cleanup_staged_source(
             &ctx.client,
             namespace,
             name,
             backup.spec.source.as_ref().and_then(|s| s.group.as_ref()),
+            &site,
+            &uid,
         )
         .await?;
+        if stage == io::StageCleanup::Retry {
+            return Ok(Action::requeue(STAGE_CLEANUP_RETRY));
+        }
     }
 
     // Namespace-deletion cascade (ADR-0005 §5): if the owning namespace is being torn
@@ -4477,7 +4843,6 @@ async fn reconcile_pin(
     let observed = backup.status.as_ref().and_then(|s| s.pinned);
     let steady = Action::requeue(TERMINAL_SNAPSHOT_STEADY_REQUEUE);
     let action = pin_decision(desired, observed);
-    let (job_name, legacy_job_name) = pin_job_names(name);
 
     // Cost gate: the common never-pinned Snapshot (spec.pin unset, no pin ever
     // ran) skips the per-pass Job GET entirely. A pin mover may only exist once
@@ -4489,17 +4854,8 @@ async fn reconcile_pin(
         return Ok(steady);
     }
 
-    let job_api: Api<Job> = Api::namespaced(ctx.client.clone(), namespace);
-    // #547 upgrade: a pin Job the previous release launched under the uncapped
-    // name is still this Snapshot's pin mover; finish it rather than launch a
-    // second one under the new name.
-    if let Some(legacy) = legacy_job_name.as_deref()
-        && let Some(job) = job_api.get_opt(legacy).await?
-    {
-        return handle_pin_job(backup, ctx, api, namespace, name, legacy, &job, action).await;
-    }
-    if let Some(job) = job_api.get_opt(&job_name).await? {
-        return handle_pin_job(backup, ctx, api, namespace, name, &job_name, &job, action).await;
+    if let Some(found) = find_pin_job(ctx, backup, namespace, name).await? {
+        return handle_pin_job(backup, ctx, api, name, &found, action).await;
     }
     if action == PinAction::NoOp {
         return Ok(steady);
@@ -4532,24 +4888,29 @@ async fn reconcile_pin(
         backup.spec.source.as_ref(),
     )?;
     let owner = io::owner_ref_for(backup, "Snapshot")?;
+    // A pin reads only the repository, so under `execution.mode: Central` its
+    // Job runs in the operator namespace and the credentials stay there.
+    let (site, job_ns, job_name) = pin_job_place(ctx, &repo, namespace, name)?;
     let creds = io::resolve_mover_creds_for(
         &ctx.client,
-        namespace,
+        &job_ns,
         &io::CredsPrefix::snapshot_pin(name),
         &owner,
         &repo,
-        config
-            .spec
-            .credential_projection
-            .as_ref()
-            .is_some_and(|p| p.enabled),
+        match &site {
+            io::RepoJobSite::InNamespace => config
+                .spec
+                .credential_projection
+                .as_ref()
+                .is_some_and(|p| p.enabled),
+            io::RepoJobSite::Central { .. } => false,
+        },
         io::repo_kind_str(repo_ref.kind),
         &repo_ref.name,
     )
     .await?;
     if creds.projected > 0 {
-        ctx.metrics
-            .inc_secrets_projected(namespace, creds.projected);
+        ctx.metrics.inc_secrets_projected(&job_ns, creds.projected);
     }
     let creds_secrets = io::repo_creds(creds.names, &repo.encryption);
     let work_spec = MoverWorkSpec {
@@ -4605,19 +4966,11 @@ async fn reconcile_pin(
         ttl_seconds_after_finished: resolved_mover.ttl_seconds_after_finished,
         ..JobLimits::default()
     };
-    let mover_identity = io::ensure_mover_identity(
-        &ctx.client,
-        namespace,
-        &[&repo.backend],
-        ctx.mover_service_account.as_deref(),
-        ctx.mover_role_kind.as_str(),
-        &ctx.mover_clusterrole,
-    )
-    .await?;
+    let mover_identity = repo_job_identity(ctx, &site, namespace, &repo).await?;
     mover_identity.decorate_labels(&mut labels);
     let inputs = MoverJobInputs {
         name: &job_name,
-        namespace,
+        namespace: &job_ns,
         owner,
         work_spec: &work_spec,
         image: &ctx.mover_image,
@@ -4647,7 +5000,18 @@ async fn reconcile_pin(
         scratch_volume: None,
         readiness_exec: None,
     };
-    let job = jobs::build_job(&inputs)?;
+    let mut job = jobs::build_job(&inputs)?;
+    match &site {
+        io::RepoJobSite::InNamespace => {}
+        // No owner reference can cross namespaces: the Snapshot's UID label
+        // stands in for it, and the Snapshot's finalizer deletes the Job.
+        io::RepoJobSite::Central { .. } => io::mark_central(
+            &mut job.metadata,
+            namespace,
+            name,
+            &backup.uid().unwrap_or_default(),
+        ),
+    }
     // Durably mark "a pin mover exists" BEFORE the Job lands (the `Pinned`
     // condition is the gate that decides whether steady passes look for one) —
     // a crash between the two leaves only a spurious per-pass GET, never an
@@ -4661,9 +5025,227 @@ async fn reconcile_pin(
         backup.meta().generation,
     );
     io::patch_status(api, name, serde_json::json!({ "conditions": conditions })).await?;
-    io::apply_mover_objects(&ctx.client, namespace, &job_name, None, &job).await?;
+    io::apply_mover_objects(&ctx.client, &job_ns, &job_name, None, &job).await?;
     tracing::info!(backup = %name, %snapshot_id, ?action, "created SnapshotPin Job");
     Ok(Action::requeue(Duration::from_secs(15)))
+}
+
+/// A pin Job this Snapshot already has, and where it was found.
+struct FoundPinJob {
+    /// The Job's namespace: the Snapshot's own, or the operator namespace.
+    namespace: String,
+    /// The Job's name.
+    name: String,
+    job: Job,
+    /// Where it was found, which decides how it is deleted.
+    site: io::RepoJobSite,
+}
+
+impl FoundPinJob {
+    /// Delete the Job once its outcome is consumed.
+    ///
+    /// An in-namespace pin goes the way every in-namespace mover run does,
+    /// which also removes a legacy same-named ConfigMap. A central pin never
+    /// had one, and the operator namespace is shared: only the Job this run
+    /// verified as its own is deleted, by UID.
+    async fn consume(&self, client: &kube::Client) -> Result<()> {
+        match &self.site {
+            io::RepoJobSite::InNamespace => {
+                io::delete_mover_run(client, &self.namespace, &self.name).await
+            }
+            io::RepoJobSite::Central { namespace } => {
+                let jobs: Api<Job> = Api::namespaced(client.clone(), namespace);
+                match jobs
+                    .delete(&self.name, &io::delete_exactly(&self.job.metadata))
+                    .await
+                {
+                    Ok(_) => Ok(()),
+                    // Gone already, or replaced by another object of that name.
+                    Err(kube::Error::Api(e)) if e.code == 404 || e.code == 409 => Ok(()),
+                    Err(e) => Err(Error::Kube(e)),
+                }
+            }
+        }
+    }
+}
+
+/// This Snapshot's existing pin Job, at either site.
+///
+/// Both places are looked in, whatever the repository says now: its
+/// `execution` can change while a pin Job runs, and that Job is still this
+/// Snapshot's. In the Snapshot's own namespace the pre-#547 uncapped name is
+/// tried first, so an upgrade finishes an in-flight pin instead of starting a
+/// second one.
+async fn find_pin_job(
+    ctx: &Context,
+    backup: &Snapshot,
+    namespace: &str,
+    name: &str,
+) -> Result<Option<FoundPinJob>> {
+    let (current, legacy) = pin_job_names(name);
+    let job_api: Api<Job> = Api::namespaced(ctx.client.clone(), namespace);
+    for candidate in legacy.into_iter().chain([current]) {
+        if let Some(job) = job_api.get_opt(&candidate).await? {
+            return Ok(Some(FoundPinJob {
+                namespace: namespace.to_string(),
+                name: candidate,
+                job: own_pin_job(&io::RepoJobSite::InNamespace, job, backup)?,
+                site: io::RepoJobSite::InNamespace,
+            }));
+        }
+    }
+    let Some(site) = central_pin_site(ctx, namespace, name) else {
+        return Ok(None);
+    };
+    let central_api: Api<Job> = Api::namespaced(ctx.client.clone(), &site.namespace);
+    let Some(job) = central_api.get_opt(&site.job_name).await? else {
+        return Ok(None);
+    };
+    let owner_site = io::RepoJobSite::Central {
+        namespace: site.namespace.clone(),
+    };
+    Ok(Some(FoundPinJob {
+        job: own_pin_job(&owner_site, job, backup)?,
+        namespace: site.namespace,
+        name: site.job_name,
+        site: owner_site,
+    }))
+}
+
+/// Where a NEW pin Job for `namespace/name` goes: the site, the Job's
+/// namespace and its name. A pin reads only the repository, so under
+/// `execution.mode: Central` its Job runs in the operator namespace and the
+/// credentials stay there.
+fn pin_job_place(
+    ctx: &Context,
+    repo: &ResolvedRepository,
+    namespace: &str,
+    name: &str,
+) -> Result<(io::RepoJobSite, String, String)> {
+    let site = io::RepoJobSite::of(
+        repo.kind,
+        repo.execution,
+        ctx.operator_namespace.as_deref(),
+        matches!(ctx.watch_scope, crate::config::WatchScope::Namespaced(_)),
+    )
+    .map_err(|(_, message)| {
+        Error::Validation(format!(
+            "the pin cannot run: {message}. The pin retries on the next reconcile"
+        ))
+    })?;
+    let (job_ns, job_name) = match &site {
+        io::RepoJobSite::InNamespace => (namespace.to_string(), pin_job_names(name).0),
+        io::RepoJobSite::Central { namespace: central } => {
+            (central.clone(), central_pin_job_name(namespace, name))
+        }
+    };
+    Ok((site, job_ns, job_name))
+}
+
+/// The identity a repository-only mover Job runs as at `site`, with its RBAC
+/// ensured. `namespace` is the owning CR's: a central mover runs in the
+/// operator namespace and patches a status there, so its identity spans both.
+pub(crate) async fn repo_job_identity(
+    ctx: &Context,
+    site: &io::RepoJobSite,
+    namespace: &str,
+    repo: &ResolvedRepository,
+) -> Result<io::MoverRunIdentity> {
+    match site {
+        io::RepoJobSite::InNamespace => {
+            io::ensure_mover_identity(
+                &ctx.client,
+                namespace,
+                &[&repo.backend],
+                ctx.mover_service_account.as_deref(),
+                ctx.mover_role_kind.as_str(),
+                &ctx.mover_clusterrole,
+            )
+            .await
+        }
+        io::RepoJobSite::Central { namespace: central } => {
+            io::ensure_central_mover_identity(
+                &ctx.client,
+                central,
+                namespace,
+                &[&repo.backend],
+                &ctx.mover_clusterrole,
+            )
+            .await
+        }
+    }
+}
+
+/// Delete this Snapshot's central Jobs: its backup mover (their pods cascade)
+/// and its pin mover, if one can exist. Neither has an owner reference, so the
+/// garbage collector never reaches them.
+async fn delete_central_jobs(
+    ctx: &Context,
+    backup: &Snapshot,
+    site: &io::MoverSite,
+    namespace: &str,
+    name: &str,
+    uid: &str,
+) -> Result<()> {
+    match site {
+        io::MoverSite::Central(central) => {
+            io::delete_central_job(&ctx.client, central, uid).await?
+        }
+        io::MoverSite::InNamespace => {}
+    }
+    if !pin_job_may_exist(backup) {
+        return Ok(());
+    }
+    match central_pin_site(ctx, namespace, name) {
+        Some(pin) => io::delete_central_job(&ctx.client, &pin, uid).await,
+        None => Ok(()),
+    }
+}
+
+/// Where the central pin Job of `namespace/name` lives, when this install can
+/// run movers centrally at all. The name is the central form of `<name>-pin`
+/// (it carries a hash of the namespace), so it never meets the backup Job's.
+fn central_pin_site(ctx: &Context, namespace: &str, name: &str) -> Option<io::CentralSite> {
+    let central = io::central_namespace(
+        ctx.operator_namespace.as_deref(),
+        matches!(ctx.watch_scope, crate::config::WatchScope::Namespaced(_)),
+    )
+    .ok()?;
+    Some(io::CentralSite {
+        job_name: central_pin_job_name(namespace, name),
+        namespace: central,
+    })
+}
+
+/// The central pin Job's name: `<name>-pin`, cut to fit, plus a hash of the
+/// owner.
+///
+/// The hash input carries a `pin:` domain. Without it this would be the
+/// central BACKUP Job name of a Snapshot that is itself named `<name>-pin`,
+/// and each of the two Jobs would block the other as a foreign object. A
+/// namespace cannot contain `:`, so no backup's `<namespace>/<name>` input
+/// equals a pin's.
+pub(crate) fn central_pin_job_name(namespace: &str, name: &str) -> String {
+    let hash = crate::naming::wide_hash(&format!("pin:{namespace}/{name}"));
+    let keep = kopiur_api::consts::JOB_NAME_MAX - (hash.len() + 1);
+    let prefix: String = format!("{name}-pin").chars().take(keep).collect();
+    format!("{}-{hash}", prefix.trim_end_matches(['-', '.']))
+}
+
+/// `job` if it is this Snapshot's pin Job, else the name-conflict error.
+/// Central and in-namespace Jobs share the operator namespace, so a Job found
+/// under this pin's name can be another Snapshot's: consuming it would record
+/// that Snapshot's pin state as this one's.
+fn own_pin_job(site: &io::RepoJobSite, job: Job, backup: &Snapshot) -> Result<Job> {
+    let ours = io::is_ours(&job.metadata, &backup.uid().unwrap_or_default());
+    if site.is_foreign(&job.metadata, ours) {
+        return Err(Error::MissingDependency(io::name_conflict_message(
+            "Job",
+            &job.namespace().unwrap_or_default(),
+            &job.name_any(),
+        )));
+    }
+    Ok(job)
 }
 
 /// The `SnapshotPin` mover Job's name for the `Snapshot` named `snapshot` —
@@ -4755,18 +5337,16 @@ fn post_pin_consume_action(action: PinAction) -> Action {
 /// Job can't satisfy the opposite toggle, and a pin that completed after a
 /// mid-flight spec flip is still recorded (the next pass then spawns the
 /// corrective mover).
-#[allow(clippy::too_many_arguments)]
 async fn handle_pin_job(
     backup: &Snapshot,
     ctx: &Context,
     api: &Api<Snapshot>,
-    namespace: &str,
     name: &str,
-    job_name: &str,
-    job: &Job,
+    found: &FoundPinJob,
     action: PinAction,
 ) -> Result<Action> {
     let observed = backup.status.as_ref().and_then(|s| s.pinned);
+    let job = &found.job;
     let target = pin_job_target(job);
     match job_terminal_state(job) {
         // Still running — wait, whatever the current decision is (a mid-flight
@@ -4788,7 +5368,7 @@ async fn handle_pin_job(
             // result can't be attributed): consume it so it can never satisfy
             // a future toggle, then act on the (now accurate) decision.
             _ => {
-                io::delete_mover_run(&ctx.client, namespace, job_name).await?;
+                found.consume(&ctx.client).await?;
                 Ok(post_pin_consume_action(action))
             }
         },
@@ -4802,7 +5382,7 @@ async fn handle_pin_job(
             // nothing wanted at all) is consumed instead so it can't block —
             // or mis-satisfy — a future toggle.
             if !pin_job_still_wanted(target, action) {
-                io::delete_mover_run(&ctx.client, namespace, job_name).await?;
+                found.consume(&ctx.client).await?;
                 return Ok(post_pin_consume_action(action));
             }
             let conditions = io::upsert_condition(
@@ -5581,15 +6161,20 @@ async fn reap_backup_creds_once(
     api: &Api<Snapshot>,
     namespace: &str,
     name: &str,
+    site: &io::MoverSite,
 ) -> Result<bool> {
     if creds_reaped(backup) {
         return Ok(true);
     }
-    let job_api: Api<Job> = Api::namespaced(ctx.client.clone(), namespace);
-    if !staged_teardown_ready(capture_job(&job_api, name).await?.as_ref()) {
+    let owner_uid = backup.uid().unwrap_or_default();
+    let job_api: Api<Job> = Api::namespaced(ctx.client.clone(), site.namespace(namespace));
+    if !staged_teardown_ready(
+        capture_job(&job_api, site, name, &owner_uid)
+            .await?
+            .as_ref(),
+    ) {
         return Ok(false);
     }
-    let owner_uid = backup.uid().unwrap_or_default();
     let secrets: Api<Secret> = Api::namespaced(ctx.client.clone(), namespace);
     let outcome = io::reap_projection(
         &secrets,

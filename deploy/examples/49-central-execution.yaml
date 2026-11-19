@@ -1,0 +1,160 @@
+# Example 49 - execution.mode: Central (run movers in the operator namespace)
+#
+# EXPERIMENTAL. A platform team sets `execution.mode: Central` once on a shared
+# ClusterRepository. Each tenant backup, restore into a new PVC, verification
+# and pin then runs its mover Job in the operator namespace (`kopiur-system`
+# here), not in the tenant namespace. A backup works like this:
+#
+#   1. Kopiur cuts a CSI VolumeSnapshot of the source PVC in the tenant namespace.
+#   2. Kopiur creates a ReferenceGrant beside that VolumeSnapshot.
+#   3. Kopiur restores the snapshot into a temporary PVC in `kopiur-system`,
+#      through a cross-namespace `dataSourceRef`.
+#   4. The mover Job in `kopiur-system` reads that PVC and writes to the repository.
+#   5. Kopiur deletes the temporary PVC, the VolumeSnapshot, and the ReferenceGrant.
+#
+# A restore works like this:
+#
+#   1. A PVC in the tenant namespace claims the Restore with `dataSourceRef`.
+#      You write that PVC (`target.populator`, shown below), or Kopiur creates
+#      it (`target.pvc`, when no PVC of that name exists).
+#   2. Kopiur creates a temporary "prime" PVC in `kopiur-system`.
+#   3. The mover Job in `kopiur-system` restores the snapshot into the prime PVC.
+#   4. Kopiur hands the volume of the prime PVC to the tenant PVC.
+#
+# No mover pod runs in the tenant namespace, and the repository credentials stay
+# in `kopiur-system`. Tenants change nothing in their SnapshotPolicy.
+#
+# Maps to `ClusterRepository.spec.execution` (crates/api/src/cluster_repository.rs).
+#
+# REQUIRES, on the cluster, for backups (a restore needs only the last item;
+# see docs/src/content/docs/central-execution.mdx):
+#   - the alpha `CrossNamespaceVolumeDataSource` feature gate on kube-apiserver
+#     and kube-controller-manager,
+#   - the same feature gate on the CSI driver's external-provisioner, with
+#     get/list/watch on `referencegrants.gateway.networking.k8s.io`,
+#   - the Gateway API `ReferenceGrant` CRD,
+#   - the CSI snapshot stack and a VolumeSnapshotClass for the source's driver,
+#   - a cluster-scoped install (`installScope: cluster`).
+#
+# LIMITS:
+#   - Backups: a PVC under `copyMethod: Snapshot` or `Clone` (also as a member
+#     of a `groupBy: VolumeGroupSnapshot` group). `copyMethod: Direct` on a PVC,
+#     a `stream` source and an NFS source fail with the reason.
+#   - Restores: `target.populator`, and `target.pvc` when the PVC does not
+#     exist yet. A restore into an existing PVC (`target.pvcRef`) and a
+#     `target.streamExec` restore still run in the tenant namespace and need
+#     the credentials there.
+#   - Browse sessions run in `kopiur-system`, so the user needs access to it.
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: kopia-platform-creds
+  # The operator namespace. A central mover loads the Secret from here, so the
+  # tenant namespace never holds a copy.
+  namespace: kopiur-system
+type: Opaque
+stringData:
+  AWS_ACCESS_KEY_ID: "REPLACE_ME"
+  AWS_SECRET_ACCESS_KEY: "REPLACE_ME"
+  KOPIA_PASSWORD: "REPLACE_ME"
+---
+# region repository
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: ClusterRepository
+metadata:
+  name: shared-central
+spec:
+  backend:
+    s3:
+      bucket: org-kopia-repo
+      endpoint: s3.us-east-1.amazonaws.com
+      region: us-east-1
+      auth:
+        secretRef:
+          name: kopia-platform-creds
+          namespace: kopiur-system # must be the operator namespace for Central
+  encryption:
+    passwordSecretRef:
+      name: kopia-platform-creds
+      namespace: kopiur-system # must be the operator namespace for Central
+      key: KOPIA_PASSWORD
+  create:
+    enabled: true
+  allowedNamespaces:
+    list:
+      - billing
+  # The one new field. Absent (or `mode: InNamespace`) keeps each mover beside
+  # its source PVC, which is the default.
+  execution:
+    mode: Central
+# endregion repository
+---
+# region policy
+# The tenant side is an ordinary policy. `copyMethod: Snapshot` is the default;
+# it is written out here because `copyMethod: Direct` does not run centrally.
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: SnapshotPolicy
+metadata:
+  name: postgres-data
+  namespace: billing
+spec:
+  repository:
+    kind: ClusterRepository
+    name: shared-central
+  copyMethod: Snapshot
+  sources:
+    - pvc:
+        name: postgres-data
+  retention:
+    keepDaily: 14
+# endregion policy
+---
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: SnapshotSchedule
+metadata:
+  name: postgres-data-nightly
+  namespace: billing
+spec:
+  policyRef:
+    name: postgres-data
+  schedule:
+    cron: "H 2 * * *"
+---
+# region restore
+# A populator restore runs centrally too. The Restore names what to restore;
+# the PVC below claims it. The restore mover never runs in `billing`.
+apiVersion: kopiur.home-operations.com/v1alpha1
+kind: Restore
+metadata:
+  name: postgres-data-restore
+  namespace: billing
+spec:
+  source:
+    fromPolicy:
+      name: postgres-data
+      offset: 0 # 0 = latest snapshot
+  target:
+    populator: {}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-data-restored
+  namespace: billing
+spec:
+  storageClassName: fast-ssd
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 100Gi
+  # This is what makes the PVC a claim on the Restore. Kopiur fills a
+  # temporary PVC in `kopiur-system` and hands its volume to this one. If the
+  # StorageClass uses `WaitForFirstConsumer`, the restore starts when a pod
+  # that mounts this PVC is scheduled.
+  dataSourceRef:
+    apiGroup: kopiur.home-operations.com
+    kind: Restore
+    name: postgres-data-restore
+# endregion restore

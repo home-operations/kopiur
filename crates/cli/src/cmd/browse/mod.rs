@@ -97,6 +97,15 @@ impl SnapshotAccess for Transport {
 }
 
 /// Open the transport the flags select.
+/// Which transport the flags select, for target resolution.
+fn transport_of(common: &BrowseCommonArgs) -> resolve::SessionTransport {
+    if common.local {
+        resolve::SessionTransport::Local
+    } else {
+        resolve::SessionTransport::Pod
+    }
+}
+
 async fn open_transport(
     ctx: &KubeCtx,
     common: &BrowseCommonArgs,
@@ -232,7 +241,13 @@ fn reject_all_namespaces(ctx: &KubeCtx, command: &'static str) -> Result<(), Cli
 pub async fn ls(ctx: &KubeCtx, args: &LsArgs, output: OutputFormat) -> Result<CmdOutput, CliError> {
     reject_all_namespaces(ctx, "ls")?;
     let components = validate_rel_path(args.path.as_deref().unwrap_or(""))?;
-    let target = resolve::resolve(ctx, &ctx.namespace, &args.common.snapshot).await?;
+    let target = resolve::resolve(
+        ctx,
+        &ctx.namespace,
+        &args.common.snapshot,
+        transport_of(&args.common),
+    )
+    .await?;
     let mut access = open_transport(ctx, &args.common, &target).await?;
     let root = access.snapshot_root(&target.kopia_snapshot_id).await?;
     let (_oid, manifest) = walk_to_dir(&mut access, &root, &components).await?;
@@ -243,7 +258,13 @@ pub async fn ls(ctx: &KubeCtx, args: &LsArgs, output: OutputFormat) -> Result<Cm
 pub async fn cat(ctx: &KubeCtx, args: &CatArgs) -> Result<CmdOutput, CliError> {
     reject_all_namespaces(ctx, "cat")?;
     let components = validate_rel_path(&args.path)?;
-    let target = resolve::resolve(ctx, &ctx.namespace, &args.common.snapshot).await?;
+    let target = resolve::resolve(
+        ctx,
+        &ctx.namespace,
+        &args.common.snapshot,
+        transport_of(&args.common),
+    )
+    .await?;
     let mut access = open_transport(ctx, &args.common, &target).await?;
     let root = access.snapshot_root(&target.kopia_snapshot_id).await?;
     let (oid, _entry) = walk_to_file(&mut access, &root, &components, &args.path).await?;
@@ -264,7 +285,13 @@ pub async fn cat(ctx: &KubeCtx, args: &CatArgs) -> Result<CmdOutput, CliError> {
 pub async fn download(ctx: &KubeCtx, args: &DownloadArgs) -> Result<CmdOutput, CliError> {
     reject_all_namespaces(ctx, "download")?;
     let components = validate_rel_path(&args.path)?;
-    let target = resolve::resolve(ctx, &ctx.namespace, &args.common.snapshot).await?;
+    let target = resolve::resolve(
+        ctx,
+        &ctx.namespace,
+        &args.common.snapshot,
+        transport_of(&args.common),
+    )
+    .await?;
     let mut access = open_transport(ctx, &args.common, &target).await?;
     let root = access.snapshot_root(&target.kopia_snapshot_id).await?;
     let (oid, entry) = walk_to_file(&mut access, &root, &components, &args.path).await?;
@@ -527,7 +554,13 @@ impl ReplState {
 /// `kubectl kopiur browse <SNAPSHOT>` — the interactive REPL.
 pub async fn browse(ctx: &KubeCtx, args: &BrowseArgs) -> Result<CmdOutput, CliError> {
     reject_all_namespaces(ctx, "browse")?;
-    let target = resolve::resolve(ctx, &ctx.namespace, &args.common.snapshot).await?;
+    let target = resolve::resolve(
+        ctx,
+        &ctx.namespace,
+        &args.common.snapshot,
+        transport_of(&args.common),
+    )
+    .await?;
     let mut access = open_transport(ctx, &args.common, &target).await?;
     let root = access.snapshot_root(&target.kopia_snapshot_id).await?;
     let mut state = ReplState::new(root);
@@ -586,19 +619,36 @@ pub async fn session_end(ctx: &KubeCtx, args: &SessionEndArgs) -> Result<CmdOutp
     reject_all_namespaces(ctx, "session end")?;
     // Resolve which repository's session to end. clap enforces exactly one
     // selector; the match stays exhaustive over the two.
-    let (kind, repo_namespace, repo_name) = match (&args.snapshot, &args.repository) {
+    //
+    // `ns` is where the session Job lives: the Snapshot's namespace, or the
+    // operator namespace for a ClusterRepository with `execution.mode: Central`.
+    let (kind, repo_namespace, repo_name, ns) = match (&args.snapshot, &args.repository) {
         (Some(snapshot), None) => {
-            let target = resolve::resolve(ctx, &ctx.namespace, snapshot).await?;
+            let target = resolve::resolve(
+                ctx,
+                &ctx.namespace,
+                snapshot,
+                resolve::SessionTransport::Pod,
+            )
+            .await?;
             (
                 target.repo.kind,
                 target.repo.namespace.clone(),
                 target.repo.name,
+                target.session_namespace,
             )
         }
         (None, Some(repository)) => {
             let kind = args.repository_kind.into();
             let repo = resolve::resolve_repo(ctx, kind, repository).await?;
-            (repo.kind, repo.namespace.clone(), repo.name)
+            let ns = resolve::session_namespace_for(
+                ctx,
+                &repo,
+                &ctx.namespace,
+                &resolve::OperatorNamespace::DiscoverFromControllerDeployment,
+            )
+            .await?;
+            (repo.kind, repo.namespace.clone(), repo.name, ns)
         }
         // Unreachable thanks to the clap group, but the match stays total.
         _ => {
@@ -610,7 +660,6 @@ pub async fn session_end(ctx: &KubeCtx, args: &SessionEndArgs) -> Result<CmdOutp
         }
     };
 
-    let ns = ctx.namespace.clone();
     match session::find_session_job(ctx, &ns, kind, repo_namespace.as_deref(), &repo_name).await? {
         Some(job) => {
             let job_name = kube::ResourceExt::name_any(&job);

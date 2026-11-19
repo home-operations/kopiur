@@ -123,6 +123,8 @@ When a backup runs, Kopiur:
 
 The staged PVC is brand-new and nothing else holds it, so the backup mover **schedules freely**. It is not tied to the node your application runs on, unlike `Direct`, which must run on that node.
 
+A `ClusterRepository` can also place the staged PVC and the mover in the operator namespace. See [Central execution](/central-execution/).
+
 ### What it requires
 
 `Snapshot` needs the cluster's **CSI snapshot stack**, which your cluster administrator installs once:

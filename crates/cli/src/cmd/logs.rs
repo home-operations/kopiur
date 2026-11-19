@@ -45,6 +45,66 @@ pub fn newest_job_owned_by(jobs: Vec<Job>, uid: &str) -> Option<Job> {
         })
 }
 
+/// The newest mover Job of `restore`, and the namespace it runs in.
+///
+/// Ordinarily that is the Restore's own namespace, where the Job carries an
+/// owner reference to it. A centrally executed populator restore pins the
+/// operator namespace in `status.execution`; its Jobs carry the Restore's UID
+/// as a label there, because an owner reference cannot cross namespaces.
+async fn newest_restore_job(
+    client: &kube::Client,
+    restore: &Restore,
+    ns: &str,
+) -> Result<Option<JobAt>, kube::Error> {
+    let uid = restore.uid().unwrap_or_default();
+    let central = central_restore_namespace(restore);
+    let (job_ns, selector) = match &central {
+        Some(central_ns) => (
+            central_ns.as_str(),
+            format!("{}={uid}", kopiur_api::consts::CENTRAL_RESTORE_UID_LABEL),
+        ),
+        None => (ns, format!("{OP_LABEL}={OP_RESTORE}")),
+    };
+    let jobs: Api<Job> = Api::namespaced(client.clone(), job_ns);
+    let listed = jobs
+        .list(&ListParams::default().labels(&selector))
+        .await?
+        .items;
+    let newest = match central {
+        // Already selected by the UID label.
+        Some(_) => listed.into_iter().max_by(|a, b| {
+            a.metadata
+                .creation_timestamp
+                .cmp(&b.metadata.creation_timestamp)
+        }),
+        None => newest_job_owned_by(listed, &uid),
+    };
+    Ok(newest.map(|job| JobAt {
+        name: job.name_any(),
+        namespace: job_ns.to_string(),
+    }))
+}
+
+/// The operator namespace a restore's mover Jobs run in, if it runs centrally.
+/// Pure.
+///
+/// Only a restore that fills volumes through the populator handshake runs
+/// centrally: a `populator` target, or a `pvc` target that was created as a
+/// claim (it then tracks that claim in `status.claims`). The pin alone does
+/// not decide: it outlives an edit of the target, and a direct restore's Job
+/// is always in the Restore's own namespace.
+pub fn central_restore_namespace(restore: &Restore) -> Option<String> {
+    let status = restore.status.as_ref()?;
+    let pinned = || status.execution.as_ref().map(|e| e.namespace.clone());
+    match &restore.spec.target {
+        kopiur_api::restore::RestoreTarget::Populator(_) => pinned(),
+        kopiur_api::restore::RestoreTarget::Pvc(_) if !status.claims.is_empty() => pinned(),
+        kopiur_api::restore::RestoreTarget::Pvc(_)
+        | kopiur_api::restore::RestoreTarget::PvcRef(_)
+        | kopiur_api::restore::RestoreTarget::StreamExec(_) => None,
+    }
+}
+
 /// Newest pod of the list (a retried Job leaves several; the newest is the
 /// current/last attempt). Pure.
 pub fn newest_pod(pods: Vec<Pod>) -> Option<Pod> {
@@ -138,12 +198,33 @@ pub fn gone_fallback(kind: &str, name: &str, tails: &[RecordedTail]) -> String {
     out
 }
 
-/// Resolve the mover Job name for the target CR.
+/// A mover Job and the namespace it runs in. That is the CR's own namespace,
+/// except for a centrally executed backup, whose `status.job.namespace` names
+/// the operator namespace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct JobAt {
+    name: String,
+    namespace: String,
+}
+
+/// The mover Job a Snapshot's status records, if it records one.
+fn recorded_job(snap: &Snapshot, snapshot_ns: &str) -> Option<JobAt> {
+    let job = snap.status.as_ref()?.job.as_ref()?;
+    Some(JobAt {
+        name: job.name.clone()?,
+        namespace: job
+            .namespace
+            .clone()
+            .unwrap_or_else(|| snapshot_ns.to_string()),
+    })
+}
+
+/// Resolve the mover Job for the target CR.
 async fn resolve_job(
     ctx: &KubeCtx,
     target: LogsTarget,
     name: &str,
-) -> Result<Result<String, String>, CliError> {
+) -> Result<Result<JobAt, String>, CliError> {
     let ns = ctx.namespace.as_str();
     match target {
         LogsTarget::Snapshot => {
@@ -153,12 +234,7 @@ async fn resolve_job(
             })?;
             // The controller records the Job name in status; fall back to an
             // ownerRef scan for status written by an older controller.
-            if let Some(job) = snap
-                .status
-                .as_ref()
-                .and_then(|s| s.job.as_ref())
-                .and_then(|j| j.name.clone())
-            {
+            if let Some(job) = recorded_job(&snap, ns) {
                 return Ok(Ok(job));
             }
             let uid = snap.uid().unwrap_or_default();
@@ -168,7 +244,10 @@ async fn resolve_job(
                 .await
                 .map_err(|e| classify_kube("list", "Job", "jobs", Some(ns), None, e))?;
             match newest_job_owned_by(listed.items, &uid) {
-                Some(job) => Ok(Ok(job.name_any())),
+                Some(job) => Ok(Ok(JobAt {
+                    name: job.name_any(),
+                    namespace: ns.to_string(),
+                })),
                 None => Ok(Err(gone_fallback(
                     "snapshot",
                     name,
@@ -181,14 +260,11 @@ async fn resolve_job(
             let restore = api.get(name).await.map_err(|e| {
                 classify_kube("get", "Restore", "restores", Some(ns), Some(name), e)
             })?;
-            let uid = restore.uid().unwrap_or_default();
-            let jobs: Api<Job> = Api::namespaced(ctx.client.clone(), ns);
-            let listed = jobs
-                .list(&ListParams::default().labels(&format!("{OP_LABEL}={OP_RESTORE}")))
+            let job = newest_restore_job(&ctx.client, &restore, ns)
                 .await
                 .map_err(|e| classify_kube("list", "Job", "jobs", Some(ns), None, e))?;
-            match newest_job_owned_by(listed.items, &uid) {
-                Some(job) => Ok(Ok(job.name_any())),
+            match job {
+                Some(job) => Ok(Ok(job)),
                 // Per claim for a fanned-out populator (#443, wave 2 finding 8).
                 None => Ok(Err(gone_fallback(
                     "restore",
@@ -201,18 +277,17 @@ async fn resolve_job(
 }
 
 /// Stream one pod's logs to stdout.
-async fn stream_pod(ctx: &KubeCtx, pod: &str, params: &LogParams) -> Result<(), CliError> {
-    let pods: Api<Pod> = Api::namespaced(ctx.client.clone(), ctx.namespace.as_str());
-    let stream = pods.log_stream(pod, params).await.map_err(|e| {
-        classify_kube(
-            "get",
-            "Pod",
-            "pods/log",
-            Some(ctx.namespace.as_str()),
-            Some(pod),
-            e,
-        )
-    })?;
+async fn stream_pod(
+    ctx: &KubeCtx,
+    ns: &str,
+    pod: &str,
+    params: &LogParams,
+) -> Result<(), CliError> {
+    let pods: Api<Pod> = Api::namespaced(ctx.client.clone(), ns);
+    let stream = pods
+        .log_stream(pod, params)
+        .await
+        .map_err(|e| classify_kube("get", "Pod", "pods/log", Some(ns), Some(pod), e))?;
     let mut lines = stream.lines();
     while let Some(line) = lines
         .try_next()
@@ -242,10 +317,10 @@ pub async fn run(
             });
         }
     };
-    let ns = ctx.namespace.as_str();
+    let ns = job.namespace.as_str();
     let pods: Api<Pod> = Api::namespaced(ctx.client.clone(), ns);
     let listed = pods
-        .list(&ListParams::default().labels(&format!("{JOB_NAME_LABEL}={job}")))
+        .list(&ListParams::default().labels(&format!("{JOB_NAME_LABEL}={}", job.name)))
         .await
         .map_err(|e| classify_kube("list", "Pod", "pods", Some(ns), None, e))?;
     let Some(pod) = newest_pod(listed.items) else {
@@ -262,7 +337,7 @@ pub async fn run(
         tail_lines: args.tail,
         ..LogParams::default()
     };
-    stream_pod(ctx, &pod.name_any(), &params).await?;
+    stream_pod(ctx, ns, &pod.name_any(), &params).await?;
     Ok(CmdOutput {
         text: String::new(),
         exit: 0,
@@ -330,7 +405,7 @@ fn restore_terminal(restore: &Restore) -> bool {
 /// gone / (terminal?, job name?).
 enum Observation {
     Gone,
-    Alive { terminal: bool, job: Option<String> },
+    Alive { terminal: bool, job: Option<JobAt> },
 }
 
 /// Observe the target CR once: phase terminality + the mover Job, resolved the
@@ -347,11 +422,7 @@ async fn observe(
             let Some(snap) = api.get_opt(name).await? else {
                 return Ok(Observation::Gone);
             };
-            let job = snap
-                .status
-                .as_ref()
-                .and_then(|st| st.job.as_ref())
-                .and_then(|j| j.name.clone());
+            let job = recorded_job(&snap, ns);
             Ok(Observation::Alive {
                 terminal: snapshot_terminal(&snap),
                 job,
@@ -362,15 +433,10 @@ async fn observe(
             let Some(restore) = api.get_opt(name).await? else {
                 return Ok(Observation::Gone);
             };
-            let uid = restore.uid().unwrap_or_default();
-            let jobs: Api<Job> = Api::namespaced(ctx.client.clone(), ns);
             // A list ERROR must propagate (caller retries) — treating it as
             // "no job" while terminal would end the stream before the final
             // pod is drained.
-            let listed = jobs
-                .list(&ListParams::default().labels(&format!("{OP_LABEL}={OP_RESTORE}")))
-                .await?;
-            let job = newest_job_owned_by(listed.items, &uid).map(|j| j.name_any());
+            let job = newest_restore_job(&ctx.client, &restore, ns).await?;
             Ok(Observation::Alive {
                 terminal: restore_terminal(&restore),
                 job,
@@ -389,8 +455,6 @@ pub async fn stream_target_logs_when_ready(ctx: &KubeCtx, target: LogsTarget, na
     const POLL: std::time::Duration = std::time::Duration::from_secs(2);
     // ~20s of consecutive stream failures before the user hears about it.
     const QUIET_FAILURES: u32 = 10;
-    let ns = ctx.namespace.as_str();
-    let pods: Api<Pod> = Api::namespaced(ctx.client.clone(), ns);
     // A retried Job produces a new pod; keep following the newest unseen pod
     // until the CR is terminal and the last pod has been streamed.
     let mut streamed: Option<String> = None;
@@ -414,8 +478,9 @@ pub async fn stream_target_logs_when_ready(ctx: &KubeCtx, target: LogsTarget, na
             tokio::time::sleep(POLL).await;
             continue;
         };
+        let pods: Api<Pod> = Api::namespaced(ctx.client.clone(), &job.namespace);
         let pod = match pods
-            .list(&ListParams::default().labels(&format!("{JOB_NAME_LABEL}={job}")))
+            .list(&ListParams::default().labels(&format!("{JOB_NAME_LABEL}={}", job.name)))
             .await
         {
             Ok(listed) => newest_pod(listed.items).map(|p| p.name_any()),
@@ -444,7 +509,7 @@ pub async fn stream_target_logs_when_ready(ctx: &KubeCtx, target: LogsTarget, na
             follow: true,
             ..LogParams::default()
         };
-        match stream_pod(ctx, &pod, &params).await {
+        match stream_pod(ctx, &job.namespace, &pod, &params).await {
             Ok(()) => {
                 // The follow stream ends when the container exits; loop to
                 // catch a retry pod or finish at the terminal phase.
@@ -548,6 +613,66 @@ mod tests {
 
         let empty = gone_fallback("restore", "r", &top(None, None));
         assert!(empty.contains("no logTail recorded"));
+    }
+
+    /// `logs restore` follows the central pin only for a restore that hands
+    /// its volume over: a populator, or a `target.pvc` created as a claim.
+    #[test]
+    fn only_a_handover_restore_is_looked_up_in_the_operator_namespace() {
+        let restore = |target: serde_json::Value, status: serde_json::Value| -> Restore {
+            serde_json::from_value(serde_json::json!({
+                "apiVersion": "kopiur.home-operations.com/v1alpha1",
+                "kind": "Restore",
+                "metadata": { "name": "r", "namespace": "billing" },
+                "spec": {
+                    "source": { "snapshotRef": { "name": "nightly" } },
+                    "target": target,
+                },
+                "status": status,
+            }))
+            .unwrap()
+        };
+        let pinned = serde_json::json!({ "execution": { "namespace": "kopiur-system" } });
+        let pinned_with_claim = serde_json::json!({
+            "execution": { "namespace": "kopiur-system" },
+            "claims": { "restored": { "phase": "Populated" } },
+        });
+        let pvc = serde_json::json!({ "pvc": { "name": "restored", "capacity": "1Gi" } });
+
+        assert_eq!(
+            central_restore_namespace(&restore(
+                serde_json::json!({ "populator": {} }),
+                pinned.clone()
+            ))
+            .as_deref(),
+            Some("kopiur-system")
+        );
+        // `target.pvc` handed over: it tracks its claim.
+        assert_eq!(
+            central_restore_namespace(&restore(pvc.clone(), pinned_with_claim.clone())).as_deref(),
+            Some("kopiur-system")
+        );
+        // A direct `target.pvc` restore that still carries a pin from before a
+        // target edit: its Job is beside the Restore.
+        assert_eq!(
+            central_restore_namespace(&restore(pvc, pinned.clone())),
+            None
+        );
+        assert_eq!(
+            central_restore_namespace(&restore(
+                serde_json::json!({ "pvcRef": { "name": "existing" } }),
+                pinned_with_claim
+            )),
+            None
+        );
+        // No pin: in the Restore's own namespace.
+        assert_eq!(
+            central_restore_namespace(&restore(
+                serde_json::json!({ "populator": {} }),
+                serde_json::json!({})
+            )),
+            None
+        );
     }
 
     /// Review wave 2, finding 8: `kubectl kopiur logs restore X` falls back to
