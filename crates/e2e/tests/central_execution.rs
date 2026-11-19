@@ -21,9 +21,12 @@
 //!
 //! 4. **Persistent cache** (#760): a policy with `mover.cache.mode: Persistent`
 //!    keeps ONE cache PVC in the operator namespace across its runs. The claim
-//!    grows with `capacity`, never appears in the workload namespace, and is
-//!    deleted with the policy. A central restore keeps its cache claim there
-//!    too, until the `Restore` is deleted.
+//!    grows with `capacity`, never appears in the workload namespace, is named
+//!    in the `Snapshot` status, and is deleted on a reset request. A central
+//!    restore keeps its cache claim there too, until the `Restore` is deleted,
+//!    and the claim holds the kopia cache and no credentials. Scenario 3 covers
+//!    the claim for each source of a many-source policy, and its deletion with
+//!    the policy.
 //!
 //! Needs the alpha `CrossNamespaceVolumeDataSource` feature on kube-apiserver and
 //! kube-controller-manager (`crates/e2e/kind-config.yaml`) and on the CSI
@@ -1232,12 +1235,25 @@ async fn central_group_members_are_staged_in_the_operator_namespace_from_one_cap
                 } ],
                 "groupBy": "VolumeGroupSnapshot",
                 "copyMethod": "Snapshot",
-                "identity": { "username": "central-grouped", "hostname": "e2e" }
+                "identity": { "username": "central-grouped", "hostname": "e2e" },
+                // #760: the members run at the same time, one mover each, so
+                // each needs its own persistent cache claim.
+                "mover": { "cache": {
+                    "capacity": "64Mi",
+                    "mode": "Persistent",
+                    "storageClassName": CSI_STORAGE_CLASS,
+                } },
             }),
         )),
         "create grouped SnapshotPolicy",
     )
     .await;
+    let policy_uid = policies
+        .get(policy)
+        .await
+        .expect("get SnapshotPolicy")
+        .uid()
+        .expect("policy uid");
     create_idempotent(
         &schedules,
         &cr(serde_json::json!({
@@ -1305,6 +1321,50 @@ async fn central_group_members_are_staged_in_the_operator_namespace_from_one_cap
         groups.len(),
         1,
         "every member must pin the SAME group object: {groups:?}"
+    );
+
+    // One persistent cache claim for each member, in the operator namespace.
+    // One claim for the whole policy would have every mover but the first wait
+    // on a Multi-Attach error wherever the members land on different nodes.
+    let group_caches: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let by_policy_uid = ListParams::default().labels(&format!(
+        "kopiur.home-operations.com/policy-uid={policy_uid},\
+         kopiur.home-operations.com/component=mover-cache"
+    ));
+    let member_claims = group_caches
+        .list(&by_policy_uid)
+        .await
+        .expect("list the policy's central cache claims")
+        .items;
+    let mut served: Vec<String> = member_claims
+        .iter()
+        .filter_map(|c| {
+            c.annotations()
+                .get("kopiur.home-operations.com/cache-source")
+                .cloned()
+        })
+        .collect();
+    served.sort();
+    assert_eq!(
+        served,
+        sources.map(str::to_string).to_vec(),
+        "each member must have its own cache claim, marked with its source PVC"
+    );
+    let mut mounted = std::collections::BTreeSet::new();
+    for child in &children {
+        let status = status_json(&backups, &child.name_any()).await;
+        let claim = &status["resolved"]["cache"]["claim"];
+        assert_eq!(
+            claim["namespace"].as_str(),
+            Some(E2E_NAMESPACE),
+            "the member must record the claim it mounted: {status}"
+        );
+        mounted.insert(claim["name"].as_str().unwrap_or_default().to_string());
+    }
+    assert_eq!(
+        mounted,
+        member_claims.iter().map(ResourceExt::name_any).collect(),
+        "each member mounts a claim of its own"
     );
 
     // Nothing ran in the workload namespace, and no Secret was copied into it.
@@ -1379,7 +1439,24 @@ async fn central_group_members_are_staged_in_the_operator_namespace_from_one_cap
     )
     .await
     .expect("the grouped Snapshots should be deleted");
+    // Deleting the policy deletes every one of its cache claims: nothing else
+    // would, since a claim in another namespace has no owner reference.
     let _ = policies.delete(policy, &DeleteParams::default()).await;
+    wait_until(
+        "central cache claims deleted with their SnapshotPolicy",
+        default_timeout(),
+        poll_interval(),
+        || async {
+            Ok(group_caches
+                .list(&by_policy_uid)
+                .await?
+                .items
+                .is_empty()
+                .then_some(()))
+        },
+    )
+    .await
+    .expect("the cache claims should be deleted with their SnapshotPolicy");
     let _ = crepos
         .delete("e2e-central-repo", &DeleteParams::default())
         .await;
@@ -1585,6 +1662,46 @@ async fn central_backup_keeps_its_persistent_cache_in_the_operator_namespace() {
             .contains(&claim_name),
         "the first mover must mount the persistent cache claim `{claim_name}`"
     );
+    // A tenant cannot list the operator namespace, so the claim is reported
+    // where the tenant can read: on the Snapshot, and as an Event on the policy.
+    let first_status = status_json(&backups, runs[0]).await;
+    assert_eq!(
+        first_status["resolved"]["cache"]["claim"],
+        serde_json::json!({ "namespace": E2E_NAMESPACE, "name": claim_name }),
+        "the Snapshot must record the claim its mover mounted: {first_status}"
+    );
+    let events: Api<Event> = Api::namespaced(client.clone(), WORKLOAD_NS);
+    let policy_event = |reason: &'static str| {
+        let (events, policy_uid) = (events.clone(), policy_uid.clone());
+        async move {
+            wait_until(
+                &format!("{reason} Event on the SnapshotPolicy"),
+                default_timeout(),
+                poll_interval(),
+                || async {
+                    let list = events.list(&ListParams::default()).await?;
+                    Ok(list.items.into_iter().find(|e| {
+                        e.reason.as_deref() == Some(reason)
+                            && e.regarding.as_ref().is_some_and(|r| {
+                                r.kind.as_deref() == Some("SnapshotPolicy")
+                                    && r.uid.as_deref() == Some(policy_uid.as_str())
+                            })
+                    }))
+                },
+            )
+            .await
+            .unwrap_or_else(|e| panic!("expected a {reason} Event on the SnapshotPolicy: {e}"))
+        }
+    };
+    let created = policy_event("CachePvcCreated").await;
+    assert!(
+        created
+            .note
+            .as_deref()
+            .is_some_and(|n| n.contains(&format!("{E2E_NAMESPACE}/{claim_name}"))),
+        "the Event must name the claim with its namespace: {:?}",
+        created.note
+    );
 
     // The workload namespace holds the source PVC and no cache volume.
     let in_workload: Vec<String> = workload_pvcs
@@ -1641,24 +1758,7 @@ async fn central_backup_keeps_its_persistent_cache_in_the_operator_namespace() {
     // The resize is reported on the policy, where its author looks, and names
     // the namespace the claim is really in. Matched by the policy's UID: a retry
     // of this test finds the Event of the previous attempt's policy too.
-    let events: Api<Event> = Api::namespaced(client.clone(), WORKLOAD_NS);
-    let grown = wait_until(
-        "CachePvcExpanded Event on the SnapshotPolicy",
-        default_timeout(),
-        poll_interval(),
-        || async {
-            let list = events.list(&ListParams::default()).await?;
-            Ok(list.items.into_iter().find(|e| {
-                e.reason.as_deref() == Some("CachePvcExpanded")
-                    && e.regarding.as_ref().is_some_and(|r| {
-                        r.kind.as_deref() == Some("SnapshotPolicy")
-                            && r.uid.as_deref() == Some(policy_uid.as_str())
-                    })
-            }))
-        },
-    )
-    .await
-    .expect("the grow must be reported on the SnapshotPolicy");
+    let grown = policy_event("CachePvcExpanded").await;
     assert!(
         grown
             .note
@@ -1759,14 +1859,20 @@ async fn central_backup_keeps_its_persistent_cache_in_the_operator_namespace() {
     );
     // The mover Job is gone after the handover, so read the claim itself: it
     // holds the kopia cache directory, which the mover only creates on the
-    // volume it mounted as its cache.
+    // volume it mounted as its cache. And it holds NOTHING else: kopia's config
+    // file carries the backend credentials in plain text, so it, the staged
+    // credential files and the logs must stay on the pod-local volume.
     central_pods
         .create(
             &PostParams::default(),
             &kopiur_e2e::builders::one_shot_pod(
                 E2E_NAMESPACE,
                 cache_reader,
-                &["test", "-d", "/mnt/cache"],
+                &[
+                    "sh",
+                    "-c",
+                    "ls -A /mnt; test -d /mnt/cache && test \"$(ls -A /mnt)\" = cache",
+                ],
                 &[(restore_claim.as_str(), "/mnt")],
             ),
         )
@@ -1774,7 +1880,7 @@ async fn central_backup_keeps_its_persistent_cache_in_the_operator_namespace() {
         .expect("create the cache reader pod");
     kopiur_e2e::wait::pod_succeeded(&client, E2E_NAMESPACE, cache_reader)
         .await
-        .expect("the restore mover must have written its kopia cache to the claim");
+        .expect("the claim must hold the kopia cache directory and nothing else");
     let _ = central_pods
         .delete(cache_reader, &DeleteParams::default())
         .await;
@@ -1828,17 +1934,24 @@ async fn central_backup_keeps_its_persistent_cache_in_the_operator_namespace() {
         .await
         .expect("delete the restored PVC");
 
-    // 4) Deleting the policy deletes its cache claim: nothing else would, since
-    //    the claim has no owner reference.
-    for run in runs {
-        let _ = backups.delete(run, &DeleteParams::default()).await;
-    }
+    // 4) A tenant cannot delete a PVC in the operator namespace. The reset
+    //    annotation on the policy is how its author gets the cache deleted
+    //    (to apply a smaller capacity, say).
+    let token = "2026-07-06T12:00:00Z";
     policies
-        .delete(policy, &DeleteParams::default())
+        .patch(
+            policy,
+            &PatchParams::default(),
+            &Patch::Merge(&serde_json::json!({
+                "metadata": { "annotations": {
+                    "kopiur.home-operations.com/cache-reset-requested-at": token
+                } }
+            })),
+        )
         .await
-        .expect("delete SnapshotPolicy");
+        .expect("request a cache reset");
     wait_until(
-        "central cache claim deleted with its SnapshotPolicy",
+        "central cache claim deleted by the reset request",
         default_timeout(),
         poll_interval(),
         || async {
@@ -1851,8 +1964,24 @@ async fn central_backup_keeps_its_persistent_cache_in_the_operator_namespace() {
         },
     )
     .await
-    .expect("the cache claim should be deleted with its SnapshotPolicy");
+    .expect("the reset request should delete the policy's cache claim");
+    wait_until(
+        "the reset request recorded as honored",
+        default_timeout(),
+        poll_interval(),
+        || async {
+            let status = status_json(&policies, policy).await;
+            Ok((status["cache"]["resetRequestHonored"].as_str() == Some(token)).then_some(()))
+        },
+    )
+    .await
+    .expect("status.cache.resetRequestHonored should record the request");
+    policy_event("CacheReset").await;
 
+    for run in runs {
+        let _ = backups.delete(run, &DeleteParams::default()).await;
+    }
+    let _ = policies.delete(policy, &DeleteParams::default()).await;
     let _ = crepos.delete(repo, &DeleteParams::default()).await;
     kopiur_e2e::pvc::delete_pvc_and_consumers(&client, WORKLOAD_NS, src)
         .await

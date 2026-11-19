@@ -4,6 +4,7 @@
 pub mod adoption;
 pub mod browse_session;
 pub mod cache;
+pub mod cache_sweep;
 pub mod catalog;
 pub mod cluster_repository;
 pub mod config;

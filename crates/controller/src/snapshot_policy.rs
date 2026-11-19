@@ -839,6 +839,104 @@ async fn handle_policy_lifecycle(
     Ok(None)
 }
 
+/// The cache-reset request on `config` that has not been acted on yet: the value
+/// of [`kopiur_api::consts::CACHE_RESET_REQUESTED_ANNOTATION`], unless
+/// `status.cache.resetRequestHonored` already holds it. Pure.
+fn pending_cache_reset(config: &SnapshotPolicy) -> Option<&str> {
+    let requested = config
+        .annotations()
+        .get(kopiur_api::consts::CACHE_RESET_REQUESTED_ANNOTATION)?;
+    let honored = config
+        .status
+        .as_ref()
+        .and_then(|s| s.cache.as_ref())
+        .and_then(|c| c.reset_request_honored.as_deref());
+    (honored != Some(requested.as_str())).then_some(requested.as_str())
+}
+
+/// Act on a pending cache-reset request ([`pending_cache_reset`]): delete every
+/// persistent cache PVC of this policy, beside it and in the operator
+/// namespace, then record the request as honored. It waits while a run of the
+/// policy is in flight ([`crate::cache_sweep::policy_run_in_flight`]). A claim
+/// that some other pod still mounts goes when that pod ends, and a run that
+/// starts before then uses a per-run volume ([`io::CachePvcClaim::Terminating`]).
+///
+/// The request exists for central claims, which the policy's author cannot
+/// delete. It covers the in-namespace ones too, so it means one thing whatever
+/// the repository's `execution.mode` is.
+async fn honor_cache_reset(
+    ctx: &Context,
+    api: &Api<SnapshotPolicy>,
+    config: &SnapshotPolicy,
+    namespace: &str,
+    name: &str,
+) -> Result<()> {
+    use k8s_openapi::api::core::v1::PersistentVolumeClaim;
+    let Some(requested) = pending_cache_reset(config) else {
+        return Ok(());
+    };
+    // A run that already picked its claim would be left with a pod waiting on
+    // a PVC that does not exist. The Snapshot watch re-runs this reconcile
+    // when that run ends.
+    if crate::cache_sweep::policy_run_in_flight(&ctx.client, namespace, name).await? {
+        io::publish_normal_event(
+            ctx,
+            config,
+            "CacheResetPending",
+            "Delete",
+            "A cache reset was requested, and a Snapshot of this SnapshotPolicy is still \
+             running. Kopiur deletes the persistent kopia cache PVCs when no Snapshot of this \
+             policy is Pending or Running.",
+        )
+        .await;
+        return Ok(());
+    }
+    let uid = config.uid().unwrap_or_default();
+    if let Ok(central) = io::central_namespace(
+        ctx.operator_namespace.as_deref(),
+        matches!(ctx.watch_scope, crate::config::WatchScope::Namespaced(_)),
+    ) {
+        io::reap_central_policy_cache_pvcs(&ctx.client, &central, &uid).await?;
+    }
+    let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(ctx.client.clone(), namespace);
+    let caches = ListParams::default().labels(&format!(
+        "{}={}",
+        io::CACHE_PVC_COMPONENT_LABEL,
+        io::CACHE_PVC_COMPONENT
+    ));
+    for pvc in pvcs.list(&caches).await?.items {
+        if !crate::cache_sweep::is_in_namespace_cache_of(&pvc, &uid) {
+            continue;
+        }
+        match pvcs
+            .delete(&pvc.name_any(), &io::delete_exactly(&pvc.metadata))
+            .await
+        {
+            Ok(_) => {}
+            Err(kube::Error::Api(e)) if e.code == 404 || e.code == 409 => {}
+            Err(e) => return Err(Error::Kube(e)),
+        }
+    }
+    io::patch_status(
+        api,
+        name,
+        serde_json::json!({ "cache": { "resetRequestHonored": requested } }),
+    )
+    .await?;
+    io::publish_normal_event(
+        ctx,
+        config,
+        "CacheReset",
+        "Delete",
+        "Deleted this SnapshotPolicy's persistent kopia cache PVCs, as the \
+         cache-reset-requested-at annotation asked. The next run creates them again and starts \
+         with an empty cache. No backup data is lost.",
+    )
+    .await;
+    tracing::info!(policy = %name, %namespace, "reset the persistent mover cache on request");
+    Ok(())
+}
+
 async fn reconcile_inner(config: &SnapshotPolicy, ctx: &Context) -> Result<Action> {
     let errs = validate::validate_backup_config(&config.spec);
     if let Some(first) = errs.into_iter().next() {
@@ -869,6 +967,7 @@ async fn reconcile_inner(config: &SnapshotPolicy, ctx: &Context) -> Result<Actio
     if let Some(action) = handle_policy_lifecycle(ctx, &api, config, &namespace, &name).await? {
         return Ok(action);
     }
+    honor_cache_reset(ctx, &api, config, &namespace, &name).await?;
 
     let existing = config
         .status
@@ -4576,5 +4675,64 @@ mod tests {
             &gate.status,
             &gate.reason
         ));
+    }
+
+    // --- cache reset request -------------------------------------------------
+
+    fn policy_with_reset(requested: Option<&str>, honored: Option<&str>) -> SnapshotPolicy {
+        let mut policy: SnapshotPolicy = serde_json::from_value(serde_json::json!({
+            "apiVersion": crate::consts::API_VERSION, "kind": "SnapshotPolicy",
+            "metadata": { "name": "pg", "namespace": "billing", "uid": "uid-pg" },
+            "spec": {
+                "repository": { "kind": "ClusterRepository", "name": "shared" },
+                "sources": [ { "pvc": { "name": "data" } } ],
+            },
+        }))
+        .expect("SnapshotPolicy");
+        if let Some(requested) = requested {
+            policy.metadata.annotations = Some(std::collections::BTreeMap::from([(
+                kopiur_api::consts::CACHE_RESET_REQUESTED_ANNOTATION.to_string(),
+                requested.to_string(),
+            )]));
+        }
+        if let Some(honored) = honored {
+            policy.status = Some(kopiur_api::snapshot_policy::SnapshotPolicyStatus {
+                cache: Some(kopiur_api::snapshot_policy::PolicyCacheStatus {
+                    reset_request_honored: Some(honored.to_string()),
+                }),
+                ..Default::default()
+            });
+        }
+        policy
+    }
+
+    /// The annotation can stay on the object (GitOps applies it on every sync):
+    /// a request is acted on once, and only a NEW value asks again.
+    #[test]
+    fn a_cache_reset_request_is_honored_once_per_value() {
+        assert_eq!(pending_cache_reset(&policy_with_reset(None, None)), None);
+        assert_eq!(
+            pending_cache_reset(&policy_with_reset(Some("2026-07-01T00:00:00Z"), None)),
+            Some("2026-07-01T00:00:00Z")
+        );
+        assert_eq!(
+            pending_cache_reset(&policy_with_reset(
+                Some("2026-07-01T00:00:00Z"),
+                Some("2026-07-01T00:00:00Z")
+            )),
+            None
+        );
+        assert_eq!(
+            pending_cache_reset(&policy_with_reset(
+                Some("2026-08-01T00:00:00Z"),
+                Some("2026-07-01T00:00:00Z")
+            )),
+            Some("2026-08-01T00:00:00Z")
+        );
+        // An honored value with the annotation removed asks for nothing.
+        assert_eq!(
+            pending_cache_reset(&policy_with_reset(None, Some("2026-07-01T00:00:00Z"))),
+            None
+        );
     }
 }

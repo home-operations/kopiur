@@ -686,15 +686,39 @@ If you set one budget, the other keeps its default share, lowered if needed so t
 
 :::caution[The two budgets may claim at most 90% of `capacity`]
 
-kopia's budgets are soft limits. It only trims the cache back to them on a periodic sweep, so a busy run goes past them in between, and kopia also stores its config, logs and blob lists on the same volume. The webhook therefore refuses a `percent` outside 1–100, a `size` larger than `capacity`, and budgets that together exceed 90% of `capacity`. The same bound applies to `contentCacheSizeMb`/`metadataCacheSizeMb` when you next edit a cache block that sets them next to a `capacity`. Objects admitted before this check keep running unchanged until you edit them. A `percent` needs a `capacity` on the same object or inherited from `moverDefaults.cache`. Without one, the run fails with a message naming the field. A `capacity` under 3Mi is refused too, because it cannot hold even 1MiB for each cache, and one would fall back to kopia's unbounded default.
+kopia's budgets are soft limits. It only trims the cache back to them on a periodic sweep, so a busy run goes past them in between, and kopia also keeps its blob lists in the cache directory. The webhook therefore refuses a `percent` outside 1–100, a `size` larger than `capacity`, and budgets that together exceed 90% of `capacity`. The same bound applies to `contentCacheSizeMb`/`metadataCacheSizeMb` when you next edit a cache block that sets them next to a `capacity`. Objects admitted before this check keep running unchanged until you edit them. A `percent` needs a `capacity` on the same object or inherited from `moverDefaults.cache`. Without one, the run fails with a message naming the field. A `capacity` under 3Mi is refused too, because it cannot hold even 1MiB for each cache, and one would fall back to kopia's unbounded default.
 
 :::
 
 **Replication movers.** A `RepositoryReplication` or `SnapshotReplication` honors `mover.cache` too, but always on a fresh per-run volume, as verification does: `mode: Persistent` is treated as `Ephemeral`, because a replication Job must not share a `ReadWriteOnce` cache claim. A `SnapshotReplication` connects both repositories, and each keeps its own cache on that volume, so each gets half of the budgets, and its `capacity` must be at least 6Mi.
 
-**Growing a `Persistent` cache.** Raise `capacity` and the next run grows the existing cache PVC, if its StorageClass sets `allowVolumeExpansion: true`. A `CachePvcExpanded` Event on the `SnapshotPolicy` (or `Restore`, `Maintenance`, or repository that owns the PVC) records it, and until the resize finishes the run still goes ahead, with every budget scaled down in proportion to fit the old size. (Some storage only finishes growing the filesystem when a pod mounts the claim, so refusing the run would stall the resize.) Kubernetes cannot shrink a PVC, and some StorageClasses cannot expand one. In those cases the PVC keeps its size, the budgets are sized to fit it, and a `CachePvcShrinkRefused` or `CachePvcExpansionNotAllowed` Warning Event says why. To apply the new size anyway, delete the cache PVC: the next run recreates it at the new `capacity`. That costs a cold cache for one run and loses no backup data.
+**Growing a `Persistent` cache.** Raise `capacity` and the next run grows the existing cache PVC, if its StorageClass sets `allowVolumeExpansion: true`. A `CachePvcExpanded` Event on the `SnapshotPolicy` (or `Restore`, `Maintenance`, or repository that owns the PVC) records it, and until the resize finishes the run still goes ahead, with every budget scaled down in proportion to fit the old size. (Some storage only finishes growing the filesystem when a pod mounts the claim, so refusing the run would stall the resize.) Kubernetes cannot shrink a PVC, and some StorageClasses cannot expand one. In those cases the PVC keeps its size, the budgets are sized to fit it, and a `CachePvcShrinkRefused` or `CachePvcExpansionNotAllowed` Warning Event says why. To apply the new size anyway, [reset the cache](#reset-a-persistent-cache): the next run recreates the PVC at the new `capacity`. That costs a cold cache for one run and loses no backup data.
 
 **Central execution.** Under `execution.mode: Central`, the `Persistent` cache PVC of a policy or a restore lives in the operator namespace, beside the mover. See [Central execution → Where a persistent cache lives](/central-execution/#where-a-persistent-cache-lives).
+
+#### Reset a persistent cache
+
+To delete the `Persistent` cache PVCs of a `SnapshotPolicy`, set the annotation `kopiur.home-operations.com/cache-reset-requested-at` to a new value. The current time is a good value.
+
+```console
+$ kubectl annotate snapshotpolicy -n billing postgres-data --overwrite kopiur.home-operations.com/cache-reset-requested-at=2026-07-06T12:00:00Z
+```
+
+Kopiur deletes every cache PVC of the policy, in its namespace and in the operator namespace. The next run creates the PVC again at the current `capacity` and `storageClassName`. That run starts with an empty cache. No backup data is lost.
+
+Kopiur acts once for each value and records the value in `status.cache.resetRequestHonored`. A `CacheReset` Event on the policy shows that the reset happened. You can keep the annotation in Git. To reset again, change the value.
+
+Kopiur waits while a `Snapshot` of the policy is `Pending` or `Running`, because that run can be about to mount the PVC. A `CacheResetPending` Event on the policy says so. When the run ends, the reset happens. If some other pod still mounts a PVC, the PVC goes after that pod ends. A run that starts before then uses a per-run volume.
+
+In the workload namespace you can also delete the PVC with `kubectl delete pvc`. Under `execution.mode: Central` the PVC is in the operator namespace, and the annotation is the way to delete it without access to that namespace.
+
+#### What a cache volume holds
+
+kopia writes the credentials of the backend in plain text into its configuration file. For S3 these are the access key and the secret key. The mover keeps that file on a volume that belongs to the pod. The credential files of a backend such as SFTP or GCS, and the kopia logs, are on that volume too. Kubernetes deletes that volume with the pod.
+
+A sized cache volume is a second volume in the mover pod, mounted at `/var/cache/kopia-volume`. This is the volume of a `capacity` under either `mode`. It holds the kopia cache and nothing else. A `Persistent` cache PVC therefore holds no repository credentials between runs.
+
+Kopiur 0.11.1 and earlier kept all of these files on the cache volume. The first mover that mounts an existing `Persistent` cache PVC removes those files from it. The cache itself stays, so that run is not a cold one.
 
 :::caution[A privileged mover needs namespace opt-in]
 

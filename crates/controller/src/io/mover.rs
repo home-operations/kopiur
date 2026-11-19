@@ -1428,21 +1428,43 @@ pub enum CachePvcResize {
     },
 }
 
+/// Label key marking a controller-owned persistent kopia cache PVC.
+pub const CACHE_PVC_COMPONENT_LABEL: &str = "kopiur.home-operations.com/component";
+/// [`CACHE_PVC_COMPONENT_LABEL`] value of a persistent kopia cache PVC.
+pub const CACHE_PVC_COMPONENT: &str = "mover-cache";
+
+/// Annotation on a central `SnapshotPolicy` cache claim: the `ClusterRepository`
+/// whose backups it serves. The periodic sweep deletes the claim once the policy
+/// no longer backs up to that repository with a central persistent cache.
+pub const CACHE_REPOSITORY_ANNOTATION: &str = "kopiur.home-operations.com/cache-repository";
+/// Annotation on a central `SnapshotPolicy` cache claim of a policy with many
+/// sources: the source PVC (in the policy's namespace) whose backups it serves.
+/// The periodic sweep deletes the claim once that PVC is gone.
+pub const CACHE_SOURCE_ANNOTATION: &str = "kopiur.home-operations.com/cache-source";
+
 /// The kinds whose movers can run in the operator namespace
 /// (`execution.mode: Central`) with a persistent cache claim there.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CentralCacheOwnerKind {
-    /// A `SnapshotPolicy`: the claim serves every backup run of the policy.
-    SnapshotPolicy,
+    /// A `SnapshotPolicy`: the claim serves its backup runs to one repository.
+    SnapshotPolicy {
+        /// The `ClusterRepository` the claim's runs back up to.
+        repository: String,
+        /// The source PVC the claim's runs back up, for a policy with many
+        /// sources (`pvcSelector`). Each source has its own mover, and the
+        /// movers of one firing run at the same time, so they cannot share one
+        /// `ReadWriteOnce` claim. `None` for a policy with a single source.
+        source_pvc: Option<String>,
+    },
     /// A `Restore`: the claim serves one of its mover Jobs.
     Restore,
 }
 
 impl CentralCacheOwnerKind {
-    fn api_resource(self) -> kube::core::ApiResource {
+    pub(crate) fn api_resource(&self) -> kube::core::ApiResource {
         use kube::core::ApiResource;
         match self {
-            CentralCacheOwnerKind::SnapshotPolicy => {
+            CentralCacheOwnerKind::SnapshotPolicy { .. } => {
                 ApiResource::erase::<kopiur_api::SnapshotPolicy>(&())
             }
             CentralCacheOwnerKind::Restore => ApiResource::erase::<kopiur_api::Restore>(&()),
@@ -1450,9 +1472,9 @@ impl CentralCacheOwnerKind {
     }
 
     /// The finalizer whose body deletes this kind's central claims.
-    fn cleanup_finalizer(self) -> &'static str {
+    pub(crate) fn cleanup_finalizer(&self) -> &'static str {
         match self {
-            CentralCacheOwnerKind::SnapshotPolicy => crate::consts::POLICY_CLEANUP_FINALIZER,
+            CentralCacheOwnerKind::SnapshotPolicy { .. } => crate::consts::POLICY_CLEANUP_FINALIZER,
             CentralCacheOwnerKind::Restore => kopiur_api::consts::RESTORE_CENTRAL_CLEANUP_FINALIZER,
         }
     }
@@ -1488,11 +1510,22 @@ impl CachePvcOwner {
         match self {
             CachePvcOwner::Reference(owner) => meta.owner_references = Some(vec![owner.clone()]),
             CachePvcOwner::Central {
-                kind: CentralCacheOwnerKind::SnapshotPolicy,
+                kind:
+                    CentralCacheOwnerKind::SnapshotPolicy {
+                        repository,
+                        source_pvc,
+                    },
                 namespace,
                 name,
                 uid,
-            } => super::mark_central_policy(meta, namespace, name, uid),
+            } => {
+                super::mark_central_policy(meta, namespace, name, uid);
+                let annotations = meta.annotations.get_or_insert_with(BTreeMap::new);
+                annotations.insert(CACHE_REPOSITORY_ANNOTATION.to_string(), repository.clone());
+                if let Some(source) = source_pvc {
+                    annotations.insert(CACHE_SOURCE_ANNOTATION.to_string(), source.clone());
+                }
+            }
             CachePvcOwner::Central {
                 kind: CentralCacheOwnerKind::Restore,
                 namespace,
@@ -1511,7 +1544,7 @@ impl CachePvcOwner {
         match self {
             CachePvcOwner::Reference(_) => super::has_central_mark(meta),
             CachePvcOwner::Central {
-                kind: CentralCacheOwnerKind::SnapshotPolicy,
+                kind: CentralCacheOwnerKind::SnapshotPolicy { .. },
                 uid,
                 ..
             } => !super::is_policys(meta, uid),
@@ -1583,6 +1616,32 @@ impl CachePvcOwner {
         }
     }
 
+    /// How the claim's owner gets the claim re-created (at a new size, say), as
+    /// the clause an Event's `Fix:` uses. An in-namespace owner's author can
+    /// delete the PVC. A central claim is in the operator namespace, where a
+    /// tenant has no rights, so the fix must be something the tenant can do.
+    pub fn recreate_hint(&self) -> String {
+        match self {
+            CachePvcOwner::Reference(_) => {
+                "delete the PVC so the next run recreates it".to_string()
+            }
+            CachePvcOwner::Central {
+                kind: CentralCacheOwnerKind::SnapshotPolicy { .. },
+                ..
+            } => format!(
+                "set the annotation `{}` on the SnapshotPolicy to a new value (the current \
+                 time, for example) so Kopiur deletes the PVC and the next run recreates it",
+                kopiur_api::consts::CACHE_RESET_REQUESTED_ANNOTATION
+            ),
+            CachePvcOwner::Central {
+                kind: CentralCacheOwnerKind::Restore,
+                ..
+            } => "ask an administrator of the operator namespace to delete the PVC so the \
+                  next run recreates it"
+                .to_string(),
+        }
+    }
+
     /// How an Event names the claim `claim_ns/claim`: with its namespace when
     /// that is not the namespace of the object the Event is reported on.
     pub fn claim_label(&self, claim_ns: &str, claim: &str) -> String {
@@ -1615,6 +1674,11 @@ pub enum CachePvcClaim {
     /// ([`CachePvcOwner::is_foreign`]). It was neither changed nor adopted, and
     /// the run must not mount it.
     Foreign,
+    /// The owner's claim exists but is being deleted (a cache reset, or the
+    /// owner going away, while a mover pod still holds it). A pod cannot start
+    /// on a claim that is being deleted, so the run must not mount it. The next
+    /// run after the deletion completes creates it again.
+    Terminating,
     /// The owner can no longer delete a claim (a central owner that is gone,
     /// is being deleted, or has no cleanup finalizer yet). The claim was
     /// deleted, and the run must not mount it.
@@ -1633,6 +1697,8 @@ pub struct EnsuredCachePvc {
     pub capacity: String,
     /// What was done about the claim's size.
     pub resize: CachePvcResize,
+    /// Whether this call created the claim.
+    pub created: bool,
 }
 
 /// Which way a cache PVC would have to change size to match the spec.
@@ -1703,7 +1769,8 @@ pub(crate) fn effective_cache_capacity(requested: &str, pvc: &PersistentVolumeCl
 /// `ReadWriteOnce`, persistent cache assumes non-overlapping runs for the owner.
 ///
 /// A claim of that name that belongs to someone else is left alone and reported
-/// as [`CachePvcClaim::Foreign`]. A claim whose owner can no longer delete it is
+/// as [`CachePvcClaim::Foreign`]. The owner's own claim that is being deleted
+/// is reported as [`CachePvcClaim::Terminating`]. A claim whose owner can no longer delete it is
 /// deleted here and reported as [`CachePvcClaim::Orphaned`]
 /// ([`CachePvcOwner::deletes_its_claims`]).
 ///
@@ -1720,10 +1787,14 @@ pub async fn ensure_cache_pvc(
     storage_class: Option<&str>,
 ) -> Result<CachePvcClaim> {
     let api: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), ns);
+    let mut created = false;
     let (claim, resize) = match api.get_opt(name).await? {
         Some(existing) => {
             if owner.is_foreign(&existing.metadata) {
                 return Ok(CachePvcClaim::Foreign);
+            }
+            if existing.metadata.deletion_timestamp.is_some() {
+                return Ok(CachePvcClaim::Terminating);
             }
             match pvc_requested_storage(&existing) {
                 None => (existing, CachePvcResize::Unchanged),
@@ -1747,7 +1818,10 @@ pub async fn ensure_cache_pvc(
         None => {
             let pvc = cache_pvc(ns, name, owner, capacity, storage_class);
             match api.create(&PostParams::default(), &pvc).await {
-                Ok(created) => (created, CachePvcResize::Unchanged),
+                Ok(claim) => {
+                    created = true;
+                    (claim, CachePvcResize::Unchanged)
+                }
                 // A concurrent reconcile won the create race: the PVC is there, reuse it.
                 // The winner may have been created at a different (smaller) capacity —
                 // the policy's capacity can change between two sibling runs — so re-read
@@ -1755,6 +1829,9 @@ pub async fn ensure_cache_pvc(
                 Err(kube::Error::Api(e)) if e.code == 409 => match api.get_opt(name).await? {
                     Some(winner) if owner.is_foreign(&winner.metadata) => {
                         return Ok(CachePvcClaim::Foreign);
+                    }
+                    Some(winner) if winner.metadata.deletion_timestamp.is_some() => {
+                        return Ok(CachePvcClaim::Terminating);
                     }
                     Some(winner) => (winner, CachePvcResize::Unchanged),
                     // The winner is already gone again. Mounting its name would
@@ -1781,6 +1858,7 @@ pub async fn ensure_cache_pvc(
         claim_name: name.to_string(),
         capacity: effective_cache_capacity(capacity, &claim),
         resize,
+        created,
     }))
 }
 
@@ -1890,8 +1968,8 @@ pub(crate) fn cache_pvc(
         name: Some(name.to_string()),
         namespace: Some(ns.to_string()),
         labels: Some(child_labels(&[(
-            "kopiur.home-operations.com/component",
-            "mover-cache",
+            CACHE_PVC_COMPONENT_LABEL,
+            CACHE_PVC_COMPONENT,
         )])),
         ..Default::default()
     };
@@ -2699,7 +2777,10 @@ mod cache_pvc_tests {
 
     fn central_policy() -> CachePvcOwner {
         CachePvcOwner::Central {
-            kind: crate::io::CentralCacheOwnerKind::SnapshotPolicy,
+            kind: crate::io::CentralCacheOwnerKind::SnapshotPolicy {
+                repository: "shared".into(),
+                source_pvc: None,
+            },
             namespace: "billing".into(),
             name: "postgres".into(),
             uid: "uid-policy".into(),
@@ -2743,7 +2824,10 @@ mod cache_pvc_tests {
             "kopiur-system",
             "c",
             &CachePvcOwner::Central {
-                kind: crate::io::CentralCacheOwnerKind::SnapshotPolicy,
+                kind: crate::io::CentralCacheOwnerKind::SnapshotPolicy {
+                    repository: "shared".into(),
+                    source_pvc: None,
+                },
                 namespace: "billing".into(),
                 name: "postgres".into(),
                 uid: "uid-other".into(),

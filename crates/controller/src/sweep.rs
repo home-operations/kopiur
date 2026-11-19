@@ -882,13 +882,16 @@ async fn delete_secret_victims(
 /// election is won (a single writer — mirroring the reconcilers). The first
 /// pass runs shortly after startup so upgraded clusters heal promptly; later
 /// passes run every `interval_secs`. `interval_secs == 0` disables the sweep
-/// entirely (the config layer documents the knob).
+/// entirely (the config layer documents the knob). `central_namespace` is the
+/// namespace central movers run in, when this install has one: each pass then
+/// also runs [`crate::cache_sweep::run_cache_sweep`] there.
 pub fn spawn_sweep(
     client: kube::Client,
     scope: config::WatchScope,
     metrics: Metrics,
     interval_secs: u64,
     min_age_secs: i64,
+    central_namespace: Option<String>,
 ) {
     if interval_secs == 0 {
         tracing::info!("orphaned-object sweep disabled (interval 0)");
@@ -960,6 +963,24 @@ pub fn spawn_sweep(
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "orphaned-object sweep failed; will retry next interval");
+                }
+            }
+            // Central persistent cache claims carry no owner reference, so
+            // nothing but their owner's finalizer and this pass deletes one.
+            if let Some(central) = &central_namespace {
+                match crate::cache_sweep::run_cache_sweep(&client, central, min_age_secs).await {
+                    Ok(outcome) => {
+                        if outcome.central + outcome.predecessors > 0 {
+                            tracing::info!(
+                                central = outcome.central,
+                                predecessors = outcome.predecessors,
+                                "swept unused persistent cache PVCs of central movers"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "central cache PVC sweep failed; will retry next interval");
+                    }
                 }
             }
         }

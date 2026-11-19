@@ -5051,6 +5051,7 @@ fn resolved_run_status_pins_the_resolved_cache() {
         capacity: Some("10Gi".into()),
         content_cache_size_mb: ws.cache.content_cache_size_mb,
         metadata_cache_size_mb: ws.cache.metadata_cache_size_mb,
+        claim: None,
     };
     let resolved = resolved_run_status(
         &cfg,
@@ -5309,7 +5310,10 @@ fn a_central_backup_keeps_its_cache_claim_in_the_operator_namespace() {
     assert_eq!(
         claim.owner,
         io::CachePvcOwner::Central {
-            kind: crate::io::CentralCacheOwnerKind::SnapshotPolicy,
+            kind: crate::io::CentralCacheOwnerKind::SnapshotPolicy {
+                repository: "shared".into(),
+                source_pvc: None
+            },
             namespace: "billing".into(),
             name: "pg".into(),
             uid: "uid-pg".into(),
@@ -5328,6 +5332,84 @@ fn a_central_backup_keeps_its_cache_claim_in_the_operator_namespace() {
     .unwrap()
     .unwrap();
     assert_ne!(other.name, claim.name);
+}
+
+/// A `pvcSelector` or group policy runs one mover for each source PVC, all at
+/// the same time and each possibly on its own node. One `ReadWriteOnce` claim
+/// for the policy would leave all but one of them `Pending` on a Multi-Attach
+/// error, so each source gets its own claim. The claim records what it serves,
+/// which is what the periodic sweep reads.
+#[test]
+fn a_central_backup_of_a_many_source_policy_gets_a_claim_for_each_source() {
+    use kopiur_api::snapshot::{PvcTargetRef, SnapshotSourceRef, SnapshotSourceTarget};
+    let cfg = stored_policy();
+    let child = |pvc: &str| {
+        let mut backup = dummy_backup();
+        backup.spec.source = Some(SnapshotSourceRef {
+            source_index: 0,
+            target: SnapshotSourceTarget::Pvc(PvcTargetRef {
+                namespace: "billing".into(),
+                name: pvc.into(),
+            }),
+            group: None,
+        });
+        backup
+    };
+    let claim_of = |backup: &Snapshot| {
+        super::backup_cache_claim(
+            &central_mover_site(),
+            &cfg,
+            backup,
+            "billing",
+            &cluster_repo("shared"),
+        )
+        .unwrap()
+        .expect("a claim")
+    };
+    let (a, b, single) = (
+        claim_of(&child("data-a")),
+        claim_of(&child("data-b")),
+        claim_of(&dummy_backup()),
+    );
+    assert_ne!(a.name, b.name, "two sources must not share one claim");
+    assert_ne!(a.name, single.name);
+    assert_eq!(a.name, claim_of(&child("data-a")).name, "stable per source");
+    assert_eq!(
+        a.owner,
+        io::CachePvcOwner::Central {
+            kind: io::CentralCacheOwnerKind::SnapshotPolicy {
+                repository: "shared".into(),
+                source_pvc: Some("data-a".into()),
+            },
+            namespace: "billing".into(),
+            name: "pg".into(),
+            uid: "uid-pg".into(),
+        }
+    );
+    // A single-source policy keeps one claim for the repository.
+    assert_eq!(
+        single.owner,
+        io::CachePvcOwner::Central {
+            kind: io::CentralCacheOwnerKind::SnapshotPolicy {
+                repository: "shared".into(),
+                source_pvc: None,
+            },
+            namespace: "billing".into(),
+            name: "pg".into(),
+            uid: "uid-pg".into(),
+        }
+    );
+    // In-namespace such a policy keeps its one historical claim.
+    let in_ns = super::backup_cache_claim(
+        &io::MoverSite::InNamespace,
+        &cfg,
+        &child("data-a"),
+        "billing",
+        &cluster_repo("shared"),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(in_ns.name, "kopiur-cache-pg");
 }
 
 /// The policy's finalizer deletes its central claims, so a run that launches

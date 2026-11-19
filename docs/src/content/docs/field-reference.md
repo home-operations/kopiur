@@ -2650,6 +2650,7 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc` · `pvcSelector` ·
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `adoption` | [object](#snapshotpolicy-statusadoption) | — | Summary of automatic adoption of discovered snapshots into this recipe. |
+| `cache` | [object](#snapshotpolicy-statuscache) | — | State of this recipe's persistent mover-cache PVCs. |
 | `conditions` | [][object](#snapshotpolicy-statusconditions) | — | Standard Kubernetes conditions (e.g. `RepositoryReachable`, `GroupSnapshotSupported`). |
 | `lastSuccessfulSnapshot` | string | — | RFC3339 timestamp of the most recent successful child `Snapshot` from this recipe. |
 | `lastVerified` | string | — | RFC3339 timestamp of the most recent successful verification (any tier).<br>Verification runs once per (repository x source) cell: a `spec.repositories` fan-out adds the repository dimension, and a `pvcSelector` source adds one cell per matched PVC (each has its own kopia source path, so each needs its own verification).<br>* one repository AND a non-selector source (`pvc`/`nfs`): stamped   directly by the verify mover, exactly as before; * otherwise — a `spec.repositories` fan-out, or ANY `pvcSelector` source   (including one currently matching a single PVC): computed by the   controller as the MINIMUM across the CURRENT cells ("everything is   verified as of T"), and absent until EVERY current cell has verified at   least once — a partially verified policy must not display a reassuring   timestamp. |
@@ -2672,6 +2673,12 @@ Externally tagged — set **exactly one** of: `nfs` · `pvc` · `pvcSelector` ·
 | `scanRequestedIdentity` | string | — | The resolved kopia identity the requested scan was scoped to, pinned at request time so a later identity-changing edit can't retarget an in-flight scan. |
 | `skippedByRetention` | integer | —<br><sub>min 0</sub> | Identity-matching discovered snapshots the last adoption pass left discovered because `spec.retention` would prune them immediately under the effective `deletionPolicy` (`Retain`/`Orphan` — a CR-only prune that would re-discover and re-adopt forever). `0`/absent when nothing was withheld. See the `AdoptionSkippedByRetention` event for the levers. |
 | `totalAdopted` | integer | —<br><sub>min 0</sub> | Running total of `Snapshot` CRs ever adopted into this recipe. |
+
+#### SnapshotPolicy `status.cache`
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `resetRequestHonored` | string | — | The value of the `kopiur.home-operations.com/cache-reset-requested-at` annotation the controller last acted on: it deleted this recipe's persistent cache PVCs for that request. A request is honored once, so the annotation can stay on the object. |
 
 #### SnapshotPolicy `status.conditions[]`
 
@@ -2998,8 +3005,16 @@ Externally tagged — set **exactly one** of: `pvc`.
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `capacity` | string | — | The cache volume size the budgets were resolved against. Absent for an `emptyDir` cache, which has no fixed size. |
+| `claim` | [object](#snapshot-statusresolvedcacheclaim) | — | The persistent cache PVC the mover mounted (`mode: Persistent`). Absent for a per-run cache volume. Under `execution.mode: Central` the PVC is in the operator namespace, which is why the namespace is recorded. |
 | `contentCacheSizeMb` | integer | — | The `--content-cache-size-mb` kopia was given; absent means kopia's own default. |
 | `metadataCacheSizeMb` | integer | — | The `--metadata-cache-size-mb` kopia was given; absent means kopia's own default. |
+
+###### Snapshot `status.resolved.cache.claim`
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `name` | string | **required** | Name of the `PersistentVolumeClaim`. |
+| `namespace` | string | **required** | Namespace of the `PersistentVolumeClaim`: the namespace the mover ran in. |
 
 ##### Snapshot `status.resolved.credentialProjection`
 

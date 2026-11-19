@@ -25,7 +25,10 @@ fn in_namespace() -> CachePvcOwner {
 /// A `SnapshotPolicy` of another namespace, under central execution.
 fn central_policy(uid: &str) -> CachePvcOwner {
     CachePvcOwner::Central {
-        kind: crate::io::CentralCacheOwnerKind::SnapshotPolicy,
+        kind: crate::io::CentralCacheOwnerKind::SnapshotPolicy {
+            repository: "shared".into(),
+            source_pvc: None,
+        },
         namespace: "billing".into(),
         name: "pg".into(),
         uid: uid.into(),
@@ -35,7 +38,7 @@ fn central_policy(uid: &str) -> CachePvcOwner {
 fn ensured(claim: CachePvcClaim) -> EnsuredCachePvc {
     match claim {
         CachePvcClaim::Ensured(e) => e,
-        other @ (CachePvcClaim::Foreign | CachePvcClaim::Orphaned) => {
+        other @ (CachePvcClaim::Foreign | CachePvcClaim::Terminating | CachePvcClaim::Orphaned) => {
             panic!("expected the owner's claim, got {other:?}")
         }
     }
@@ -1006,4 +1009,73 @@ async fn a_central_restore_never_touches_a_policys_claim() {
     .await;
     assert_eq!(out, CachePvcClaim::Foreign);
     assert!(writes(&log).is_empty(), "{log:?}");
+}
+
+// --- a claim that is being deleted -------------------------------------------
+
+/// A pod cannot start on a claim that is being deleted: it stays `Pending`,
+/// and once the claim is gone it waits on a PVC that does not exist. So such a
+/// claim is not mounted and not resized. This is what a cache reset relies on
+/// while a mover pod still holds the old claim.
+#[tokio::test]
+async fn a_claim_that_is_being_deleted_is_not_mounted_or_resized() {
+    let mut terminating = central_claim_json("1Gi", "uid-pg");
+    terminating["metadata"]["deletionTimestamp"] = "2026-01-01T00:00:00Z".into();
+    let (out, log) = ensure_central(
+        Some(terminating.clone()),
+        StatusCode::CREATED,
+        &central_policy("uid-pg"),
+        "2Gi",
+    )
+    .await;
+    assert_eq!(out, CachePvcClaim::Terminating);
+    assert!(writes(&log).is_empty(), "{log:?}");
+
+    // The same for an owner-referenced claim.
+    let mut terminating = pvc_json("1Gi", Some("1Gi"));
+    terminating["metadata"]["deletionTimestamp"] = "2026-01-01T00:00:00Z".into();
+    let (out, log) = ensure_central(
+        Some(terminating),
+        StatusCode::CREATED,
+        &in_namespace(),
+        "2Gi",
+    )
+    .await;
+    assert_eq!(out, CachePvcClaim::Terminating);
+    assert!(writes(&log).is_empty(), "{log:?}");
+}
+
+/// The claim of a policy with many sources records the repository and the
+/// source PVC it serves, for the periodic sweep.
+#[tokio::test]
+async fn a_policy_claim_records_the_repository_and_source_it_serves() {
+    let owner = CachePvcOwner::Central {
+        kind: crate::io::CentralCacheOwnerKind::SnapshotPolicy {
+            repository: "shared".into(),
+            source_pvc: Some("data-a".into()),
+        },
+        namespace: "billing".into(),
+        name: "pg".into(),
+        uid: "uid-pg".into(),
+    };
+    let (_, log) = ensure_central(None, StatusCode::CREATED, &owner, "5Gi").await;
+    let post = log
+        .iter()
+        .find(|l| l.starts_with("POST"))
+        .expect("the claim is created");
+    let created: PersistentVolumeClaim =
+        serde_json::from_str(post.splitn(3, ' ').nth(2).expect("POST body")).expect("posted claim");
+    let annotations = created.metadata.annotations.expect("annotations");
+    assert_eq!(
+        annotations
+            .get(crate::io::CACHE_REPOSITORY_ANNOTATION)
+            .map(String::as_str),
+        Some("shared")
+    );
+    assert_eq!(
+        annotations
+            .get(crate::io::CACHE_SOURCE_ANNOTATION)
+            .map(String::as_str),
+        Some("data-a")
+    );
 }

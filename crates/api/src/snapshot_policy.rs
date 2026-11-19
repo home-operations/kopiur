@@ -1171,9 +1171,25 @@ pub struct SnapshotPolicyStatus {
     /// with a `+N` overflow marker. Written by the controller.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repository_summary: Option<String>,
+    /// State of this recipe's persistent mover-cache PVCs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache: Option<PolicyCacheStatus>,
     /// Standard Kubernetes conditions (e.g. `RepositoryReachable`, `GroupSnapshotSupported`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conditions: Vec<Condition>,
+}
+
+/// State of a `SnapshotPolicy`'s persistent mover-cache PVCs
+/// (`status.cache`).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Default, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PolicyCacheStatus {
+    /// The value of the `kopiur.home-operations.com/cache-reset-requested-at`
+    /// annotation the controller last acted on: it deleted this recipe's
+    /// persistent cache PVCs for that request. A request is honored once, so
+    /// the annotation can stay on the object.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reset_request_honored: Option<String>,
 }
 
 /// One repository's verification record on a multi-repository policy

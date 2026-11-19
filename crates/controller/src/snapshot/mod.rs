@@ -2064,11 +2064,13 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
     // persistent claim that is its live capacity (a pending or refused resize can
     // leave it smaller than the spec), so re-resolve against it here; for per-run
     // volumes this reproduces what `build_backup_run` already computed.
-    let resolved_cache = crate::cache::cache_budgets_for_volume(
+    let mut resolved_cache = crate::cache::cache_budgets_for_volume(
         crate::cache::effective_cache(&repo, recipe_mover.as_ref().and_then(|m| m.cache.as_ref()))
             .as_ref(),
         &resolved_volume,
     )?;
+    resolved_cache.claim =
+        crate::cache::mounted_claim(&resolved_volume.volume, site.namespace(&namespace));
     work_spec.cache = crate::cache::tuning_of(&resolved_cache);
     let cache_volume = resolved_volume.volume;
     // RWO Multi-Attach avoidance: pin the mover to the node the source PVC is
@@ -5729,7 +5731,12 @@ struct BackupCacheClaim {
 ///   state, so N fan-out children sharing one PVC would poison each other's
 ///   cache. Single-repo children keep the legacy name byte-identical.
 /// - **Central**: [`io::central_cache_pvc_name`] in the operator namespace, marked
-///   with the policy's UID and deleted by the policy's finalizer.
+///   with the policy's UID and deleted by the policy's finalizer. One claim for
+///   each repository, and for a policy with many sources (`spec.source` is set
+///   on the run) one for each source PVC: the movers of one firing run at the
+///   same time, each possibly on its own node, and cannot share one
+///   `ReadWriteOnce` claim. In-namespace such a policy keeps its one historical
+///   claim.
 ///
 /// `None` for a central run of a policy that is being deleted: its finalizer
 /// deletes the policy's central claims, so such a run gets a per-run volume.
@@ -5757,20 +5764,31 @@ fn backup_cache_claim(
             owner: io::CachePvcOwner::Reference(policy),
         }),
         io::MoverSite::Central(_) if config.metadata.deletion_timestamp.is_some() => None,
-        io::MoverSite::Central(central) => Some(BackupCacheClaim {
-            namespace: central.namespace.clone(),
-            name: io::central_cache_pvc_name(
-                &policy.name,
-                &policy.uid,
-                &kopiur_api::common::repo_key(repo, &policy_ns),
-            ),
-            owner: io::CachePvcOwner::Central {
-                kind: crate::io::CentralCacheOwnerKind::SnapshotPolicy,
-                namespace: policy_ns,
-                name: policy.name,
-                uid: policy.uid,
-            },
-        }),
+        io::MoverSite::Central(central) => {
+            // Exhaustive over the target (no `_ =>`): a new kind of source must
+            // decide how its movers are told apart.
+            let source_pvc = backup.spec.source.as_ref().map(|s| match &s.target {
+                kopiur_api::snapshot::SnapshotSourceTarget::Pvc(pvc) => pvc.name.clone(),
+            });
+            let repo_key = kopiur_api::common::repo_key(repo, &policy_ns);
+            let key = match &source_pvc {
+                Some(pvc) => format!("{repo_key}/pvc/{pvc}"),
+                None => repo_key,
+            };
+            Some(BackupCacheClaim {
+                namespace: central.namespace.clone(),
+                name: io::central_cache_pvc_name(&policy.name, &policy.uid, &key),
+                owner: io::CachePvcOwner::Central {
+                    kind: io::CentralCacheOwnerKind::SnapshotPolicy {
+                        repository: repo.name.clone(),
+                        source_pvc,
+                    },
+                    namespace: policy_ns,
+                    name: policy.name,
+                    uid: policy.uid,
+                },
+            })
+        }
     })
 }
 

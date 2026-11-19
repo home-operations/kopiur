@@ -401,6 +401,12 @@ pub async fn run(config: config::ControllerConfig) -> anyhow::Result<()> {
         metrics.clone(),
         config.work_spec_sweep_interval_secs,
         config.work_spec_sweep_min_age_secs,
+        // Central cache claims exist only where central execution can run.
+        crate::io::central_namespace(
+            config.operator_namespace.as_deref(),
+            matches!(config.watch_scope, crate::config::WatchScope::Namespaced(_)),
+        )
+        .ok(),
     );
 
     let controllers = spawn_all(
