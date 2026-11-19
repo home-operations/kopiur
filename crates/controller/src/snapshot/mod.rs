@@ -5764,7 +5764,8 @@ fn backup_cache_claim(
                 &policy.uid,
                 &kopiur_api::common::repo_key(repo, &policy_ns),
             ),
-            owner: io::CachePvcOwner::CentralPolicy {
+            owner: io::CachePvcOwner::Central {
+                kind: crate::io::CentralCacheOwnerKind::SnapshotPolicy,
                 namespace: policy_ns,
                 name: policy.name,
                 uid: policy.uid,

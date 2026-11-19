@@ -433,8 +433,8 @@ pub fn verify_cache_volume(effective: Option<&CacheDefaults>) -> CacheVolume {
     }
 }
 
-/// The cache volume for a mover that cannot mount the owner's persistent cache PVC
-/// (a central restore mover runs outside the `Restore`'s namespace). Same rule as
+/// The cache volume for a run that must not use its owner's persistent cache PVC
+/// (a central backup whose `SnapshotPolicy` is being deleted). Same rule as
 /// [`verify_cache_volume`]: a `capacity` yields a fresh sized ephemeral volume
 /// whatever the `mode`, and no `capacity` yields an `emptyDir`.
 pub fn per_run_cache_volume(effective: Option<&CacheDefaults>) -> ResolvedCacheVolume {
@@ -995,7 +995,8 @@ mod tests {
         let resolved = resolve_cache_volume(
             &ctx,
             "kopiur-system",
-            CachePvcOwner::CentralPolicy {
+            CachePvcOwner::Central {
+                kind: crate::io::CentralCacheOwnerKind::SnapshotPolicy,
                 namespace: "billing".into(),
                 name: "pg".into(),
                 uid: "uid-pg".into(),

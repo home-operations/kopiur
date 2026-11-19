@@ -24,7 +24,8 @@ fn in_namespace() -> CachePvcOwner {
 
 /// A `SnapshotPolicy` of another namespace, under central execution.
 fn central_policy(uid: &str) -> CachePvcOwner {
-    CachePvcOwner::CentralPolicy {
+    CachePvcOwner::Central {
+        kind: crate::io::CentralCacheOwnerKind::SnapshotPolicy,
         namespace: "billing".into(),
         name: "pg".into(),
         uid: uid.into(),
@@ -396,7 +397,8 @@ fn live_policy() -> serde_json::Value {
 }
 
 /// A mock apiserver for one claim name. `stored` is the claim a GET returns
-/// (`None` is a 404), `policy` is the `SnapshotPolicy` a GET returns, and a
+/// (`None` is a 404), `policy` is the owner (a `SnapshotPolicy` or a `Restore`)
+/// a GET returns, and a
 /// POST answers `post` (`201` echoes the claim with the UID `pvc-created`;
 /// nothing is stored: these tests only look at what was sent). Every request
 /// is logged as `METHOD path body`.
@@ -421,7 +423,7 @@ fn claim_apiserver(
             ));
             let not_found = (StatusCode::NOT_FOUND, status_body(404));
             let (status, json) = match method.as_str() {
-                "GET" if path.contains("/snapshotpolicies/") => {
+                "GET" if path.contains("/snapshotpolicies/") || path.contains("/restores/") => {
                     policy.map_or(not_found, |p| (StatusCode::OK, p))
                 }
                 "GET" if path.contains("/persistentvolumeclaims/") => {
@@ -650,26 +652,39 @@ async fn a_lost_create_race_against_a_foreign_claim_is_foreign() {
 // --- #760 review: the claim must not outlive its policy ---------------------
 
 #[test]
-fn a_central_policy_reaps_its_claims_only_while_it_is_live_and_finalized() {
-    use super::central_policy_reaps;
+fn a_central_owner_reaps_its_claims_only_while_it_is_live_and_finalized() {
+    use super::central_owner_reaps;
+    let finalizer = crate::consts::POLICY_CLEANUP_FINALIZER;
     let meta = |v: serde_json::Value| -> kube::core::ObjectMeta {
         serde_json::from_value(v["metadata"].clone()).expect("ObjectMeta")
     };
-    assert!(central_policy_reaps(&meta(live_policy()), "uid-pg"));
-    // A re-created policy of the same name is a different owner.
-    assert!(!central_policy_reaps(&meta(live_policy()), "uid-old"));
+    assert!(central_owner_reaps(
+        &meta(live_policy()),
+        "uid-pg",
+        finalizer
+    ));
+    // A re-created owner of the same name is a different owner.
+    assert!(!central_owner_reaps(
+        &meta(live_policy()),
+        "uid-old",
+        finalizer
+    ));
     let mut deleting = live_policy();
     deleting["metadata"]["deletionTimestamp"] = "2026-01-01T00:00:00Z".into();
-    assert!(!central_policy_reaps(&meta(deleting), "uid-pg"));
-    // No cleanup finalizer yet: deleting the policy now would run no cleanup.
+    assert!(!central_owner_reaps(&meta(deleting), "uid-pg", finalizer));
+    // No cleanup finalizer yet: deleting the owner now would run no cleanup.
+    // Another kind's finalizer does not count.
+    assert!(!central_owner_reaps(
+        &meta(live_policy()),
+        "uid-pg",
+        kopiur_api::consts::RESTORE_CENTRAL_CLEANUP_FINALIZER
+    ));
     let mut bare = live_policy();
-    bare["metadata"]["finalizers"] = serde_json::json!(["example.com/other"]);
-    assert!(!central_policy_reaps(&meta(bare.clone()), "uid-pg"));
     bare["metadata"]
         .as_object_mut()
         .unwrap()
         .remove("finalizers");
-    assert!(!central_policy_reaps(&meta(bare), "uid-pg"));
+    assert!(!central_owner_reaps(&meta(bare), "uid-pg", finalizer));
 }
 
 /// The policy's finalizer lists and deletes its central claims once. A run that
@@ -878,4 +893,117 @@ async fn a_create_conflict_with_a_vanished_claim_is_retried_not_mounted() {
         crate::error::ErrorClass::Transient,
         "a transient error, so the next pass creates the claim: {err:?}"
     );
+}
+
+// --- a central Restore owns its claims the same way --------------------------
+
+/// A `Restore` of another namespace, under central execution.
+fn central_restore(uid: &str) -> CachePvcOwner {
+    CachePvcOwner::Central {
+        kind: crate::io::CentralCacheOwnerKind::Restore,
+        namespace: "billing".into(),
+        name: "pg-restore".into(),
+        uid: uid.into(),
+    }
+}
+
+/// The `Restore` `billing/pg-restore` as the API server stores it once it runs
+/// centrally: UID `uid-restore`, carrying the central cleanup finalizer.
+fn live_restore() -> serde_json::Value {
+    serde_json::json!({
+        "apiVersion": crate::consts::API_VERSION, "kind": "Restore",
+        "metadata": {
+            "name": "pg-restore", "namespace": "billing", "uid": "uid-restore",
+            "finalizers": [kopiur_api::consts::RESTORE_CENTRAL_CLEANUP_FINALIZER],
+        },
+    })
+}
+
+/// The claim of a central restore mover is marked with the `Restore`'s UID,
+/// which is the label the `Restore`'s cleanup finalizer deletes by, and the
+/// `Restore` (not a `SnapshotPolicy`) is what is read back.
+#[tokio::test]
+async fn a_central_restores_claim_carries_the_restore_uid_and_is_kept_while_it_is_live() {
+    let (out, log) = ensure_central_of(
+        None,
+        Some(live_restore()),
+        StatusCode::CREATED,
+        &central_restore("uid-restore"),
+        "5Gi",
+    )
+    .await;
+    assert_eq!(ensured(out).capacity, "5Gi");
+    let post = log
+        .iter()
+        .find(|l| l.starts_with("POST"))
+        .expect("the claim is created");
+    let created: PersistentVolumeClaim =
+        serde_json::from_str(post.splitn(3, ' ').nth(2).expect("POST body")).expect("posted claim");
+    assert_eq!(created.metadata.owner_references, None);
+    let labels = created.metadata.labels.as_ref().expect("labels");
+    assert_eq!(
+        labels
+            .get(crate::io::CENTRAL_RESTORE_UID_LABEL)
+            .map(String::as_str),
+        Some("uid-restore")
+    );
+    assert!(
+        !labels.contains_key(CENTRAL_POLICY_UID_LABEL),
+        "a restore's claim must not look like a policy's: {labels:?}"
+    );
+    assert!(
+        log.iter()
+            .any(|l| l.starts_with("GET") && l.contains("/namespaces/billing/restores/pg-restore")),
+        "the Restore is read back: {log:?}"
+    );
+    assert!(!log.iter().any(|l| l.starts_with("DELETE")), "{log:?}");
+}
+
+/// A `Restore` that is being deleted, or that is not (or not yet) a central one,
+/// runs no cleanup for a claim created now.
+#[tokio::test]
+async fn a_claim_created_for_a_restore_that_cannot_reap_it_is_deleted_again() {
+    let mut deleting = live_restore();
+    deleting["metadata"]["deletionTimestamp"] = "2026-01-01T00:00:00Z".into();
+    let mut unfinalized = live_restore();
+    unfinalized["metadata"]
+        .as_object_mut()
+        .unwrap()
+        .remove("finalizers");
+    for (what, restore) in [
+        ("a deleted Restore", None),
+        ("a Restore being deleted", Some(deleting)),
+        ("a Restore without its central finalizer", Some(unfinalized)),
+    ] {
+        let (out, log) = ensure_central_of(
+            None,
+            restore,
+            StatusCode::CREATED,
+            &central_restore("uid-restore"),
+            "5Gi",
+        )
+        .await;
+        assert_eq!(out, CachePvcClaim::Orphaned, "{what}");
+        assert!(
+            log.last().is_some_and(|l| l.starts_with("DELETE")
+                && l.contains(r#""preconditions":{"uid":"pvc-created"}"#)),
+            "{what}: the created claim is deleted: {log:?}"
+        );
+    }
+}
+
+/// A restore and a policy never share a claim, even under one name and one UID
+/// string: each kind recognizes only its own label.
+#[tokio::test]
+async fn a_central_restore_never_touches_a_policys_claim() {
+    let (out, log) = ensure_central_of(
+        Some(central_claim_json("1Gi", "uid-restore")),
+        Some(live_restore()),
+        StatusCode::CREATED,
+        &central_restore("uid-restore"),
+        "2Gi",
+    )
+    .await;
+    assert_eq!(out, CachePvcClaim::Foreign);
+    assert!(writes(&log).is_empty(), "{log:?}");
 }

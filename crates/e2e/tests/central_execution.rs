@@ -22,7 +22,8 @@
 //! 4. **Persistent cache** (#760): a policy with `mover.cache.mode: Persistent`
 //!    keeps ONE cache PVC in the operator namespace across its runs. The claim
 //!    grows with `capacity`, never appears in the workload namespace, and is
-//!    deleted with the policy.
+//!    deleted with the policy. A central restore keeps its cache claim there
+//!    too, until the `Restore` is deleted.
 //!
 //! Needs the alpha `CrossNamespaceVolumeDataSource` feature on kube-apiserver and
 //! kube-controller-manager (`crates/e2e/kind-config.yaml`) and on the CSI
@@ -1457,20 +1458,29 @@ async fn central_backup_keeps_its_persistent_cache_in_the_operator_namespace() {
     let repo = "e2e-central-cache-repo";
     let policy = "e2e-central-cache-policy";
     let runs = ["e2e-central-cache-backup-1", "e2e-central-cache-backup-2"];
+    let restore = "e2e-central-cache-restore";
+    let restored = "e2e-central-cache-restored";
+    let cache_reader = "e2e-central-cache-reader";
     let policies: Api<SnapshotPolicy> = Api::namespaced(client.clone(), WORKLOAD_NS);
     let backups: Api<Snapshot> = Api::namespaced(client.clone(), WORKLOAD_NS);
+    let restores: Api<Restore> = Api::namespaced(client.clone(), WORKLOAD_NS);
     let central_jobs: Api<Job> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let central_pods: Api<Pod> = Api::namespaced(client.clone(), E2E_NAMESPACE);
     let central_pvcs: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), E2E_NAMESPACE);
     let workload_pvcs: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), WORKLOAD_NS);
 
     // A retry of this test finds the previous attempt's objects; start clean.
     // The policy must be GONE, not just deleted: its claim is keyed by its UID.
+    let _ = central_pods
+        .delete(cache_reader, &DeleteParams::default())
+        .await;
+    let _ = restores.delete(restore, &DeleteParams::default()).await;
     for run in runs {
         let _ = backups.delete(run, &DeleteParams::default()).await;
     }
     let _ = policies.delete(policy, &DeleteParams::default()).await;
     wait_until(
-        "previous Snapshots and SnapshotPolicy gone",
+        "previous Snapshots, Restore and SnapshotPolicy gone",
         default_timeout(),
         poll_interval(),
         || async {
@@ -1479,11 +1489,19 @@ async fn central_backup_keeps_its_persistent_cache_in_the_operator_namespace() {
                     return Ok(None);
                 }
             }
+            if restores.get_opt(restore).await?.is_some()
+                || central_pods.get_opt(cache_reader).await?.is_some()
+            {
+                return Ok(None);
+            }
             Ok(policies.get_opt(policy).await?.is_none().then_some(()))
         },
     )
     .await
     .expect("a previous attempt's objects must clear");
+    kopiur_e2e::pvc::delete_pvc_and_consumers(&client, WORKLOAD_NS, restored)
+        .await
+        .expect("clear a previous restored PVC");
 
     csi_source_with_marker(&client, WORKLOAD_NS, src).await;
     let crepos = central_repository(&client, repo, "central-cache").await;
@@ -1650,7 +1668,167 @@ async fn central_backup_keeps_its_persistent_cache_in_the_operator_namespace() {
         grown.note
     );
 
-    // 3) Deleting the policy deletes its cache claim: nothing else would, since
+    // 3) A central restore with a Persistent cache keeps its claim in the
+    //    operator namespace too, marked with the Restore's UID.
+    restores
+        .create(
+            &PostParams::default(),
+            &cr(serde_json::json!({
+                "apiVersion": "kopiur.home-operations.com/v1alpha1",
+                "kind": "Restore",
+                "metadata": { "name": restore, "namespace": WORKLOAD_NS },
+                "spec": {
+                    "repository": { "kind": "ClusterRepository", "name": repo },
+                    "source": { "snapshotRef": { "name": runs[1] } },
+                    "target": { "populator": {} },
+                    "mover": { "cache": {
+                        "capacity": "64Mi",
+                        "mode": "Persistent",
+                        "storageClassName": CSI_STORAGE_CLASS,
+                    } },
+                },
+            })),
+        )
+        .await
+        .expect("create Restore");
+    workload_pvcs
+        .create(
+            &PostParams::default(),
+            &cr(serde_json::json!({
+                "apiVersion": "v1", "kind": "PersistentVolumeClaim",
+                "metadata": { "name": restored, "namespace": WORKLOAD_NS },
+                "spec": {
+                    "accessModes": ["ReadWriteOnce"],
+                    "storageClassName": CSI_STORAGE_CLASS,
+                    "resources": { "requests": { "storage": "64Mi" } },
+                    "dataSourceRef": {
+                        "apiGroup": "kopiur.home-operations.com",
+                        "kind": "Restore",
+                        "name": restore,
+                    },
+                },
+            })),
+        )
+        .await
+        .expect("create the claiming PVC");
+    wait_phase(&restores, restore, "Completed")
+        .await
+        .expect("the centrally executed Restore should Complete");
+    let restore_status = status_json(&restores, restore).await;
+    assert_eq!(
+        restore_status["execution"]["namespace"].as_str(),
+        Some(E2E_NAMESPACE),
+        "the restore must be a central one: {restore_status}"
+    );
+    let restore_uid = restores
+        .get(restore)
+        .await
+        .expect("get Restore")
+        .uid()
+        .expect("restore uid");
+    let restore_caches = ListParams::default().labels(&format!(
+        "kopiur.home-operations.com/restore-uid={restore_uid},\
+         kopiur.home-operations.com/component=mover-cache"
+    ));
+    let restore_claims = central_pvcs
+        .list(&restore_caches)
+        .await
+        .expect("list the Restore's central cache claims")
+        .items;
+    assert_eq!(
+        restore_claims.len(),
+        1,
+        "exactly one cache claim for the Restore's one mover: {:?}",
+        restore_claims
+            .iter()
+            .map(ResourceExt::name_any)
+            .collect::<Vec<_>>()
+    );
+    let restore_claim = restore_claims[0].name_any();
+    assert_ne!(restore_claim, claim_name);
+    assert!(
+        restore_claims[0].owner_references().is_empty(),
+        "a cross-namespace owner reference would have the claim garbage collected"
+    );
+    assert_eq!(
+        restore_claims[0]
+            .annotations()
+            .get("kopiur.home-operations.com/restore")
+            .map(String::as_str),
+        Some(format!("{WORKLOAD_NS}/{restore}").as_str())
+    );
+    // The mover Job is gone after the handover, so read the claim itself: it
+    // holds the kopia cache directory, which the mover only creates on the
+    // volume it mounted as its cache.
+    central_pods
+        .create(
+            &PostParams::default(),
+            &kopiur_e2e::builders::one_shot_pod(
+                E2E_NAMESPACE,
+                cache_reader,
+                &["test", "-d", "/mnt/cache"],
+                &[(restore_claim.as_str(), "/mnt")],
+            ),
+        )
+        .await
+        .expect("create the cache reader pod");
+    kopiur_e2e::wait::pod_succeeded(&client, E2E_NAMESPACE, cache_reader)
+        .await
+        .expect("the restore mover must have written its kopia cache to the claim");
+    let _ = central_pods
+        .delete(cache_reader, &DeleteParams::default())
+        .await;
+    // Still no cache volume beside the workload: the source and the restored PVC.
+    let mut in_workload: Vec<String> = workload_pvcs
+        .list(&ListParams::default())
+        .await
+        .expect("list workload PVCs")
+        .items
+        .iter()
+        .map(ResourceExt::name_any)
+        .collect();
+    in_workload.sort();
+    assert_eq!(
+        in_workload,
+        vec![restored.to_string(), src.to_string()],
+        "a central restore must not create a cache PVC in the workload namespace"
+    );
+
+    // Deleting the Restore deletes its cache claim, and leaves the policy's.
+    restores
+        .delete(restore, &DeleteParams::default())
+        .await
+        .expect("delete Restore");
+    wait_until(
+        "central cache claim deleted with its Restore",
+        default_timeout(),
+        poll_interval(),
+        || async {
+            Ok(central_pvcs
+                .list(&restore_caches)
+                .await?
+                .items
+                .is_empty()
+                .then_some(()))
+        },
+    )
+    .await
+    .expect("the cache claim should be deleted with its Restore");
+    assert_eq!(
+        central_pvcs
+            .list(&by_policy)
+            .await
+            .expect("list the policy's central claims")
+            .items
+            .len(),
+        1,
+        "deleting a Restore must not delete the policy's cache claim"
+    );
+    kopiur_e2e::pvc::delete_pvc_and_consumers(&client, WORKLOAD_NS, restored)
+        .await
+        .expect("delete the restored PVC");
+
+    // 4) Deleting the policy deletes its cache claim: nothing else would, since
     //    the claim has no owner reference.
     for run in runs {
         let _ = backups.delete(run, &DeleteParams::default()).await;

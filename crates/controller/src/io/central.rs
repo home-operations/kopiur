@@ -388,20 +388,20 @@ pub async fn reap_central_policy_jobs(
     Ok(())
 }
 
-/// The persistent cache PVC of the `SnapshotPolicy` `policy_name` (UID
-/// `policy_uid`) for the repository `repo_key`, in the operator namespace: a
-/// legible prefix of the policy name plus the full 64-bit FNV-1a of
-/// `<policy_uid>/<repo_key>`. A kopia cache holds the state of ONE repository,
-/// so each repository of a policy gets its own claim. The hash is over the UID,
-/// not the name: policies of every namespace share the operator namespace, and
-/// a re-created policy must not find the claim of the one it replaced. A UID
+/// The name of a persistent cache PVC in the operator namespace, for the owner
+/// `owner_name` (UID `owner_uid`): a legible prefix of the owner's name plus the
+/// full 64-bit FNV-1a of `<owner_uid>/<key>`. `key` tells the owner's claims
+/// apart: the repository for a `SnapshotPolicy` (a kopia cache holds the state
+/// of ONE repository), the mover Job for a `Restore`. The hash is over the UID,
+/// not the name: owners of every namespace share the operator namespace, and a
+/// re-created owner must not find the claim of the one it replaced. A UID
 /// holds no `/`, so the first `/` always ends it. Bounded by the 63-byte label
 /// limit.
-pub fn central_cache_pvc_name(policy_name: &str, policy_uid: &str, repo_key: &str) -> String {
+pub fn central_cache_pvc_name(owner_name: &str, owner_uid: &str, key: &str) -> String {
     const PREFIX: &str = "kopiur-cache-";
-    let hash = crate::naming::wide_hash(&format!("{policy_uid}/{repo_key}"));
+    let hash = crate::naming::wide_hash(&format!("{owner_uid}/{key}"));
     let keep = 63 - PREFIX.len() - (hash.len() + 1);
-    let slug: String = policy_name.chars().take(keep).collect();
+    let slug: String = owner_name.chars().take(keep).collect();
     format!("{PREFIX}{}-{hash}", slug.trim_end_matches(['-', '.']))
 }
 
@@ -1059,7 +1059,8 @@ pub fn privileged_consent_namespaces<'a>(workload_ns: &'a str, mover_ns: &'a str
 }
 
 /// Delete every central object of the `Restore` with UID `restore_uid`: its
-/// mover Jobs (their pods cascade) and its prime PVCs. Called from the
+/// mover Jobs (their pods cascade), its prime PVCs, and its persistent cache
+/// PVCs. Called from the
 /// `Restore`'s finalizer, because no owner reference reaches these objects.
 /// Idempotent and 404-tolerant.
 pub async fn reap_central_restore(

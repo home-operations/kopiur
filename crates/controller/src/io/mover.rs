@@ -1428,6 +1428,36 @@ pub enum CachePvcResize {
     },
 }
 
+/// The kinds whose movers can run in the operator namespace
+/// (`execution.mode: Central`) with a persistent cache claim there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CentralCacheOwnerKind {
+    /// A `SnapshotPolicy`: the claim serves every backup run of the policy.
+    SnapshotPolicy,
+    /// A `Restore`: the claim serves one of its mover Jobs.
+    Restore,
+}
+
+impl CentralCacheOwnerKind {
+    fn api_resource(self) -> kube::core::ApiResource {
+        use kube::core::ApiResource;
+        match self {
+            CentralCacheOwnerKind::SnapshotPolicy => {
+                ApiResource::erase::<kopiur_api::SnapshotPolicy>(&())
+            }
+            CentralCacheOwnerKind::Restore => ApiResource::erase::<kopiur_api::Restore>(&()),
+        }
+    }
+
+    /// The finalizer whose body deletes this kind's central claims.
+    fn cleanup_finalizer(self) -> &'static str {
+        match self {
+            CentralCacheOwnerKind::SnapshotPolicy => crate::consts::POLICY_CLEANUP_FINALIZER,
+            CentralCacheOwnerKind::Restore => kopiur_api::consts::RESTORE_CENTRAL_CLEANUP_FINALIZER,
+        }
+    }
+}
+
 /// Who a persistent cache PVC belongs to: how the claim is marked when it is
 /// created, and how a claim found under its name is recognized.
 #[derive(Debug, Clone, PartialEq)]
@@ -1436,16 +1466,18 @@ pub enum CachePvcOwner {
     /// own namespace, or a `ClusterRepository`). The garbage collector deletes
     /// the claim with it.
     Reference(OwnerReference),
-    /// A `SnapshotPolicy` whose movers run in the operator namespace
+    /// An object whose movers run in the operator namespace
     /// (`execution.mode: Central`). An owner must share its dependent's
-    /// namespace, so the claim carries the policy's UID label instead, and the
-    /// policy's finalizer deletes it.
-    CentralPolicy {
-        /// The policy's namespace.
+    /// namespace, so the claim carries the owner's UID label instead, and the
+    /// owner's finalizer deletes it.
+    Central {
+        /// What the owner is.
+        kind: CentralCacheOwnerKind,
+        /// The owner's namespace.
         namespace: String,
-        /// The policy's name.
+        /// The owner's name.
         name: String,
-        /// The policy's UID.
+        /// The owner's UID.
         uid: String,
     },
 }
@@ -1455,49 +1487,65 @@ impl CachePvcOwner {
     fn mark(&self, meta: &mut ObjectMeta) {
         match self {
             CachePvcOwner::Reference(owner) => meta.owner_references = Some(vec![owner.clone()]),
-            CachePvcOwner::CentralPolicy {
+            CachePvcOwner::Central {
+                kind: CentralCacheOwnerKind::SnapshotPolicy,
                 namespace,
                 name,
                 uid,
             } => super::mark_central_policy(meta, namespace, name, uid),
+            CachePvcOwner::Central {
+                kind: CentralCacheOwnerKind::Restore,
+                namespace,
+                name,
+                uid,
+            } => super::mark_central_restore(meta, namespace, name, uid),
         }
     }
 
     /// Whether a claim found under this owner's claim name belongs to someone
     /// else. Central and in-namespace claims share the operator namespace, so the
     /// check runs both ways (as [`super::MoverSite::is_foreign`] does): a central
-    /// policy owns only a claim labelled with its UID, and an in-namespace owner
+    /// owner owns only a claim labelled with its UID, and an in-namespace owner
     /// owns no claim that carries a central mark.
     fn is_foreign(&self, meta: &ObjectMeta) -> bool {
         match self {
             CachePvcOwner::Reference(_) => super::has_central_mark(meta),
-            CachePvcOwner::CentralPolicy { uid, .. } => !super::is_policys(meta, uid),
+            CachePvcOwner::Central {
+                kind: CentralCacheOwnerKind::SnapshotPolicy,
+                uid,
+                ..
+            } => !super::is_policys(meta, uid),
+            CachePvcOwner::Central {
+                kind: CentralCacheOwnerKind::Restore,
+                uid,
+                ..
+            } => !super::is_restores(meta, uid),
         }
     }
 
     /// Whether a claim that exists now is certain to be deleted with this owner.
     ///
     /// An owner-referenced claim always is: the garbage collector also deletes
-    /// a dependent whose owner is already gone. A central policy's claim is
-    /// deleted by nothing but the policy's finalizer, which lists the claims
-    /// once the policy is being deleted. So this reads the policy from the API
-    /// server (never a cache), and the caller asks AFTER the claim exists: a
-    /// policy seen live here had not started that list, and the list finds the
+    /// a dependent whose owner is already gone. A central owner's claim is
+    /// deleted by nothing but the owner's finalizer, which lists the claims
+    /// once the owner is being deleted. So this reads the owner from the API
+    /// server (never a cache), and the caller asks AFTER the claim exists: an
+    /// owner seen live here had not started that list, and the list finds the
     /// claim.
     async fn deletes_its_claims(&self, client: &kube::Client) -> Result<bool> {
         match self {
             CachePvcOwner::Reference(_) => Ok(true),
-            CachePvcOwner::CentralPolicy {
+            CachePvcOwner::Central {
+                kind,
                 namespace,
                 name,
                 uid,
             } => {
-                let policies: Api<kopiur_api::SnapshotPolicy> =
-                    Api::namespaced(client.clone(), namespace);
-                Ok(policies
-                    .get_opt(name)
-                    .await?
-                    .is_some_and(|policy| central_policy_reaps(&policy.metadata, uid)))
+                let owners: Api<kube::core::DynamicObject> =
+                    Api::namespaced_with(client.clone(), namespace, &kind.api_resource());
+                Ok(owners.get_opt(name).await?.is_some_and(|owner| {
+                    central_owner_reaps(&owner.metadata, uid, kind.cleanup_finalizer())
+                }))
             }
         }
     }
@@ -1516,20 +1564,22 @@ impl CachePvcOwner {
                 namespace: (owner.kind != "ClusterRepository").then(|| claim_ns.to_string()),
                 ..Default::default()
             },
-            CachePvcOwner::CentralPolicy {
+            CachePvcOwner::Central {
+                kind,
                 namespace,
                 name,
                 uid,
-            } => ObjectReference {
-                api_version: Some(
-                    <kopiur_api::SnapshotPolicy as kube::Resource>::api_version(&()).into_owned(),
-                ),
-                kind: Some("SnapshotPolicy".to_string()),
-                name: Some(name.clone()),
-                uid: Some(uid.clone()),
-                namespace: Some(namespace.clone()),
-                ..Default::default()
-            },
+            } => {
+                let resource = kind.api_resource();
+                ObjectReference {
+                    api_version: Some(resource.api_version),
+                    kind: Some(resource.kind),
+                    name: Some(name.clone()),
+                    uid: Some(uid.clone()),
+                    namespace: Some(namespace.clone()),
+                    ..Default::default()
+                }
+            }
         }
     }
 
@@ -1538,22 +1588,22 @@ impl CachePvcOwner {
     pub fn claim_label(&self, claim_ns: &str, claim: &str) -> String {
         match self {
             CachePvcOwner::Reference(_) => claim.to_string(),
-            CachePvcOwner::CentralPolicy { .. } => format!("{claim_ns}/{claim}"),
+            CachePvcOwner::Central { .. } => format!("{claim_ns}/{claim}"),
         }
     }
 }
 
-/// Whether the `SnapshotPolicy` described by `meta` is the one with UID `uid`,
-/// and its finalizer is still due to delete its central claims: it carries the
-/// cleanup finalizer and is not being deleted. Pure.
-pub(crate) fn central_policy_reaps(meta: &ObjectMeta, uid: &str) -> bool {
+/// Whether the central owner described by `meta` is the one with UID `uid`, and
+/// its finalizer is still due to delete its central claims: it carries
+/// `cleanup_finalizer` and is not being deleted. Pure.
+pub(crate) fn central_owner_reaps(meta: &ObjectMeta, uid: &str, cleanup_finalizer: &str) -> bool {
     meta.uid.as_deref() == Some(uid)
         && meta.deletion_timestamp.is_none()
         && meta
             .finalizers
             .iter()
             .flatten()
-            .any(|f| f == crate::consts::POLICY_CLEANUP_FINALIZER)
+            .any(|f| f == cleanup_finalizer)
 }
 
 /// What [`ensure_cache_pvc`] found or made under the claim name.
@@ -1565,7 +1615,7 @@ pub enum CachePvcClaim {
     /// ([`CachePvcOwner::is_foreign`]). It was neither changed nor adopted, and
     /// the run must not mount it.
     Foreign,
-    /// The owner can no longer delete a claim (a central policy that is gone,
+    /// The owner can no longer delete a claim (a central owner that is gone,
     /// is being deleted, or has no cleanup finalizer yet). The claim was
     /// deleted, and the run must not mount it.
     Orphaned,
@@ -2648,7 +2698,8 @@ mod cache_pvc_tests {
     }
 
     fn central_policy() -> CachePvcOwner {
-        CachePvcOwner::CentralPolicy {
+        CachePvcOwner::Central {
+            kind: crate::io::CentralCacheOwnerKind::SnapshotPolicy,
             namespace: "billing".into(),
             name: "postgres".into(),
             uid: "uid-policy".into(),
@@ -2691,7 +2742,8 @@ mod cache_pvc_tests {
         let theirs = cache_pvc(
             "kopiur-system",
             "c",
-            &CachePvcOwner::CentralPolicy {
+            &CachePvcOwner::Central {
+                kind: crate::io::CentralCacheOwnerKind::SnapshotPolicy,
                 namespace: "billing".into(),
                 name: "postgres".into(),
                 uid: "uid-other".into(),

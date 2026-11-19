@@ -5308,7 +5308,8 @@ fn a_central_backup_keeps_its_cache_claim_in_the_operator_namespace() {
     );
     assert_eq!(
         claim.owner,
-        io::CachePvcOwner::CentralPolicy {
+        io::CachePvcOwner::Central {
+            kind: crate::io::CentralCacheOwnerKind::SnapshotPolicy,
             namespace: "billing".into(),
             name: "pg".into(),
             uid: "uid-pg".into(),
