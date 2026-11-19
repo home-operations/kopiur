@@ -437,8 +437,8 @@ pub struct CacheSweepOutcome {
     pub central: usize,
     /// In-namespace predecessors deleted.
     pub predecessors: usize,
-    /// Retired claims outside the operator namespace deleted (the second step
-    /// of a predecessor, or of a cache reset whose policy stopped reconciling).
+    /// Retired claims deleted, in any namespace: the last step for a claim
+    /// that an earlier pass or a cache reset retired.
     pub retired: usize,
 }
 
@@ -550,7 +550,8 @@ pub async fn run_cache_sweep(
         let Some(owner) = claim_owner(&claim) else {
             continue;
         };
-        if claim.metadata.deletion_timestamp.is_some() {
+        // A retired claim was already judged. `drain_retired` finishes it.
+        if claim.metadata.deletion_timestamp.is_some() || io::is_retired(&claim.metadata) {
             continue;
         }
         match pass
@@ -567,7 +568,7 @@ pub async fn run_cache_sweep(
             }
         }
     }
-    outcome.retired = pass.drain_retired(central_ns).await?;
+    outcome.retired = pass.drain_retired().await?;
     Ok(outcome)
 }
 
@@ -582,13 +583,19 @@ struct Pass<'a> {
 }
 
 impl Pass<'_> {
-    /// Finish the deletion of every retired cache claim outside the operator
-    /// namespace: a predecessor that an earlier pass retired, or the claims of
-    /// a cache reset. A retired claim is never mounted again, so one that is
-    /// left behind keeps every later run of its policy on a per-run volume.
-    /// This does not depend on what retired it still being true (the
-    /// repository can have left `Central` since). Returns the deletes accepted.
-    async fn drain_retired(&self, central_ns: &str) -> Result<usize> {
+    /// Finish the deletion of EVERY retired cache claim, in every namespace: a
+    /// central claim or a predecessor that an earlier pass retired, and the
+    /// claims of a cache reset. A retired claim is never mounted again, so one
+    /// that is left behind keeps every later run of its owner on a per-run
+    /// volume.
+    ///
+    /// The drain reads nothing but the mark. It does not depend on what
+    /// retired the claim still being true (the repository can have left
+    /// `Central` since), nor on where the claim is: an owner-referenced claim
+    /// of a policy that lives in the operator namespace carries no central
+    /// mark, so the loop over the central claims never judges it. Returns the
+    /// deletes accepted.
+    async fn drain_retired(&self) -> Result<usize> {
         let all: Api<PersistentVolumeClaim> = Api::all(self.client.clone());
         let caches = ListParams::default().labels(&format!(
             "{CACHE_PVC_COMPONENT_LABEL}={CACHE_PVC_COMPONENT}"
@@ -599,9 +606,7 @@ impl Pass<'_> {
             .items
             .into_iter()
             .filter(|pvc| {
-                io::is_retired(&pvc.metadata)
-                    && pvc.metadata.deletion_timestamp.is_none()
-                    && pvc.namespace().as_deref() != Some(central_ns)
+                io::is_retired(&pvc.metadata) && pvc.metadata.deletion_timestamp.is_none()
             })
             .map(|pvc| {
                 let api =
@@ -628,15 +633,7 @@ impl Pass<'_> {
             .as_ref()
             .map(|t| self.now - t.0.as_second());
         let mut swept = CacheSweepOutcome::default();
-        // A retired claim was judged by an earlier pass or a reset, which is
-        // waiting for its grace period or for a Job. No new run mounts it, so
-        // it only goes.
-        let verdict = if io::is_retired(&claim.metadata) {
-            Verdict::Delete("it was retired")
-        } else {
-            claim_verdict(age, self.min_age_secs, state)
-        };
-        if let Verdict::Delete(reason) = verdict
+        if let Verdict::Delete(reason) = claim_verdict(age, self.min_age_secs, state)
             && self.delete_central(claim, state).await?
         {
             swept.central = 1;
@@ -657,8 +654,8 @@ impl Pass<'_> {
     }
 
     /// Delete a central claim that got a `Delete` verdict. A claim of a live
-    /// policy can still have a mover, so it goes through [`retire_and_delete`]
-    /// and is deleted on a later pass. A claim whose owner is gone has no
+    /// policy can still have a mover, so it goes through [`retire_and_delete`],
+    /// which retires it now. [`Pass::drain_retired`] deletes it on a later pass. A claim whose owner is gone has no
     /// runs left: the finalizer of a `Snapshot` deletes its central Job.
     /// `true` when a delete was accepted.
     async fn delete_central(

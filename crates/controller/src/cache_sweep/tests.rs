@@ -611,14 +611,54 @@ async fn a_retired_central_claim_is_deleted_even_when_its_policy_uses_it_again()
     // Younger than the min-age floor: the mark decides, not the age.
     claim["metadata"]["creationTimestamp"] = chrono::Utc::now().to_rfc3339().into();
     let (outcome, log) = one_pass(World {
-        central: vec![claim],
+        central: vec![claim.clone()],
+        everywhere: vec![claim],
         ..World::default()
     })
     .await;
-    assert_eq!(outcome.central, 1, "{log:?}");
+    assert_eq!(
+        outcome,
+        CacheSweepOutcome {
+            central: 0,
+            predecessors: 0,
+            retired: 1
+        },
+        "{log:?}"
+    );
+    let deletes = with_method(&log, "DELETE");
+    assert_eq!(deletes.len(), 1, "deleted once, by the drain: {log:?}");
+    assert!(
+        deletes[0].starts_with(
+            "DELETE /api/v1/namespaces/kopiur-system/persistentvolumeclaims/kopiur-cache-pg-2 "
+        ),
+        "{log:?}"
+    );
+    assert!(
+        !log.iter().any(|l| l.contains("/snapshotpolicies/")),
+        "a retired claim is not judged again: {log:?}"
+    );
+}
+
+/// A policy can live in the operator namespace. The claim it used beside
+/// itself is then in the operator namespace too, with an owner reference and
+/// no central mark, so the loop over the central claims never judges it. A
+/// drain that left the operator namespace out stranded such a claim once its
+/// repository went back to `InNamespace`: retired for good, and every later
+/// backup of the policy on a per-run volume.
+#[tokio::test]
+async fn a_retired_owner_referenced_claim_in_the_operator_namespace_is_drained() {
+    let mut claim = retired(predecessor_claim(), LONG_AGO);
+    claim["metadata"]["namespace"] = "kopiur-system".into();
+    let (outcome, log) = one_pass(World {
+        central: vec![claim.clone()],
+        everywhere: vec![claim],
+        ..World::default()
+    })
+    .await;
+    assert_eq!(outcome.retired, 1, "{log:?}");
     assert!(
         log.iter().any(|l| l.starts_with(
-            "DELETE /api/v1/namespaces/kopiur-system/persistentvolumeclaims/kopiur-cache-pg-2 "
+            "DELETE /api/v1/namespaces/kopiur-system/persistentvolumeclaims/kopiur-cache-pg "
         )),
         "{log:?}"
     );
