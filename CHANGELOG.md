@@ -1,5 +1,30 @@
 # Changelog
 
+## [0.11.1](https://github.com/home-operations/kopiur/compare/0.11.0...0.11.1) (2026-11-19)
+
+
+### Features
+
+* **controller:** run movers in the operator namespace (execution.mode: Central) ([#734](https://github.com/home-operations/kopiur/issues/734)) ([499649c](https://github.com/home-operations/kopiur/commit/499649cc59cd842637934fb8875af91218d763fa))
+
+
+### Miscellaneous Chores
+
+* **github-action:** update action jdx/mise-action (v5.2.7 → v5.2.8) ([#743](https://github.com/home-operations/kopiur/issues/743)) ([44d5b25](https://github.com/home-operations/kopiur/commit/44d5b2572be3dcdbc3392e7352c359c17dc19433))
+* **github-action:** update action jdx/mise-action (v5.2.8 → v5.2.9) ([#756](https://github.com/home-operations/kopiur/issues/756)) ([65cb4fc](https://github.com/home-operations/kopiur/commit/65cb4fc32417d799f1741bfa15c2d9bfeab82174))
+* **mise:** install oxfmt from GitHub releases ([#751](https://github.com/home-operations/kopiur/issues/751)) ([50d7e82](https://github.com/home-operations/kopiur/commit/50d7e826586587153f4df8b6beed598fe803be30))
+* **mise:** update mise tools ([#746](https://github.com/home-operations/kopiur/issues/746)) ([4841930](https://github.com/home-operations/kopiur/commit/48419302ae31287dad6a5cd033c4172d60d7dc64))
+* **mise:** update tool github:oxc-project/oxc (0.75.0 → 0.78.0) ([#753](https://github.com/home-operations/kopiur/issues/753)) ([3dbf691](https://github.com/home-operations/kopiur/commit/3dbf691a14891a7db3a6e2f3f0eec97e57a8daae))
+* **npm:** update dependency @tanstack/react-query (5.107.1 → 5.108.0) ([#755](https://github.com/home-operations/kopiur/issues/755)) ([c8d1ef5](https://github.com/home-operations/kopiur/commit/c8d1ef54f729b11d24df76119ccbe2b9d3ff56ad))
+* **npm:** update dependency @testing-library/user-event (14.6.10 → 14.6.12) ([#748](https://github.com/home-operations/kopiur/issues/748)) ([bef3c79](https://github.com/home-operations/kopiur/commit/bef3c79070d35ad4bc38de8b7def7eb5c1f1dc1e))
+* **npm:** update dependency eslint-plugin-react-refresh (0.5.7 → 0.5.8) ([#747](https://github.com/home-operations/kopiur/issues/747)) ([a97d561](https://github.com/home-operations/kopiur/commit/a97d561e8e0494f3b9b70a714c85ade410578ee9))
+* **npm:** update dependency lucide-react (1.73.0 → 1.74.0) ([#754](https://github.com/home-operations/kopiur/issues/754)) ([ddcc546](https://github.com/home-operations/kopiur/commit/ddcc546eddd4429d6fae205ca24942c92e481289))
+* **npm:** update dependency typescript-eslint (8.72.2 → 8.73.0) ([#750](https://github.com/home-operations/kopiur/issues/750)) ([ff6673f](https://github.com/home-operations/kopiur/commit/ff6673fa44ab0103d3dba64af6ada5bcb61d7bba))
+* **npm:** update web ui dependencies ([#757](https://github.com/home-operations/kopiur/issues/757)) ([cd97ef7](https://github.com/home-operations/kopiur/commit/cd97ef7e8b0045c3674a62fc56c70557601f7476))
+* **rust:** update crate bytes (1.12.1 → 1.12.2) ([#752](https://github.com/home-operations/kopiur/issues/752)) ([1473c2c](https://github.com/home-operations/kopiur/commit/1473c2c05bd81141f013d34a7ed3a73b087be065))
+* **rust:** update crate clap (4.6.7 → 4.6.8) ([#749](https://github.com/home-operations/kopiur/issues/749)) ([e550387](https://github.com/home-operations/kopiur/commit/e5503879d5c9d19dfd8db9bfc76c1ed2da24afe9))
+* **rust:** update crate rand (0.10.3 → 0.10.4) ([#744](https://github.com/home-operations/kopiur/issues/744)) ([fd8af28](https://github.com/home-operations/kopiur/commit/fd8af28834d99fa52518624fe1fbf7147cc3c615))
+
 ## [0.11.0](https://github.com/home-operations/kopiur/compare/0.10.21...0.11.0) (2026-11-15)
 
 
