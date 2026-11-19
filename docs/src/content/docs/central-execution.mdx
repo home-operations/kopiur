@@ -122,6 +122,43 @@ inside or above it. The mover pod mounts the repository volume at the path of
 the repository, and two mounts cannot overlap. Kopiur refuses such a backup
 with the reason `CentralExecutionUnsupported`.
 
+### Where a persistent cache lives
+
+A policy with `mover.cache.mode: Persistent` keeps its kopia cache between
+runs. See [Sizing the kopia cache](/backups/#sizing-the-kopia-cache). Under
+central execution, Kopiur creates the cache PVC in the operator namespace,
+because the mover pod can only mount a PVC from its own namespace. You change
+nothing in the `SnapshotPolicy`.
+
+- The first run of a policy creates the PVC. Each later run mounts the same
+  PVC, so it starts with the cache of the run before.
+- The PVC is named `kopiur-cache-<policy>-<hash>`. The hash is made from the UID
+  of the policy and the repository, because policies from many namespaces share
+  the operator namespace. A policy with more than one repository gets one PVC
+  for each repository.
+- A higher `capacity` grows the PVC on the next run, as it does in the workload
+  namespace. The Events about the PVC appear on the `SnapshotPolicy`. They name
+  the PVC with its namespace, for example `kopiur-system/kopiur-cache-…`.
+- The workload namespace holds no cache PVC.
+- The PVC is `ReadWriteOnce`, so the runs of one policy must not overlap. This
+  is the same rule as in the workload namespace.
+
+List the cache PVCs of all policies. The annotation
+`kopiur.home-operations.com/policy` on each PVC names its policy as
+`<namespace>/<name>`.
+
+```console
+$ kubectl get pvc -n kopiur-system -l kopiur.home-operations.com/component=mover-cache,kopiur.home-operations.com/policy-uid
+```
+
+A tenant sets the `capacity` and the `storageClassName` of this PVC. The volume
+is in the operator namespace, so a `ResourceQuota` of the workload namespace
+does not count it. Set a quota on the operator namespace if you must limit it.
+
+If a PVC of that name exists and does not belong to the policy, Kopiur does not
+mount it. The run gets a new volume of the same capacity instead, and a
+`CachePvcNameConflict` Warning Event on the `SnapshotPolicy` names the PVC.
+
 ### How a restore works
 
 A central restore hands a finished volume to a PVC in the workload namespace.
@@ -282,9 +319,10 @@ Without that access, read the recorded log tail: `status.logTail` on a
   `execution.mode: Central` later. It moves to central execution only when none
   of its claims is in progress or finished, for example after you re-create its
   claiming PVC.
-- **No persistent cache.** A `mover.cache` with `mode: Persistent` becomes a
-  per-run volume of the same capacity. The persistent cache PVC belongs to the
-  `SnapshotPolicy` and lives in the workload namespace.
+- **A restore has no persistent cache.** A central restore with
+  `mover.cache.mode: Persistent` gets a per-run volume of the same capacity.
+  A central backup keeps its cache. See
+  [Where a persistent cache lives](#where-a-persistent-cache-lives).
 - **Hooks still act in the workload namespace.** The controller runs
   `workloadExec` hooks through the API server. A `runJob` hook creates its Job
   in the workload namespace. Neither one uses the repository credentials.
@@ -299,7 +337,9 @@ Without that access, read the recorded log tail: `status.logTail` on a
   a `ClusterRepository` can name them. If you point a central backup or restore
   at a namespaced `Repository` after it started, Kopiur refuses to launch it.
 - **Zonal volumes.** The staged PVC and the mover pod must land in the zone of
-  the snapshot. Kopiur adds no placement rule for this.
+  the snapshot. Kopiur adds no placement rule for this. A persistent cache PVC
+  stays in the zone, or on the node, where its first run put it. The later
+  movers of that policy can only run there.
 - **The operator keeps its cluster-wide RBAC.** Central execution keeps movers
   and credentials out of tenant namespaces. It does not yet reduce the
   permissions of the controller.
@@ -388,6 +428,22 @@ the policy.
 
 A central pin Job is labelled with the UID of the `Snapshot`. Kopiur deletes it
 when it has recorded the result, or when you delete the `Snapshot`.
+
+### The cache of a policy
+
+A central cache PVC is labelled with the UID of the `SnapshotPolicy`
+(`kopiur.home-operations.com/policy-uid`). Kopiur deletes it when you delete
+the policy.
+
+Kopiur does not delete a cache PVC in these two cases. Delete the PVC by hand
+if you do not want it.
+
+- The policy stops using `mode: Persistent`, or the repository stops using
+  `execution.mode: Central`. The PVC stays in the operator namespace until you
+  delete the policy.
+- You set `execution.mode: Central` on a repository that already has policies
+  with a persistent cache. Each `kopiur-cache-<policy>` PVC stays in its
+  workload namespace, unused, until you delete the policy.
 
 ### After a restore
 

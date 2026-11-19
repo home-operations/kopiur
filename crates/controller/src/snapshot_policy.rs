@@ -684,14 +684,16 @@ async fn handle_policy_deletion(
         return Ok(Action::await_change());
     }
 
-    // Central verification Jobs carry no owner reference (they live in the
-    // operator namespace), so the garbage collector never reaches them.
+    // Central verification Jobs and cache PVCs carry no owner reference (they
+    // live in the operator namespace), so the garbage collector never reaches
+    // them.
     if let Ok(central) = io::central_namespace(
         ctx.operator_namespace.as_deref(),
         matches!(ctx.watch_scope, crate::config::WatchScope::Namespaced(_)),
     ) {
-        io::reap_central_policy_jobs(&ctx.client, &central, &config.uid().unwrap_or_default())
-            .await?;
+        let uid = config.uid().unwrap_or_default();
+        io::reap_central_policy_jobs(&ctx.client, &central, &uid).await?;
+        io::reap_central_policy_cache_pvcs(&ctx.client, &central, &uid).await?;
     }
 
     let backup_api: Api<Snapshot> = Api::namespaced(ctx.client.clone(), namespace);

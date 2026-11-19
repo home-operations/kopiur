@@ -388,6 +388,51 @@ pub async fn reap_central_policy_jobs(
     Ok(())
 }
 
+/// The persistent cache PVC of the `SnapshotPolicy` `policy_name` (UID
+/// `policy_uid`) for the repository `repo_key`, in the operator namespace: a
+/// legible prefix of the policy name plus the full 64-bit FNV-1a of
+/// `<policy_uid>/<repo_key>`. A kopia cache holds the state of ONE repository,
+/// so each repository of a policy gets its own claim. The hash is over the UID,
+/// not the name: policies of every namespace share the operator namespace, and
+/// a re-created policy must not find the claim of the one it replaced. A UID
+/// holds no `/`, so the first `/` always ends it. Bounded by the 63-byte label
+/// limit.
+pub fn central_cache_pvc_name(policy_name: &str, policy_uid: &str, repo_key: &str) -> String {
+    const PREFIX: &str = "kopiur-cache-";
+    let hash = crate::naming::wide_hash(&format!("{policy_uid}/{repo_key}"));
+    let keep = 63 - PREFIX.len() - (hash.len() + 1);
+    let slug: String = policy_name.chars().take(keep).collect();
+    format!("{PREFIX}{}-{hash}", slug.trim_end_matches(['-', '.']))
+}
+
+/// Delete every central cache PVC of the `SnapshotPolicy` with UID
+/// `policy_uid`. Called from the policy's finalizer, because no owner reference
+/// reaches these claims. A claim that a mover pod still mounts goes when that
+/// pod ends (`kubernetes.io/pvc-protection`). Idempotent and 404-tolerant.
+pub async fn reap_central_policy_cache_pvcs(
+    client: &kube::Client,
+    central_ns: &str,
+    policy_uid: &str,
+) -> Result<()> {
+    let selector = format!("{CENTRAL_POLICY_UID_LABEL}={policy_uid}");
+    let params = kube::api::ListParams::default().labels(&selector);
+    let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), central_ns);
+    for pvc in pvcs.list(&params).await?.items {
+        match pvcs
+            .delete(
+                &kube::ResourceExt::name_any(&pvc),
+                &delete_exactly(&pvc.metadata),
+            )
+            .await
+        {
+            Ok(_) => {}
+            Err(kube::Error::Api(e)) if e.code == 404 || e.code == 409 => {}
+            Err(e) => return Err(Error::Kube(e)),
+        }
+    }
+    Ok(())
+}
+
 /// Where a central mover pod mounts its source volume, whatever the source is.
 ///
 /// A central mover pod holds the shared repository credentials, so nothing a
@@ -1487,6 +1532,35 @@ mod tests {
     }
 
     #[test]
+    fn central_cache_pvc_names_are_per_policy_uid_and_repository_and_fit_a_label() {
+        let repo = "ClusterRepository/shared";
+        let a = central_cache_pvc_name("postgres", "uid-a", repo);
+        assert!(a.starts_with("kopiur-cache-postgres-"), "{a}");
+        assert_eq!(
+            a,
+            central_cache_pvc_name("postgres", "uid-a", repo),
+            "stable"
+        );
+        // The same policy name in two namespaces, or a re-created policy.
+        assert_ne!(a, central_cache_pvc_name("postgres", "uid-b", repo));
+        // Two repositories of one policy never share a kopia cache.
+        assert_ne!(
+            a,
+            central_cache_pvc_name("postgres", "uid-a", "ClusterRepository/offsite")
+        );
+        for name in [
+            "x".repeat(253),
+            format!("{}-{}", "y".repeat(33), "z".repeat(40)),
+        ] {
+            let n = central_cache_pvc_name(&name, "uid-a", repo);
+            assert!(n.len() <= 63, "{n}");
+            assert!(!n.contains("--"), "{n}");
+        }
+        // The claim is looked up by name on every run: pin a literal.
+        assert_eq!(a, "kopiur-cache-postgres-94c57734fbfe76da");
+    }
+
+    #[test]
     fn pinned_site_comes_from_status_job_namespace_only() {
         assert_eq!(
             MoverSite::pinned(None, "billing", "nightly"),
@@ -2374,6 +2448,85 @@ mod tests {
         assert!(central.is_foreign(&plain, false));
         // A central backup's or restore's object is not an in-namespace Job either.
         assert!(has_central_mark(&marked));
+    }
+
+    /// The policy's finalizer is the only thing that deletes its central cache
+    /// claims. It must select them by the policy's UID, and delete exactly the
+    /// claim it listed: a claim re-created under that name is left alone.
+    #[tokio::test]
+    async fn reaping_a_policys_cache_claims_selects_by_uid_and_deletes_exactly_those() {
+        use http::{Request, Response, StatusCode};
+        use kube::client::Body;
+        use std::sync::{Arc, Mutex};
+
+        let log = Arc::new(Mutex::new(Vec::<String>::new()));
+        let svc = {
+            let log = log.clone();
+            tower::service_fn(move |req: Request<Body>| {
+                let log = log.clone();
+                async move {
+                    let method = req.method().as_str().to_string();
+                    let uri = req.uri().to_string();
+                    let bytes = http_body_util::BodyExt::collect(req.into_body())
+                        .await
+                        .expect("collect request body")
+                        .to_bytes();
+                    log.lock().unwrap().push(format!(
+                        "{method} {uri} {}",
+                        String::from_utf8_lossy(&bytes)
+                    ));
+                    let json = match method.as_str() {
+                        "GET" => serde_json::json!({
+                            "apiVersion": "v1", "kind": "PersistentVolumeClaimList",
+                            "metadata": {},
+                            "items": [
+                                { "metadata": { "name": "kopiur-cache-a", "uid": "pvc-a" } },
+                                { "metadata": { "name": "kopiur-cache-b", "uid": "pvc-b" } },
+                            ],
+                        }),
+                        _ => serde_json::json!({
+                            "apiVersion": "v1", "kind": "PersistentVolumeClaim",
+                            "metadata": { "name": "deleted" },
+                        }),
+                    };
+                    Ok::<_, std::convert::Infallible>(
+                        Response::builder()
+                            .status(StatusCode::OK)
+                            .header("content-type", "application/json")
+                            .body(Body::from(serde_json::to_vec(&json).unwrap()))
+                            .unwrap(),
+                    )
+                }
+            })
+        };
+        let client = kube::Client::new(svc, "kopiur-system");
+        reap_central_policy_cache_pvcs(&client, "kopiur-system", "uid-pg")
+            .await
+            .expect("reap");
+
+        let log = log.lock().unwrap().clone();
+        assert!(
+            log[0].starts_with("GET /api/v1/namespaces/kopiur-system/persistentvolumeclaims?")
+                && log[0]
+                    .contains("labelSelector=kopiur.home-operations.com%2Fpolicy-uid%3Duid-pg"),
+            "the claims are listed by the policy's UID label: {}",
+            log[0]
+        );
+        let deletes: Vec<&String> = log.iter().filter(|l| l.starts_with("DELETE")).collect();
+        assert_eq!(deletes.len(), 2, "{log:?}");
+        for (delete, (name, uid)) in deletes
+            .iter()
+            .zip([("kopiur-cache-a", "pvc-a"), ("kopiur-cache-b", "pvc-b")])
+        {
+            assert!(
+                delete.contains(&format!("/persistentvolumeclaims/{name}")),
+                "{delete}"
+            );
+            assert!(
+                delete.contains(&format!(r#""preconditions":{{"uid":"{uid}"}}"#)),
+                "the delete is pinned to the listed claim's UID: {delete}"
+            );
+        }
     }
 
     #[test]

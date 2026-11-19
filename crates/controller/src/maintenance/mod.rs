@@ -896,7 +896,7 @@ async fn spawn_maintenance_job(
     let resolved_volume = crate::cache::resolve_cache_volume(
         ctx,
         namespace,
-        owner.clone(),
+        io::CachePvcOwner::Reference(owner.clone()),
         &format!("kopiur-cache-{cr_name}"),
         effective_cache.as_ref(),
     )

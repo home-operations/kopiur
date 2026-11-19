@@ -1428,8 +1428,151 @@ pub enum CachePvcResize {
     },
 }
 
-/// The outcome of [`ensure_cache_pvc`]: the claim to mount, the size kopia's cache
-/// budgets must fit in, and what happened to the claim's size.
+/// Who a persistent cache PVC belongs to: how the claim is marked when it is
+/// created, and how a claim found under its name is recognized.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CachePvcOwner {
+    /// An object the claim can carry an owner reference to (one in the claim's
+    /// own namespace, or a `ClusterRepository`). The garbage collector deletes
+    /// the claim with it.
+    Reference(OwnerReference),
+    /// A `SnapshotPolicy` whose movers run in the operator namespace
+    /// (`execution.mode: Central`). An owner must share its dependent's
+    /// namespace, so the claim carries the policy's UID label instead, and the
+    /// policy's finalizer deletes it.
+    CentralPolicy {
+        /// The policy's namespace.
+        namespace: String,
+        /// The policy's name.
+        name: String,
+        /// The policy's UID.
+        uid: String,
+    },
+}
+
+impl CachePvcOwner {
+    /// Mark `meta` as this owner's claim.
+    fn mark(&self, meta: &mut ObjectMeta) {
+        match self {
+            CachePvcOwner::Reference(owner) => meta.owner_references = Some(vec![owner.clone()]),
+            CachePvcOwner::CentralPolicy {
+                namespace,
+                name,
+                uid,
+            } => super::mark_central_policy(meta, namespace, name, uid),
+        }
+    }
+
+    /// Whether a claim found under this owner's claim name belongs to someone
+    /// else. Central and in-namespace claims share the operator namespace, so the
+    /// check runs both ways (as [`super::MoverSite::is_foreign`] does): a central
+    /// policy owns only a claim labelled with its UID, and an in-namespace owner
+    /// owns no claim that carries a central mark.
+    fn is_foreign(&self, meta: &ObjectMeta) -> bool {
+        match self {
+            CachePvcOwner::Reference(_) => super::has_central_mark(meta),
+            CachePvcOwner::CentralPolicy { uid, .. } => !super::is_policys(meta, uid),
+        }
+    }
+
+    /// Whether a claim that exists now is certain to be deleted with this owner.
+    ///
+    /// An owner-referenced claim always is: the garbage collector also deletes
+    /// a dependent whose owner is already gone. A central policy's claim is
+    /// deleted by nothing but the policy's finalizer, which lists the claims
+    /// once the policy is being deleted. So this reads the policy from the API
+    /// server (never a cache), and the caller asks AFTER the claim exists: a
+    /// policy seen live here had not started that list, and the list finds the
+    /// claim.
+    async fn deletes_its_claims(&self, client: &kube::Client) -> Result<bool> {
+        match self {
+            CachePvcOwner::Reference(_) => Ok(true),
+            CachePvcOwner::CentralPolicy {
+                namespace,
+                name,
+                uid,
+            } => {
+                let policies: Api<kopiur_api::SnapshotPolicy> =
+                    Api::namespaced(client.clone(), namespace);
+                Ok(policies
+                    .get_opt(name)
+                    .await?
+                    .is_some_and(|policy| central_policy_reaps(&policy.metadata, uid)))
+            }
+        }
+    }
+
+    /// The object that Events about a claim in `claim_ns` are reported on.
+    pub fn event_ref(&self, claim_ns: &str) -> k8s_openapi::api::core::v1::ObjectReference {
+        use k8s_openapi::api::core::v1::ObjectReference;
+        match self {
+            CachePvcOwner::Reference(owner) => ObjectReference {
+                api_version: Some(owner.api_version.clone()),
+                kind: Some(owner.kind.clone()),
+                name: Some(owner.name.clone()),
+                uid: Some(owner.uid.clone()),
+                // A ClusterRepository is cluster-scoped; every other owner
+                // lives beside its claim.
+                namespace: (owner.kind != "ClusterRepository").then(|| claim_ns.to_string()),
+                ..Default::default()
+            },
+            CachePvcOwner::CentralPolicy {
+                namespace,
+                name,
+                uid,
+            } => ObjectReference {
+                api_version: Some(
+                    <kopiur_api::SnapshotPolicy as kube::Resource>::api_version(&()).into_owned(),
+                ),
+                kind: Some("SnapshotPolicy".to_string()),
+                name: Some(name.clone()),
+                uid: Some(uid.clone()),
+                namespace: Some(namespace.clone()),
+                ..Default::default()
+            },
+        }
+    }
+
+    /// How an Event names the claim `claim_ns/claim`: with its namespace when
+    /// that is not the namespace of the object the Event is reported on.
+    pub fn claim_label(&self, claim_ns: &str, claim: &str) -> String {
+        match self {
+            CachePvcOwner::Reference(_) => claim.to_string(),
+            CachePvcOwner::CentralPolicy { .. } => format!("{claim_ns}/{claim}"),
+        }
+    }
+}
+
+/// Whether the `SnapshotPolicy` described by `meta` is the one with UID `uid`,
+/// and its finalizer is still due to delete its central claims: it carries the
+/// cleanup finalizer and is not being deleted. Pure.
+pub(crate) fn central_policy_reaps(meta: &ObjectMeta, uid: &str) -> bool {
+    meta.uid.as_deref() == Some(uid)
+        && meta.deletion_timestamp.is_none()
+        && meta
+            .finalizers
+            .iter()
+            .flatten()
+            .any(|f| f == crate::consts::POLICY_CLEANUP_FINALIZER)
+}
+
+/// What [`ensure_cache_pvc`] found or made under the claim name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CachePvcClaim {
+    /// The owner's claim exists and can be mounted.
+    Ensured(EnsuredCachePvc),
+    /// A claim of that name exists and belongs to someone else
+    /// ([`CachePvcOwner::is_foreign`]). It was neither changed nor adopted, and
+    /// the run must not mount it.
+    Foreign,
+    /// The owner can no longer delete a claim (a central policy that is gone,
+    /// is being deleted, or has no cleanup finalizer yet). The claim was
+    /// deleted, and the run must not mount it.
+    Orphaned,
+}
+
+/// The owner's claim from [`ensure_cache_pvc`]: the claim to mount, the size
+/// kopia's cache budgets must fit in, and what happened to the claim's size.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnsuredCachePvc {
     /// Name of the cache PVC.
@@ -1505,9 +1648,14 @@ pub(crate) fn effective_cache_capacity(requested: &str, pvc: &PersistentVolumeCl
 
 /// Ensure a controller-owned **persistent** kopia cache PVC named `name` exists in
 /// `ns` (a warm cache reused across this owner's runs, ADR §3.1). Creates it
-/// `ReadWriteOnce` at `capacity` with the optional `storage_class`, owner-referenced
-/// so it is GC'd with `owner`. Because it is `ReadWriteOnce`, persistent cache
-/// assumes non-overlapping runs for the owner.
+/// `ReadWriteOnce` at `capacity` with the optional `storage_class`, marked as
+/// `owner`'s ([`CachePvcOwner`]) so it is deleted with it. Because it is
+/// `ReadWriteOnce`, persistent cache assumes non-overlapping runs for the owner.
+///
+/// A claim of that name that belongs to someone else is left alone and reported
+/// as [`CachePvcClaim::Foreign`]. A claim whose owner can no longer delete it is
+/// deleted here and reported as [`CachePvcClaim::Orphaned`]
+/// ([`CachePvcOwner::deletes_its_claims`]).
 ///
 /// An existing claim is reconciled toward `capacity` grow-only (#613): a larger
 /// capacity patches `spec.resources.requests.storage` when the claim's
@@ -1517,57 +1665,73 @@ pub async fn ensure_cache_pvc(
     client: &kube::Client,
     ns: &str,
     name: &str,
-    owner: OwnerReference,
+    owner: &CachePvcOwner,
     capacity: &str,
     storage_class: Option<&str>,
-) -> Result<EnsuredCachePvc> {
+) -> Result<CachePvcClaim> {
     let api: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), ns);
-    let fresh = |resize| EnsuredCachePvc {
-        claim_name: name.to_string(),
-        capacity: capacity.to_string(),
-        resize,
-    };
-    let Some(existing) = api.get_opt(name).await? else {
-        let pvc = cache_pvc(ns, name, owner, capacity, storage_class);
-        return match api.create(&PostParams::default(), &pvc).await {
-            Ok(_) => Ok(fresh(CachePvcResize::Unchanged)),
-            // A concurrent reconcile won the create race: the PVC is there, reuse it.
-            // The winner may have been created at a different (smaller) capacity —
-            // the policy's capacity can change between two sibling runs — so re-read
-            // it and size the budgets to what it actually holds (#707 review).
-            Err(kube::Error::Api(e)) if e.code == 409 => {
-                let capacity = api.get_opt(name).await?.map_or_else(
-                    || capacity.to_string(),
-                    |w| effective_cache_capacity(capacity, &w),
-                );
-                Ok(EnsuredCachePvc {
-                    claim_name: name.to_string(),
-                    capacity,
-                    resize: CachePvcResize::Unchanged,
-                })
+    let (claim, resize) = match api.get_opt(name).await? {
+        Some(existing) => {
+            if owner.is_foreign(&existing.metadata) {
+                return Ok(CachePvcClaim::Foreign);
             }
-            Err(e) => Err(Error::Kube(e)),
-        };
+            match pvc_requested_storage(&existing) {
+                None => (existing, CachePvcResize::Unchanged),
+                Some(current) => match resize_direction(&current, capacity) {
+                    ResizeDirection::Same => (existing, CachePvcResize::Unchanged),
+                    ResizeDirection::Shrink => (
+                        existing,
+                        CachePvcResize::ShrinkRefused {
+                            current,
+                            requested: capacity.to_string(),
+                        },
+                    ),
+                    ResizeDirection::Grow => {
+                        let (resize, grown) =
+                            grow_cache_pvc(client, &api, existing, &current, capacity).await?;
+                        (grown, resize)
+                    }
+                },
+            }
+        }
+        None => {
+            let pvc = cache_pvc(ns, name, owner, capacity, storage_class);
+            match api.create(&PostParams::default(), &pvc).await {
+                Ok(created) => (created, CachePvcResize::Unchanged),
+                // A concurrent reconcile won the create race: the PVC is there, reuse it.
+                // The winner may have been created at a different (smaller) capacity —
+                // the policy's capacity can change between two sibling runs — so re-read
+                // it and size the budgets to what it actually holds (#707 review).
+                Err(kube::Error::Api(e)) if e.code == 409 => match api.get_opt(name).await? {
+                    Some(winner) if owner.is_foreign(&winner.metadata) => {
+                        return Ok(CachePvcClaim::Foreign);
+                    }
+                    Some(winner) => (winner, CachePvcResize::Unchanged),
+                    // The winner is already gone again. Mounting its name would
+                    // leave the mover pod waiting on a claim that does not exist,
+                    // so fail the pass: the next one creates the claim.
+                    None => return Err(Error::Kube(kube::Error::Api(e))),
+                },
+                Err(e) => return Err(Error::Kube(e)),
+            }
+        }
     };
-    let Some(current) = pvc_requested_storage(&existing) else {
-        return Ok(fresh(CachePvcResize::Unchanged));
-    };
-    let (resize, after) = match resize_direction(&current, capacity) {
-        ResizeDirection::Same => (CachePvcResize::Unchanged, existing),
-        ResizeDirection::Shrink => (
-            CachePvcResize::ShrinkRefused {
-                current,
-                requested: capacity.to_string(),
-            },
-            existing,
-        ),
-        ResizeDirection::Grow => grow_cache_pvc(client, &api, existing, &current, capacity).await?,
-    };
-    Ok(EnsuredCachePvc {
+    if !owner.deletes_its_claims(client).await? {
+        match api
+            .delete(name, &super::delete_exactly(&claim.metadata))
+            .await
+        {
+            Ok(_) => {}
+            Err(kube::Error::Api(e)) if e.code == 404 || e.code == 409 => {}
+            Err(e) => return Err(Error::Kube(e)),
+        }
+        return Ok(CachePvcClaim::Orphaned);
+    }
+    Ok(CachePvcClaim::Ensured(EnsuredCachePvc {
         claim_name: name.to_string(),
-        capacity: effective_cache_capacity(capacity, &after),
+        capacity: effective_cache_capacity(capacity, &claim),
         resize,
-    })
+    }))
 }
 
 /// Whether a StorageClass lets its PVCs be expanded (`allowVolumeExpansion: true`;
@@ -1579,7 +1743,9 @@ pub(crate) fn storage_class_allows_expansion(
 }
 
 /// Grow an existing cache PVC to `capacity`, checking its StorageClass first.
-/// Returns the outcome and the claim as it now stands.
+/// Returns the outcome and the claim as it now stands. The patch carries the
+/// UID of `pvc`, so it can only change the claim that was read: the API server
+/// refuses it for a claim that replaced that one under the same name.
 async fn grow_cache_pvc(
     client: &kube::Client,
     api: &Api<PersistentVolumeClaim>,
@@ -1619,6 +1785,7 @@ async fn grow_cache_pvc(
     }
     let name = pvc.name_any();
     let patch = serde_json::json!({
+        "metadata": { "uid": pvc.metadata.uid },
         "spec": { "resources": { "requests": { "storage": capacity } } }
     });
     match api
@@ -1636,6 +1803,9 @@ async fn grow_cache_pvc(
             },
             grown,
         )),
+        // The claim under this name is no longer the one that was read. Decide
+        // again on the next reconcile, from the claim that is there then.
+        Err(kube::Error::Api(e)) if refused_for_uid(&e) => Err(Error::Kube(kube::Error::Api(e))),
         // 403/422: the apiserver's own expansion admission refused it (e.g. a
         // StorageClass we could not read does not allow expansion).
         Err(kube::Error::Api(e)) if matches!(e.code, 403 | 422) => Ok((
@@ -1646,27 +1816,38 @@ async fn grow_cache_pvc(
     }
 }
 
+/// Whether the API server refused a patch because the `metadata.uid` it carried
+/// is not the UID of the stored object. Pure.
+pub(crate) fn refused_for_uid(status: &kube::core::Status) -> bool {
+    status.code == 422
+        && status
+            .details
+            .as_ref()
+            .is_some_and(|d| d.causes.iter().any(|c| c.field == "metadata.uid"))
+}
+
 /// The controller-owned persistent kopia cache PVC [`ensure_cache_pvc`] creates:
-/// `ReadWriteOnce` at `capacity`, optional `storage_class`, owner-referenced to
-/// `owner` (so it is GC'd with it), labeled as a mover cache. Pure, for tests.
+/// `ReadWriteOnce` at `capacity`, optional `storage_class`, marked as `owner`'s
+/// (so it is deleted with it), labeled as a mover cache. Pure, for tests.
 pub(crate) fn cache_pvc(
     ns: &str,
     name: &str,
-    owner: OwnerReference,
+    owner: &CachePvcOwner,
     capacity: &str,
     storage_class: Option<&str>,
 ) -> PersistentVolumeClaim {
+    let mut metadata = ObjectMeta {
+        name: Some(name.to_string()),
+        namespace: Some(ns.to_string()),
+        labels: Some(child_labels(&[(
+            "kopiur.home-operations.com/component",
+            "mover-cache",
+        )])),
+        ..Default::default()
+    };
+    owner.mark(&mut metadata);
     PersistentVolumeClaim {
-        metadata: ObjectMeta {
-            name: Some(name.to_string()),
-            namespace: Some(ns.to_string()),
-            owner_references: Some(vec![owner]),
-            labels: Some(child_labels(&[(
-                "kopiur.home-operations.com/component",
-                "mover-cache",
-            )])),
-            ..Default::default()
-        },
+        metadata,
         spec: Some(PersistentVolumeClaimSpec {
             access_modes: Some(vec!["ReadWriteOnce".to_string()]),
             resources: Some(VolumeResourceRequirements {
@@ -2430,7 +2611,7 @@ mod cache_pvc_tests {
         let pvc = cache_pvc(
             "kopiur-system",
             "kopiur-cache-snapdel-garage-1a2b3c4d",
-            owner.clone(),
+            &CachePvcOwner::Reference(owner.clone()),
             "10Gi",
             Some("local-hostpath"),
         );
@@ -2456,8 +2637,112 @@ mod cache_pvc_tests {
             Quantity("10Gi".into())
         );
         // No storageClassName → the cluster default.
-        let pvc = cache_pvc("ns", "c", Default::default(), "1Gi", None);
+        let pvc = cache_pvc(
+            "ns",
+            "c",
+            &CachePvcOwner::Reference(Default::default()),
+            "1Gi",
+            None,
+        );
         assert_eq!(pvc.spec.unwrap().storage_class_name, None);
+    }
+
+    fn central_policy() -> CachePvcOwner {
+        CachePvcOwner::CentralPolicy {
+            namespace: "billing".into(),
+            name: "postgres".into(),
+            uid: "uid-policy".into(),
+        }
+    }
+
+    /// A central policy's claim lives in another namespace than the policy, so
+    /// an owner reference would have the garbage collector delete it at once.
+    #[test]
+    fn a_central_policys_cache_pvc_carries_its_uid_label_and_no_owner_reference() {
+        let pvc = cache_pvc("kopiur-system", "c", &central_policy(), "5Gi", None);
+        assert_eq!(pvc.metadata.owner_references, None);
+        let labels = pvc.metadata.labels.as_ref().unwrap();
+        assert_eq!(
+            labels
+                .get(crate::io::CENTRAL_POLICY_UID_LABEL)
+                .map(String::as_str),
+            Some("uid-policy")
+        );
+        assert_eq!(
+            labels
+                .get("kopiur.home-operations.com/component")
+                .map(String::as_str),
+            Some("mover-cache")
+        );
+        assert_eq!(
+            pvc.metadata
+                .annotations
+                .as_ref()
+                .and_then(|a| a.get(crate::io::CENTRAL_POLICY_ANNOTATION))
+                .map(String::as_str),
+            Some("billing/postgres")
+        );
+    }
+
+    #[test]
+    fn a_claim_is_foreign_unless_it_carries_exactly_this_owners_mark() {
+        let in_namespace = CachePvcOwner::Reference(Default::default());
+        let mine = cache_pvc("kopiur-system", "c", &central_policy(), "5Gi", None).metadata;
+        let theirs = cache_pvc(
+            "kopiur-system",
+            "c",
+            &CachePvcOwner::CentralPolicy {
+                namespace: "billing".into(),
+                name: "postgres".into(),
+                uid: "uid-other".into(),
+            },
+            "5Gi",
+            None,
+        )
+        .metadata;
+        let owner_referenced = cache_pvc("kopiur-system", "c", &in_namespace, "5Gi", None).metadata;
+
+        assert!(!central_policy().is_foreign(&mine));
+        assert!(central_policy().is_foreign(&theirs));
+        assert!(central_policy().is_foreign(&owner_referenced));
+        // An in-namespace owner keeps its historical "any claim of that name"
+        // rule, except for a claim that a central policy marked.
+        assert!(!in_namespace.is_foreign(&owner_referenced));
+        assert!(in_namespace.is_foreign(&mine));
+    }
+
+    #[test]
+    fn events_about_a_central_claim_go_to_the_policy_and_name_the_claims_namespace() {
+        let owner = central_policy();
+        let regarding = owner.event_ref("kopiur-system");
+        assert_eq!(regarding.kind.as_deref(), Some("SnapshotPolicy"));
+        assert_eq!(regarding.namespace.as_deref(), Some("billing"));
+        assert_eq!(regarding.name.as_deref(), Some("postgres"));
+        assert_eq!(regarding.uid.as_deref(), Some("uid-policy"));
+        assert_eq!(
+            regarding.api_version.as_deref(),
+            Some(crate::consts::API_VERSION)
+        );
+        assert_eq!(owner.claim_label("kopiur-system", "c"), "kopiur-system/c");
+
+        let reference = |kind: &str| {
+            CachePvcOwner::Reference(OwnerReference {
+                kind: kind.into(),
+                ..Default::default()
+            })
+        };
+        assert_eq!(
+            reference("SnapshotPolicy")
+                .event_ref("ns")
+                .namespace
+                .as_deref(),
+            Some("ns")
+        );
+        assert_eq!(
+            reference("ClusterRepository").event_ref("ns").namespace,
+            None
+        );
+        assert_eq!(reference("SnapshotPolicy").claim_label("ns", "c"), "c");
     }
 }
 

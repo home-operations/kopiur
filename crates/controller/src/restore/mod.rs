@@ -4363,7 +4363,7 @@ async fn run_restore_mover(
             crate::cache::resolve_cache_volume(
                 ctx,
                 namespace,
-                owner.clone(),
+                io::CachePvcOwner::Reference(owner.clone()),
                 &format!("kopiur-cache-{job_name}"),
                 effective_cache.as_ref(),
             )

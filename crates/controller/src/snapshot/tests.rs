@@ -5215,7 +5215,7 @@ async fn an_ephemeral_per_run_capacity_reaches_the_mover_volume_with_no_api_call
     let resolved = crate::cache::resolve_cache_volume(
         &ctx,
         "ns",
-        Default::default(),
+        io::CachePvcOwner::Reference(Default::default()),
         "kopiur-cache-pg-ns-abc123",
         super::cache_volume_spec(&repo, &cfg, run.spec.mover.as_ref()).as_ref(),
     )
@@ -5231,6 +5231,135 @@ async fn an_ephemeral_per_run_capacity_reaches_the_mover_volume_with_no_api_call
             storage_class: Some("slow".into()),
         },
         "the per-run capacity/class must reach the mover's cache volume"
+    );
+}
+
+// --- #760: where a backup's persistent cache claim lives -------------------
+
+/// `policy_with_mover`, stored: with the namespace and UID the API server gives it.
+fn stored_policy() -> SnapshotPolicy {
+    let mut cfg = policy_with_mover(serde_json::json!({
+        "cache": { "capacity": "5Gi", "mode": "Persistent" },
+    }));
+    cfg.metadata.namespace = Some("billing".into());
+    cfg.metadata.uid = Some("uid-pg".into());
+    cfg
+}
+
+fn cluster_repo(name: &str) -> kopiur_api::common::RepositoryRef {
+    kopiur_api::common::RepositoryRef {
+        kind: kopiur_api::common::RepositoryKind::ClusterRepository,
+        name: name.into(),
+        namespace: None,
+    }
+}
+
+fn central_mover_site() -> io::MoverSite {
+    io::MoverSite::Central(io::CentralSite {
+        namespace: "kopiur-system".into(),
+        job_name: "nightly-1f0c7a55d2e9b6a4".into(),
+    })
+}
+
+#[test]
+fn an_in_namespace_backup_keeps_its_policy_owned_cache_claim_beside_the_policy() {
+    let cfg = stored_policy();
+    let claim = super::backup_cache_claim(
+        &io::MoverSite::InNamespace,
+        &cfg,
+        &dummy_backup(),
+        "billing",
+        &cluster_repo("shared"),
+    )
+    .unwrap()
+    .expect("an in-namespace run always has a claim");
+    assert_eq!(claim.namespace, "billing");
+    // The historical name, byte for byte: an existing claim must keep matching.
+    assert_eq!(claim.name, "kopiur-cache-pg");
+    match claim.owner {
+        io::CachePvcOwner::Reference(owner) => {
+            assert_eq!(
+                (owner.kind.as_str(), owner.name.as_str(), owner.uid.as_str()),
+                ("SnapshotPolicy", "pg", "uid-pg")
+            );
+        }
+        other => panic!("expected an owner reference, got {other:?}"),
+    }
+}
+
+/// #760: a central mover runs in the operator namespace, so the warm cache has
+/// to live there too. It used to be replaced by a fresh volume on every run.
+#[test]
+fn a_central_backup_keeps_its_cache_claim_in_the_operator_namespace() {
+    let cfg = stored_policy();
+    let claim = super::backup_cache_claim(
+        &central_mover_site(),
+        &cfg,
+        &dummy_backup(),
+        "billing",
+        &cluster_repo("shared"),
+    )
+    .unwrap()
+    .expect("a central run of a live policy has a claim");
+    assert_eq!(claim.namespace, "kopiur-system");
+    assert_eq!(
+        claim.name,
+        io::central_cache_pvc_name("pg", "uid-pg", "ClusterRepository/shared")
+    );
+    assert_eq!(
+        claim.owner,
+        io::CachePvcOwner::CentralPolicy {
+            namespace: "billing".into(),
+            name: "pg".into(),
+            uid: "uid-pg".into(),
+        }
+    );
+
+    // A kopia cache holds one repository's state: a second repository of the
+    // same policy gets its own claim.
+    let other = super::backup_cache_claim(
+        &central_mover_site(),
+        &cfg,
+        &dummy_backup(),
+        "billing",
+        &cluster_repo("offsite"),
+    )
+    .unwrap()
+    .unwrap();
+    assert_ne!(other.name, claim.name);
+}
+
+/// The policy's finalizer deletes its central claims, so a run that launches
+/// while the policy is being deleted asks for none.
+#[test]
+fn a_central_backup_of_a_policy_being_deleted_gets_no_persistent_claim() {
+    let mut cfg = stored_policy();
+    cfg.metadata.deletion_timestamp = Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+        k8s_openapi::jiff::Timestamp::from_second(1_700_000_000).unwrap(),
+    ));
+    assert_eq!(
+        super::backup_cache_claim(
+            &central_mover_site(),
+            &cfg,
+            &dummy_backup(),
+            "billing",
+            &cluster_repo("shared"),
+        )
+        .unwrap(),
+        None
+    );
+    // In-namespace the claim is owner-referenced, so the garbage collector
+    // handles this case.
+    assert!(
+        super::backup_cache_claim(
+            &io::MoverSite::InNamespace,
+            &cfg,
+            &dummy_backup(),
+            "billing",
+            &cluster_repo("shared"),
+        )
+        .unwrap()
+        .is_some()
     );
 }
 
