@@ -334,44 +334,88 @@ fn only_this_policys_owner_referenced_cache_is_a_predecessor() {
 
 // --- one pass against a mock apiserver ----------------------------------------
 
-/// One pass against a mock apiserver that holds two central claims: one of a
-/// policy that is gone, and one of the live policy `billing/pg`, which still
-/// uses it and left the claim `kopiur-cache-pg` beside itself. `runs` are the
-/// `Snapshot`s of that policy. Returns the outcome and every request as
+/// What the mock apiserver of [`one_pass`] holds.
+#[derive(Clone, Default)]
+struct World {
+    /// The cache claims of the operator namespace (`kopiur-system`).
+    central: Vec<serde_json::Value>,
+    /// The cache claims of every namespace (the drain's cluster-wide LIST).
+    everywhere: Vec<serde_json::Value>,
+    /// The claim `billing/kopiur-cache-pg`, when a GET by name finds it.
+    predecessor: Option<serde_json::Value>,
+    /// The kopiur-managed Jobs of every namespace.
+    jobs: Vec<serde_json::Value>,
+}
+
+const LONG_AGO: &str = "2020-01-01T00:00:00Z";
+
+/// A central cache claim of the policy `billing/<policy>`, created long ago.
+fn central_claim(name: &str, pvc_uid: &str, policy: &str, policy_uid: &str) -> serde_json::Value {
+    serde_json::json!({
+        "metadata": {
+            "name": name, "namespace": "kopiur-system", "uid": pvc_uid,
+            "creationTimestamp": LONG_AGO,
+            "labels": {
+                CACHE_PVC_COMPONENT_LABEL: CACHE_PVC_COMPONENT,
+                CENTRAL_POLICY_UID_LABEL: policy_uid,
+            },
+            "annotations": {
+                CENTRAL_POLICY_ANNOTATION: format!("billing/{policy}"),
+                CACHE_REPOSITORY_ANNOTATION: "shared",
+            },
+        },
+    })
+}
+
+/// The claim the policy `billing/pg` used beside itself before its repository
+/// ran centrally.
+fn predecessor_claim() -> serde_json::Value {
+    serde_json::json!({
+        "apiVersion": "v1", "kind": "PersistentVolumeClaim",
+        "metadata": {
+            "name": "kopiur-cache-pg", "namespace": "billing", "uid": "pvc-predecessor",
+            "labels": { CACHE_PVC_COMPONENT_LABEL: CACHE_PVC_COMPONENT },
+            "ownerReferences": [{
+                "apiVersion": crate::consts::API_VERSION,
+                "kind": "SnapshotPolicy", "name": "pg", "uid": "uid-pg",
+            }],
+        },
+    })
+}
+
+fn retired(mut claim: serde_json::Value, at: &str) -> serde_json::Value {
+    claim["metadata"]["annotations"][crate::io::CACHE_RETIRED_ANNOTATION] = at.into();
+    claim
+}
+
+/// A kopiur mover Job in `namespace` whose pod mounts `claim`.
+fn job_mounting(namespace: &str, claim: &str, conditions: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "apiVersion": "batch/v1", "kind": "Job",
+        "metadata": { "name": "mover", "namespace": namespace },
+        "spec": { "template": { "spec": {
+            "containers": [{ "name": "mover", "image": "mover" }],
+            "volumes": [
+                { "name": "kopia-state", "emptyDir": {} },
+                { "name": "kopia-cache", "persistentVolumeClaim": { "claimName": claim } },
+            ],
+        } } },
+        "status": { "conditions": conditions },
+    })
+}
+
+/// One pass over `world`. Returns the outcome and every request as
 /// `METHOD path body`.
-async fn one_pass(runs: serde_json::Value) -> (CacheSweepOutcome, Vec<String>) {
+async fn one_pass(world: World) -> (CacheSweepOutcome, Vec<String>) {
     use http::{Request, Response, StatusCode};
     use kube::client::Body;
     use std::sync::{Arc, Mutex};
 
-    let central_claim = |name: &str, pvc_uid: &str, policy: &str, policy_uid: &str| {
-        serde_json::json!({
-            "metadata": {
-                "name": name, "namespace": "kopiur-system", "uid": pvc_uid,
-                "creationTimestamp": "2020-01-01T00:00:00Z",
-                "labels": {
-                    CACHE_PVC_COMPONENT_LABEL: CACHE_PVC_COMPONENT,
-                    CENTRAL_POLICY_UID_LABEL: policy_uid,
-                },
-                "annotations": {
-                    CENTRAL_POLICY_ANNOTATION: format!("billing/{policy}"),
-                    CACHE_REPOSITORY_ANNOTATION: "shared",
-                },
-            },
-        })
-    };
     let log = Arc::new(Mutex::new(Vec::<String>::new()));
     let svc = {
         let log = log.clone();
         tower::service_fn(move |req: Request<Body>| {
-            let (log, runs) = (log.clone(), runs.clone());
-            let listed = serde_json::json!({
-                "apiVersion": "v1", "kind": "PersistentVolumeClaimList", "metadata": {},
-                "items": [
-                    central_claim("kopiur-cache-gone-1", "pvc-orphan", "gone", "uid-gone"),
-                    central_claim("kopiur-cache-pg-2", "pvc-in-use", "pg", "uid-pg"),
-                ],
-            });
+            let (log, world) = (log.clone(), world.clone());
             async move {
                 let method = req.method().as_str().to_string();
                 let path = req.uri().path().to_string();
@@ -384,51 +428,50 @@ async fn one_pass(runs: serde_json::Value) -> (CacheSweepOutcome, Vec<String>) {
                     String::from_utf8_lossy(&bytes)
                 ));
                 let ok = |v: serde_json::Value| (StatusCode::OK, v);
+                let list = |kind: &str, items: Vec<serde_json::Value>| {
+                    ok(serde_json::json!({
+                        "apiVersion": "v1", "kind": kind, "metadata": {}, "items": items,
+                    }))
+                };
+                let not_found = (
+                    StatusCode::NOT_FOUND,
+                    serde_json::json!({
+                        "kind": "Status", "apiVersion": "v1", "status": "Failure",
+                        "reason": "NotFound", "code": 404,
+                    }),
+                );
                 let (status, json) = match (method.as_str(), path.as_str()) {
                     ("GET", "/api/v1/namespaces/kopiur-system/persistentvolumeclaims") => {
-                        ok(listed)
+                        list("PersistentVolumeClaimList", world.central)
+                    }
+                    ("GET", "/api/v1/persistentvolumeclaims") => {
+                        list("PersistentVolumeClaimList", world.everywhere)
                     }
                     ("GET", p) if p.ends_with("/namespaces/billing/snapshotpolicies/pg") => {
                         ok(serde_json::to_value(persistent_policy()).unwrap())
                     }
-                    ("GET", p) if p.ends_with("/namespaces/billing/snapshots") => {
-                        ok(serde_json::json!({
-                            "apiVersion": crate::consts::API_VERSION, "kind": "SnapshotList",
-                            "metadata": {}, "items": runs,
-                        }))
-                    }
                     ("GET", p) if p.ends_with("/clusterrepositories/shared") => {
                         ok(serde_json::to_value(central_repo()).unwrap())
                     }
-                    // The claim the policy used beside itself before the
-                    // repository ran centrally.
                     (
                         "GET",
                         "/api/v1/namespaces/billing/persistentvolumeclaims/kopiur-cache-pg",
-                    ) => ok(serde_json::json!({
+                    ) => world.predecessor.map_or(not_found, ok),
+                    ("GET", p) if p.starts_with("/apis/batch/v1/namespaces/") => {
+                        let namespace = p.split('/').nth(5).unwrap_or_default().to_string();
+                        let jobs = world
+                            .jobs
+                            .into_iter()
+                            .filter(|j| j["metadata"]["namespace"] == namespace.as_str())
+                            .collect();
+                        list("JobList", jobs)
+                    }
+                    ("DELETE" | "PATCH", _) => ok(serde_json::json!({
                         "apiVersion": "v1", "kind": "PersistentVolumeClaim",
-                        "metadata": {
-                            "name": "kopiur-cache-pg", "namespace": "billing",
-                            "uid": "pvc-predecessor",
-                            "labels": { CACHE_PVC_COMPONENT_LABEL: CACHE_PVC_COMPONENT },
-                            "ownerReferences": [{
-                                "apiVersion": crate::consts::API_VERSION,
-                                "kind": "SnapshotPolicy", "name": "pg", "uid": "uid-pg",
-                            }],
-                        },
-                    })),
-                    ("DELETE", _) => ok(serde_json::json!({
-                        "apiVersion": "v1", "kind": "PersistentVolumeClaim",
-                        "metadata": { "name": "deleted" },
+                        "metadata": { "name": "written" },
                     })),
                     // The policy `gone`, and anything else.
-                    _ => (
-                        StatusCode::NOT_FOUND,
-                        serde_json::json!({
-                            "kind": "Status", "apiVersion": "v1", "status": "Failure",
-                            "reason": "NotFound", "code": 404,
-                        }),
-                    ),
+                    _ => not_found,
                 };
                 Ok::<_, std::convert::Infallible>(
                     Response::builder()
@@ -448,75 +491,199 @@ async fn one_pass(runs: serde_json::Value) -> (CacheSweepOutcome, Vec<String>) {
     (outcome, log)
 }
 
-fn deletes(log: &[String]) -> Vec<&String> {
-    log.iter().filter(|l| l.starts_with("DELETE")).collect()
+fn with_method<'a>(log: &'a [String], method: &str) -> Vec<&'a String> {
+    log.iter().filter(|l| l.starts_with(method)).collect()
 }
 
-/// A pass deletes the claim of an owner that is gone, keeps the claim of a
-/// policy that still uses it, and deletes the claim that policy left beside
-/// itself. Every delete carries the UID of the claim that was read.
+const PREDECESSOR: &str = "/namespaces/billing/persistentvolumeclaims/kopiur-cache-pg ";
+
+/// The first pass that finds an unused claim of a LIVE policy only retires it.
+/// Deleting it at once can take it from under a mover that Kubernetes does not
+/// protect yet: a run that picked the claim and has not created its Job, or a
+/// Job whose pod is not scheduled. The claim of an owner that is gone has no
+/// mover left, and is deleted at once, by UID.
 #[tokio::test]
-async fn a_pass_deletes_the_orphan_and_the_predecessor_and_keeps_the_claim_in_use() {
-    let finished = serde_json::json!([{
-        "metadata": { "name": "pg-1", "namespace": "billing" },
-        "spec": { "policyRef": { "name": "pg" } },
-        "status": { "phase": "Succeeded" },
-    }]);
-    let (outcome, log) = one_pass(finished).await;
+async fn the_first_pass_retires_a_predecessor_and_deletes_only_the_orphan() {
+    let (outcome, log) = one_pass(World {
+        central: vec![
+            central_claim("kopiur-cache-gone-1", "pvc-orphan", "gone", "uid-gone"),
+            central_claim("kopiur-cache-pg-2", "pvc-in-use", "pg", "uid-pg"),
+        ],
+        predecessor: Some(predecessor_claim()),
+        ..World::default()
+    })
+    .await;
     assert_eq!(
         outcome,
         CacheSweepOutcome {
             central: 1,
-            predecessors: 1
+            predecessors: 0,
+            retired: 0
         }
     );
-    let deletes = deletes(&log);
-    assert_eq!(deletes.len(), 2, "{log:?}");
+    let deletes = with_method(&log, "DELETE");
+    assert_eq!(deletes.len(), 1, "{log:?}");
     assert!(
         deletes[0].contains("/namespaces/kopiur-system/persistentvolumeclaims/kopiur-cache-gone-1")
             && deletes[0].contains(r#""preconditions":{"uid":"pvc-orphan"}"#),
         "the orphan is deleted, by UID: {}",
         deletes[0]
     );
+    let patches = with_method(&log, "PATCH");
+    assert_eq!(patches.len(), 1, "{log:?}");
     assert!(
-        deletes[1].contains("/namespaces/billing/persistentvolumeclaims/kopiur-cache-pg")
-            && deletes[1].contains(r#""preconditions":{"uid":"pvc-predecessor"}"#),
-        "the in-namespace predecessor is deleted, by UID: {}",
-        deletes[1]
-    );
-    assert!(
-        !log.iter()
-            .any(|l| l.starts_with("DELETE") && l.contains("kopiur-cache-pg-2")),
-        "a claim in use is never deleted: {log:?}"
-    );
-    assert!(
-        log.iter()
-            .any(|l| l.starts_with("GET") && l.contains("/namespaces/billing/snapshots")),
-        "the policy's runs are read before its predecessor is deleted: {log:?}"
+        patches[0].contains(PREDECESSOR)
+            && patches[0].contains(crate::io::CACHE_RETIRED_ANNOTATION)
+            && patches[0].contains(r#""uid":"pvc-predecessor""#),
+        "the predecessor is retired, and the patch names the claim that was read: {}",
+        patches[0]
     );
 }
 
-/// A run that began beside the policy may be about to mount the predecessor.
-/// Nothing of a policy is deleted while one of its runs is in flight. The
-/// orphan has no runs to wait for.
+/// A later pass deletes a retired claim, wherever it is and whatever retired
+/// it: the predecessor of a policy, or the claims of a cache reset. This holds
+/// when the repository has left `Central` again in between, which is why the
+/// drain does not depend on a central claim that is in use.
 #[tokio::test]
-async fn a_pass_deletes_nothing_of_a_policy_with_a_run_in_flight() {
-    let running = serde_json::json!([{
-        "metadata": { "name": "pg-2", "namespace": "billing" },
-        "spec": { "policyRef": { "name": "pg" } },
-        "status": { "phase": "Running" },
-    }]);
-    let (outcome, log) = one_pass(running).await;
-    assert_eq!(
-        outcome,
-        CacheSweepOutcome {
-            central: 1,
-            predecessors: 0
-        }
+async fn a_later_pass_deletes_a_retired_claim_that_no_job_mounts() {
+    let (outcome, log) = one_pass(World {
+        everywhere: vec![retired(predecessor_claim(), LONG_AGO)],
+        ..World::default()
+    })
+    .await;
+    assert_eq!(outcome.retired, 1, "{log:?}");
+    let position = |method: &str, needle: &str| {
+        log.iter()
+            .position(|l| l.starts_with(method) && l.contains(needle))
+            .unwrap_or_else(|| panic!("no {method} {needle} in {log:?}"))
+    };
+    assert!(
+        position("GET", "/apis/batch/v1/namespaces/billing/jobs") < position("DELETE", PREDECESSOR),
+        "the Jobs are read before the claim is deleted: {log:?}"
     );
-    let deletes = deletes(&log);
-    assert_eq!(deletes.len(), 1, "{log:?}");
-    assert!(deletes[0].contains("kopiur-cache-gone-1"), "{}", deletes[0]);
+    assert!(
+        with_method(&log, "PATCH").is_empty(),
+        "a retired claim is not marked again: {log:?}"
+    );
+}
+
+/// A Job with retries left starts a new pod after an attempt fails, when its
+/// `Snapshot` already reads `Failed`. A retired claim stays while such a Job
+/// mounts it, and while its grace period runs.
+#[tokio::test]
+async fn a_retired_claim_stays_while_a_job_mounts_it_or_its_grace_period_runs() {
+    let (outcome, log) = one_pass(World {
+        everywhere: vec![retired(predecessor_claim(), LONG_AGO)],
+        jobs: vec![job_mounting(
+            "billing",
+            "kopiur-cache-pg",
+            serde_json::json!([]),
+        )],
+        ..World::default()
+    })
+    .await;
+    assert_eq!(outcome.retired, 0);
+    assert!(with_method(&log, "DELETE").is_empty(), "{log:?}");
+
+    let just_now = chrono::Utc::now().to_rfc3339();
+    let (outcome, log) = one_pass(World {
+        everywhere: vec![retired(predecessor_claim(), &just_now)],
+        ..World::default()
+    })
+    .await;
+    assert_eq!(outcome.retired, 0);
+    assert!(with_method(&log, "DELETE").is_empty(), "{log:?}");
+    assert!(
+        !log.iter().any(|l| l.contains("/jobs")),
+        "the Jobs are only read after the grace period: {log:?}"
+    );
+}
+
+/// A central claim that an earlier pass or a reset retired is deleted on a
+/// later pass, even when its policy uses a persistent cache again by then:
+/// nothing mounts a retired claim, so keeping it would keep the runs cold.
+#[tokio::test]
+async fn a_retired_central_claim_is_deleted_even_when_its_policy_uses_it_again() {
+    let mut claim = retired(
+        central_claim("kopiur-cache-pg-2", "pvc-retired", "pg", "uid-pg"),
+        LONG_AGO,
+    );
+    // Younger than the min-age floor: the mark decides, not the age.
+    claim["metadata"]["creationTimestamp"] = chrono::Utc::now().to_rfc3339().into();
+    let (outcome, log) = one_pass(World {
+        central: vec![claim],
+        ..World::default()
+    })
+    .await;
+    assert_eq!(outcome.central, 1, "{log:?}");
+    assert!(
+        log.iter().any(|l| l.starts_with(
+            "DELETE /api/v1/namespaces/kopiur-system/persistentvolumeclaims/kopiur-cache-pg-2 "
+        )),
+        "{log:?}"
+    );
+}
+
+/// Which Jobs keep a retired claim: only one that can still start a pod on it.
+#[test]
+fn only_an_unfinished_job_that_mounts_the_claim_keeps_it() {
+    let job = |claim: &str, conditions: serde_json::Value| -> k8s_openapi::api::batch::v1::Job {
+        serde_json::from_value(job_mounting("billing", claim, conditions)).expect("Job")
+    };
+    let done = |kind: &str| serde_json::json!([{ "type": kind, "status": "True" }]);
+    // Running, or between two attempts.
+    assert!(claim_has_a_job(&[job("c", serde_json::json!([]))], "c"));
+    assert!(claim_has_a_job(
+        &[job(
+            "c",
+            serde_json::json!([{ "type": "Failed", "status": "False" }])
+        )],
+        "c"
+    ));
+    // Finished either way: it starts no more pods.
+    assert!(!claim_has_a_job(&[job("c", done("Complete"))], "c"));
+    assert!(!claim_has_a_job(&[job("c", done("Failed"))], "c"));
+    // A Job of another claim, and no Jobs at all.
+    assert!(!claim_has_a_job(
+        &[job("other", serde_json::json!([]))],
+        "c"
+    ));
+    assert!(!claim_has_a_job(&[], "c"));
+    // Being deleted: its pods go with it, and no new one starts.
+    let mut deleting = job("c", serde_json::json!([]));
+    deleting.metadata.deletion_timestamp =
+        Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+            k8s_openapi::jiff::Timestamp::from_second(1_700_000_000).unwrap(),
+        ));
+    assert!(!claim_has_a_job(&[deleting], "c"));
+}
+
+/// A run reads its claim and creates its Job a few API calls later. The grace
+/// period covers that gap, so the Job check sees every run that read the claim
+/// before it was retired.
+#[test]
+fn a_retired_claim_is_kept_for_the_grace_period() {
+    assert!(!grace_elapsed(1_000, 1_000));
+    assert!(!grace_elapsed(1_000, 1_000 + RETIRE_GRACE_SECS - 1));
+    assert!(grace_elapsed(1_000, 1_000 + RETIRE_GRACE_SECS));
+    let meta = |annotations: serde_json::Value| -> kube::core::ObjectMeta {
+        serde_json::from_value(serde_json::json!({ "annotations": annotations })).expect("meta")
+    };
+    assert_eq!(
+        retired_at(&meta(serde_json::json!({
+            crate::io::CACHE_RETIRED_ANNOTATION: "1970-01-01T00:16:40Z"
+        }))),
+        Some(1_000)
+    );
+    assert_eq!(retired_at(&meta(serde_json::json!({}))), None);
+    // A mark that is not a time is not a retirement time. The claim is still
+    // retired (`io::is_retired`), and `retire_claim` stamps it again.
+    assert_eq!(
+        retired_at(&meta(serde_json::json!({
+            crate::io::CACHE_RETIRED_ANNOTATION: "yes"
+        }))),
+        None
+    );
 }
 
 /// A PVC that still exists but that no `pvcSelector` of the policy matches any
@@ -559,41 +726,4 @@ fn a_source_counts_only_while_a_selector_of_the_policy_matches_it() {
         &persistent_policy(),
         &source(serde_json::json!({ "backup": "yes" }))
     ));
-}
-
-/// A run picks its claim and then creates its Job. A claim deleted in between
-/// leaves that run's pod waiting on a PVC that does not exist. So a reset and
-/// the sweep wait for every run that is not finished.
-#[test]
-fn a_run_is_in_flight_until_it_is_terminal_or_being_deleted() {
-    let run = |status: serde_json::Value, deleting: bool| -> kopiur_api::Snapshot {
-        let mut v = serde_json::json!({
-            "apiVersion": crate::consts::API_VERSION, "kind": "Snapshot",
-            "metadata": { "name": "s", "namespace": "billing" },
-            "spec": { "policyRef": { "name": "pg" } },
-            "status": status,
-        });
-        if deleting {
-            v["metadata"]["deletionTimestamp"] = "2026-01-01T00:00:00Z".into();
-        }
-        serde_json::from_value(v).expect("Snapshot")
-    };
-    for phase in ["Pending", "Running", "SomethingNew"] {
-        assert!(
-            run_in_flight(&run(serde_json::json!({ "phase": phase }), false)),
-            "{phase}"
-        );
-    }
-    // Created a moment ago: no phase yet.
-    assert!(run_in_flight(&run(serde_json::json!({}), false)));
-    for phase in ["Succeeded", "Failed", "Unchanged", "Discovered"] {
-        assert!(
-            !run_in_flight(&run(serde_json::json!({ "phase": phase }), false)),
-            "{phase}"
-        );
-    }
-    assert!(!run_in_flight(&run(
-        serde_json::json!({ "phase": "Running" }),
-        true
-    )));
 }

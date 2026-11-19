@@ -970,10 +970,11 @@ pub fn spawn_sweep(
             if let Some(central) = &central_namespace {
                 match crate::cache_sweep::run_cache_sweep(&client, central, min_age_secs).await {
                     Ok(outcome) => {
-                        if outcome.central + outcome.predecessors > 0 {
+                        if outcome.central + outcome.predecessors + outcome.retired > 0 {
                             tracing::info!(
                                 central = outcome.central,
                                 predecessors = outcome.predecessors,
+                                retired = outcome.retired,
                                 "swept unused persistent cache PVCs of central movers"
                             );
                         }

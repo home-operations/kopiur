@@ -22,7 +22,7 @@
 //! The decision ([`claim_verdict`]) is pure and conservative: anything the pass
 //! cannot read with certainty is kept. A deleted cache costs one cold run and
 //! no backup data, but a claim is only deleted on positive evidence, and never
-//! while a run of its policy is in flight ([`policy_run_in_flight`]).
+//! from under a mover ([`retire_and_delete`]).
 
 use std::collections::HashSet;
 
@@ -240,41 +240,6 @@ pub fn policy_selects(policy: &SnapshotPolicy, source: &PersistentVolumeClaim) -
     })
 }
 
-/// Whether `snapshot` is a run that may still mount a cache claim: not being
-/// deleted, and not in a terminal phase. A run with no phase yet counts. Pure.
-pub fn run_in_flight(snapshot: &kopiur_api::Snapshot) -> bool {
-    snapshot.metadata.deletion_timestamp.is_none()
-        && !snapshot
-            .status
-            .as_ref()
-            .and_then(|s| s.phase.as_ref())
-            .is_some_and(kopiur_api::SnapshotPhase::is_terminal)
-}
-
-/// Whether a run of the `SnapshotPolicy` `namespace/policy` is in flight
-/// ([`run_in_flight`]).
-///
-/// A claim must not be deleted under such a run. A run picks its claim, then
-/// creates its Job, and the Job's pod is only protected by
-/// `kubernetes.io/pvc-protection` once it is scheduled. A claim deleted in
-/// between leaves that pod waiting on a PVC that does not exist, and the run
-/// fails at its pod startup deadline.
-pub async fn policy_run_in_flight(
-    client: &kube::Client,
-    namespace: &str,
-    policy: &str,
-) -> Result<bool> {
-    let snapshots: Api<kopiur_api::Snapshot> = Api::namespaced(client.clone(), namespace);
-    let by_policy =
-        ListParams::default().labels(&format!("{}={policy}", crate::consts::CONFIG_LABEL));
-    Ok(snapshots
-        .list(&by_policy)
-        .await?
-        .items
-        .iter()
-        .any(run_in_flight))
-}
-
 /// The name of the claim `policy` used BESIDE ITSELF for `repository` before
 /// that repository ran its movers centrally
 /// (`kopiur_api::expand::cache_pvc_name`), or `None` when the policy does not
@@ -308,6 +273,163 @@ pub fn is_in_namespace_cache_of(pvc: &PersistentVolumeClaim, policy_uid: &str) -
             .any(|r| r.kind == "SnapshotPolicy" && r.uid == policy_uid)
 }
 
+/// How long a retired claim is kept before it can be deleted.
+///
+/// A run reads its claim in [`io::ensure_cache_pvc`] and creates its Job a few
+/// API calls later, in the same reconcile pass. A run that read the claim just
+/// before it was retired has no Job yet. After this long it has one, and the
+/// Job check in [`retire_and_delete`] sees it.
+pub const RETIRE_GRACE_SECS: i64 = 60;
+
+/// When `meta` was retired (unix seconds), read off
+/// [`io::CACHE_RETIRED_ANNOTATION`]. `None` for a claim that is not retired, or
+/// whose mark is not a time. Pure.
+pub fn retired_at(meta: &kube::core::ObjectMeta) -> Option<i64> {
+    let value = meta
+        .annotations
+        .as_ref()?
+        .get(io::CACHE_RETIRED_ANNOTATION)?;
+    chrono::DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|t| t.timestamp())
+}
+
+/// Whether a claim retired at `retired_at` has been kept for
+/// [`RETIRE_GRACE_SECS`]. Pure.
+pub fn grace_elapsed(retired_at: i64, now: i64) -> bool {
+    now - retired_at >= RETIRE_GRACE_SECS
+}
+
+/// Whether one of `jobs` can still start a pod that mounts the claim named
+/// `claim`: its pod template mounts the claim, and it is neither finished nor
+/// being deleted. A Job with retries left starts a new pod after an attempt
+/// fails, long after the `Snapshot` it serves reported that failure. Pure.
+pub fn claim_has_a_job(jobs: &[k8s_openapi::api::batch::v1::Job], claim: &str) -> bool {
+    jobs.iter().any(|job| {
+        job.metadata.deletion_timestamp.is_none()
+            && io::mover_job_terminal(job).is_none()
+            && job
+                .spec
+                .as_ref()
+                .and_then(|s| s.template.spec.as_ref())
+                .and_then(|s| s.volumes.as_ref())
+                .is_some_and(|volumes| {
+                    volumes.iter().any(|v| {
+                        v.persistent_volume_claim
+                            .as_ref()
+                            .is_some_and(|c| c.claim_name == claim)
+                    })
+                })
+    })
+}
+
+/// Mark `pvc` as retired ([`io::CACHE_RETIRED_ANNOTATION`]), so that no run
+/// mounts it from now on, and return when it was retired (unix seconds). An
+/// existing mark is kept. The patch carries the UID of `pvc`, so it can only
+/// mark the claim that was read. `None` when that claim is gone or was
+/// replaced.
+async fn retire_claim(
+    api: &Api<PersistentVolumeClaim>,
+    pvc: &PersistentVolumeClaim,
+    now: i64,
+) -> Result<Option<i64>> {
+    if let Some(at) = retired_at(&pvc.metadata) {
+        return Ok(Some(at));
+    }
+    let stamp = chrono::DateTime::from_timestamp(now, 0)
+        .unwrap_or_else(chrono::Utc::now)
+        .to_rfc3339();
+    let patch = serde_json::json!({
+        "metadata": {
+            "uid": pvc.metadata.uid,
+            "annotations": { io::CACHE_RETIRED_ANNOTATION: stamp },
+        },
+    });
+    match api
+        .patch(
+            &pvc.name_any(),
+            &kube::api::PatchParams::default(),
+            &kube::api::Patch::Merge(&patch),
+        )
+        .await
+    {
+        Ok(_) => Ok(Some(now)),
+        Err(kube::Error::Api(e)) if e.code == 404 || io::refused_for_uid(&e) => Ok(None),
+        Err(e) => Err(Error::Kube(e)),
+    }
+}
+
+/// What [`retire_and_delete`] did with the claims it was given.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Retirement {
+    /// Claims whose delete was accepted.
+    pub deleted: usize,
+    /// Claims that are retired and still kept: their grace period is not over,
+    /// or a Job that mounts them is not finished. The caller comes back later.
+    pub waiting: usize,
+}
+
+/// Delete persistent cache `claims` without taking one from under a mover.
+///
+/// Kubernetes only protects a claim from deletion while a SCHEDULED pod mounts
+/// it. A pod that is not scheduled yet, the next pod of a Job with retries
+/// left, and a run that picked the claim but has not created its Job yet are
+/// all unprotected: delete the claim, and that pod waits for a PVC that does
+/// not exist until its startup deadline fails the run. So a claim goes in
+/// three steps, each of which a later call continues:
+///
+/// 1. **Retire it.** From then on no run mounts it
+///    ([`io::CachePvcClaim::Terminating`]).
+/// 2. **Keep it for [`RETIRE_GRACE_SECS`].** A run that read the claim before
+///    step 1 creates its Job in that time.
+/// 3. **Delete it once no unfinished Job mounts it** ([`claim_has_a_job`]).
+///
+/// The test is about the claim, not about the `Snapshot`s of its policy: a
+/// `Snapshot` can reference a policy of another namespace without the policy
+/// label, it reports `Failed` while its Job still has retries, and the runs
+/// that start after step 1 do not mount the claim at all.
+///
+/// `now` is the decision clock (unix seconds).
+pub async fn retire_and_delete(
+    client: &kube::Client,
+    claims: &[(Api<PersistentVolumeClaim>, PersistentVolumeClaim)],
+    now: i64,
+) -> Result<Retirement> {
+    use k8s_openapi::api::batch::v1::Job;
+    let managed = ListParams::default().labels(&format!(
+        "{}={}",
+        crate::consts::MANAGED_BY_LABEL,
+        crate::consts::MANAGED_BY_VALUE
+    ));
+    // The Jobs of each namespace, listed at most once, and only after a claim
+    // of that namespace finished its grace period.
+    let mut jobs: std::collections::HashMap<String, Vec<Job>> = std::collections::HashMap::new();
+    let mut outcome = Retirement::default();
+    for (api, pvc) in claims {
+        let Some(retired) = retire_claim(api, pvc, now).await? else {
+            continue;
+        };
+        if !grace_elapsed(retired, now) {
+            outcome.waiting += 1;
+            continue;
+        }
+        let namespace = pvc.namespace().unwrap_or_default();
+        if !jobs.contains_key(&namespace) {
+            let listed = Api::<Job>::namespaced(client.clone(), &namespace)
+                .list(&managed)
+                .await?
+                .items;
+            jobs.insert(namespace.clone(), listed);
+        }
+        if claim_has_a_job(&jobs[&namespace], &pvc.name_any()) {
+            outcome.waiting += 1;
+        } else if delete_claim(api, pvc).await? {
+            outcome.deleted += 1;
+        }
+    }
+    Ok(outcome)
+}
+
 /// What one pass deleted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct CacheSweepOutcome {
@@ -315,6 +437,9 @@ pub struct CacheSweepOutcome {
     pub central: usize,
     /// In-namespace predecessors deleted.
     pub predecessors: usize,
+    /// Retired claims outside the operator namespace deleted (the second step
+    /// of a predecessor, or of a cache reset whose policy stopped reconciling).
+    pub retired: usize,
 }
 
 /// Delete `pvc` exactly (its UID is a precondition). `true` when the delete was
@@ -442,6 +567,7 @@ pub async fn run_cache_sweep(
             }
         }
     }
+    outcome.retired = pass.drain_retired(central_ns).await?;
     Ok(outcome)
 }
 
@@ -456,6 +582,38 @@ struct Pass<'a> {
 }
 
 impl Pass<'_> {
+    /// Finish the deletion of every retired cache claim outside the operator
+    /// namespace: a predecessor that an earlier pass retired, or the claims of
+    /// a cache reset. A retired claim is never mounted again, so one that is
+    /// left behind keeps every later run of its policy on a per-run volume.
+    /// This does not depend on what retired it still being true (the
+    /// repository can have left `Central` since). Returns the deletes accepted.
+    async fn drain_retired(&self, central_ns: &str) -> Result<usize> {
+        let all: Api<PersistentVolumeClaim> = Api::all(self.client.clone());
+        let caches = ListParams::default().labels(&format!(
+            "{CACHE_PVC_COMPONENT_LABEL}={CACHE_PVC_COMPONENT}"
+        ));
+        let retired: Vec<_> = all
+            .list(&caches)
+            .await?
+            .items
+            .into_iter()
+            .filter(|pvc| {
+                io::is_retired(&pvc.metadata)
+                    && pvc.metadata.deletion_timestamp.is_none()
+                    && pvc.namespace().as_deref() != Some(central_ns)
+            })
+            .map(|pvc| {
+                let api =
+                    Api::namespaced(self.client.clone(), &pvc.namespace().unwrap_or_default());
+                (api, pvc)
+            })
+            .collect();
+        Ok(retire_and_delete(self.client, &retired, self.now)
+            .await?
+            .deleted)
+    }
+
     /// Judge one central claim, and delete it or the predecessor it replaced.
     async fn sweep_claim(
         &self,
@@ -470,9 +628,16 @@ impl Pass<'_> {
             .as_ref()
             .map(|t| self.now - t.0.as_second());
         let mut swept = CacheSweepOutcome::default();
-        if let Verdict::Delete(reason) = claim_verdict(age, self.min_age_secs, state)
-            && !self.held_by_a_run(state, owner).await?
-            && delete_claim(self.central, claim).await?
+        // A retired claim was judged by an earlier pass or a reset, which is
+        // waiting for its grace period or for a Job. No new run mounts it, so
+        // it only goes.
+        let verdict = if io::is_retired(&claim.metadata) {
+            Verdict::Delete("it was retired")
+        } else {
+            claim_verdict(age, self.min_age_secs, state)
+        };
+        if let Verdict::Delete(reason) = verdict
+            && self.delete_central(claim, state).await?
         {
             swept.central = 1;
             tracing::info!(claim = %claim.name_any(),
@@ -491,15 +656,25 @@ impl Pass<'_> {
         Ok(swept)
     }
 
-    /// Whether a run of the claim's live policy is in flight, so the claim
-    /// stays for this pass ([`policy_run_in_flight`]). A claim whose owner is
-    /// gone has no runs left to wait for.
-    async fn held_by_a_run(&self, state: OwnerState, owner: &ClaimOwner) -> Result<bool> {
+    /// Delete a central claim that got a `Delete` verdict. A claim of a live
+    /// policy can still have a mover, so it goes through [`retire_and_delete`]
+    /// and is deleted on a later pass. A claim whose owner is gone has no
+    /// runs left: the finalizer of a `Snapshot` deletes its central Job.
+    /// `true` when a delete was accepted.
+    async fn delete_central(
+        &self,
+        claim: &PersistentVolumeClaim,
+        state: OwnerState,
+    ) -> Result<bool> {
         match state {
-            OwnerState::LivePolicy(_) => {
-                policy_run_in_flight(self.client, &owner.namespace, &owner.name).await
+            OwnerState::LivePolicy(_) | OwnerState::Terminating | OwnerState::LiveRestore => {
+                let claims = [(self.central.clone(), claim.clone())];
+                Ok(retire_and_delete(self.client, &claims, self.now)
+                    .await?
+                    .deleted
+                    > 0)
             }
-            OwnerState::Gone | OwnerState::Terminating | OwnerState::LiveRestore => Ok(false),
+            OwnerState::Gone => delete_claim(self.central, claim).await,
         }
     }
 
@@ -523,19 +698,20 @@ impl Pass<'_> {
         if !predecessors_seen.insert((owner.namespace.clone(), predecessor.clone())) {
             return Ok(false);
         }
-        // A run that began beside the policy before the repository went
-        // central may still be about to mount it.
-        if policy_run_in_flight(self.client, &owner.namespace, &owner.name).await? {
-            return Ok(false);
-        }
         let beside: Api<PersistentVolumeClaim> =
             Api::namespaced(self.client.clone(), &owner.namespace);
+        // A run that began beside the policy before the repository went
+        // central may still mount it, hence retire-then-delete. This pass
+        // retires it, and [`Pass::drain_retired`] deletes it on a later one.
         let deleted = match beside.get_opt(&predecessor).await? {
             Some(pvc)
                 if pvc.metadata.deletion_timestamp.is_none()
                     && is_in_namespace_cache_of(&pvc, &owner.uid) =>
             {
-                delete_claim(&beside, &pvc).await?
+                retire_and_delete(self.client, &[(beside.clone(), pvc)], self.now)
+                    .await?
+                    .deleted
+                    > 0
             }
             Some(_) | None => false,
         };

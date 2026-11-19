@@ -809,10 +809,42 @@ pub async fn reconcile(config: Arc<SnapshotPolicy>, ctx: Arc<Context>) -> Result
     // from here on. The RELIABLE synced signal — see `Context::mark_config_synced`.
     ctx.mark_config_synced();
     let start = std::time::Instant::now();
+    // The cache reset does not depend on the rest of the reconcile (a policy
+    // whose repository is missing can still drop its cache), and while one is
+    // pending the policy comes back for it on a short cadence.
+    let reset = cache_reset_step(&config, &ctx).await;
     let result = reconcile_inner(&config, &ctx).await;
     ctx.metrics
         .record_reconcile("SnapshotPolicy", start.elapsed().as_secs_f64());
-    result
+    match (reset, result) {
+        (Ok(CacheReset::Pending), Ok(_)) => Ok(Action::requeue(CACHE_RESET_RETRY)),
+        (Err(e), Ok(_)) => Err(e),
+        (_, result) => result,
+    }
+}
+
+/// How soon a policy with a pending cache reset is reconciled again: the reset
+/// continues when the grace period of its claims is over, or when a mover Job
+/// that mounts one of them finishes, and no watch reports either.
+const CACHE_RESET_RETRY: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Where a cache reset stands after one reconcile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CacheReset {
+    /// No request, or the request is done.
+    Settled,
+    /// The claims are retired, and at least one is still kept.
+    Pending,
+}
+
+/// Run [`honor_cache_reset`] for a live policy. A policy that is being deleted
+/// has its claims deleted by its finalizer.
+async fn cache_reset_step(config: &SnapshotPolicy, ctx: &Context) -> Result<CacheReset> {
+    let (Some(namespace), None) = (config.namespace(), &config.metadata.deletion_timestamp) else {
+        return Ok(CacheReset::Settled);
+    };
+    let api: Api<SnapshotPolicy> = Api::namespaced(ctx.client.clone(), &namespace);
+    honor_cache_reset(ctx, &api, config, &namespace, &config.name_any()).await
 }
 
 /// `reconcile_inner`'s deletion/finalizer front-matter, extracted to a single
@@ -856,10 +888,11 @@ fn pending_cache_reset(config: &SnapshotPolicy) -> Option<&str> {
 
 /// Act on a pending cache-reset request ([`pending_cache_reset`]): delete every
 /// persistent cache PVC of this policy, beside it and in the operator
-/// namespace, then record the request as honored. It waits while a run of the
-/// policy is in flight ([`crate::cache_sweep::policy_run_in_flight`]). A claim
-/// that some other pod still mounts goes when that pod ends, and a run that
-/// starts before then uses a per-run volume ([`io::CachePvcClaim::Terminating`]).
+/// namespace, then record the request as honored. The claims are retired
+/// first and deleted after a grace period, once no unfinished mover Job mounts
+/// them ([`crate::cache_sweep::retire_and_delete`]), so the request stays
+/// [`CacheReset::Pending`] for at least that long. A run that starts in
+/// between uses a per-run volume ([`io::CachePvcClaim::Terminating`]).
 ///
 /// The request exists for central claims, which the policy's author cannot
 /// delete. It covers the in-namespace ones too, so it means one thing whatever
@@ -870,33 +903,22 @@ async fn honor_cache_reset(
     config: &SnapshotPolicy,
     namespace: &str,
     name: &str,
-) -> Result<()> {
+) -> Result<CacheReset> {
     use k8s_openapi::api::core::v1::PersistentVolumeClaim;
     let Some(requested) = pending_cache_reset(config) else {
-        return Ok(());
+        return Ok(CacheReset::Settled);
     };
-    // A run that already picked its claim would be left with a pod waiting on
-    // a PVC that does not exist. The Snapshot watch re-runs this reconcile
-    // when that run ends.
-    if crate::cache_sweep::policy_run_in_flight(&ctx.client, namespace, name).await? {
-        io::publish_normal_event(
-            ctx,
-            config,
-            "CacheResetPending",
-            "Delete",
-            "A cache reset was requested, and a Snapshot of this SnapshotPolicy is still \
-             running. Kopiur deletes the persistent kopia cache PVCs when no Snapshot of this \
-             policy is Pending or Running.",
-        )
-        .await;
-        return Ok(());
-    }
     let uid = config.uid().unwrap_or_default();
+    let mut claims = Vec::new();
     if let Ok(central) = io::central_namespace(
         ctx.operator_namespace.as_deref(),
         matches!(ctx.watch_scope, crate::config::WatchScope::Namespaced(_)),
     ) {
-        io::reap_central_policy_cache_pvcs(&ctx.client, &central, &uid).await?;
+        let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(ctx.client.clone(), &central);
+        let ours = ListParams::default().labels(&format!("{}={uid}", io::CENTRAL_POLICY_UID_LABEL));
+        for pvc in pvcs.list(&ours).await?.items {
+            claims.push((pvcs.clone(), pvc));
+        }
     }
     let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(ctx.client.clone(), namespace);
     let caches = ListParams::default().labels(&format!(
@@ -905,17 +927,26 @@ async fn honor_cache_reset(
         io::CACHE_PVC_COMPONENT
     ));
     for pvc in pvcs.list(&caches).await?.items {
-        if !crate::cache_sweep::is_in_namespace_cache_of(&pvc, &uid) {
-            continue;
+        if crate::cache_sweep::is_in_namespace_cache_of(&pvc, &uid) {
+            claims.push((pvcs.clone(), pvc));
         }
-        match pvcs
-            .delete(&pvc.name_any(), &io::delete_exactly(&pvc.metadata))
-            .await
-        {
-            Ok(_) => {}
-            Err(kube::Error::Api(e)) if e.code == 404 || e.code == 409 => {}
-            Err(e) => return Err(Error::Kube(e)),
-        }
+    }
+    // A claim is not deleted from under a mover: it is retired, kept for a
+    // grace period, and deleted once no unfinished Job mounts it.
+    let retirement =
+        crate::cache_sweep::retire_and_delete(&ctx.client, &claims, Utc::now().timestamp()).await?;
+    if retirement.waiting > 0 {
+        io::publish_normal_event(
+            ctx,
+            config,
+            "CacheResetPending",
+            "Delete",
+            "A cache reset was requested. No new run mounts the persistent kopia cache PVCs of \
+             this SnapshotPolicy any more. Kopiur deletes each one a minute after that, or \
+             when the mover Job that still mounts it finishes.",
+        )
+        .await;
+        return Ok(CacheReset::Pending);
     }
     io::patch_status(
         api,
@@ -934,7 +965,7 @@ async fn honor_cache_reset(
     )
     .await;
     tracing::info!(policy = %name, %namespace, "reset the persistent mover cache on request");
-    Ok(())
+    Ok(CacheReset::Settled)
 }
 
 async fn reconcile_inner(config: &SnapshotPolicy, ctx: &Context) -> Result<Action> {
@@ -967,7 +998,6 @@ async fn reconcile_inner(config: &SnapshotPolicy, ctx: &Context) -> Result<Actio
     if let Some(action) = handle_policy_lifecycle(ctx, &api, config, &namespace, &name).await? {
         return Ok(action);
     }
-    honor_cache_reset(ctx, &api, config, &namespace, &name).await?;
 
     let existing = config
         .status

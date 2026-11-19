@@ -1079,3 +1079,21 @@ async fn a_policy_claim_records_the_repository_and_source_it_serves() {
         Some("data-a")
     );
 }
+
+/// A reset or the sweep retires a claim before it looks for runs in flight
+/// (`cache_sweep::retire_and_delete`). From that moment no run may mount it:
+/// the claim can be deleted as soon as the runs that existed at the mark end.
+#[tokio::test]
+async fn a_retired_claim_is_not_mounted_or_resized() {
+    for owner in [central_policy("uid-pg"), in_namespace()] {
+        let mut retired = match &owner {
+            CachePvcOwner::Central { .. } => central_claim_json("1Gi", "uid-pg"),
+            CachePvcOwner::Reference(_) => pvc_json("1Gi", Some("1Gi")),
+        };
+        retired["metadata"]["annotations"] =
+            serde_json::json!({ crate::io::CACHE_RETIRED_ANNOTATION: "2026-01-01T00:00:00Z" });
+        let (out, log) = ensure_central(Some(retired), StatusCode::CREATED, &owner, "2Gi").await;
+        assert_eq!(out, CachePvcClaim::Terminating, "{owner:?}");
+        assert!(writes(&log).is_empty(), "{log:?}");
+    }
+}

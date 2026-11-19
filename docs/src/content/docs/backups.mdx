@@ -708,7 +708,7 @@ Kopiur deletes every cache PVC of the policy, in its namespace and in the operat
 
 Kopiur acts once for each value and records the value in `status.cache.resetRequestHonored`. A `CacheReset` Event on the policy shows that the reset happened. You can keep the annotation in Git. To reset again, change the value.
 
-Kopiur waits while a `Snapshot` of the policy is `Pending` or `Running`, because that run can be about to mount the PVC. A `CacheResetPending` Event on the policy says so. When the run ends, the reset happens. If some other pod still mounts a PVC, the PVC goes after that pod ends. A run that starts before then uses a per-run volume.
+The reset takes at least one minute. Kopiur first marks each PVC with the annotation `kopiur.home-operations.com/cache-retired-at`. No new run mounts a marked PVC. Kopiur deletes a marked PVC one minute later. If a mover Job that mounts the PVC is not finished then, Kopiur waits for that Job. A `CacheResetPending` Event on the policy shows the wait. A run that starts during the wait uses a per-run volume.
 
 In the workload namespace you can also delete the PVC with `kubectl delete pvc`. Under `execution.mode: Central` the PVC is in the operator namespace, and the annotation is the way to delete it without access to that namespace.
 

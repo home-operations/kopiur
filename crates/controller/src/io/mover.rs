@@ -1433,6 +1433,29 @@ pub const CACHE_PVC_COMPONENT_LABEL: &str = "kopiur.home-operations.com/componen
 /// [`CACHE_PVC_COMPONENT_LABEL`] value of a persistent kopia cache PVC.
 pub const CACHE_PVC_COMPONENT: &str = "mover-cache";
 
+/// Annotation (RFC 3339 time) that RETIRES a persistent cache claim: the
+/// controller decided to delete it, and no run may mount it from now on
+/// ([`CachePvcClaim::Terminating`]).
+///
+/// It is the first step of deleting a claim that a mover may still want
+/// (`crate::cache_sweep::retire_and_delete`): the claim is retired, kept for a
+/// grace period, and deleted once no unfinished Job mounts it. Deleting it
+/// directly can take it from under a pod that is not scheduled yet.
+pub const CACHE_RETIRED_ANNOTATION: &str = "kopiur.home-operations.com/cache-retired-at";
+
+/// Whether a claim carries [`CACHE_RETIRED_ANNOTATION`].
+pub fn is_retired(meta: &ObjectMeta) -> bool {
+    meta.annotations
+        .as_ref()
+        .is_some_and(|a| a.contains_key(CACHE_RETIRED_ANNOTATION))
+}
+
+/// Whether the owner's own claim must not be mounted because it is on its way
+/// out: being deleted, or retired.
+fn is_leaving(meta: &ObjectMeta) -> bool {
+    meta.deletion_timestamp.is_some() || is_retired(meta)
+}
+
 /// Annotation on a central `SnapshotPolicy` cache claim: the `ClusterRepository`
 /// whose backups it serves. The periodic sweep deletes the claim once the policy
 /// no longer backs up to that repository with a central persistent cache.
@@ -1674,10 +1697,10 @@ pub enum CachePvcClaim {
     /// ([`CachePvcOwner::is_foreign`]). It was neither changed nor adopted, and
     /// the run must not mount it.
     Foreign,
-    /// The owner's claim exists but is being deleted (a cache reset, or the
-    /// owner going away, while a mover pod still holds it). A pod cannot start
-    /// on a claim that is being deleted, so the run must not mount it. The next
-    /// run after the deletion completes creates it again.
+    /// The owner's claim exists but is on its way out: it is being deleted, or
+    /// it is retired ([`CACHE_RETIRED_ANNOTATION`]) and will be. A pod cannot
+    /// start on a claim that is being deleted, so the run must not mount it.
+    /// The next run after the deletion completes creates it again.
     Terminating,
     /// The owner can no longer delete a claim (a central owner that is gone,
     /// is being deleted, or has no cleanup finalizer yet). The claim was
@@ -1793,7 +1816,7 @@ pub async fn ensure_cache_pvc(
             if owner.is_foreign(&existing.metadata) {
                 return Ok(CachePvcClaim::Foreign);
             }
-            if existing.metadata.deletion_timestamp.is_some() {
+            if is_leaving(&existing.metadata) {
                 return Ok(CachePvcClaim::Terminating);
             }
             match pvc_requested_storage(&existing) {
@@ -1830,7 +1853,7 @@ pub async fn ensure_cache_pvc(
                     Some(winner) if owner.is_foreign(&winner.metadata) => {
                         return Ok(CachePvcClaim::Foreign);
                     }
-                    Some(winner) if winner.metadata.deletion_timestamp.is_some() => {
+                    Some(winner) if is_leaving(&winner.metadata) => {
                         return Ok(CachePvcClaim::Terminating);
                     }
                     Some(winner) => (winner, CachePvcResize::Unchanged),
