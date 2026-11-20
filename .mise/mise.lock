@@ -3,24 +3,27 @@
 lockfile_version = 4
 
 [[tools."aqua:EmbarkStudios/cargo-deny"]]
-version = "0.20.2"
+version = "0.21.0"
 backend = "aqua:EmbarkStudios/cargo-deny"
-specifiers = ["0.20.2"]
+specifiers = ["0.21.0"]
 
 [tools."aqua:EmbarkStudios/cargo-deny"."platforms.linux-arm64"]
-checksum = "sha256:995c82be0defc7a025cae49a2aa2644ce8245c9a3318fc4103907c6a285e8c7d"
-url = "https://github.com/EmbarkStudios/cargo-deny/releases/download/0.20.2/cargo-deny-0.20.2-aarch64-unknown-linux-musl.tar.gz"
-url_api = "https://api.github.com/repos/EmbarkStudios/cargo-deny/releases/assets/471598345"
+checksum = "sha256:47cc5d88d43cd568028080fece02d729f56f0ff8e6c168563ce6589e3c0f4738"
+checksum_source = "mise-versions"
+url = "https://github.com/EmbarkStudios/cargo-deny/releases/download/0.21.0/cargo-deny-0.21.0-aarch64-unknown-linux-musl.tar.gz"
+url_api = "https://api.github.com/repos/EmbarkStudios/cargo-deny/releases/assets/755169459"
 
 [tools."aqua:EmbarkStudios/cargo-deny"."platforms.linux-x64"]
-checksum = "sha256:9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f"
-url = "https://github.com/EmbarkStudios/cargo-deny/releases/download/0.20.2/cargo-deny-0.20.2-x86_64-unknown-linux-musl.tar.gz"
-url_api = "https://api.github.com/repos/EmbarkStudios/cargo-deny/releases/assets/471598214"
+checksum = "sha256:a2170b854ff697e79e39c4c538981c9c1bdd803addbae6719a4cb66b4585a903"
+checksum_source = "mise-versions"
+url = "https://github.com/EmbarkStudios/cargo-deny/releases/download/0.21.0/cargo-deny-0.21.0-x86_64-unknown-linux-musl.tar.gz"
+url_api = "https://api.github.com/repos/EmbarkStudios/cargo-deny/releases/assets/755168773"
 
 [tools."aqua:EmbarkStudios/cargo-deny"."platforms.macos-arm64"]
-checksum = "sha256:fe67d82a10d8597a3549364cb733a3f9cc1bfff9031b7ae46384a9f2a72090c3"
-url = "https://github.com/EmbarkStudios/cargo-deny/releases/download/0.20.2/cargo-deny-0.20.2-aarch64-apple-darwin.tar.gz"
-url_api = "https://api.github.com/repos/EmbarkStudios/cargo-deny/releases/assets/471597689"
+checksum = "sha256:c99a789160775ada8cb54aed72cfdae5a9b72e27434f8868d17c9634c3f52425"
+checksum_source = "mise-versions"
+url = "https://github.com/EmbarkStudios/cargo-deny/releases/download/0.21.0/cargo-deny-0.21.0-aarch64-apple-darwin.tar.gz"
+url_api = "https://api.github.com/repos/EmbarkStudios/cargo-deny/releases/assets/755174277"
 
 [[tools."aqua:dadav/helm-schema"]]
 version = "0.24.0"
@@ -109,30 +112,30 @@ url_api = "https://api.github.com/repos/sigstore/cosign/releases/assets/66006925
 provenance = "cosign"
 
 [[tools."github:oxc-project/oxc"]]
-version = "0.78.0"
+version = "0.79.0"
 backend = "github:oxc-project/oxc"
-specifiers = ["0.78.0"]
+specifiers = ["0.79.0"]
 
 [tools."github:oxc-project/oxc".options]
 matching_regex = "^oxfmt-"
 version_prefix = "oxfmt_v"
 
 [tools."github:oxc-project/oxc"."platforms.linux-arm64"]
-checksum = "sha256:7f90c13c29ff9f8c5f6955bfff9623909cc80ddb2704007249c2532676bd5266"
-url = "https://github.com/oxc-project/oxc/releases/download/oxfmt_v0.78.0/oxfmt-aarch64-unknown-linux-gnu.tar.gz"
-url_api = "https://api.github.com/repos/oxc-project/oxc/releases/assets/727291684"
+checksum = "sha256:2d550f171f2464df1fc7dd63154c6c77d795a9c6d54f99a3366cb45d2ff9e46d"
+url = "https://github.com/oxc-project/oxc/releases/download/oxfmt_v0.79.0/oxfmt-aarch64-unknown-linux-gnu.tar.gz"
+url_api = "https://api.github.com/repos/oxc-project/oxc/releases/assets/754764756"
 provenance = "github-attestations"
 
 [tools."github:oxc-project/oxc"."platforms.linux-x64"]
-checksum = "sha256:ed43ec296f699a5bcbb1c1947e2aeb4271c3674e43dc6db463f8c1da4c9bf15f"
-url = "https://github.com/oxc-project/oxc/releases/download/oxfmt_v0.78.0/oxfmt-x86_64-unknown-linux-gnu.tar.gz"
-url_api = "https://api.github.com/repos/oxc-project/oxc/releases/assets/727291793"
+checksum = "sha256:458ba526dd692baad90c5cf164341257e339da2a6e0f585dea6eae6644df5608"
+url = "https://github.com/oxc-project/oxc/releases/download/oxfmt_v0.79.0/oxfmt-x86_64-unknown-linux-gnu.tar.gz"
+url_api = "https://api.github.com/repos/oxc-project/oxc/releases/assets/754764891"
 provenance = "github-attestations"
 
 [tools."github:oxc-project/oxc"."platforms.macos-arm64"]
-checksum = "sha256:ba7e010e627377d12fa3ea0d40433d6cbaea66abfb0ea22f998f544cbd1dea90"
-url = "https://github.com/oxc-project/oxc/releases/download/oxfmt_v0.78.0/oxfmt-aarch64-apple-darwin.tar.gz"
-url_api = "https://api.github.com/repos/oxc-project/oxc/releases/assets/727291686"
+checksum = "sha256:c75859a53ec3a57a78d3e9752d2e9604badfca97dda65366c310ed2f5bf28534"
+url = "https://github.com/oxc-project/oxc/releases/download/oxfmt_v0.79.0/oxfmt-aarch64-apple-darwin.tar.gz"
+url_api = "https://api.github.com/repos/oxc-project/oxc/releases/assets/754764750"
 provenance = "github-attestations"
 
 [[tools.helm]]
@@ -344,27 +347,27 @@ url = "https://github.com/koalaman/shellcheck/releases/download/v0.11.0/shellche
 url_api = "https://api.github.com/repos/koalaman/shellcheck/releases/assets/279056932"
 
 [[tools.vendir]]
-version = "0.46.3"
+version = "0.47.0"
 backend = "aqua:carvel-dev/vendir"
-specifiers = ["0.46.3"]
+specifiers = ["0.47.0"]
 
 [tools.vendir."platforms.linux-arm64"]
-checksum = "sha256:821a9da837a017270743597a2e9b796d2d256385ad85450d6c5d89f05dd5aac9"
+checksum = "sha256:60b5331f0f68e374df3e283744ca7b28b69015d388c432a4dbd14d3202ec6fce"
 checksum_source = "mise-versions"
-url = "https://github.com/carvel-dev/vendir/releases/download/v0.46.3/vendir-linux-arm64"
-url_api = "https://api.github.com/repos/carvel-dev/vendir/releases/assets/655447804"
+url = "https://github.com/carvel-dev/vendir/releases/download/v0.47.0/vendir-linux-arm64"
+url_api = "https://api.github.com/repos/carvel-dev/vendir/releases/assets/754191088"
 
 [tools.vendir."platforms.linux-x64"]
-checksum = "sha256:5af8823ecc67b3ce2359bb0b70e72a5dbd765135722ca0ff42c16bc4d7409847"
+checksum = "sha256:9d1099f48f04882a716934178bb9ba8f2373c96b0bea536540106757bc4081e3"
 checksum_source = "mise-versions"
-url = "https://github.com/carvel-dev/vendir/releases/download/v0.46.3/vendir-linux-amd64"
-url_api = "https://api.github.com/repos/carvel-dev/vendir/releases/assets/655447795"
+url = "https://github.com/carvel-dev/vendir/releases/download/v0.47.0/vendir-linux-amd64"
+url_api = "https://api.github.com/repos/carvel-dev/vendir/releases/assets/754191176"
 
 [tools.vendir."platforms.macos-arm64"]
-checksum = "sha256:52b3c224329c11f7189847fc9687a7e9f319626f893dd9a8bcc3704dbc89cc25"
+checksum = "sha256:08749252b25280e4fce50d23036caf562ac7c3cfa600eed7c134f4762a6b5cde"
 checksum_source = "mise-versions"
-url = "https://github.com/carvel-dev/vendir/releases/download/v0.46.3/vendir-darwin-arm64"
-url_api = "https://api.github.com/repos/carvel-dev/vendir/releases/assets/655447796"
+url = "https://github.com/carvel-dev/vendir/releases/download/v0.47.0/vendir-darwin-arm64"
+url_api = "https://api.github.com/repos/carvel-dev/vendir/releases/assets/754191092"
 
 [[tools.yq]]
 version = "4.54.3"
