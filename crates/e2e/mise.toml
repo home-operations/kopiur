@@ -180,7 +180,7 @@ docker exec "$NODE" sh -c '
   # PVC ROOT is the kopia repo — a subdir under one shared PVC gives no isolation.
   # Each scenario binds its own PVC over one of these dirs. KEEP IN LOCKSTEP with
   # crates/e2e/src/consts.rs::REPO_SUBPATHS.
-  for s in stream stream-fail moverdefaults scc-shadow recmeta nsdel-orphan nsdel-delete pin pinrestore populator populator2 popempty popempty2 readonly kstatus verify vfydeep vfyinh vfygate vfycache repl-src repl-dst repl-s3-src repl-run-src repl-run-dst projgate hooks gfs errh colocation colocation-off colocation-missing copymethod copymethod-csi copymethod-explicit idxhealth epochparams epochparams-default staging-recover staging-timeout staging-override staging-mismatch massdel-cascade massdel-breaker massdel-prune massdel-single massdel-nooverlap massdel-throttle massdel-outage massdel-cap2 massdel-heldprune massdel-cache adopt-prune adopt-ignore adopt-quiet polcasc-retain polcasc-delete polcasc-simul recrestore partial waitanchor waitref multipvc-fanout multipvc-group vfyfanout populator-fanout unchanged-dedup unchanged-default srepl-src srepl-dst srepl-coex-src srepl-coex-dst srepl-sel-src srepl-sel-dst srepl-susp-src srepl-susp-dst srepl-run-src srepl-run-dst mrepo-a mrepo-b mrepo-ret-a mrepo-ret-b mrepo-down-a mrepo-down-b mrepo-rest-a mrepo-rest-b seed-primary seed-mirror seed-blob seed-mig-src seed-mig-dst seed-empty-src seed-empty-dst conc-cap conc-counted conc-restore conc-uncapped conc-env-a conc-env-b conc-replace ui ui-cluster privroot cachebudget cachegrow pwkey central central-refuse central-cache; do
+  for s in stream stream-fail moverdefaults scc-shadow recmeta nsdel-orphan nsdel-delete pin pinrestore populator populator2 popempty popempty2 readonly kstatus verify vfydeep vfyinh vfygate vfycache repl-src repl-dst repl-s3-src repl-run-src repl-run-dst projgate hooks gfs errh colocation colocation-off colocation-missing copymethod copymethod-csi copymethod-explicit idxhealth epochparams epochparams-default staging-recover staging-timeout staging-override staging-mismatch massdel-cascade massdel-breaker massdel-prune massdel-single massdel-nooverlap massdel-throttle massdel-outage massdel-cap2 massdel-heldprune massdel-cache adopt-prune adopt-ignore adopt-quiet polcasc-retain polcasc-delete polcasc-simul recrestore partial waitanchor waitref multipvc-fanout multipvc-group vfyfanout populator-fanout unchanged-dedup unchanged-default srepl-src srepl-dst srepl-coex-src srepl-coex-dst srepl-sel-src srepl-sel-dst srepl-susp-src srepl-susp-dst srepl-run-src srepl-run-dst mrepo-a mrepo-b mrepo-ret-a mrepo-ret-b mrepo-down-a mrepo-down-b mrepo-rest-a mrepo-rest-b seed-primary seed-mirror seed-blob seed-mig-src seed-mig-dst seed-empty-src seed-empty-dst conc-cap conc-counted conc-restore conc-uncapped conc-env-a conc-env-b conc-replace ui ui-cluster privroot cachebudget cachegrow pwkey central central-refuse central-cache central-sweep cachescrub cachereset; do
     mkdir -p "/kopiur-e2e/repos/$s"
   done
   # Source dir with one UNREADABLE file for the errorHandling.ignoreFileErrors
@@ -583,7 +583,7 @@ true
 '''
 
 [tasks.run]
-description = "Run the Rust e2e tests against an already-provisioned cluster (KOPIUR_E2E_BINS selects test binaries; KOPIUR_E2E_TESTFILTER filters by name)"
+description = "Run the Rust e2e tests against an already-provisioned cluster (KOPIUR_E2E_BINS selects test binaries; KOPIUR_E2E_TESTFILTER filters by name; KOPIUR_E2E_PARTITION runs one slice)"
 dir = "{{config_root}}/../.."
 env = { KUBECONFIG = "{{config_root}}/../../target/e2e/kubeconfig" }
 run = '''
@@ -597,6 +597,10 @@ trap 'rc=$?; if [ "$rc" -ne 0 ]; then echo "==> e2e tests FAILED (rc=$rc) — du
 # KOPIUR_E2E_BINS — space-separated test-binary (file) names, expanded to repeated
 # `--test <name>` target flags, so a CI shard runs only its files. Empty ⇒ all.
 # KOPIUR_E2E_TESTFILTER — name-substring filter (nextest positional filter).
+# KOPIUR_E2E_PARTITION — a nextest partition (`slice:M/N`): run only that slice
+# of the selected tests. A CI shard that takes too long is split into N jobs
+# this way. nextest slices AFTER the binary and name filters, round-robin in
+# name order, so the N slices together are exactly the unsliced selection.
 #
 # KOPIUR_E2E_ARCHIVE — run the prebuilt tests in this nextest archive (`mise run
 # test-archive`, target/nextest/e2e.tar.zst) instead of compiling. This is how CI
@@ -610,9 +614,10 @@ if [ -n "${KOPIUR_E2E_ARCHIVE:-}" ]; then
   for b in ${KOPIUR_E2E_BINS:-}; do FILTER="${FILTER:+$FILTER | }binary(=$b)"; done
   set --
   if [ -n "$FILTER" ]; then set -- -E "$FILTER"; fi
-  echo "==> running e2e tests from $KOPIUR_E2E_ARCHIVE${KOPIUR_E2E_BINS:+ (binaries:$KOPIUR_E2E_BINS)}"
+  echo "==> running e2e tests from $KOPIUR_E2E_ARCHIVE${KOPIUR_E2E_BINS:+ (binaries:$KOPIUR_E2E_BINS)}${KOPIUR_E2E_PARTITION:+ (partition: $KOPIUR_E2E_PARTITION)}"
   cargo-nextest nextest run --profile e2e --archive-file "$KOPIUR_E2E_ARCHIVE" --workspace-remap . \
-    "$@" --no-fail-fast --run-ignored all --no-capture ${KOPIUR_E2E_TESTFILTER:-}
+    "$@" ${KOPIUR_E2E_PARTITION:+--partition "$KOPIUR_E2E_PARTITION"} \
+    --no-fail-fast --run-ignored all --no-capture ${KOPIUR_E2E_TESTFILTER:-}
   echo "==> e2e tests passed"
   exit 0
 fi
@@ -631,7 +636,8 @@ echo "==> running e2e tests${KOPIUR_E2E_BINS:+ (binaries:$KOPIUR_E2E_BINS)}"
 # nextest still exits non-zero overall, so the trap + CI failure are unaffected.
 # `--run-ignored all` ≙ libtest `--include-ignored`; `--no-capture` streams
 # output live and keeps execution serial, like the old `--test-threads=1 --nocapture`.
-cargo nextest run --profile e2e -p kopiur-e2e --features e2e $BINS --no-fail-fast \
+cargo nextest run --profile e2e -p kopiur-e2e --features e2e $BINS \
+  ${KOPIUR_E2E_PARTITION:+--partition "$KOPIUR_E2E_PARTITION"} --no-fail-fast \
   --run-ignored all --no-capture ${KOPIUR_E2E_TESTFILTER:-}
 echo "==> e2e tests passed"
 '''

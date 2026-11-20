@@ -422,4 +422,137 @@ mod shard_coverage {
              shard: {phantom:?}"
         );
     }
+
+    /// One `matrix.include` entry of the e2e job: its `bins:` value and its
+    /// `partition:` value, when it has one.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct Shard {
+        name: String,
+        bins: String,
+        partition: Option<String>,
+    }
+
+    /// The value of a `key: "..."` or `key: ...` line, without quotes.
+    fn scalar<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+        let rest = line.trim().strip_prefix(key)?.trim();
+        Some(rest.trim_matches('"'))
+    }
+
+    /// Every `- shard:` entry of the e2e job's matrix, read off the file's own
+    /// line shape (each key is on a line of its own), so this needs no YAML
+    /// parser.
+    fn shards() -> Vec<Shard> {
+        let path = repo_root().join(".github/workflows/ci.yaml");
+        let yaml = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        let mut shards: Vec<Shard> = Vec::new();
+        for line in yaml.lines() {
+            if let Some(name) = scalar(line, "- shard:") {
+                shards.push(Shard {
+                    name: name.to_string(),
+                    bins: String::new(),
+                    partition: None,
+                });
+            } else if let (Some(bins), Some(shard)) = (scalar(line, "bins:"), shards.last_mut()) {
+                shard.bins = bins.to_string();
+            } else if let (Some(partition), Some(shard)) =
+                (scalar(line, "partition:"), shards.last_mut())
+            {
+                shard.partition = Some(partition.to_string());
+            }
+        }
+        shards
+    }
+
+    /// What is wrong with the way `shards` (all with the same `bins:`) cover
+    /// their tests, if anything. Pure.
+    ///
+    /// One unpartitioned entry runs every test. A partitioned set must be
+    /// exactly `slice:1/N` through `slice:N/N`: nextest gives each test to one
+    /// slice, so a missing slice is a set of tests that never runs, a slice
+    /// listed twice runs its tests twice, and two sets with different `N` (or
+    /// a partitioned entry beside an unpartitioned one) overlap.
+    fn partition_problem(shards: &[&Shard]) -> Option<String> {
+        let partitions: Vec<&str> = shards
+            .iter()
+            .filter_map(|s| s.partition.as_deref())
+            .collect();
+        if partitions.is_empty() {
+            return (shards.len() > 1).then(|| "more than one unpartitioned shard".to_string());
+        }
+        if partitions.len() != shards.len() {
+            return Some("a partitioned shard beside an unpartitioned one".to_string());
+        }
+        let n = partitions.len();
+        let mut expected: Vec<String> = (1..=n).map(|m| format!("slice:{m}/{n}")).collect();
+        let mut found: Vec<String> = partitions.iter().map(|p| p.to_string()).collect();
+        expected.sort();
+        found.sort();
+        (found != expected).then(|| format!("expected {expected:?}, found {found:?}"))
+    }
+
+    /// A shard that takes too long is split with `partition: "slice:M/N"` into
+    /// N jobs. The split is only complete when every one of the N slices has a
+    /// job. A slice that is left out, or dropped later when someone removes a
+    /// "redundant" entry, is silent: CI stays green and those tests never run.
+    #[test]
+    fn every_partitioned_shard_lists_all_of_its_slices() {
+        let shards = shards();
+        assert!(
+            shards.len() > 10 && shards.iter().all(|s| !s.bins.is_empty()),
+            "sanity: expected to read the e2e matrix, found {shards:?}"
+        );
+        let mut by_bins: std::collections::BTreeMap<&str, Vec<&Shard>> = Default::default();
+        for shard in &shards {
+            by_bins.entry(shard.bins.as_str()).or_default().push(shard);
+        }
+        for (bins, group) in &by_bins {
+            let names: Vec<&str> = group.iter().map(|s| s.name.as_str()).collect();
+            assert_eq!(
+                partition_problem(group),
+                None,
+                "the shards {names:?} (bins: \"{bins}\") do not cover their tests exactly \
+                 once. Fix: in .github/workflows/ci.yaml give them `partition: \"slice:1/N\"` \
+                 through `\"slice:N/N\"`, one entry each, or one entry with no `partition`."
+            );
+        }
+        // A binary named by two different `bins:` values runs twice, or, with
+        // partitions, is sliced two different ways.
+        let mut owner: std::collections::BTreeMap<&str, &str> = Default::default();
+        for bins in by_bins.keys() {
+            for binary in bins.split_whitespace() {
+                if let Some(other) = owner.insert(binary, bins) {
+                    panic!(
+                        "the e2e binary `{binary}` is in two different `bins:` values \
+                         (\"{other}\" and \"{bins}\"), so CI runs it twice"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_partition_set_must_be_complete_and_not_overlap() {
+        let shard = |partition: Option<&str>| Shard {
+            name: "s".into(),
+            bins: "b".into(),
+            partition: partition.map(str::to_string),
+        };
+        let check = |partitions: &[Option<&str>]| {
+            let shards: Vec<Shard> = partitions.iter().map(|p| shard(*p)).collect();
+            partition_problem(&shards.iter().collect::<Vec<_>>())
+        };
+        assert_eq!(check(&[None]), None);
+        assert_eq!(
+            check(&[Some("slice:1/3"), Some("slice:3/3"), Some("slice:2/3")]),
+            None
+        );
+        // A slice left out, a slice listed twice, and the wrong total.
+        assert!(check(&[Some("slice:1/3"), Some("slice:2/3")]).is_some());
+        assert!(check(&[Some("slice:1/2"), Some("slice:1/2")]).is_some());
+        assert!(check(&[Some("slice:1/2"), Some("slice:2/3")]).is_some());
+        // Every test twice, and a partitioned entry beside an unpartitioned one.
+        assert!(check(&[None, None]).is_some());
+        assert!(check(&[None, Some("slice:1/1")]).is_some());
+    }
 }

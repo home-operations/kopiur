@@ -274,6 +274,12 @@ pub const REPO_SUBPATHS: &[&str] = &[
     "central",
     "central-refuse",
     "central-cache",
+    "central-sweep",
+    // The life of a Persistent cache PVC after its first run
+    // (cache_lifecycle.rs): the scrub of an older release's files, and a
+    // reset under a running mover.
+    "cachescrub",
+    "cachereset",
 ];
 // --- web console (kopiur-ui) roles and bindings ---------------------------------
 /// The aggregate human ClusterRole the chart renders (`ui.rbac.userRoles`). Bound
