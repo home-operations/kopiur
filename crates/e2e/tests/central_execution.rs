@@ -28,6 +28,10 @@
 //!    the claim for each source of a many-source policy, and its deletion with
 //!    the policy.
 //!
+//! 5. **Cache sweep** (#760): the periodic sweep deletes a central cache PVC
+//!    whose owner is gone, one that its live policy stopped using, and the PVC
+//!    the policy left beside itself. It keeps the PVC that is in use.
+//!
 //! Needs the alpha `CrossNamespaceVolumeDataSource` feature on kube-apiserver and
 //! kube-controller-manager (`crates/e2e/kind-config.yaml`) and on the CSI
 //! provisioner, plus the `ReferenceGrant` CRD (`manifests/csi-snapshot`).
@@ -1981,6 +1985,245 @@ async fn central_backup_keeps_its_persistent_cache_in_the_operator_namespace() {
     for run in runs {
         let _ = backups.delete(run, &DeleteParams::default()).await;
     }
+    let _ = policies.delete(policy, &DeleteParams::default()).await;
+    let _ = crepos.delete(repo, &DeleteParams::default()).await;
+    kopiur_e2e::pvc::delete_pvc_and_consumers(&client, WORKLOAD_NS, src)
+        .await
+        .expect("delete the source PVC");
+}
+
+/// A cache PVC that only the sweep can tell from a real one: it carries the
+/// cache label and whatever marks the caller adds, and binds to nothing
+/// (`storageClassName: ""` with no matching volume), so it costs no storage.
+fn marked_cache_pvc(ns: &str, name: &str, metadata: serde_json::Value) -> PersistentVolumeClaim {
+    let mut pvc = serde_json::json!({
+        "apiVersion": "v1", "kind": "PersistentVolumeClaim",
+        "metadata": { "name": name, "namespace": ns },
+        "spec": {
+            "accessModes": ["ReadWriteOnce"],
+            "storageClassName": "",
+            "resources": { "requests": { "storage": "1Mi" } },
+        },
+    });
+    for (key, value) in metadata.as_object().expect("metadata object") {
+        pvc["metadata"][key] = value.clone();
+    }
+    pvc["metadata"]["labels"]["kopiur.home-operations.com/component"] = "mover-cache".into();
+    cr(pvc)
+}
+
+/// #760: a central cache PVC has no owner reference, and its policy's author
+/// cannot delete a PVC in the operator namespace. So the periodic sweep is the
+/// only thing that removes one that nothing uses any more. The harness runs
+/// the sweep every 15 seconds with a 30 second minimum age
+/// (`deploy/e2e/values.yaml`).
+///
+/// Three claims must go and one must stay:
+///
+/// - an **orphan**: marked for a `SnapshotPolicy` that does not exist (its
+///   finalizer was removed by hand, or the operator was downgraded);
+/// - the **predecessor**: the `kopiur-cache-<policy>` PVC the policy used
+///   beside itself before its repository ran movers centrally;
+/// - the policy's **own central claim**, once the policy stops using a
+///   `Persistent` cache;
+/// - and until then that claim stays, however many passes see it.
+///
+/// A claim of a live policy is never deleted directly: the sweep retires it,
+/// and deletes it on a later pass.
+#[tokio::test]
+#[ignore = "requires the e2e harness + the CSI snapshot stack (mise run //crates/e2e:snapshot-stack)"]
+async fn central_cache_claims_are_swept_when_nothing_uses_them() {
+    let Some(world) = World::connect().await else {
+        return;
+    };
+    world.ensure(&[Need::Filesystem]).await.expect("fixtures");
+    let client = world.client().clone();
+    if !csi_class_present_or_skip(&client, CSI_STORAGE_CLASS).await {
+        return;
+    }
+    ensure_namespace(&client, WORKLOAD_NS)
+        .await
+        .expect("workload namespace");
+
+    let src = "e2e-central-sweep-src";
+    let repo = "e2e-central-sweep-repo";
+    let policy = "e2e-central-sweep-policy";
+    let backup = "e2e-central-sweep-backup";
+    let orphan = "kopiur-cache-e2e-central-sweep-orphan";
+    let predecessor = format!("kopiur-cache-{policy}");
+    let retired = "kopiur.home-operations.com/cache-retired-at";
+    let policies: Api<SnapshotPolicy> = Api::namespaced(client.clone(), WORKLOAD_NS);
+    let backups: Api<Snapshot> = Api::namespaced(client.clone(), WORKLOAD_NS);
+    let central_pvcs: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let workload_pvcs: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), WORKLOAD_NS);
+
+    // A retry of this test finds the previous attempt's objects; start clean.
+    let _ = backups.delete(backup, &DeleteParams::default()).await;
+    let _ = policies.delete(policy, &DeleteParams::default()).await;
+    let _ = central_pvcs.delete(orphan, &DeleteParams::default()).await;
+    let _ = workload_pvcs
+        .delete(&predecessor, &DeleteParams::default())
+        .await;
+    wait_until(
+        "previous attempt's objects gone",
+        default_timeout(),
+        poll_interval(),
+        || async {
+            Ok((backups.get_opt(backup).await?.is_none()
+                && policies.get_opt(policy).await?.is_none()
+                && central_pvcs.get_opt(orphan).await?.is_none()
+                && workload_pvcs.get_opt(&predecessor).await?.is_none())
+            .then_some(()))
+        },
+    )
+    .await
+    .expect("a previous attempt's objects must clear");
+
+    csi_source_with_marker(&client, WORKLOAD_NS, src).await;
+    let crepos = central_repository(&client, repo, "central-sweep").await;
+    create_idempotent(
+        &policies,
+        &cr(snapshot_policy_json(
+            WORKLOAD_NS,
+            policy,
+            "ClusterRepository",
+            repo,
+            serde_json::json!({
+                "copyMethod": "Snapshot",
+                "sources": [ { "pvc": { "name": src } } ],
+                "mover": { "cache": {
+                    "capacity": "64Mi",
+                    "mode": "Persistent",
+                    "storageClassName": CSI_STORAGE_CLASS,
+                } },
+            }),
+        )),
+        "create SnapshotPolicy with a Persistent cache",
+    )
+    .await;
+    let policy_uid = policies
+        .get(policy)
+        .await
+        .expect("get SnapshotPolicy")
+        .uid()
+        .expect("policy uid");
+    let by_policy = ListParams::default().labels(&format!(
+        "kopiur.home-operations.com/policy-uid={policy_uid}"
+    ));
+
+    // The policy's own central claim, made by a real run.
+    central_run(&backups, backup, policy).await;
+    let own = central_pvcs
+        .list(&by_policy)
+        .await
+        .expect("list the policy's central claims")
+        .items;
+    assert_eq!(own.len(), 1, "one central cache claim for the policy");
+    let (own_name, own_uid) = (own[0].name_any(), own[0].uid().expect("claim uid"));
+
+    // The claim the policy would have left beside itself, and a claim whose
+    // policy is gone.
+    workload_pvcs
+        .create(
+            &PostParams::default(),
+            &marked_cache_pvc(
+                WORKLOAD_NS,
+                &predecessor,
+                serde_json::json!({ "ownerReferences": [{
+                    "apiVersion": "kopiur.home-operations.com/v1alpha1",
+                    "kind": "SnapshotPolicy", "name": policy, "uid": policy_uid,
+                }] }),
+            ),
+        )
+        .await
+        .expect("create the in-namespace predecessor");
+    central_pvcs
+        .create(
+            &PostParams::default(),
+            &marked_cache_pvc(
+                E2E_NAMESPACE,
+                orphan,
+                serde_json::json!({
+                    "labels": {
+                        "kopiur.home-operations.com/policy-uid":
+                            "00000000-0000-4000-8000-000000000000",
+                    },
+                    "annotations": {
+                        "kopiur.home-operations.com/policy":
+                            format!("{WORKLOAD_NS}/e2e-central-sweep-deleted-policy"),
+                        "kopiur.home-operations.com/cache-repository": repo,
+                    },
+                }),
+            ),
+        )
+        .await
+        .expect("create the orphaned central claim");
+
+    // 1) The orphan and the predecessor go. The predecessor takes two passes
+    //    and the grace period: retired first, deleted later.
+    wait_until(
+        "the orphaned central claim swept",
+        default_timeout(),
+        poll_interval(),
+        || async { Ok(central_pvcs.get_opt(orphan).await?.is_none().then_some(())) },
+    )
+    .await
+    .expect("the sweep should delete a central cache claim whose policy is gone");
+    wait_until(
+        "the in-namespace predecessor swept",
+        default_timeout(),
+        poll_interval(),
+        || async {
+            Ok(workload_pvcs
+                .get_opt(&predecessor)
+                .await?
+                .is_none()
+                .then_some(()))
+        },
+    )
+    .await
+    .expect("the sweep should delete the claim that central execution replaced");
+
+    // The claim that is in use survived every one of those passes, untouched.
+    let kept = central_pvcs
+        .get(&own_name)
+        .await
+        .expect("the claim in use must still exist");
+    assert_eq!(kept.uid().as_deref(), Some(own_uid.as_str()));
+    assert!(
+        !kept.annotations().contains_key(retired) && kept.metadata.deletion_timestamp.is_none(),
+        "a claim in use must be neither retired nor deleted: {:?}",
+        kept.metadata
+    );
+
+    // 2) The policy stops using a Persistent cache. Now its own claim goes too.
+    policies
+        .patch(
+            policy,
+            &PatchParams::default(),
+            &Patch::Merge(&serde_json::json!({
+                "spec": { "mover": { "cache": { "mode": "Ephemeral" } } }
+            })),
+        )
+        .await
+        .expect("switch the policy to an Ephemeral cache");
+    wait_until(
+        "the unused central claim swept",
+        default_timeout(),
+        poll_interval(),
+        || async {
+            Ok(central_pvcs
+                .list(&by_policy)
+                .await?
+                .items
+                .is_empty()
+                .then_some(()))
+        },
+    )
+    .await
+    .expect("the sweep should delete a central cache claim its policy no longer uses");
+
+    let _ = backups.delete(backup, &DeleteParams::default()).await;
     let _ = policies.delete(policy, &DeleteParams::default()).await;
     let _ = crepos.delete(repo, &DeleteParams::default()).await;
     kopiur_e2e::pvc::delete_pvc_and_consumers(&client, WORKLOAD_NS, src)

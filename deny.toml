@@ -3,7 +3,16 @@
 
 [advisories]
 version = 2
-ignore = []
+ignore = [
+    # `chrono` and `chrono-tz` were declared unmaintained (all versions, no
+    # patched release). The cron engine this project is locked to (`croner`)
+    # and the CEL evaluator (`cel`) are built on chrono, so it cannot be
+    # dropped until they move, and the schedule time zones need chrono-tz
+    # with it. Neither advisory reports a vulnerability. Remove these when
+    # croner and cel no longer depend on chrono.
+    { id = "RUSTSEC-2026-0543", reason = "chrono is unmaintained; required by croner and cel" },
+    { id = "RUSTSEC-2026-0555", reason = "chrono-tz is unmaintained; schedule time zones use it with chrono" },
+]
 
 [licenses]
 version = 2

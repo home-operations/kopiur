@@ -174,17 +174,26 @@ jobs:
       contents: read
     strategy:
       fail-fast: false # one shard's failure shouldn't cancel the others
-      # Every home-operations repository shares one 20-job Actions concurrency
-      # cap (GitHub Free); unthrottled, this matrix alone fills it.
-      max-parallel: 8
+      # No `max-parallel`: the organization's plan runs every shard at once, so
+      # the e2e phase lasts as long as its LONGEST shard. Keep every shard under
+      # about ten minutes. `partition` splits a shard that outgrows that:
+      # nextest slices the shard's tests (after the `bins` filter, round-robin
+      # in name order) into N parts, and each part is a job with a cluster of
+      # its own. List ALL N parts: a missing part is a set of tests that never
+      # runs (crates/e2e/src/lib.rs `shard_coverage` fails on that).
       matrix:
         include:
           - shard: lifecycle
             bins: "lifecycle"
             backends: false # Filesystem only — skip the backend-image preload
-          - shard: restore
+          - shard: restore-1
             bins: "restore leak_cleanup"
             backends: false # Filesystem only — the restore class needs no object store
+            partition: "slice:1/2"
+          - shard: restore-2
+            bins: "restore leak_cleanup"
+            backends: false # Filesystem only — the restore class needs no object store
+            partition: "slice:2/2"
           - shard: backends
             bins: "backends ttl_rerun"
             backends: true
@@ -196,15 +205,23 @@ jobs:
             backends: true
           # Reconcile-quiescence guards. Both watch for CHURN over a fixed window —
           # steady_state a 45s quiet window on status/resourceVersion, health_probe a
-          # 180s window on bootstrap-Job UIDs (the #273 regression guard) — so this
-          # shard must not share a cluster with a binary that restarts the operator
-          # (mass_deletion) or floods the apiserver. steady_state runs FIRST, on the
-          # cleanest cluster: its own bound is eroded by leftover CRs' requeue ticks.
+          # 180s window on bootstrap-Job UIDs (the #273 regression guard) — so
+          # neither may share a cluster with a binary that restarts the operator
+          # (mass_deletion) or floods the apiserver. steady_state has a cluster of
+          # its own: its bound is eroded by leftover CRs' requeue ticks.
           # backends: true for health_probe's MinIO buckets; steady_state is
-          # Filesystem-only and rides along.
-          - shard: quiescence
-            bins: "steady_state health_probe"
+          # Filesystem-only.
+          - shard: steady-state
+            bins: "steady_state"
+            backends: false
+          - shard: health-probe-1
+            bins: "health_probe"
             backends: true
+            partition: "slice:1/2"
+          - shard: health-probe-2
+            bins: "health_probe"
+            backends: true
+            partition: "slice:2/2"
           # Deadline-kill classification, maintenance exemption, relaunch holdoff
           # and deadline escalation (#413/#414/#415). Own shard: the #415 guard
           # asserts NO new discovery Job appears inside a 90s wall-clock window,
@@ -218,15 +235,33 @@ jobs:
           # KOPIUR_MAX_CONCURRENT_DELETE_JOBS and waits out a rollout — it restores the
           # env on exit, but the restart inside that window must not race another
           # binary's reconciles. Filesystem-only (isolated repo subpaths per scenario).
-          - shard: mass-deletion
+          - shard: mass-deletion-1
             bins: "mass_deletion"
             backends: false
+            partition: "slice:1/4"
+          - shard: mass-deletion-2
+            bins: "mass_deletion"
+            backends: false
+            partition: "slice:2/4"
+          - shard: mass-deletion-3
+            bins: "mass_deletion"
+            backends: false
+            partition: "slice:3/4"
+          - shard: mass-deletion-4
+            bins: "mass_deletion"
+            backends: false
+            partition: "slice:4/4"
           # kubectl-kopiur plugin (the `run` task builds kopiur-cli before the suite)
           # + multi-cluster shared-repository scenarios + the #476 catalog-window
           # expiry guard. All S3-backed, none mutates the install.
-          - shard: cli-multicluster
+          - shard: cli-multicluster-1
             bins: "cli multi_cluster catalog_window"
             backends: true
+            partition: "slice:1/2"
+          - shard: cli-multicluster-2
+            bins: "cli multi_cluster catalog_window"
+            backends: true
+            partition: "slice:2/2"
           # Workload identity (auth.workloadIdentity): full S3 pipeline with NO
           # static keys via the anonymous-policy bucket + kopia's ambient chain,
           # plus the Job-shape and missing-SA-condition assertions.
@@ -238,35 +273,71 @@ jobs:
           # timeout. `csi: true` installs the CSI snapshot stack (csi-hostpath-sc) so
           # the populator-restore handshake (repository_lifecycle) and copyMethod
           # Snapshot/Clone (copy_methods) tests run for real instead of self-skipping.
-          - shard: reshape-core
+          - shard: reshape-core-1
             bins: "mover_config data_integrity repository_lifecycle tenancy copy_methods"
             backends: false
             csi: true
-          # #613 mover cache budgets: percent budgets reaching kopia, and a
-          # Persistent cache PVC growing with `capacity` (needs an expandable
-          # StorageClass, hence `csi: true` for csi-hostpath-sc). Its own shard so
-          # reshape-core stays well under the job timeout. central_execution
-          # (`execution.mode: Central`) rides along: it needs the same CSI stack
-          # plus the cross-namespace feature gate the e2e kind config turns on.
-          - shard: cache-budgets
-            bins: "cache_budgets central_execution"
+            partition: "slice:1/2"
+          - shard: reshape-core-2
+            bins: "mover_config data_integrity repository_lifecycle tenancy copy_methods"
             backends: false
             csi: true
+            partition: "slice:2/2"
+          # #613 mover cache budgets: percent budgets reaching kopia, and a
+          # Persistent cache PVC growing with `capacity` (needs an expandable
+          # StorageClass, hence `csi: true` for csi-hostpath-sc). cache_lifecycle
+          # (#760) rides along on the same class: the scrub of an older
+          # release's files from a cache PVC, and a cache reset that waits for a
+          # running mover. That one swaps in the slow-mover image for its
+          # window, which no binary of another shard may see.
+          - shard: cache-budgets
+            bins: "cache_budgets cache_lifecycle"
+            backends: false
+            csi: true
+          # `execution.mode: Central`: needs the CSI stack plus the
+          # cross-namespace feature gate the e2e kind config turns on. Its
+          # sweep scenario waits out the cache sweep's retire-then-delete.
+          - shard: central-execution-1
+            bins: "central_execution"
+            backends: false
+            csi: true
+            partition: "slice:1/2"
+          - shard: central-execution-2
+            bins: "central_execution"
+            backends: false
+            csi: true
+            partition: "slice:2/2"
           # #464 live-pod inherit hold + heal: the scale-to-zero and staged
           # copyMethod scenarios wait out real scheduling (~11 min together), which
           # left reshape-core within a slow artifact download of the 30-minute job
           # limit (a cancelled run on #715). `csi: true` for the staged-copyMethod
           # scenario's csi-hostpath-sc source.
-          - shard: inherit-hold
+          - shard: inherit-hold-1
             bins: "inherit_hold"
             backends: false
             csi: true
+            partition: "slice:1/3"
+          - shard: inherit-hold-2
+            bins: "inherit_hold"
+            backends: false
+            csi: true
+            partition: "slice:2/3"
+          - shard: inherit-hold-3
+            bins: "inherit_hold"
+            backends: false
+            csi: true
+            partition: "slice:3/3"
           # Hooks (ADR §4.8) + GFS time-bucketed retention + policy knobs. The
           # httpRequest hook reuses the WebDAV fixture as its receiver, so this
           # shard preloads the backend images.
-          - shard: hooks-retention
+          - shard: hooks-retention-1
             bins: "hooks retention policy_knobs adoption"
             backends: true
+            partition: "slice:1/2"
+          - shard: hooks-retention-2
+            bins: "hooks retention policy_knobs adoption"
+            backends: true
+            partition: "slice:2/2"
           # Streamed command sources: the mover execs into a workload pod and pipes
           # stdout into kopia. Its own shard because the scenarios mutate the
           # NAMESPACE annotation that gates stream-exec (on, then off, then on
@@ -398,9 +469,18 @@ jobs:
           # replaced run's operator-prune exemption is measured against a breaker
           # that is actually firing. Both are scoped to `conc-replace`, but any
           # other binary sharing that repo would be caught in the held wave.
-          - shard: concurrency
+          - shard: concurrency-1
             bins: "concurrency"
             backends: false
+            partition: "slice:1/3"
+          - shard: concurrency-2
+            bins: "concurrency"
+            backends: false
+            partition: "slice:2/3"
+          - shard: concurrency-3
+            bins: "concurrency"
+            backends: false
+            partition: "slice:3/3"
           # Namespaced install (installScope=namespaced, Role-only RBAC): the
           # operator must reconcile its release namespace (the pre-scoping
           # controller sat Ready-but-inert on 403'd cluster-wide watches) and
@@ -527,6 +607,8 @@ jobs:
       - name: Run e2e tests
         env:
           KOPIUR_E2E_BINS: ${{ matrix.bins }}
+          # Which slice of the shard's tests this job runs (`slice:M/N`).
+          KOPIUR_E2E_PARTITION: ${{ matrix.partition || '' }}
           KOPIUR_E2E_SKIP_BUILD: "1"
           KOPIUR_E2E_ARCHIVE: target/nextest/e2e.tar.zst
           KOPIUR_E2E_CLI_BIN: ${{ github.workspace }}/target/nextest/kopiur

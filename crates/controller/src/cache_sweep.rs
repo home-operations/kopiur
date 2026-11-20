@@ -41,11 +41,6 @@ use crate::io::{
     CENTRAL_RESTORE_ANNOTATION, CENTRAL_RESTORE_UID_LABEL,
 };
 
-/// Never delete a claim younger than this, whatever the configured sweep
-/// min-age: a run creates the claim before the cache has caught up with the
-/// spec edit that made the run want it.
-pub const CACHE_MIN_AGE_FLOOR_SECS: i64 = 15 * 60;
-
 /// The kind of object a central cache claim names as its owner.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClaimOwnerKind {
@@ -141,8 +136,14 @@ pub enum Verdict {
 /// Decide what to do with a central cache claim of age `age_secs` (`None` when
 /// it carries no creation timestamp) whose owner is in `state`. Pure, and
 /// exhaustive (no `_ =>`): a new state must decide here.
+///
+/// `min_age_secs` is the sweep's configured minimum age, with no floor of its
+/// own on top. It only damps the pass against a spec that is still being
+/// edited. What keeps a claim from being taken from under a mover is
+/// [`retire_and_delete`], whatever the age, and the owner is read from the API
+/// server, never from a cache.
 pub fn claim_verdict(age_secs: Option<i64>, min_age_secs: i64, state: OwnerState) -> Verdict {
-    let old_enough = age_secs.is_some_and(|age| age >= min_age_secs.max(CACHE_MIN_AGE_FLOOR_SECS));
+    let old_enough = age_secs.is_some_and(|age| age >= min_age_secs);
     if !old_enough {
         return Verdict::Keep;
     }
@@ -308,19 +309,83 @@ pub fn claim_has_a_job(jobs: &[k8s_openapi::api::batch::v1::Job], claim: &str) -
     jobs.iter().any(|job| {
         job.metadata.deletion_timestamp.is_none()
             && io::mover_job_terminal(job).is_none()
-            && job
-                .spec
-                .as_ref()
-                .and_then(|s| s.template.spec.as_ref())
-                .and_then(|s| s.volumes.as_ref())
-                .is_some_and(|volumes| {
-                    volumes.iter().any(|v| {
-                        v.persistent_volume_claim
-                            .as_ref()
-                            .is_some_and(|c| c.claim_name == claim)
-                    })
-                })
+            && job_mounts(job, claim)
     })
+}
+
+/// Whether the pod template of `job` mounts the claim named `claim`. Pure.
+fn job_mounts(job: &k8s_openapi::api::batch::v1::Job, claim: &str) -> bool {
+    job.spec
+        .as_ref()
+        .and_then(|s| s.template.spec.as_ref())
+        .and_then(|s| s.volumes.as_ref())
+        .is_some_and(|volumes| {
+            volumes.iter().any(|v| {
+                v.persistent_volume_claim
+                    .as_ref()
+                    .is_some_and(|c| c.claim_name == claim)
+            })
+        })
+}
+
+/// The FINISHED Jobs among `jobs` whose pod template mounts the claim named
+/// `claim`. Their pods are what still holds the claim once [`claim_has_a_job`]
+/// is false ([`release_claim`]). Pure.
+pub fn finished_jobs_of_claim<'a>(
+    jobs: &'a [k8s_openapi::api::batch::v1::Job],
+    claim: &str,
+) -> Vec<&'a k8s_openapi::api::batch::v1::Job> {
+    jobs.iter()
+        .filter(|job| io::mover_job_terminal(job).is_some() && job_mounts(job, claim))
+        .collect()
+}
+
+/// Whether `pod` is controlled by the Job with the UID `job_uid`. The job-name
+/// label alone is not enough: a Job that replaced the finished one under the
+/// same name gives its live pods the same label. Pure.
+pub fn pod_is_of_job(pod: &k8s_openapi::api::core::v1::Pod, job_uid: &str) -> bool {
+    pod.metadata
+        .owner_references
+        .iter()
+        .flatten()
+        .any(|owner| owner.controller == Some(true) && owner.uid == job_uid)
+}
+
+/// Delete the pods of the finished mover Jobs `finished` in `namespace`, so
+/// that the claim they mounted can actually go.
+///
+/// Kubernetes keeps a deleted PVC (`Terminating`) while ANY pod object
+/// references it, finished or not. A finished mover pod stays until the TTL of
+/// its Job, one hour by default. Without this, a deleted cache claim would stay
+/// that long, and every run in that time would find it leaving and use a
+/// per-run volume. The Jobs themselves stay. The same is done for a staged
+/// source PVC (`io::cleanup_staged_source`), and for the same reason: list +
+/// delete by name, because the controller holds `delete` and `list` on pods and
+/// not `deletecollection`.
+async fn release_claim(
+    client: &kube::Client,
+    namespace: &str,
+    finished: &[&k8s_openapi::api::batch::v1::Job],
+) -> Result<()> {
+    use k8s_openapi::api::core::v1::Pod;
+    let pods: Api<Pod> = Api::namespaced(client.clone(), namespace);
+    for job in finished {
+        let Some(job_uid) = job.uid() else { continue };
+        let of_job = ListParams::default()
+            .labels(&format!("batch.kubernetes.io/job-name={}", job.name_any()));
+        let listed = pods.list(&of_job).await?.items;
+        for pod in listed.iter().filter(|pod| pod_is_of_job(pod, &job_uid)) {
+            match pods
+                .delete(&pod.name_any(), &io::delete_exactly(&pod.metadata))
+                .await
+            {
+                Ok(_) => {}
+                Err(kube::Error::Api(e)) if e.code == 404 || e.code == 409 => {}
+                Err(e) => return Err(Error::Kube(e)),
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Mark `pvc` as retired ([`io::CACHE_RETIRED_ANNOTATION`]), so that no run
@@ -382,7 +447,10 @@ pub struct Retirement {
 ///    ([`io::CachePvcClaim::Terminating`]).
 /// 2. **Keep it for [`RETIRE_GRACE_SECS`].** A run that read the claim before
 ///    step 1 creates its Job in that time.
-/// 3. **Delete it once no unfinished Job mounts it** ([`claim_has_a_job`]).
+/// 3. **Delete it once no unfinished Job mounts it** ([`claim_has_a_job`]),
+///    together with the pods of the finished Jobs that mounted it
+///    ([`release_claim`]): Kubernetes keeps a PVC while any pod object
+///    references it.
 ///
 /// The test is about the claim, not about the `Snapshot`s of its policy: a
 /// `Snapshot` can reference a policy of another namespace without the policy
@@ -421,9 +489,13 @@ pub async fn retire_and_delete(
                 .items;
             jobs.insert(namespace.clone(), listed);
         }
-        if claim_has_a_job(&jobs[&namespace], &pvc.name_any()) {
+        let (jobs, claim) = (&jobs[&namespace], pvc.name_any());
+        if claim_has_a_job(jobs, &claim) {
             outcome.waiting += 1;
-        } else if delete_claim(api, pvc).await? {
+            continue;
+        }
+        release_claim(client, &namespace, &finished_jobs_of_claim(jobs, &claim)).await?;
+        if delete_claim(api, pvc).await? {
             outcome.deleted += 1;
         }
     }

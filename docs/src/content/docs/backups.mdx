@@ -710,6 +710,8 @@ Kopiur acts once for each value and records the value in `status.cache.resetRequ
 
 The reset takes at least one minute. Kopiur first marks each PVC with the annotation `kopiur.home-operations.com/cache-retired-at`. No new run mounts a marked PVC. Kopiur deletes a marked PVC one minute later. If a mover Job that mounts the PVC is not finished then, Kopiur waits for that Job. A `CacheResetPending` Event on the policy shows the wait. A run that starts during the wait uses a per-run volume.
 
+Kubernetes keeps a deleted PVC while a pod uses it, and a finished pod counts. Kopiur therefore deletes the pods of the finished mover Jobs that mounted the PVC. The Jobs stay. The output of such a mover is in `status.logTail` of its `Snapshot`.
+
 In the workload namespace you can also delete the PVC with `kubectl delete pvc`. Under `execution.mode: Central` the PVC is in the operator namespace, and the annotation is the way to delete it without access to that namespace.
 
 #### What a cache volume holds
