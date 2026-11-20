@@ -124,27 +124,20 @@ fn a_claim_is_deleted_only_on_positive_evidence() {
     }
 }
 
-/// A run creates its claim before a cached view has caught up with the spec
-/// edit that made the run want it. A young claim is never judged, whatever the
-/// configured min-age.
+/// The configured minimum age damps the pass against a spec that is still
+/// being edited. A claim with no creation timestamp is a partial read: keep it.
 #[test]
-fn a_young_claim_is_never_deleted() {
-    let young = Some(CACHE_MIN_AGE_FLOOR_SECS - 1);
-    assert_eq!(claim_verdict(young, 0, OwnerState::Gone), Verdict::Keep);
-    assert_eq!(claim_verdict(None, 0, OwnerState::Gone), Verdict::Keep);
+fn a_claim_younger_than_the_minimum_age_is_not_judged() {
+    assert_eq!(claim_verdict(Some(29), 30, OwnerState::Gone), Verdict::Keep);
     assert!(matches!(
-        claim_verdict(Some(CACHE_MIN_AGE_FLOOR_SECS), 0, OwnerState::Gone),
+        claim_verdict(Some(30), 30, OwnerState::Gone),
         Verdict::Delete(_)
     ));
-    // A larger configured min-age wins over the floor.
-    assert_eq!(
-        claim_verdict(
-            Some(CACHE_MIN_AGE_FLOOR_SECS),
-            2 * CACHE_MIN_AGE_FLOOR_SECS,
-            OwnerState::Gone
-        ),
-        Verdict::Keep
-    );
+    assert_eq!(claim_verdict(None, 0, OwnerState::Gone), Verdict::Keep);
+    assert!(matches!(
+        claim_verdict(Some(0), 0, OwnerState::Gone),
+        Verdict::Delete(_)
+    ));
 }
 
 #[test]
@@ -392,7 +385,7 @@ fn retired(mut claim: serde_json::Value, at: &str) -> serde_json::Value {
 fn job_mounting(namespace: &str, claim: &str, conditions: serde_json::Value) -> serde_json::Value {
     serde_json::json!({
         "apiVersion": "batch/v1", "kind": "Job",
-        "metadata": { "name": "mover", "namespace": namespace },
+        "metadata": { "name": "mover", "namespace": namespace, "uid": "job-uid" },
         "spec": { "template": { "spec": {
             "containers": [{ "name": "mover", "image": "mover" }],
             "volumes": [
@@ -466,6 +459,32 @@ async fn one_pass(world: World) -> (CacheSweepOutcome, Vec<String>) {
                             .collect();
                         list("JobList", jobs)
                     }
+                    // The pods that carry the job-name label of a mover Job: one
+                    // of the Job `job-uid`, and one of a Job that took its name.
+                    ("GET", p) if p.ends_with("/pods") => {
+                        let pod = |name: &str, job_uid: &str| {
+                            serde_json::json!({
+                                "metadata": {
+                                    "name": name, "namespace": "billing", "uid": "pod-uid",
+                                    "ownerReferences": [{
+                                        "apiVersion": "batch/v1", "kind": "Job", "name": "mover",
+                                        "uid": job_uid, "controller": true,
+                                    }],
+                                },
+                            })
+                        };
+                        list(
+                            "PodList",
+                            vec![
+                                pod("mover-abcde", "job-uid"),
+                                pod("mover-fresh", "replacement-uid"),
+                            ],
+                        )
+                    }
+                    ("DELETE", p) if p.contains("/pods/") => ok(serde_json::json!({
+                        "apiVersion": "v1", "kind": "Pod",
+                        "metadata": { "name": "deleted" },
+                    })),
                     ("DELETE" | "PATCH", _) => ok(serde_json::json!({
                         "apiVersion": "v1", "kind": "PersistentVolumeClaim",
                         "metadata": { "name": "written" },
@@ -664,6 +683,59 @@ async fn a_retired_owner_referenced_claim_in_the_operator_namespace_is_drained()
     );
 }
 
+/// Kubernetes keeps a deleted PVC (`Terminating`) while any pod object
+/// references it, and a finished mover pod stays for the TTL of its Job, one
+/// hour by default. A live cluster showed the result: the cache claim was
+/// deleted and stayed, and every run in that hour used a per-run volume. So the
+/// pods of the FINISHED Jobs that mounted the claim are deleted first. The Job
+/// stays, and a Job of another claim is not touched.
+#[tokio::test]
+async fn the_finished_mover_pods_that_hold_a_claim_are_deleted_before_it() {
+    let complete = serde_json::json!([{ "type": "Complete", "status": "True" }]);
+    let mut other = job_mounting("billing", "some-other-claim", complete.clone());
+    other["metadata"]["name"] = "other-mover".into();
+    let (outcome, log) = one_pass(World {
+        everywhere: vec![retired(predecessor_claim(), LONG_AGO)],
+        jobs: vec![job_mounting("billing", "kopiur-cache-pg", complete), other],
+        ..World::default()
+    })
+    .await;
+    assert_eq!(outcome.retired, 1, "{log:?}");
+    let position = |method: &str, needle: &str| {
+        log.iter()
+            .position(|l| l.starts_with(method) && l.contains(needle))
+            .unwrap_or_else(|| panic!("no {method} {needle} in {log:?}"))
+    };
+    let pod_deleted = position("DELETE", "/namespaces/billing/pods/mover-abcde");
+    assert!(
+        log[pod_deleted].contains(r#""preconditions":{"uid":"pod-uid"}"#),
+        "exactly the listed pod is deleted: {}",
+        log[pod_deleted]
+    );
+    assert!(
+        pod_deleted < position("DELETE", PREDECESSOR),
+        "the pod goes before the claim: {log:?}"
+    );
+    // A Job that took the name of the finished one gives its pods the same
+    // label. Its pod is not of the Job that was judged, so it stays.
+    assert!(
+        !log.iter()
+            .any(|l| l.starts_with("DELETE") && l.contains("mover-fresh")),
+        "a pod of another Job with the same name is kept: {log:?}"
+    );
+    // Only the pods of the Job that mounted this claim were asked for.
+    let pod_lists: Vec<&String> = log
+        .iter()
+        .filter(|l| l.starts_with("GET") && l.contains("/pods"))
+        .collect();
+    assert_eq!(pod_lists.len(), 1, "{log:?}");
+    assert!(
+        !log.iter()
+            .any(|l| l.starts_with("DELETE") && l.contains("/jobs/")),
+        "the Job itself is kept: {log:?}"
+    );
+}
+
 /// Which Jobs keep a retired claim: only one that can still start a pod on it.
 #[test]
 fn only_an_unfinished_job_that_mounts_the_claim_keeps_it() {
@@ -696,6 +768,20 @@ fn only_an_unfinished_job_that_mounts_the_claim_keeps_it() {
             k8s_openapi::jiff::Timestamp::from_second(1_700_000_000).unwrap(),
         ));
     assert!(!claim_has_a_job(&[deleting], "c"));
+
+    // The finished Jobs of the claim are the ones whose pods still hold it.
+    let mut finished = job("c", done("Complete"));
+    finished.metadata.name = Some("done".into());
+    let jobs = [
+        finished,
+        job("c", serde_json::json!([])),
+        job("other", done("Failed")),
+    ];
+    let names: Vec<String> = finished_jobs_of_claim(&jobs, "c")
+        .into_iter()
+        .map(|job| job.name_any())
+        .collect();
+    assert_eq!(names, ["done"]);
 }
 
 /// A run reads its claim and creates its Job a few API calls later. The grace

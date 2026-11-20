@@ -497,7 +497,8 @@ The cleanup does not delete the PVC of a live policy at once, because a mover
 can be about to mount it. It first marks the PVC with the annotation
 `kopiur.home-operations.com/cache-retired-at`, so that no new run mounts it.
 A later pass deletes the PVC, after every mover Job that mounts it is
-finished. To delete the cache PVCs of a policy without the wait for the
+finished. Kubernetes keeps a deleted PVC while a pod uses it, so that pass also
+deletes the pods of those finished Jobs. The Jobs stay. To delete the cache PVCs of a policy without the wait for the
 cleanup, [reset the cache](#reset-the-cache).
 
 :::note[After a downgrade]
