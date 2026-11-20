@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.11.2](https://github.com/home-operations/kopiur/compare/0.11.1...0.11.2) (2026-11-20)
+
+
+### Features
+
+* **controller:** keep a persistent mover cache under central execution ([#761](https://github.com/home-operations/kopiur/issues/761)) ([eab9bfb](https://github.com/home-operations/kopiur/commit/eab9bfbb2d8053c652e6b03eb0ae2957cbaf1f10))
+
+
+### Continuous Integration
+
+* **e2e:** run every shard at once, split the slow shards, cover the cache lifecycle ([#768](https://github.com/home-operations/kopiur/issues/768)) ([afc21c4](https://github.com/home-operations/kopiur/commit/afc21c41acf9ca37d40cf4ec8b14bb9cfa4f9acd))
+
+
+### Miscellaneous Chores
+
+* **npm:** update dependency @testing-library/user-event (14.6.12 → 14.6.13) ([#763](https://github.com/home-operations/kopiur/issues/763)) ([2e461b1](https://github.com/home-operations/kopiur/commit/2e461b16245069f86273161b7fa7c179a63937fe))
+* **npm:** update dependency astro (7.4.12 → 7.4.13) ([#758](https://github.com/home-operations/kopiur/issues/758)) ([c86d66e](https://github.com/home-operations/kopiur/commit/c86d66e5b38ecef4dfd0e0c6629cfdf3c8545047))
+* **npm:** update dependency lucide-react (1.75.0 → 1.76.0) ([#766](https://github.com/home-operations/kopiur/issues/766)) ([7748526](https://github.com/home-operations/kopiur/commit/77485264a8ce77c29100249105ccec2c5ea5c2db))
+
 ## [0.11.1](https://github.com/home-operations/kopiur/compare/0.11.0...0.11.1) (2026-11-19)
 
 
