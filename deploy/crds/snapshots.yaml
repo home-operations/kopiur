@@ -1102,6 +1102,23 @@ spec:
                           `emptyDir` cache, which has no fixed size.
                         nullable: true
                         type: string
+                      claim:
+                        description: |-
+                          The persistent cache PVC the mover mounted (`mode: Persistent`). Absent
+                          for a per-run cache volume. Under `execution.mode: Central` the PVC is
+                          in the operator namespace, which is why the namespace is recorded.
+                        nullable: true
+                        properties:
+                          name:
+                            description: Name of the `PersistentVolumeClaim`.
+                            type: string
+                          namespace:
+                            description: "Namespace of the `PersistentVolumeClaim`: the namespace the mover ran in."
+                            type: string
+                        required:
+                        - name
+                        - namespace
+                        type: object
                       contentCacheSizeMb:
                         description: The `--content-cache-size-mb` kopia was given; absent means kopia's own default.
                         format: int64

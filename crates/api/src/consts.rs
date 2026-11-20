@@ -212,6 +212,17 @@ pub const ALLOW_REINITIALIZE_ANNOTATION: &str = "kopiur.home-operations.com/allo
 pub const CATALOG_SCAN_REQUESTED_ANNOTATION: &str =
     "kopiur.home-operations.com/catalog-scan-requested-at";
 
+/// Annotation a user stamps on a `SnapshotPolicy` to REQUEST that its persistent
+/// mover-cache PVCs are deleted, so the next run creates them again (at a
+/// smaller `capacity`, on another StorageClass, or to drop a damaged cache).
+/// It exists because a policy whose movers run in the operator namespace
+/// (`execution.mode: Central`) keeps its cache PVC there, where its author
+/// cannot delete it. The VALUE is an opaque token (a timestamp by convention):
+/// honored once via `status.cache.resetRequestHonored` (equality). The cache is
+/// rebuilt; no backup data is lost.
+pub const CACHE_RESET_REQUESTED_ANNOTATION: &str =
+    "kopiur.home-operations.com/cache-reset-requested-at";
+
 /// The API version string for kopiur CRDs (used in mover `TargetRef`s and
 /// `kubectl -o name`-style output).
 pub const API_VERSION: &str = "kopiur.home-operations.com/v1alpha1";
@@ -901,6 +912,7 @@ mod tests {
             ALLOW_REINITIALIZE_ANNOTATION,
             PRIVILEGED_MOVERS_ANNOTATION,
             CATALOG_SCAN_REQUESTED_ANNOTATION,
+            CACHE_RESET_REQUESTED_ANNOTATION,
             REPO_POOL_LABEL,
         ] {
             assert!(s.starts_with(crate::GROUP), "{s} must be group-prefixed");

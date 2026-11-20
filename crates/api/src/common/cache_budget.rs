@@ -32,6 +32,21 @@ pub struct ResolvedCache {
     /// The `--metadata-cache-size-mb` kopia was given; absent means kopia's own default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metadata_cache_size_mb: Option<i64>,
+    /// The persistent cache PVC the mover mounted (`mode: Persistent`). Absent
+    /// for a per-run cache volume. Under `execution.mode: Central` the PVC is
+    /// in the operator namespace, which is why the namespace is recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim: Option<CacheClaimRef>,
+}
+
+/// A persistent mover-cache `PersistentVolumeClaim`, fully qualified.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CacheClaimRef {
+    /// Namespace of the `PersistentVolumeClaim`: the namespace the mover ran in.
+    pub namespace: String,
+    /// Name of the `PersistentVolumeClaim`.
+    pub name: String,
 }
 
 /// How [`resolve_cache_budgets`] treats the original `*CacheSizeMb` fields.
@@ -368,6 +383,7 @@ pub fn resolve_cache_budgets(
             capacity: None,
             content_cache_size_mb: content.map(|b| b.mb),
             metadata_cache_size_mb: metadata.map(|b| b.mb),
+            claim: None,
         });
     };
     // Default content against metadata's explicit value, then metadata against the
@@ -383,6 +399,7 @@ pub fn resolve_cache_budgets(
         capacity: capacity.map(str::to_string),
         content_cache_size_mb: content_r.map(|b| b.mb),
         metadata_cache_size_mb: metadata_r.map(|b| b.mb),
+        claim: None,
     })
 }
 
@@ -464,6 +481,7 @@ pub fn fit_cache_budgets(r: &ResolvedCache, available: &str) -> ResolvedCache {
         capacity: Some(available.to_string()),
         content_cache_size_mb: content,
         metadata_cache_size_mb: metadata,
+        claim: r.claim.clone(),
     }
 }
 

@@ -36,3 +36,16 @@ pub const CONFIG_PATH_ENV: &str = "KOPIA_CONFIG_PATH";
 /// in `deploy/helm/kopiur/templates/deployment.yaml` and in
 /// `kopiur_mover::jobs::build_job`.
 pub const DEFAULT_CACHE_DIR: &str = "/var/cache/kopia";
+
+/// Where a mover `Job` mounts a SIZED cache volume (a generic ephemeral volume,
+/// or a persistent PVC), when it has one.
+///
+/// It is a mount of its own, not [`DEFAULT_CACHE_DIR`], so that such a volume
+/// holds the kopia cache and nothing else. kopia writes the backend
+/// credentials in plain text into its config file (`accessKeyID` and
+/// `secretAccessKey` for S3, even when they come from the environment), and
+/// the mover stages credential files beside it. Those stay on the pod-local
+/// `emptyDir` at [`DEFAULT_CACHE_DIR`], which is deleted with the pod. A
+/// persistent cache PVC outlives every pod, and its StorageClass can be one a
+/// tenant chose.
+pub const CACHE_VOLUME_DIR: &str = "/var/cache/kopia-volume";

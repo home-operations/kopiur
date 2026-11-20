@@ -1,7 +1,7 @@
 //! e2e: `ClusterRepository.spec.execution.mode: Central`: the backup mover runs
 //! in the OPERATOR namespace and reads a cross-namespace CSI snapshot restore.
 //!
-//! Three scenarios:
+//! Four scenarios:
 //!
 //! 1. **Central backup**: a CSI PVC in a workload namespace that holds neither the
 //!    repository credentials nor the repository volume is backed up by a mover Job
@@ -18,6 +18,15 @@
 //! 3. **Central group**: a `groupBy: VolumeGroupSnapshot` policy over two PVCs.
 //!    One shared capture in the workload namespace, each member staged and
 //!    backed up in the operator namespace.
+//!
+//! 4. **Persistent cache** (#760): a policy with `mover.cache.mode: Persistent`
+//!    keeps ONE cache PVC in the operator namespace across its runs. The claim
+//!    grows with `capacity`, never appears in the workload namespace, is named
+//!    in the `Snapshot` status, and is deleted on a reset request. A central
+//!    restore keeps its cache claim there too, until the `Restore` is deleted,
+//!    and the claim holds the kopia cache and no credentials. Scenario 3 covers
+//!    the claim for each source of a many-source policy, and its deletion with
+//!    the policy.
 //!
 //! Needs the alpha `CrossNamespaceVolumeDataSource` feature on kube-apiserver and
 //! kube-controller-manager (`crates/e2e/kind-config.yaml`) and on the CSI
@@ -37,6 +46,7 @@ use kube::{Api, Client, ResourceExt};
 
 use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Pod, Secret};
+use k8s_openapi::api::events::v1::Event;
 use k8s_openapi::api::rbac::v1::RoleBinding;
 use kopiur_api::{ClusterRepository, Restore, Snapshot, SnapshotPolicy};
 use kopiur_e2e::{
@@ -1225,12 +1235,25 @@ async fn central_group_members_are_staged_in_the_operator_namespace_from_one_cap
                 } ],
                 "groupBy": "VolumeGroupSnapshot",
                 "copyMethod": "Snapshot",
-                "identity": { "username": "central-grouped", "hostname": "e2e" }
+                "identity": { "username": "central-grouped", "hostname": "e2e" },
+                // #760: the members run at the same time, one mover each, so
+                // each needs its own persistent cache claim.
+                "mover": { "cache": {
+                    "capacity": "64Mi",
+                    "mode": "Persistent",
+                    "storageClassName": CSI_STORAGE_CLASS,
+                } },
             }),
         )),
         "create grouped SnapshotPolicy",
     )
     .await;
+    let policy_uid = policies
+        .get(policy)
+        .await
+        .expect("get SnapshotPolicy")
+        .uid()
+        .expect("policy uid");
     create_idempotent(
         &schedules,
         &cr(serde_json::json!({
@@ -1298,6 +1321,50 @@ async fn central_group_members_are_staged_in_the_operator_namespace_from_one_cap
         groups.len(),
         1,
         "every member must pin the SAME group object: {groups:?}"
+    );
+
+    // One persistent cache claim for each member, in the operator namespace.
+    // One claim for the whole policy would have every mover but the first wait
+    // on a Multi-Attach error wherever the members land on different nodes.
+    let group_caches: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let by_policy_uid = ListParams::default().labels(&format!(
+        "kopiur.home-operations.com/policy-uid={policy_uid},\
+         kopiur.home-operations.com/component=mover-cache"
+    ));
+    let member_claims = group_caches
+        .list(&by_policy_uid)
+        .await
+        .expect("list the policy's central cache claims")
+        .items;
+    let mut served: Vec<String> = member_claims
+        .iter()
+        .filter_map(|c| {
+            c.annotations()
+                .get("kopiur.home-operations.com/cache-source")
+                .cloned()
+        })
+        .collect();
+    served.sort();
+    assert_eq!(
+        served,
+        sources.map(str::to_string).to_vec(),
+        "each member must have its own cache claim, marked with its source PVC"
+    );
+    let mut mounted = std::collections::BTreeSet::new();
+    for child in &children {
+        let status = status_json(&backups, &child.name_any()).await;
+        let claim = &status["resolved"]["cache"]["claim"];
+        assert_eq!(
+            claim["namespace"].as_str(),
+            Some(E2E_NAMESPACE),
+            "the member must record the claim it mounted: {status}"
+        );
+        mounted.insert(claim["name"].as_str().unwrap_or_default().to_string());
+    }
+    assert_eq!(
+        mounted,
+        member_claims.iter().map(ResourceExt::name_any).collect(),
+        "each member mounts a claim of its own"
     );
 
     // Nothing ran in the workload namespace, and no Secret was copied into it.
@@ -1372,7 +1439,24 @@ async fn central_group_members_are_staged_in_the_operator_namespace_from_one_cap
     )
     .await
     .expect("the grouped Snapshots should be deleted");
+    // Deleting the policy deletes every one of its cache claims: nothing else
+    // would, since a claim in another namespace has no owner reference.
     let _ = policies.delete(policy, &DeleteParams::default()).await;
+    wait_until(
+        "central cache claims deleted with their SnapshotPolicy",
+        default_timeout(),
+        poll_interval(),
+        || async {
+            Ok(group_caches
+                .list(&by_policy_uid)
+                .await?
+                .items
+                .is_empty()
+                .then_some(()))
+        },
+    )
+    .await
+    .expect("the cache claims should be deleted with their SnapshotPolicy");
     let _ = crepos
         .delete("e2e-central-repo", &DeleteParams::default())
         .await;
@@ -1381,4 +1465,525 @@ async fn central_group_members_are_staged_in_the_operator_namespace_from_one_cap
             .await
             .expect("delete the source PVC");
     }
+}
+
+/// The claim names the pods of the central mover Job `job` mount.
+async fn mounted_claims(jobs: &Api<Job>, job: &str) -> Vec<String> {
+    let job = jobs
+        .get(job)
+        .await
+        .expect("the mover Job must exist in the operator namespace");
+    job.spec
+        .and_then(|s| s.template.spec)
+        .and_then(|s| s.volumes)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|v| v.persistent_volume_claim.map(|c| c.claim_name))
+        .collect()
+}
+
+/// Run `backup` of `policy` in the workload namespace to `Succeeded`, and return
+/// the name of its central mover Job.
+async fn central_run(backups: &Api<Snapshot>, backup: &str, policy: &str) -> String {
+    create_idempotent(
+        backups,
+        &cr(snapshot_json(
+            WORKLOAD_NS,
+            backup,
+            policy,
+            serde_json::json!({}),
+        )),
+        "create Snapshot",
+    )
+    .await;
+    wait_phase(backups, backup, "Succeeded")
+        .await
+        .unwrap_or_else(|e| panic!("{backup} must succeed: {e}"));
+    let status = status_json(backups, backup).await;
+    assert_eq!(
+        status["job"]["namespace"].as_str(),
+        Some(E2E_NAMESPACE),
+        "the run must be a central one: {status}"
+    );
+    status["job"]["name"]
+        .as_str()
+        .expect("status.job.name")
+        .to_string()
+}
+
+/// #760: under `execution.mode: Central` a `mode: Persistent` cache used to be
+/// replaced by a fresh volume on every run, so each run started with a cold
+/// kopia cache and the storage provisioned and deleted a sized volume per run.
+/// The claim cannot live beside the policy (the mover could not mount it), so it
+/// lives in the operator namespace, marked with the policy's UID.
+#[tokio::test]
+#[ignore = "requires the e2e harness + the CSI snapshot stack (mise run //crates/e2e:snapshot-stack)"]
+async fn central_backup_keeps_its_persistent_cache_in_the_operator_namespace() {
+    let Some(world) = World::connect().await else {
+        return;
+    };
+    world.ensure(&[Need::Filesystem]).await.expect("fixtures");
+    let client = world.client().clone();
+    if !csi_class_present_or_skip(&client, CSI_STORAGE_CLASS).await {
+        return;
+    }
+    ensure_namespace(&client, WORKLOAD_NS)
+        .await
+        .expect("workload namespace");
+
+    let src = "e2e-central-cache-src";
+    let repo = "e2e-central-cache-repo";
+    let policy = "e2e-central-cache-policy";
+    let runs = ["e2e-central-cache-backup-1", "e2e-central-cache-backup-2"];
+    let restore = "e2e-central-cache-restore";
+    let restored = "e2e-central-cache-restored";
+    let cache_reader = "e2e-central-cache-reader";
+    let policies: Api<SnapshotPolicy> = Api::namespaced(client.clone(), WORKLOAD_NS);
+    let backups: Api<Snapshot> = Api::namespaced(client.clone(), WORKLOAD_NS);
+    let restores: Api<Restore> = Api::namespaced(client.clone(), WORKLOAD_NS);
+    let central_jobs: Api<Job> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let central_pods: Api<Pod> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let central_pvcs: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), E2E_NAMESPACE);
+    let workload_pvcs: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), WORKLOAD_NS);
+
+    // A retry of this test finds the previous attempt's objects; start clean.
+    // The policy must be GONE, not just deleted: its claim is keyed by its UID.
+    let _ = central_pods
+        .delete(cache_reader, &DeleteParams::default())
+        .await;
+    let _ = restores.delete(restore, &DeleteParams::default()).await;
+    for run in runs {
+        let _ = backups.delete(run, &DeleteParams::default()).await;
+    }
+    let _ = policies.delete(policy, &DeleteParams::default()).await;
+    wait_until(
+        "previous Snapshots, Restore and SnapshotPolicy gone",
+        default_timeout(),
+        poll_interval(),
+        || async {
+            for run in runs {
+                if backups.get_opt(run).await?.is_some() {
+                    return Ok(None);
+                }
+            }
+            if restores.get_opt(restore).await?.is_some()
+                || central_pods.get_opt(cache_reader).await?.is_some()
+            {
+                return Ok(None);
+            }
+            Ok(policies.get_opt(policy).await?.is_none().then_some(()))
+        },
+    )
+    .await
+    .expect("a previous attempt's objects must clear");
+    kopiur_e2e::pvc::delete_pvc_and_consumers(&client, WORKLOAD_NS, restored)
+        .await
+        .expect("clear a previous restored PVC");
+
+    csi_source_with_marker(&client, WORKLOAD_NS, src).await;
+    let crepos = central_repository(&client, repo, "central-cache").await;
+    create_idempotent(
+        &policies,
+        &cr(snapshot_policy_json(
+            WORKLOAD_NS,
+            policy,
+            "ClusterRepository",
+            repo,
+            serde_json::json!({
+                "copyMethod": "Snapshot",
+                "sources": [ { "pvc": { "name": src } } ],
+                "mover": { "cache": {
+                    "capacity": "64Mi",
+                    "mode": "Persistent",
+                    "storageClassName": CSI_STORAGE_CLASS,
+                } },
+            }),
+        )),
+        "create SnapshotPolicy with a Persistent cache",
+    )
+    .await;
+    let policy_uid = policies
+        .get(policy)
+        .await
+        .expect("get SnapshotPolicy")
+        .uid()
+        .expect("policy uid");
+    let by_policy = ListParams::default().labels(&format!(
+        "kopiur.home-operations.com/policy-uid={policy_uid}"
+    ));
+
+    // 1) The first run creates the cache claim, in the operator namespace.
+    let first_job = central_run(&backups, runs[0], policy).await;
+    let claims = central_pvcs
+        .list(&by_policy)
+        .await
+        .expect("list the policy's central claims")
+        .items;
+    assert_eq!(
+        claims.len(),
+        1,
+        "exactly one cache claim for the policy: {:?}",
+        claims.iter().map(ResourceExt::name_any).collect::<Vec<_>>()
+    );
+    let claim = &claims[0];
+    let claim_name = claim.name_any();
+    let claim_uid = claim.uid().expect("claim uid");
+    assert_eq!(
+        claim
+            .labels()
+            .get("kopiur.home-operations.com/component")
+            .map(String::as_str),
+        Some("mover-cache")
+    );
+    assert!(
+        claim.owner_references().is_empty(),
+        "a cross-namespace owner reference would have the claim garbage collected: {:?}",
+        claim.owner_references()
+    );
+    assert_eq!(
+        claim
+            .annotations()
+            .get("kopiur.home-operations.com/policy")
+            .map(String::as_str),
+        Some(format!("{WORKLOAD_NS}/{policy}").as_str())
+    );
+    let requested = |c: &PersistentVolumeClaim| {
+        c.spec
+            .as_ref()
+            .and_then(|s| s.resources.as_ref())
+            .and_then(|r| r.requests.as_ref())
+            .and_then(|r| r.get("storage"))
+            .map(|q| q.0.clone())
+    };
+    assert_eq!(requested(claim).as_deref(), Some("64Mi"));
+    assert!(
+        mounted_claims(&central_jobs, &first_job)
+            .await
+            .contains(&claim_name),
+        "the first mover must mount the persistent cache claim `{claim_name}`"
+    );
+    // A tenant cannot list the operator namespace, so the claim is reported
+    // where the tenant can read: on the Snapshot, and as an Event on the policy.
+    let first_status = status_json(&backups, runs[0]).await;
+    assert_eq!(
+        first_status["resolved"]["cache"]["claim"],
+        serde_json::json!({ "namespace": E2E_NAMESPACE, "name": claim_name }),
+        "the Snapshot must record the claim its mover mounted: {first_status}"
+    );
+    let events: Api<Event> = Api::namespaced(client.clone(), WORKLOAD_NS);
+    let policy_event = |reason: &'static str| {
+        let (events, policy_uid) = (events.clone(), policy_uid.clone());
+        async move {
+            wait_until(
+                &format!("{reason} Event on the SnapshotPolicy"),
+                default_timeout(),
+                poll_interval(),
+                || async {
+                    let list = events.list(&ListParams::default()).await?;
+                    Ok(list.items.into_iter().find(|e| {
+                        e.reason.as_deref() == Some(reason)
+                            && e.regarding.as_ref().is_some_and(|r| {
+                                r.kind.as_deref() == Some("SnapshotPolicy")
+                                    && r.uid.as_deref() == Some(policy_uid.as_str())
+                            })
+                    }))
+                },
+            )
+            .await
+            .unwrap_or_else(|e| panic!("expected a {reason} Event on the SnapshotPolicy: {e}"))
+        }
+    };
+    let created = policy_event("CachePvcCreated").await;
+    assert!(
+        created
+            .note
+            .as_deref()
+            .is_some_and(|n| n.contains(&format!("{E2E_NAMESPACE}/{claim_name}"))),
+        "the Event must name the claim with its namespace: {:?}",
+        created.note
+    );
+
+    // The workload namespace holds the source PVC and no cache volume.
+    let in_workload: Vec<String> = workload_pvcs
+        .list(&ListParams::default())
+        .await
+        .expect("list workload PVCs")
+        .items
+        .iter()
+        .map(ResourceExt::name_any)
+        .collect();
+    assert_eq!(
+        in_workload,
+        vec![src.to_string()],
+        "no cache PVC may be created in the workload namespace"
+    );
+
+    // 2) Raise the capacity and run again: the SAME claim is mounted (the warm
+    //    cache of the first run), and it has grown.
+    policies
+        .patch(
+            policy,
+            &PatchParams::default(),
+            &Patch::Merge(&serde_json::json!({
+                "spec": { "mover": { "cache": { "capacity": "128Mi" } } }
+            })),
+        )
+        .await
+        .expect("raise the policy's cache capacity");
+    let second_job = central_run(&backups, runs[1], policy).await;
+    assert_ne!(second_job, first_job);
+    let after = central_pvcs
+        .list(&by_policy)
+        .await
+        .expect("list the policy's central claims")
+        .items;
+    assert_eq!(after.len(), 1, "the second run must not create a claim");
+    assert_eq!(
+        after[0].uid().as_deref(),
+        Some(claim_uid.as_str()),
+        "the second run must reuse the claim of the first, not a re-created one"
+    );
+    assert!(
+        mounted_claims(&central_jobs, &second_job)
+            .await
+            .contains(&claim_name),
+        "the second mover must mount the same cache claim"
+    );
+    assert_eq!(
+        requested(&after[0]).as_deref(),
+        Some("128Mi"),
+        "raising mover.cache.capacity must grow the central cache claim"
+    );
+
+    // The resize is reported on the policy, where its author looks, and names
+    // the namespace the claim is really in. Matched by the policy's UID: a retry
+    // of this test finds the Event of the previous attempt's policy too.
+    let grown = policy_event("CachePvcExpanded").await;
+    assert!(
+        grown
+            .note
+            .as_deref()
+            .is_some_and(|n| n.contains(&format!("{E2E_NAMESPACE}/{claim_name}"))),
+        "the Event must name the claim with its namespace: {:?}",
+        grown.note
+    );
+
+    // 3) A central restore with a Persistent cache keeps its claim in the
+    //    operator namespace too, marked with the Restore's UID.
+    restores
+        .create(
+            &PostParams::default(),
+            &cr(serde_json::json!({
+                "apiVersion": "kopiur.home-operations.com/v1alpha1",
+                "kind": "Restore",
+                "metadata": { "name": restore, "namespace": WORKLOAD_NS },
+                "spec": {
+                    "repository": { "kind": "ClusterRepository", "name": repo },
+                    "source": { "snapshotRef": { "name": runs[1] } },
+                    "target": { "populator": {} },
+                    "mover": { "cache": {
+                        "capacity": "64Mi",
+                        "mode": "Persistent",
+                        "storageClassName": CSI_STORAGE_CLASS,
+                    } },
+                },
+            })),
+        )
+        .await
+        .expect("create Restore");
+    workload_pvcs
+        .create(
+            &PostParams::default(),
+            &cr(serde_json::json!({
+                "apiVersion": "v1", "kind": "PersistentVolumeClaim",
+                "metadata": { "name": restored, "namespace": WORKLOAD_NS },
+                "spec": {
+                    "accessModes": ["ReadWriteOnce"],
+                    "storageClassName": CSI_STORAGE_CLASS,
+                    "resources": { "requests": { "storage": "64Mi" } },
+                    "dataSourceRef": {
+                        "apiGroup": "kopiur.home-operations.com",
+                        "kind": "Restore",
+                        "name": restore,
+                    },
+                },
+            })),
+        )
+        .await
+        .expect("create the claiming PVC");
+    wait_phase(&restores, restore, "Completed")
+        .await
+        .expect("the centrally executed Restore should Complete");
+    let restore_status = status_json(&restores, restore).await;
+    assert_eq!(
+        restore_status["execution"]["namespace"].as_str(),
+        Some(E2E_NAMESPACE),
+        "the restore must be a central one: {restore_status}"
+    );
+    let restore_uid = restores
+        .get(restore)
+        .await
+        .expect("get Restore")
+        .uid()
+        .expect("restore uid");
+    let restore_caches = ListParams::default().labels(&format!(
+        "kopiur.home-operations.com/restore-uid={restore_uid},\
+         kopiur.home-operations.com/component=mover-cache"
+    ));
+    let restore_claims = central_pvcs
+        .list(&restore_caches)
+        .await
+        .expect("list the Restore's central cache claims")
+        .items;
+    assert_eq!(
+        restore_claims.len(),
+        1,
+        "exactly one cache claim for the Restore's one mover: {:?}",
+        restore_claims
+            .iter()
+            .map(ResourceExt::name_any)
+            .collect::<Vec<_>>()
+    );
+    let restore_claim = restore_claims[0].name_any();
+    assert_ne!(restore_claim, claim_name);
+    assert!(
+        restore_claims[0].owner_references().is_empty(),
+        "a cross-namespace owner reference would have the claim garbage collected"
+    );
+    assert_eq!(
+        restore_claims[0]
+            .annotations()
+            .get("kopiur.home-operations.com/restore")
+            .map(String::as_str),
+        Some(format!("{WORKLOAD_NS}/{restore}").as_str())
+    );
+    // The mover Job is gone after the handover, so read the claim itself: it
+    // holds the kopia cache directory, which the mover only creates on the
+    // volume it mounted as its cache. And it holds NOTHING else: kopia's config
+    // file carries the backend credentials in plain text, so it, the staged
+    // credential files and the logs must stay on the pod-local volume.
+    central_pods
+        .create(
+            &PostParams::default(),
+            &kopiur_e2e::builders::one_shot_pod(
+                E2E_NAMESPACE,
+                cache_reader,
+                &[
+                    "sh",
+                    "-c",
+                    "ls -A /mnt; test -d /mnt/cache && test \"$(ls -A /mnt)\" = cache",
+                ],
+                &[(restore_claim.as_str(), "/mnt")],
+            ),
+        )
+        .await
+        .expect("create the cache reader pod");
+    kopiur_e2e::wait::pod_succeeded(&client, E2E_NAMESPACE, cache_reader)
+        .await
+        .expect("the claim must hold the kopia cache directory and nothing else");
+    let _ = central_pods
+        .delete(cache_reader, &DeleteParams::default())
+        .await;
+    // Still no cache volume beside the workload: the source and the restored PVC.
+    let mut in_workload: Vec<String> = workload_pvcs
+        .list(&ListParams::default())
+        .await
+        .expect("list workload PVCs")
+        .items
+        .iter()
+        .map(ResourceExt::name_any)
+        .collect();
+    in_workload.sort();
+    assert_eq!(
+        in_workload,
+        vec![restored.to_string(), src.to_string()],
+        "a central restore must not create a cache PVC in the workload namespace"
+    );
+
+    // Deleting the Restore deletes its cache claim, and leaves the policy's.
+    restores
+        .delete(restore, &DeleteParams::default())
+        .await
+        .expect("delete Restore");
+    wait_until(
+        "central cache claim deleted with its Restore",
+        default_timeout(),
+        poll_interval(),
+        || async {
+            Ok(central_pvcs
+                .list(&restore_caches)
+                .await?
+                .items
+                .is_empty()
+                .then_some(()))
+        },
+    )
+    .await
+    .expect("the cache claim should be deleted with its Restore");
+    assert_eq!(
+        central_pvcs
+            .list(&by_policy)
+            .await
+            .expect("list the policy's central claims")
+            .items
+            .len(),
+        1,
+        "deleting a Restore must not delete the policy's cache claim"
+    );
+    kopiur_e2e::pvc::delete_pvc_and_consumers(&client, WORKLOAD_NS, restored)
+        .await
+        .expect("delete the restored PVC");
+
+    // 4) A tenant cannot delete a PVC in the operator namespace. The reset
+    //    annotation on the policy is how its author gets the cache deleted
+    //    (to apply a smaller capacity, say).
+    let token = "2026-07-06T12:00:00Z";
+    policies
+        .patch(
+            policy,
+            &PatchParams::default(),
+            &Patch::Merge(&serde_json::json!({
+                "metadata": { "annotations": {
+                    "kopiur.home-operations.com/cache-reset-requested-at": token
+                } }
+            })),
+        )
+        .await
+        .expect("request a cache reset");
+    wait_until(
+        "central cache claim deleted by the reset request",
+        default_timeout(),
+        poll_interval(),
+        || async {
+            Ok(central_pvcs
+                .list(&by_policy)
+                .await?
+                .items
+                .is_empty()
+                .then_some(()))
+        },
+    )
+    .await
+    .expect("the reset request should delete the policy's cache claim");
+    wait_until(
+        "the reset request recorded as honored",
+        default_timeout(),
+        poll_interval(),
+        || async {
+            let status = status_json(&policies, policy).await;
+            Ok((status["cache"]["resetRequestHonored"].as_str() == Some(token)).then_some(()))
+        },
+    )
+    .await
+    .expect("status.cache.resetRequestHonored should record the request");
+    policy_event("CacheReset").await;
+
+    for run in runs {
+        let _ = backups.delete(run, &DeleteParams::default()).await;
+    }
+    let _ = policies.delete(policy, &DeleteParams::default()).await;
+    let _ = crepos.delete(repo, &DeleteParams::default()).await;
+    kopiur_e2e::pvc::delete_pvc_and_consumers(&client, WORKLOAD_NS, src)
+        .await
+        .expect("delete the source PVC");
 }

@@ -1140,7 +1140,8 @@ async fn commit_populate_site(
 /// The LIVE prime PVCs a central restore owns, by name: the operator-namespace
 /// counterpart of the `primes` half of [`claiming_pvcs`]. Selected by the
 /// `Restore`'s UID label, which stands in for the owner reference a
-/// cross-namespace object cannot carry.
+/// cross-namespace object cannot carry, and by the prime's `op` label: the
+/// restore's persistent cache PVCs carry the UID label too.
 async fn central_primes(
     ctx: &Context,
     central_ns: &str,
@@ -1148,7 +1149,7 @@ async fn central_primes(
 ) -> Result<std::collections::BTreeSet<String>> {
     use k8s_openapi::api::core::v1::PersistentVolumeClaim;
     let pvc_api: Api<PersistentVolumeClaim> = Api::namespaced(ctx.client.clone(), central_ns);
-    let selector = format!("{}={restore_uid}", io::CENTRAL_RESTORE_UID_LABEL);
+    let selector = central_primes_selector(restore_uid);
     Ok(pvc_api
         .list(&kube::api::ListParams::default().labels(&selector))
         .await?
@@ -1159,8 +1160,18 @@ async fn central_primes(
         .collect())
 }
 
+/// The label selector of [`central_primes`]. Pure.
+fn central_primes_selector(restore_uid: &str) -> String {
+    format!(
+        "{}={restore_uid},{}={}",
+        io::CENTRAL_RESTORE_UID_LABEL,
+        crate::consts::OP_LABEL,
+        crate::consts::OP_RESTORE_POPULATE
+    )
+}
+
 /// Run the central cleanup finalizer of a deleted `Restore`: delete its prime
-/// PVCs and mover Jobs in the operator namespace, then release it.
+/// PVCs, cache PVCs and mover Jobs in the operator namespace, then release it.
 ///
 /// The pin is read LIVE. The finalizer is added before the pin, so a cached
 /// object can show the finalizer without it; a restore that has the finalizer
@@ -3680,6 +3691,38 @@ impl<'a> RestoreDestination<'a> {
     }
 }
 
+/// The persistent cache claim a restore mover Job mounts when its cache is
+/// `mode: Persistent`: its name, and the `Restore` as its owner. One claim for
+/// each mover Job, beside the mover, because a pod can only mount a PVC of its
+/// own namespace:
+///
+/// - **In-namespace**: `kopiur-cache-<job>`, owner-referenced to the `Restore`.
+/// - **Central**: [`io::central_cache_pvc_name`] in the operator namespace,
+///   marked with the `Restore`'s UID and deleted by its central cleanup
+///   finalizer.
+fn restore_cache_claim(
+    site: &io::RestoreSite,
+    restore: &k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference,
+    namespace: &str,
+    job_name: &str,
+) -> (String, io::CachePvcOwner) {
+    match site {
+        io::RestoreSite::InNamespace => (
+            format!("kopiur-cache-{job_name}"),
+            io::CachePvcOwner::Reference(restore.clone()),
+        ),
+        io::RestoreSite::Central { .. } => (
+            io::central_cache_pvc_name(&restore.name, &restore.uid, job_name),
+            io::CachePvcOwner::Central {
+                kind: io::CentralCacheOwnerKind::Restore,
+                namespace: namespace.to_string(),
+                name: restore.name.clone(),
+                uid: restore.uid.clone(),
+            },
+        ),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_restore_mover(
     ctx: &Context,
@@ -4358,23 +4401,15 @@ async fn run_restore_mover(
     };
     let repo_volume = restore_repo_volume(&work_spec.operation, &repo.backend);
     // Resolve the cache VOLUME; a persistent cache PVC is owned by this Restore.
-    let resolved_volume = match site {
-        io::RestoreSite::InNamespace => {
-            crate::cache::resolve_cache_volume(
-                ctx,
-                namespace,
-                owner.clone(),
-                &format!("kopiur-cache-{job_name}"),
-                effective_cache.as_ref(),
-            )
-            .await?
-        }
-        // A persistent cache PVC is owned by the Restore, which cannot own
-        // anything in the operator namespace.
-        io::RestoreSite::Central { .. } => {
-            crate::cache::per_run_cache_volume(effective_cache.as_ref())
-        }
-    };
+    let (cache_claim, cache_owner) = restore_cache_claim(site, &owner, namespace, job_name);
+    let resolved_volume = crate::cache::resolve_cache_volume(
+        ctx,
+        mover_ns,
+        cache_owner,
+        &cache_claim,
+        effective_cache.as_ref(),
+    )
+    .await?;
     work_spec.cache = crate::cache::tuning_of(&crate::cache::cache_budgets_for_volume(
         effective_cache.as_ref(),
         &resolved_volume,

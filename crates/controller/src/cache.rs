@@ -12,7 +12,7 @@ use kopiur_api::snapshot_policy::DeepVerification;
 use kopiur_kopia::CacheTuning;
 
 use crate::error::Result;
-use crate::io::ResolvedRepository;
+use crate::io::{CachePvcOwner, ResolvedRepository};
 use crate::jobs::CacheVolume;
 
 /// The mover's **effective** cache config: the repository's `moverDefaults.cache`
@@ -138,6 +138,23 @@ impl ResolvedCacheVolume {
     }
 }
 
+/// The persistent claim `volume` mounts in `namespace` (the mover's), for
+/// `status.resolved.cache.claim`; `None` for a per-run volume. Exhaustive (no
+/// `_ =>`): a new volume shape must decide whether it is a claim someone can
+/// look up.
+pub fn mounted_claim(
+    volume: &CacheVolume,
+    namespace: &str,
+) -> Option<kopiur_api::common::CacheClaimRef> {
+    match volume {
+        CacheVolume::Pvc { claim_name } => Some(kopiur_api::common::CacheClaimRef {
+            namespace: namespace.to_string(),
+            name: claim_name.clone(),
+        }),
+        CacheVolume::EmptyDir | CacheVolume::Ephemeral { .. } => None,
+    }
+}
+
 /// The budgets for a resolved cache volume (#707 review): resolved against the
 /// CONFIGURED capacity — the one admission validated, so an admitted edit can
 /// never fail here just because the claim has not grown yet — then scaled down
@@ -212,21 +229,14 @@ pub fn replication_cache(
 pub async fn report_cache_pvc_resize(
     ctx: &crate::context::Context,
     ns: &str,
-    owner: &OwnerReference,
+    owner: &CachePvcOwner,
     ensured: &crate::io::EnsuredCachePvc,
 ) {
-    let regarding = k8s_openapi::api::core::v1::ObjectReference {
-        api_version: Some(owner.api_version.clone()),
-        kind: Some(owner.kind.clone()),
-        name: Some(owner.name.clone()),
-        uid: Some(owner.uid.clone()),
-        // A ClusterRepository is cluster-scoped; every other owner lives in `ns`.
-        namespace: (owner.kind != "ClusterRepository").then(|| ns.to_string()),
-        ..Default::default()
-    };
-    let Some(ev) = cache_pvc_resize_event(&ensured.claim_name, &ensured.resize) else {
+    let claim = owner.claim_label(ns, &ensured.claim_name);
+    let Some(ev) = cache_pvc_resize_event(&claim, &ensured.resize, &owner.recreate_hint()) else {
         return;
     };
+    let regarding = owner.event_ref(ns);
     match ev.severity {
         ResizeEventSeverity::Normal => {
             crate::io::publish_normal_event_on_ref(ctx, &regarding, ev.reason, "Resize", &ev.note)
@@ -236,6 +246,85 @@ pub async fn report_cache_pvc_resize(
             crate::io::publish_warning_event_on_ref(ctx, &regarding, ev.reason, "Resize", &ev.note)
                 .await;
         }
+    }
+}
+
+/// The Warning for a cache claim that belongs to someone else
+/// ([`crate::io::CachePvcClaim::Foreign`]). Pure, so the what/why/fix wording is
+/// unit-tested.
+pub fn cache_pvc_conflict_note(claim: &str) -> String {
+    format!(
+        "kopia cache PVC `{claim}` already exists and belongs to a different owner, so this run \
+         does not mount it and starts with an empty cache volume instead. Backups continue \
+         without a warm cache. Fix: delete that PVC (or the object that owns it); the next run \
+         then creates the cache PVC."
+    )
+}
+
+/// Ensure the persistent cache claim `claim_name` in `ns` for `owner` and resolve
+/// it to the volume the mover mounts. A claim of that name that belongs to
+/// someone else is never mounted: the run gets a fresh sized volume instead, and
+/// a Warning on the owner says why. So does a run whose owner can no longer
+/// delete a claim ([`crate::io::CachePvcClaim::Orphaned`]). A cache is an
+/// optimization, so it must not stop a backup.
+async fn persistent_cache_volume(
+    ctx: &crate::context::Context,
+    ns: &str,
+    owner: &CachePvcOwner,
+    claim_name: &str,
+    capacity: &str,
+    storage_class: Option<&str>,
+) -> Result<ResolvedCacheVolume> {
+    use crate::io::CachePvcClaim;
+    let per_run = || {
+        ResolvedCacheVolume::per_run(CacheVolume::Ephemeral {
+            capacity: capacity.to_string(),
+            storage_class: storage_class.map(str::to_string),
+        })
+    };
+    match crate::io::ensure_cache_pvc(&ctx.client, ns, claim_name, owner, capacity, storage_class)
+        .await?
+    {
+        CachePvcClaim::Ensured(ensured) => {
+            if ensured.created {
+                // The only place a central claim's name and namespace reach
+                // its owner's author, who cannot list the operator namespace.
+                crate::io::publish_normal_event_on_ref(
+                    ctx,
+                    &owner.event_ref(ns),
+                    "CachePvcCreated",
+                    "Provision",
+                    &format!(
+                        "Created kopia cache PVC `{}` ({capacity}). Later runs start with the \
+                         cache this run leaves there.",
+                        owner.claim_label(ns, &ensured.claim_name)
+                    ),
+                )
+                .await;
+            }
+            report_cache_pvc_resize(ctx, ns, owner, &ensured).await;
+            Ok(ResolvedCacheVolume {
+                volume: CacheVolume::Pvc {
+                    claim_name: ensured.claim_name,
+                },
+                capacity: Some(ensured.capacity),
+                configured: Some(capacity.to_string()),
+            })
+        }
+        CachePvcClaim::Foreign => {
+            crate::io::publish_warning_event_on_ref(
+                ctx,
+                &owner.event_ref(ns),
+                "CachePvcNameConflict",
+                "Provision",
+                &cache_pvc_conflict_note(&owner.claim_label(ns, claim_name)),
+            )
+            .await;
+            Ok(per_run())
+        }
+        // The claim is on its way out (with its owner, or for a cache reset):
+        // nothing to report.
+        CachePvcClaim::Terminating | CachePvcClaim::Orphaned => Ok(per_run()),
     }
 }
 
@@ -259,11 +348,14 @@ pub struct ResizeEvent {
     pub note: String,
 }
 
-/// The Event for a cache-PVC resize outcome; `None` when nothing changed. Pure, so
-/// the what/why/fix wording is unit-tested.
+/// The Event for a cache-PVC resize outcome; `None` when nothing changed.
+/// `recreate` is how this claim's owner gets it re-created
+/// ([`CachePvcOwner::recreate_hint`]). Pure, so the what/why/fix wording is
+/// unit-tested.
 pub fn cache_pvc_resize_event(
     claim: &str,
     resize: &crate::io::CachePvcResize,
+    recreate: &str,
 ) -> Option<ResizeEvent> {
     use crate::io::CachePvcResize;
     // Exhaustive (no `_ =>`): a new outcome must decide whether it is surfaced.
@@ -289,7 +381,7 @@ pub fn cache_pvc_resize_event(
                 "kopia cache PVC `{claim}` is {current} but mover.cache.capacity asks for \
                  {requested}; it was not grown because {reason}. Backups continue with cache \
                  budgets sized to {current}. Fix: use a StorageClass with \
-                 `allowVolumeExpansion: true`, or delete the PVC so the next run recreates it at \
+                 `allowVolumeExpansion: true`, or {recreate} at \
                  {requested} (the cache is rebuilt; no backup data is lost)."
             ),
         }),
@@ -299,8 +391,8 @@ pub fn cache_pvc_resize_event(
             note: format!(
                 "mover.cache.capacity {requested} is smaller than kopia cache PVC `{claim}` \
                  ({current}), and Kubernetes cannot shrink a PVC, so it keeps {current}. Cache \
-                 budgets follow the smaller {requested}. Fix: delete the PVC so the next run \
-                 recreates it at {requested} (the cache is rebuilt; no backup data is lost), or \
+                 budgets follow the smaller {requested}. Fix: {recreate} at {requested} (the \
+                 cache is rebuilt; no backup data is lost), or \
                  set capacity back to {current}."
             ),
         }),
@@ -316,14 +408,15 @@ pub fn cache_pvc_resize_event(
 ///   owner's runs ([`CacheVolume::Pvc`]), provisioned here (owner-referenced for GC).
 ///
 /// `cache_owner` owns a persistent cache PVC (e.g. the `SnapshotPolicy` for backups, so
-/// the warm cache survives individual `Snapshot` CRs); `claim_name` is its stable name.
+/// the warm cache survives individual `Snapshot` CRs); `claim_name` is its stable name
+/// in `ns`, the namespace the mover runs in.
 ///
 /// An existing persistent PVC is grown (never shrunk) toward `capacity`, and any
 /// resize outcome is reported on `cache_owner` ([`report_cache_pvc_resize`]).
 pub async fn resolve_cache_volume(
     ctx: &crate::context::Context,
     ns: &str,
-    cache_owner: OwnerReference,
+    cache_owner: CachePvcOwner,
     claim_name: &str,
     effective: Option<&CacheDefaults>,
 ) -> Result<ResolvedCacheVolume> {
@@ -336,23 +429,15 @@ pub async fn resolve_cache_volume(
     };
     match c.effective_mode() {
         CacheVolumeMode::Persistent => {
-            let ensured = crate::io::ensure_cache_pvc(
-                &ctx.client,
+            persistent_cache_volume(
+                ctx,
                 ns,
+                &cache_owner,
                 claim_name,
-                cache_owner.clone(),
                 &capacity,
                 c.storage_class_name.as_deref(),
             )
-            .await?;
-            report_cache_pvc_resize(ctx, ns, &cache_owner, &ensured).await;
-            Ok(ResolvedCacheVolume {
-                volume: CacheVolume::Pvc {
-                    claim_name: ensured.claim_name,
-                },
-                capacity: Some(ensured.capacity),
-                configured: Some(capacity),
-            })
+            .await
         }
         CacheVolumeMode::Ephemeral => Ok(ResolvedCacheVolume::per_run(CacheVolume::Ephemeral {
             capacity,
@@ -385,10 +470,10 @@ pub fn verify_cache_volume(effective: Option<&CacheDefaults>) -> CacheVolume {
     }
 }
 
-/// The cache volume for a mover that cannot mount the owner's persistent cache PVC
-/// (a central backup mover runs outside the `SnapshotPolicy`'s namespace). Same
-/// rule as [`verify_cache_volume`]: a `capacity` yields a fresh sized ephemeral
-/// volume whatever the `mode`, and no `capacity` yields an `emptyDir`.
+/// The cache volume for a run that must not use its owner's persistent cache PVC
+/// (a central backup whose `SnapshotPolicy` is being deleted). Same rule as
+/// [`verify_cache_volume`]: a `capacity` yields a fresh sized ephemeral volume
+/// whatever the `mode`, and no `capacity` yields an `emptyDir`.
 pub fn per_run_cache_volume(effective: Option<&CacheDefaults>) -> ResolvedCacheVolume {
     ResolvedCacheVolume::per_run(verify_cache_volume(effective))
 }
@@ -496,23 +581,15 @@ pub async fn resolve_snapdel_cache_volume(
             capacity,
             storage_class,
         } => {
-            let ensured = crate::io::ensure_cache_pvc(
-                &ctx.client,
+            persistent_cache_volume(
+                ctx,
                 ns,
+                &CachePvcOwner::Reference(owner),
                 claim_name,
-                owner.clone(),
                 capacity,
                 storage_class.as_deref(),
             )
-            .await?;
-            report_cache_pvc_resize(ctx, ns, &owner, &ensured).await;
-            Ok(ResolvedCacheVolume {
-                volume: CacheVolume::Pvc {
-                    claim_name: ensured.claim_name,
-                },
-                capacity: Some(ensured.capacity),
-                configured: Some(capacity.clone()),
-            })
+            .await
         }
     }
 }
@@ -844,8 +921,9 @@ mod tests {
     fn resize_events_say_what_why_and_fix_within_the_note_limit() {
         use crate::io::CachePvcResize;
         let claim = "kopiur-cache-some-very-long-policy-name-ns-abcdef";
+        let recreate = CachePvcOwner::Reference(Default::default()).recreate_hint();
         assert_eq!(
-            cache_pvc_resize_event(claim, &CachePvcResize::Unchanged),
+            cache_pvc_resize_event(claim, &CachePvcResize::Unchanged, &recreate),
             None
         );
 
@@ -855,6 +933,7 @@ mod tests {
                 from: "1Gi".into(),
                 to: "2Gi".into(),
             },
+            &recreate,
         )
         .unwrap();
         assert_eq!(grown.severity, ResizeEventSeverity::Normal);
@@ -868,6 +947,7 @@ mod tests {
                 reason: "its StorageClass `standard` does not set `allowVolumeExpansion: true`"
                     .into(),
             },
+            &recreate,
         )
         .unwrap();
         let shrink = cache_pvc_resize_event(
@@ -876,6 +956,7 @@ mod tests {
                 current: "4Gi".into(),
                 requested: "2Gi".into(),
             },
+            &recreate,
         )
         .unwrap();
         for (ev, reason) in [
@@ -890,6 +971,182 @@ mod tests {
         }
         assert!(refused.note.contains("allowVolumeExpansion"));
         assert!(shrink.note.contains("cannot shrink"));
+        // The in-namespace wording is unchanged: its author can delete the PVC.
+        assert!(
+            shrink
+                .note
+                .contains("Fix: delete the PVC so the next run recreates it at 2Gi"),
+            "{}",
+            shrink.note
+        );
+    }
+
+    /// A central claim is in the operator namespace, where the owner's author
+    /// has no rights. "Delete the PVC" is not a fix that author can apply, so
+    /// the Event names one that is, and still fits an Event note.
+    #[test]
+    fn a_central_claims_resize_events_name_a_fix_the_owner_can_apply() {
+        use crate::io::CachePvcResize;
+        let policy = CachePvcOwner::Central {
+            kind: crate::io::CentralCacheOwnerKind::SnapshotPolicy {
+                repository: "shared".into(),
+                source_pvc: None,
+            },
+            namespace: "billing".into(),
+            name: "pg".into(),
+            uid: "uid-pg".into(),
+        };
+        let restore = CachePvcOwner::Central {
+            kind: crate::io::CentralCacheOwnerKind::Restore,
+            namespace: "billing".into(),
+            name: "pg-restore".into(),
+            uid: "uid-restore".into(),
+        };
+        let claim = "kopiur-system/kopiur-cache-some-very-long-policy-name-94c57734fbfe76da";
+        let refusals = |owner: &CachePvcOwner| {
+            [
+                CachePvcResize::ExpansionNotAllowed {
+                    current: "1Gi".into(),
+                    requested: "2Gi".into(),
+                    reason: "its StorageClass `standard` does not set `allowVolumeExpansion: true`"
+                        .into(),
+                },
+                CachePvcResize::ShrinkRefused {
+                    current: "4Gi".into(),
+                    requested: "2Gi".into(),
+                },
+            ]
+            .map(|r| cache_pvc_resize_event(claim, &r, &owner.recreate_hint()).unwrap())
+        };
+        for ev in refusals(&policy) {
+            assert!(
+                ev.note
+                    .contains(kopiur_api::consts::CACHE_RESET_REQUESTED_ANNOTATION),
+                "names the reset annotation: {}",
+                ev.note
+            );
+            assert!(!ev.note.contains("delete the PVC"), "{}", ev.note);
+            assert!(ev.note.len() <= 1024, "Event note limit: {}", ev.note.len());
+        }
+        for ev in refusals(&restore) {
+            assert!(ev.note.contains("administrator"), "{}", ev.note);
+            assert!(ev.note.len() <= 1024, "Event note limit: {}", ev.note.len());
+        }
+    }
+
+    #[test]
+    fn only_a_persistent_claim_is_recorded_in_status() {
+        assert_eq!(
+            mounted_claim(
+                &CacheVolume::Pvc {
+                    claim_name: "kopiur-cache-pg".into()
+                },
+                "kopiur-system"
+            ),
+            Some(kopiur_api::common::CacheClaimRef {
+                namespace: "kopiur-system".into(),
+                name: "kopiur-cache-pg".into(),
+            })
+        );
+        assert_eq!(mounted_claim(&CacheVolume::EmptyDir, "ns"), None);
+        assert_eq!(
+            mounted_claim(
+                &CacheVolume::Ephemeral {
+                    capacity: "1Gi".into(),
+                    storage_class: None
+                },
+                "ns"
+            ),
+            None
+        );
+    }
+
+    // --- #760: a claim that belongs to someone else ------------------------------
+
+    #[test]
+    fn a_cache_claim_conflict_says_what_why_and_the_fix() {
+        let note = cache_pvc_conflict_note("kopiur-system/kopiur-cache-pg-94c57734fbfe76da");
+        assert!(
+            note.contains("`kopiur-system/kopiur-cache-pg-94c57734fbfe76da`"),
+            "names the PVC with its namespace: {note}"
+        );
+        assert!(note.contains("belongs to a different owner"), "{note}");
+        assert!(note.contains("Backups continue"), "{note}");
+        assert!(note.contains("Fix:"), "carries the fix: {note}");
+        assert!(note.len() <= 1024, "Event note limit: {}", note.len());
+    }
+
+    /// A cache is an optimization. A claim under the policy's claim name that
+    /// belongs to someone else must not be mounted, and must not stop the backup
+    /// either: the run gets a fresh volume of the configured size and class.
+    #[tokio::test]
+    async fn a_foreign_cache_claim_degrades_the_run_to_a_fresh_volume() {
+        use http::{Request, Response, StatusCode};
+        use kube::client::Body;
+
+        // Every claim GET answers an unmarked claim; everything else (the Event
+        // POST included) is a 404, which the best-effort publisher swallows.
+        let svc = tower::service_fn(move |req: Request<Body>| async move {
+            let claim =
+                req.method() == "GET" && req.uri().path().contains("/persistentvolumeclaims/");
+            let (status, json) = if claim {
+                (
+                    StatusCode::OK,
+                    serde_json::json!({
+                        "apiVersion": "v1", "kind": "PersistentVolumeClaim",
+                        "metadata": { "name": "kopiur-cache-pg", "namespace": "kopiur-system" },
+                        "spec": { "resources": { "requests": { "storage": "1Gi" } } },
+                    }),
+                )
+            } else {
+                (
+                    StatusCode::NOT_FOUND,
+                    serde_json::json!({
+                        "kind": "Status", "apiVersion": "v1", "status": "Failure", "code": 404,
+                    }),
+                )
+            };
+            Ok::<_, std::convert::Infallible>(
+                Response::builder()
+                    .status(status)
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&json).unwrap()))
+                    .unwrap(),
+            )
+        });
+        let ctx = crate::context::Context::test_context(kube::Client::new(svc, "kopiur-system"));
+        let eff = CacheDefaults {
+            capacity: Some("2Gi".into()),
+            storage_class_name: Some("fast".into()),
+            mode: Some(CacheVolumeMode::Persistent),
+            ..Default::default()
+        };
+        let resolved = resolve_cache_volume(
+            &ctx,
+            "kopiur-system",
+            CachePvcOwner::Central {
+                kind: crate::io::CentralCacheOwnerKind::SnapshotPolicy {
+                    repository: "shared".into(),
+                    source_pvc: None,
+                },
+                namespace: "billing".into(),
+                name: "pg".into(),
+                uid: "uid-pg".into(),
+            },
+            "kopiur-cache-pg",
+            Some(&eff),
+        )
+        .await
+        .expect("a foreign claim must not fail the run");
+        assert_eq!(
+            resolved.volume,
+            CacheVolume::Ephemeral {
+                capacity: "2Gi".into(),
+                storage_class: Some("fast".into()),
+            }
+        );
+        assert_eq!(resolved.capacity.as_deref(), Some("2Gi"));
+        assert_eq!(resolved.configured.as_deref(), Some("2Gi"));
     }
 
     // --- #707 review follow-ups --------------------------------------------------

@@ -6,6 +6,17 @@ sidebar:
 
 This page covers upgrading the operator across releases. Most upgrades are a routine `helm upgrade`, or a Flux or Argo reconcile: bump the chart version, roll the Deployments, done. The one exception so far is **0.5.x → 0.6.0**, which moves the CustomResourceDefinitions (CRDs) between two Helm mechanisms and needs one deliberate step to avoid data loss. Read that section before you cross it.
 
+## After 0.11.1: a cache volume no longer holds repository credentials (no action needed)
+
+kopia writes the credentials of the backend in plain text into its configuration file. Before this release the mover kept that file on the cache volume. The credential files of backends such as SFTP and GCS, and the kopia logs, were there too. A `mover.cache` with `mode: Persistent` therefore kept them on its PVC between runs.
+
+The mover now keeps those files on a volume that belongs to the pod. A sized cache volume is mounted at `/var/cache/kopia-volume` and holds the kopia cache only. See [Backups → What a cache volume holds](/backups/#what-a-cache-volume-holds).
+
+- Existing `Persistent` cache PVCs are cleaned on their next run. The first mover that mounts one removes the old configuration, credential and log files from it. The cache stays, so that run is not a cold one.
+- A cache PVC that no mover mounts again keeps the old files. Delete such a PVC by hand. If you do not trust the storage of that PVC, rotate the backend credentials.
+- Use the mover image of the same release as the controller. The chart does this. An older mover image under the new controller has one limit. A repository seed or a `SnapshotReplication` mover then keeps its extra kopia caches on the pod volume. The kopia cache budgets still limit them.
+- The permission error names a new path. A cache volume that the mover cannot write now fails with `permission denied` under `/var/cache/kopia-volume`. The old path was `/var/cache/kopia/logs`.
+
 ## Group snapshots need the `v1` API: only if you use `groupBy: VolumeGroupSnapshot`
 
 Kopiur now uses the `groupsnapshot.storage.k8s.io/v1` API for group snapshots, and no longer uses `v1beta1`. external-snapshotter serves `v1` from release 8.6. `groupBy: VolumeGroupSnapshot` is the default for a `pvcSelector` source. On a cluster with an older release, each `Snapshot` of such a policy fails with reason `NoVolumeGroupSnapshotClass`. The `SnapshotPolicy` itself can stay `Ready`. Single-PVC backups and `groupBy: None` are not affected. Per-volume snapshots already used `snapshot.storage.k8s.io/v1`.

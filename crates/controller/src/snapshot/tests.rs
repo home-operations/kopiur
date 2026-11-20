@@ -5051,6 +5051,7 @@ fn resolved_run_status_pins_the_resolved_cache() {
         capacity: Some("10Gi".into()),
         content_cache_size_mb: ws.cache.content_cache_size_mb,
         metadata_cache_size_mb: ws.cache.metadata_cache_size_mb,
+        claim: None,
     };
     let resolved = resolved_run_status(
         &cfg,
@@ -5215,7 +5216,7 @@ async fn an_ephemeral_per_run_capacity_reaches_the_mover_volume_with_no_api_call
     let resolved = crate::cache::resolve_cache_volume(
         &ctx,
         "ns",
-        Default::default(),
+        io::CachePvcOwner::Reference(Default::default()),
         "kopiur-cache-pg-ns-abc123",
         super::cache_volume_spec(&repo, &cfg, run.spec.mover.as_ref()).as_ref(),
     )
@@ -5231,6 +5232,217 @@ async fn an_ephemeral_per_run_capacity_reaches_the_mover_volume_with_no_api_call
             storage_class: Some("slow".into()),
         },
         "the per-run capacity/class must reach the mover's cache volume"
+    );
+}
+
+// --- #760: where a backup's persistent cache claim lives -------------------
+
+/// `policy_with_mover`, stored: with the namespace and UID the API server gives it.
+fn stored_policy() -> SnapshotPolicy {
+    let mut cfg = policy_with_mover(serde_json::json!({
+        "cache": { "capacity": "5Gi", "mode": "Persistent" },
+    }));
+    cfg.metadata.namespace = Some("billing".into());
+    cfg.metadata.uid = Some("uid-pg".into());
+    cfg
+}
+
+fn cluster_repo(name: &str) -> kopiur_api::common::RepositoryRef {
+    kopiur_api::common::RepositoryRef {
+        kind: kopiur_api::common::RepositoryKind::ClusterRepository,
+        name: name.into(),
+        namespace: None,
+    }
+}
+
+fn central_mover_site() -> io::MoverSite {
+    io::MoverSite::Central(io::CentralSite {
+        namespace: "kopiur-system".into(),
+        job_name: "nightly-1f0c7a55d2e9b6a4".into(),
+    })
+}
+
+#[test]
+fn an_in_namespace_backup_keeps_its_policy_owned_cache_claim_beside_the_policy() {
+    let cfg = stored_policy();
+    let claim = super::backup_cache_claim(
+        &io::MoverSite::InNamespace,
+        &cfg,
+        &dummy_backup(),
+        "billing",
+        &cluster_repo("shared"),
+    )
+    .unwrap()
+    .expect("an in-namespace run always has a claim");
+    assert_eq!(claim.namespace, "billing");
+    // The historical name, byte for byte: an existing claim must keep matching.
+    assert_eq!(claim.name, "kopiur-cache-pg");
+    match claim.owner {
+        io::CachePvcOwner::Reference(owner) => {
+            assert_eq!(
+                (owner.kind.as_str(), owner.name.as_str(), owner.uid.as_str()),
+                ("SnapshotPolicy", "pg", "uid-pg")
+            );
+        }
+        other => panic!("expected an owner reference, got {other:?}"),
+    }
+}
+
+/// #760: a central mover runs in the operator namespace, so the warm cache has
+/// to live there too. It used to be replaced by a fresh volume on every run.
+#[test]
+fn a_central_backup_keeps_its_cache_claim_in_the_operator_namespace() {
+    let cfg = stored_policy();
+    let claim = super::backup_cache_claim(
+        &central_mover_site(),
+        &cfg,
+        &dummy_backup(),
+        "billing",
+        &cluster_repo("shared"),
+    )
+    .unwrap()
+    .expect("a central run of a live policy has a claim");
+    assert_eq!(claim.namespace, "kopiur-system");
+    assert_eq!(
+        claim.name,
+        io::central_cache_pvc_name("pg", "uid-pg", "ClusterRepository/shared")
+    );
+    assert_eq!(
+        claim.owner,
+        io::CachePvcOwner::Central {
+            kind: crate::io::CentralCacheOwnerKind::SnapshotPolicy {
+                repository: "shared".into(),
+                source_pvc: None
+            },
+            namespace: "billing".into(),
+            name: "pg".into(),
+            uid: "uid-pg".into(),
+        }
+    );
+
+    // A kopia cache holds one repository's state: a second repository of the
+    // same policy gets its own claim.
+    let other = super::backup_cache_claim(
+        &central_mover_site(),
+        &cfg,
+        &dummy_backup(),
+        "billing",
+        &cluster_repo("offsite"),
+    )
+    .unwrap()
+    .unwrap();
+    assert_ne!(other.name, claim.name);
+}
+
+/// A `pvcSelector` or group policy runs one mover for each source PVC, all at
+/// the same time and each possibly on its own node. One `ReadWriteOnce` claim
+/// for the policy would leave all but one of them `Pending` on a Multi-Attach
+/// error, so each source gets its own claim. The claim records what it serves,
+/// which is what the periodic sweep reads.
+#[test]
+fn a_central_backup_of_a_many_source_policy_gets_a_claim_for_each_source() {
+    use kopiur_api::snapshot::{PvcTargetRef, SnapshotSourceRef, SnapshotSourceTarget};
+    let cfg = stored_policy();
+    let child = |pvc: &str| {
+        let mut backup = dummy_backup();
+        backup.spec.source = Some(SnapshotSourceRef {
+            source_index: 0,
+            target: SnapshotSourceTarget::Pvc(PvcTargetRef {
+                namespace: "billing".into(),
+                name: pvc.into(),
+            }),
+            group: None,
+        });
+        backup
+    };
+    let claim_of = |backup: &Snapshot| {
+        super::backup_cache_claim(
+            &central_mover_site(),
+            &cfg,
+            backup,
+            "billing",
+            &cluster_repo("shared"),
+        )
+        .unwrap()
+        .expect("a claim")
+    };
+    let (a, b, single) = (
+        claim_of(&child("data-a")),
+        claim_of(&child("data-b")),
+        claim_of(&dummy_backup()),
+    );
+    assert_ne!(a.name, b.name, "two sources must not share one claim");
+    assert_ne!(a.name, single.name);
+    assert_eq!(a.name, claim_of(&child("data-a")).name, "stable per source");
+    assert_eq!(
+        a.owner,
+        io::CachePvcOwner::Central {
+            kind: io::CentralCacheOwnerKind::SnapshotPolicy {
+                repository: "shared".into(),
+                source_pvc: Some("data-a".into()),
+            },
+            namespace: "billing".into(),
+            name: "pg".into(),
+            uid: "uid-pg".into(),
+        }
+    );
+    // A single-source policy keeps one claim for the repository.
+    assert_eq!(
+        single.owner,
+        io::CachePvcOwner::Central {
+            kind: io::CentralCacheOwnerKind::SnapshotPolicy {
+                repository: "shared".into(),
+                source_pvc: None,
+            },
+            namespace: "billing".into(),
+            name: "pg".into(),
+            uid: "uid-pg".into(),
+        }
+    );
+    // In-namespace such a policy keeps its one historical claim.
+    let in_ns = super::backup_cache_claim(
+        &io::MoverSite::InNamespace,
+        &cfg,
+        &child("data-a"),
+        "billing",
+        &cluster_repo("shared"),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(in_ns.name, "kopiur-cache-pg");
+}
+
+/// The policy's finalizer deletes its central claims, so a run that launches
+/// while the policy is being deleted asks for none.
+#[test]
+fn a_central_backup_of_a_policy_being_deleted_gets_no_persistent_claim() {
+    let mut cfg = stored_policy();
+    cfg.metadata.deletion_timestamp = Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+        k8s_openapi::jiff::Timestamp::from_second(1_700_000_000).unwrap(),
+    ));
+    assert_eq!(
+        super::backup_cache_claim(
+            &central_mover_site(),
+            &cfg,
+            &dummy_backup(),
+            "billing",
+            &cluster_repo("shared"),
+        )
+        .unwrap(),
+        None
+    );
+    // In-namespace the claim is owner-referenced, so the garbage collector
+    // handles this case.
+    assert!(
+        super::backup_cache_claim(
+            &io::MoverSite::InNamespace,
+            &cfg,
+            &dummy_backup(),
+            "billing",
+            &cluster_repo("shared"),
+        )
+        .unwrap()
+        .is_some()
     );
 }
 

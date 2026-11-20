@@ -4691,3 +4691,72 @@ fn a_finished_in_namespace_populate_still_counts_as_started() {
         );
     }
 }
+
+// --- a restore mover's persistent cache claim --------------------------------
+
+fn restore_owner() -> k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference {
+    k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference {
+        api_version: crate::consts::API_VERSION.into(),
+        kind: "Restore".into(),
+        name: "pg-restore".into(),
+        uid: "uid-restore".into(),
+        controller: Some(true),
+        block_owner_deletion: Some(false),
+    }
+}
+
+#[test]
+fn an_in_namespace_restore_keeps_its_cache_claim_beside_the_restore() {
+    let (name, owner) = super::restore_cache_claim(
+        &io::RestoreSite::InNamespace,
+        &restore_owner(),
+        "billing",
+        "pg-restore-populate-1a2b3c4d",
+    );
+    // The historical name, byte for byte: an existing claim must keep matching.
+    assert_eq!(name, "kopiur-cache-pg-restore-populate-1a2b3c4d");
+    assert_eq!(owner, io::CachePvcOwner::Reference(restore_owner()));
+}
+
+/// A central restore mover runs in the operator namespace, so its persistent
+/// cache claim lives there too. It used to be replaced by a per-run volume.
+#[test]
+fn a_central_restore_keeps_its_cache_claim_in_the_operator_namespace() {
+    let site = io::RestoreSite::Central {
+        namespace: "kopiur-system".into(),
+    };
+    let job = "pg-restore-populate-1a2b3c4d";
+    let (name, owner) = super::restore_cache_claim(&site, &restore_owner(), "billing", job);
+    assert_eq!(
+        name,
+        io::central_cache_pvc_name("pg-restore", "uid-restore", job)
+    );
+    assert_eq!(
+        owner,
+        io::CachePvcOwner::Central {
+            kind: io::CentralCacheOwnerKind::Restore,
+            namespace: "billing".into(),
+            name: "pg-restore".into(),
+            uid: "uid-restore".into(),
+        }
+    );
+    // Each mover Job of the restore (one for each claiming PVC) gets its own.
+    let (other, _) = super::restore_cache_claim(
+        &site,
+        &restore_owner(),
+        "billing",
+        "pg-restore-populate-99999999",
+    );
+    assert_ne!(other, name);
+}
+
+/// The cache claim carries the `Restore`'s UID label, as the prime PVCs do.
+/// It must not be counted as a prime.
+#[test]
+fn central_primes_are_selected_by_the_populate_op_label_too() {
+    assert_eq!(
+        super::central_primes_selector("uid-restore"),
+        "kopiur.home-operations.com/restore-uid=uid-restore,\
+         kopiur.home-operations.com/op=restore-populate"
+    );
+}

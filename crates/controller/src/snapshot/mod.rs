@@ -2044,43 +2044,33 @@ async fn reconcile_inner(backup: &Snapshot, ctx: &Context) -> Result<Action> {
     }
     // Resolve the cache VOLUME (emptyDir / sized-ephemeral / persistent PVC). A
     // persistent cache PVC is owned by the SnapshotPolicy so a warm cache survives
-    // across individual Snapshot runs (ADR §3.1). A pinned child of a MULTI-repo
-    // policy gets a per-repository PVC (`kopiur-cache-<policy>-<rslug>-<h6>`,
-    // `kopiur_api::expand::cache_pvc_name`): the kopia cache is repository-specific
-    // state, so N fan-out children sharing one PVC would poison each other's
-    // cache. Single-repo children keep the legacy name byte-identical.
-    let cache_pvc = kopiur_api::expand::cache_pvc_name(
-        &config.name_any(),
-        config.namespace().as_deref().unwrap_or(&namespace),
-        kopiur_api::is_multi_repo(&config.spec)
-            .then_some(backup.spec.repository.as_ref())
-            .flatten(),
-    );
+    // across individual Snapshot runs (ADR §3.1).
     let cache_spec = cache_volume_spec(&repo, &config, recipe_mover.as_ref());
-    let resolved_volume = match &site {
-        io::MoverSite::InNamespace => {
-            crate::cache::resolve_cache_volume(
-                ctx,
-                &namespace,
-                io::owner_ref_for(&config, "SnapshotPolicy")?,
-                &cache_pvc,
-                cache_spec.as_ref(),
-            )
-            .await?
-        }
-        // The persistent cache PVC belongs to the SnapshotPolicy and lives in its
-        // namespace, where a central mover cannot mount it.
-        io::MoverSite::Central(_) => crate::cache::per_run_cache_volume(cache_spec.as_ref()),
-    };
+    let resolved_volume =
+        match backup_cache_claim(&site, &config, backup, &namespace, &repo.repository_ref())? {
+            Some(claim) => {
+                crate::cache::resolve_cache_volume(
+                    ctx,
+                    &claim.namespace,
+                    claim.owner,
+                    &claim.name,
+                    cache_spec.as_ref(),
+                )
+                .await?
+            }
+            None => crate::cache::per_run_cache_volume(cache_spec.as_ref()),
+        };
     // #613: kopia's cache budgets must fit the volume ACTUALLY mounted. For a
     // persistent claim that is its live capacity (a pending or refused resize can
     // leave it smaller than the spec), so re-resolve against it here; for per-run
     // volumes this reproduces what `build_backup_run` already computed.
-    let resolved_cache = crate::cache::cache_budgets_for_volume(
+    let mut resolved_cache = crate::cache::cache_budgets_for_volume(
         crate::cache::effective_cache(&repo, recipe_mover.as_ref().and_then(|m| m.cache.as_ref()))
             .as_ref(),
         &resolved_volume,
     )?;
+    resolved_cache.claim =
+        crate::cache::mounted_claim(&resolved_volume.volume, site.namespace(&namespace));
     work_spec.cache = crate::cache::tuning_of(&resolved_cache);
     let cache_volume = resolved_volume.volume;
     // RWO Multi-Attach avoidance: pin the mover to the node the source PVC is
@@ -5716,6 +5706,90 @@ fn policy_cache_spec(
         repo,
         config.spec.mover.as_ref().and_then(|m| m.cache.as_ref()),
     )
+}
+
+/// A backup's persistent cache claim: where it lives, what it is called, and
+/// whose it is.
+#[derive(Debug, Clone, PartialEq)]
+struct BackupCacheClaim {
+    /// The namespace of the claim, which is the namespace the mover runs in.
+    namespace: String,
+    /// The claim's name.
+    name: String,
+    /// The `SnapshotPolicy`, as the owner of a claim in that namespace.
+    owner: io::CachePvcOwner,
+}
+
+/// The persistent cache claim a run of `config` at `site` mounts when its cache
+/// is `mode: Persistent`. The claim always lives beside the mover, because a pod
+/// can only mount a PVC of its own namespace:
+///
+/// - **In-namespace**: `kopiur-cache-<policy>` in the policy's namespace, owner-
+///   referenced to the policy. A pinned child of a MULTI-repo policy gets a
+///   per-repository claim (`kopiur-cache-<policy>-<rslug>-<h6>`,
+///   `kopiur_api::expand::cache_pvc_name`): the kopia cache is repository-specific
+///   state, so N fan-out children sharing one PVC would poison each other's
+///   cache. Single-repo children keep the legacy name byte-identical.
+/// - **Central**: [`io::central_cache_pvc_name`] in the operator namespace, marked
+///   with the policy's UID and deleted by the policy's finalizer. One claim for
+///   each repository, and for a policy with many sources (`spec.source` is set
+///   on the run) one for each source PVC: the movers of one firing run at the
+///   same time, each possibly on its own node, and cannot share one
+///   `ReadWriteOnce` claim. In-namespace such a policy keeps its one historical
+///   claim.
+///
+/// `None` for a central run of a policy that is being deleted: its finalizer
+/// deletes the policy's central claims, so such a run gets a per-run volume.
+/// This reads a cached policy and only saves the work. What keeps a claim from
+/// outliving its policy is the live check in [`io::ensure_cache_pvc`].
+fn backup_cache_claim(
+    site: &io::MoverSite,
+    config: &SnapshotPolicy,
+    backup: &Snapshot,
+    namespace: &str,
+    repo: &RepositoryRef,
+) -> Result<Option<BackupCacheClaim>> {
+    let policy = io::owner_ref_for(config, "SnapshotPolicy")?;
+    let policy_ns = config.namespace().unwrap_or_else(|| namespace.to_string());
+    Ok(match site {
+        io::MoverSite::InNamespace => Some(BackupCacheClaim {
+            namespace: namespace.to_string(),
+            name: kopiur_api::expand::cache_pvc_name(
+                &policy.name,
+                &policy_ns,
+                kopiur_api::is_multi_repo(&config.spec)
+                    .then_some(backup.spec.repository.as_ref())
+                    .flatten(),
+            ),
+            owner: io::CachePvcOwner::Reference(policy),
+        }),
+        io::MoverSite::Central(_) if config.metadata.deletion_timestamp.is_some() => None,
+        io::MoverSite::Central(central) => {
+            // Exhaustive over the target (no `_ =>`): a new kind of source must
+            // decide how its movers are told apart.
+            let source_pvc = backup.spec.source.as_ref().map(|s| match &s.target {
+                kopiur_api::snapshot::SnapshotSourceTarget::Pvc(pvc) => pvc.name.clone(),
+            });
+            let repo_key = kopiur_api::common::repo_key(repo, &policy_ns);
+            let key = match &source_pvc {
+                Some(pvc) => format!("{repo_key}/pvc/{pvc}"),
+                None => repo_key,
+            };
+            Some(BackupCacheClaim {
+                namespace: central.namespace.clone(),
+                name: io::central_cache_pvc_name(&policy.name, &policy.uid, &key),
+                owner: io::CachePvcOwner::Central {
+                    kind: io::CentralCacheOwnerKind::SnapshotPolicy {
+                        repository: repo.name.clone(),
+                        source_pvc,
+                    },
+                    namespace: policy_ns,
+                    name: policy.name,
+                    uid: policy.uid,
+                },
+            })
+        }
+    })
 }
 
 /// The cache config governing this run's cache **volume**, splitting the decision by

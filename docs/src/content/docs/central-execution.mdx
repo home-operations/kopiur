@@ -122,6 +122,88 @@ inside or above it. The mover pod mounts the repository volume at the path of
 the repository, and two mounts cannot overlap. Kopiur refuses such a backup
 with the reason `CentralExecutionUnsupported`.
 
+### Where a persistent cache lives
+
+A `mover.cache` with `mode: Persistent` keeps the kopia cache of a mover between
+runs. See [Sizing the kopia cache](/backups/#sizing-the-kopia-cache). Under
+central execution, Kopiur creates the cache PVC in the operator namespace,
+because the mover pod can only mount a PVC from its own namespace. You change
+nothing in the `SnapshotPolicy` or the `Restore`.
+
+For a backup, the cache belongs to the `SnapshotPolicy`:
+
+- The first run of a policy creates the PVC. Each later run mounts the same
+  PVC, so it starts with the cache of the run before.
+- The PVC is named `kopiur-cache-<policy>-<hash>`. The hash is made from the UID
+  of the policy and the repository, because policies from many namespaces share
+  the operator namespace. A policy with more than one repository gets one PVC
+  for each repository.
+- A policy with a `pvcSelector` source gets one PVC for each source PVC, also
+  under `groupBy: VolumeGroupSnapshot`. Such a policy runs one mover for each
+  source at the same time, and those movers cannot share a `ReadWriteOnce`
+  volume. Each of these PVCs has the full `capacity`.
+- A higher `capacity` grows the PVC on the next run, as it does in the workload
+  namespace. The Events about the PVC appear on the `SnapshotPolicy`. They name
+  the PVC with its namespace, for example `kopiur-system/kopiur-cache-…`.
+- The PVC is `ReadWriteOnce`, so the runs of one policy for one source must not
+  overlap. This is the same rule as in the workload namespace.
+
+For a central restore, the cache belongs to the `Restore`:
+
+- Each mover Job of the restore gets its own PVC, named
+  `kopiur-cache-<restore>-<hash>`. A restore has one mover Job for each PVC
+  that claims it.
+- The PVC stays until you delete the `Restore`. A new attempt of the same mover
+  Job mounts it again.
+
+In both cases the workload namespace holds no cache PVC.
+
+#### Find the cache PVC
+
+A tenant has no access to the operator namespace, so Kopiur reports the PVC on
+objects the tenant can read:
+
+- Each `Snapshot` records the PVC that its mover mounted.
+- A `CachePvcCreated` Event on the `SnapshotPolicy` or the `Restore` names the
+  PVC when Kopiur creates it.
+
+```console
+$ kubectl get snapshot -n billing postgres-data-20260706 -o jsonpath='{.status.resolved.cache.claim}'
+{"name":"kopiur-cache-postgres-data-94c57734fbfe76da","namespace":"kopiur-system"}
+```
+
+An administrator can list the cache PVCs in the operator namespace. On the PVC
+of a central backup or restore, an annotation names the owner as
+`<namespace>/<name>`: `kopiur.home-operations.com/policy` for a
+`SnapshotPolicy`, and `kopiur.home-operations.com/restore` for a `Restore`.
+
+```console
+$ kubectl get pvc -n kopiur-system -l kopiur.home-operations.com/component=mover-cache
+```
+
+#### Reset the cache
+
+A tenant cannot delete a PVC in the operator namespace. To delete the cache
+PVCs of a policy, set the annotation
+`kopiur.home-operations.com/cache-reset-requested-at` on the `SnapshotPolicy`
+to a new value. See [Reset a persistent cache](/backups/#reset-a-persistent-cache).
+Do this to apply a smaller `capacity` or a different `storageClassName`.
+
+#### What a tenant controls
+
+A tenant sets the `capacity` and the `storageClassName` of this PVC. The volume
+is in the operator namespace, so a `ResourceQuota` of the workload namespace
+does not count it. To limit it, set a quota on the operator namespace.
+
+The PVC holds the kopia cache and nothing else. The repository credentials are
+not on it. See
+[What a cache volume holds](/backups/#what-a-cache-volume-holds).
+
+If a PVC of that name exists and does not belong to the policy or the restore,
+Kopiur does not mount it. The run gets a new volume of the same capacity
+instead, and a `CachePvcNameConflict` Warning Event on the `SnapshotPolicy` or
+the `Restore` names the PVC.
+
 ### How a restore works
 
 A central restore hands a finished volume to a PVC in the workload namespace.
@@ -282,9 +364,6 @@ Without that access, read the recorded log tail: `status.logTail` on a
   `execution.mode: Central` later. It moves to central execution only when none
   of its claims is in progress or finished, for example after you re-create its
   claiming PVC.
-- **No persistent cache.** A `mover.cache` with `mode: Persistent` becomes a
-  per-run volume of the same capacity. The persistent cache PVC belongs to the
-  `SnapshotPolicy` and lives in the workload namespace.
 - **Hooks still act in the workload namespace.** The controller runs
   `workloadExec` hooks through the API server. A `runJob` hook creates its Job
   in the workload namespace. Neither one uses the repository credentials.
@@ -299,7 +378,9 @@ Without that access, read the recorded log tail: `status.logTail` on a
   a `ClusterRepository` can name them. If you point a central backup or restore
   at a namespaced `Repository` after it started, Kopiur refuses to launch it.
 - **Zonal volumes.** The staged PVC and the mover pod must land in the zone of
-  the snapshot. Kopiur adds no placement rule for this.
+  the snapshot. Kopiur adds no placement rule for this. A persistent cache PVC
+  stays in the zone, or on the node, where its first run put it. The later
+  movers of that policy can only run there.
 - **The operator keeps its cluster-wide RBAC.** Central execution keeps movers
   and credentials out of tenant namespaces. It does not yet reduce the
   permissions of the controller.
@@ -389,6 +470,44 @@ the policy.
 A central pin Job is labelled with the UID of the `Snapshot`. Kopiur deletes it
 when it has recorded the result, or when you delete the `Snapshot`.
 
+### A persistent cache
+
+A central cache PVC is labelled with the UID of its owner:
+`kopiur.home-operations.com/policy-uid` for a `SnapshotPolicy`, and
+`kopiur.home-operations.com/restore-uid` for a `Restore`. Kopiur deletes the
+PVC when you delete that policy or that restore.
+
+Kopiur also deletes a cache PVC that nothing uses any more. A periodic cleanup
+does this, every 6 hours by default. It only deletes a PVC that is at least
+1 hour old. See [The object sweep](/movers/#the-object-sweep) for the two
+settings. The cleanup deletes a central cache PVC in these cases:
+
+- Its `SnapshotPolicy` or `Restore` no longer exists.
+- Its policy no longer backs up to the repository of the PVC.
+- The repository no longer sets `execution.mode: Central`.
+- The policy no longer has a `mode: Persistent` cache with a `capacity`.
+- The source PVC that it serves no longer exists, or the `pvcSelector` of the
+  policy no longer matches it.
+
+A policy that now keeps its cache in the operator namespace can have an older
+cache PVC in its workload namespace (`kopiur-cache-<policy>`). The cleanup
+deletes that PVC too.
+
+The cleanup does not delete the PVC of a live policy at once, because a mover
+can be about to mount it. It first marks the PVC with the annotation
+`kopiur.home-operations.com/cache-retired-at`, so that no new run mounts it.
+A later pass deletes the PVC, after every mover Job that mounts it is
+finished. To delete the cache PVCs of a policy without the wait for the
+cleanup, [reset the cache](#reset-the-cache).
+
+:::note[After a downgrade]
+
+Kopiur 0.11.1 and earlier do not know these PVCs. If you downgrade, delete the
+central cache PVCs by hand. Find them with the `kubectl get pvc` command in
+[Find the cache PVC](#find-the-cache-pvc).
+
+:::
+
 ### After a restore
 
 The prime PVC and the mover Job also cannot carry an owner reference to the
@@ -398,8 +517,8 @@ The prime PVC and the mover Job also cannot carry an owner reference to the
 - Kopiur deletes the prime PVC and the Job when it hands the volume over.
 - A central `Restore` carries the finalizer
   `kopiur.home-operations.com/central-restore-cleanup`. When you delete the
-  `Restore`, Kopiur deletes any prime PVC and Job that remain, and then removes
-  the finalizer.
+  `Restore`, Kopiur deletes any prime PVC and Job that remain, and its
+  persistent cache PVCs, and then removes the finalizer.
 
 ## RBAC
 

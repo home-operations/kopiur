@@ -174,9 +174,8 @@ pub struct ExecutionSpec {
     /// of a PVC, the `CrossNamespaceVolumeDataSource` feature gate on
     /// kube-apiserver and kube-controller-manager, the same gate on the CSI
     /// driver's external-provisioner, and the Gateway API `ReferenceGrant`
-    /// CRD. A `mover.cache` of `mode: Persistent` is provisioned per run
-    /// instead, because the persistent cache PVC lives in the workload
-    /// namespace.
+    /// CRD. A central mover's `mover.cache` of `mode: Persistent` keeps its
+    /// cache PVC in the operator namespace, beside the mover.
     pub mode: ExecutionMode,
 }
 

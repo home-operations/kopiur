@@ -5207,9 +5207,8 @@ spec:
                       of a PVC, the `CrossNamespaceVolumeDataSource` feature gate on
                       kube-apiserver and kube-controller-manager, the same gate on the CSI
                       driver's external-provisioner, and the Gateway API `ReferenceGrant`
-                      CRD. A `mover.cache` of `mode: Persistent` is provisioned per run
-                      instead, because the persistent cache PVC lives in the workload
-                      namespace.
+                      CRD. A central mover's `mover.cache` of `mode: Persistent` keeps its
+                      cache PVC in the operator namespace, beside the mover.
                     enum:
                     - InNamespace
                     - Central
@@ -10481,6 +10480,19 @@ spec:
                     nullable: true
                     type: integer
                 type: object
+              cache:
+                description: State of this recipe's persistent mover-cache PVCs.
+                nullable: true
+                properties:
+                  resetRequestHonored:
+                    description: |-
+                      The value of the `kopiur.home-operations.com/cache-reset-requested-at`
+                      annotation the controller last acted on: it deleted this recipe's
+                      persistent cache PVCs for that request. A request is honored once, so
+                      the annotation can stay on the object.
+                    nullable: true
+                    type: string
+                type: object
               conditions:
                 description: Standard Kubernetes conditions (e.g. `RepositoryReachable`, `GroupSnapshotSupported`).
                 items:
@@ -11864,6 +11876,23 @@ spec:
                           `emptyDir` cache, which has no fixed size.
                         nullable: true
                         type: string
+                      claim:
+                        description: |-
+                          The persistent cache PVC the mover mounted (`mode: Persistent`). Absent
+                          for a per-run cache volume. Under `execution.mode: Central` the PVC is
+                          in the operator namespace, which is why the namespace is recorded.
+                        nullable: true
+                        properties:
+                          name:
+                            description: Name of the `PersistentVolumeClaim`.
+                            type: string
+                          namespace:
+                            description: "Namespace of the `PersistentVolumeClaim`: the namespace the mover ran in."
+                            type: string
+                        required:
+                        - name
+                        - namespace
+                        type: object
                       contentCacheSizeMb:
                         description: The `--content-cache-size-mb` kopia was given; absent means kopia's own default.
                         format: int64
