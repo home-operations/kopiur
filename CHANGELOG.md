@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.11.3](https://github.com/home-operations/kopiur/compare/0.11.2...0.11.3) (2026-11-21)
+
+
+### Miscellaneous Chores
+
+* **github-action:** update action actions/setup-go (v7.0.0 → v7.1.0) ([#765](https://github.com/home-operations/kopiur/issues/765)) ([a5ad064](https://github.com/home-operations/kopiur/commit/a5ad064d154a279a19709dfa4614086cf2000d8b))
+* **mise:** update mise tools ([#759](https://github.com/home-operations/kopiur/issues/759)) ([95bb657](https://github.com/home-operations/kopiur/commit/95bb6573810cb4296e929819dd9359b01cd6d7fe))
+* **npm:** update dependency @tanstack/react-query (5.108.0 → 5.108.1) ([#770](https://github.com/home-operations/kopiur/issues/770)) ([f08a97b](https://github.com/home-operations/kopiur/commit/f08a97b1d02788d87107971c832bd01a78c89ae7))
+* **npm:** update dependency lucide-react (1.76.0 → 1.77.0) ([#772](https://github.com/home-operations/kopiur/issues/772)) ([71bef12](https://github.com/home-operations/kopiur/commit/71bef12af120f80194fe7c3cb4f62fd2fb70cb63))
+* **rust:** update crate clap (4.6.8 → 4.6.9) ([#764](https://github.com/home-operations/kopiur/issues/764)) ([5a02356](https://github.com/home-operations/kopiur/commit/5a02356dc1384a78aa386029ec6e78ee502df132))
+* **rust:** update crate url (2.5.8 → 2.5.9) ([#771](https://github.com/home-operations/kopiur/issues/771)) ([81a2a96](https://github.com/home-operations/kopiur/commit/81a2a9698217c4fa92000ab4fa861c05a41d723c))
+
 ## [0.11.2](https://github.com/home-operations/kopiur/compare/0.11.1...0.11.2) (2026-11-20)
 
 
