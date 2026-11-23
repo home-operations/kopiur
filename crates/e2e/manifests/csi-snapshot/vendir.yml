@@ -16,7 +16,7 @@ directories:
       - path: provisioner
         git:
           url: https://github.com/kubernetes-csi/external-provisioner
-          ref: v6.4.0
+          ref: v6.4.1
           depth: 1
         includePaths:
           - deploy/kubernetes/rbac.yaml
