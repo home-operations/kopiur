@@ -26,10 +26,10 @@ directories:
       - client/v8.7.0
     path: snapshotter
   - git:
-      commitTitle: 'Merge pull request #618 from gnufied/add-2.3-release-note...'
-      sha: baa08e6d8773f167dbddce36579f36d84bbe3fde
+      commitTitle: 'Merge pull request #642 from jsafrane/changelog-release-2.3...'
+      sha: 9bb6e4a2d15de6c091c10a23379a3925615b9796
       tags:
-      - v2.3.0
+      - v2.3.1
     path: resizer
   - git:
       commitTitle: 'chore: Prep for v1.7.0 (#5433)'

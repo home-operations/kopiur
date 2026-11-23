@@ -40,7 +40,7 @@ directories:
       - path: resizer
         git:
           url: https://github.com/kubernetes-csi/external-resizer
-          ref: v2.3.0
+          ref: v2.3.1
           depth: 1
         includePaths:
           - deploy/kubernetes/rbac.yaml
