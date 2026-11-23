@@ -8,10 +8,10 @@ directories:
       - v1.19.0
     path: hostpath
   - git:
-      commitTitle: 'Merge pull request #1595 from jsafrane/changelog-6.4...'
-      sha: 72f13ee46fb93c11a72ef91549e70158283c03af
+      commitTitle: 'Merge pull request #1625 from jsafrane/changelog-release-6.4...'
+      sha: 698c579a80595741f6fbbc8b9db0508817017375
       tags:
-      - v6.4.0
+      - v6.4.1
     path: provisioner
   - git:
       commitTitle: 'Merge pull request #786 from jsafrane/changelog-release-4.13...'
