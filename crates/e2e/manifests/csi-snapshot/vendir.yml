@@ -32,7 +32,7 @@ directories:
       - path: snapshotter
         git:
           url: https://github.com/kubernetes-csi/external-snapshotter
-          ref: v8.7.0
+          ref: v8.7.1
           depth: 1
         includePaths:
           - deploy/kubernetes/csi-snapshotter/rbac-csi-snapshotter.yaml

@@ -20,10 +20,10 @@ directories:
       - v4.13.0
     path: attacher
   - git:
-      commitTitle: 'Merge pull request #1510 from xing-yang/changelog_8.7.0_on_8.7...'
-      sha: 9cc6050ab00a0c56d84ba0279e518a00367363e7
+      commitTitle: 'Merge pull request #1538 from xing-yang/changelog_8.7.1...'
+      sha: 9aea5b81a82aa262567bb4345c1caf2510d026dc
       tags:
-      - client/v8.7.0
+      - v8.7.1
     path: snapshotter
   - git:
       commitTitle: 'Merge pull request #618 from gnufied/add-2.3-release-note...'
