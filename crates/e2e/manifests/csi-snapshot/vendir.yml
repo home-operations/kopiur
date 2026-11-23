@@ -24,7 +24,7 @@ directories:
       - path: attacher
         git:
           url: https://github.com/kubernetes-csi/external-attacher
-          ref: v4.13.0
+          ref: v4.13.1
           depth: 1
         includePaths:
           - deploy/kubernetes/rbac.yaml
