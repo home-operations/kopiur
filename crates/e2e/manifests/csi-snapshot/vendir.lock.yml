@@ -14,10 +14,10 @@ directories:
       - v6.4.0
     path: provisioner
   - git:
-      commitTitle: 'Merge pull request #760 from jsafrane/changelog-4.13...'
-      sha: 40d44ae14961a415348180a0e666651e82e44eb7
+      commitTitle: 'Merge pull request #786 from jsafrane/changelog-release-4.13...'
+      sha: 0d4ab2d7ab3a633d4186e2a998f89887ad22e5e9
       tags:
-      - v4.13.0
+      - v4.13.1
     path: attacher
   - git:
       commitTitle: 'Merge pull request #1510 from xing-yang/changelog_8.7.0_on_8.7...'
