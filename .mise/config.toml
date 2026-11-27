@@ -34,7 +34,7 @@ config_roots = ["crates/e2e"]
 # worked example: it was landed exactly this way.
 [tools]
 rust = { version = "1.100.0", components = "rustfmt,clippy,llvm-tools" }
-lefthook = "2.2.2"
+lefthook = "2.2.3"
 # Runtime for the web UI SPA (`crates/ui/web`), which pnpm builds and tests.
 node = "26.13.1"
 # Package manager for the web UI SPA (`crates/ui/web`). Resolved from the `aqua`
