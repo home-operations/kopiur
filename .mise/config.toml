@@ -47,7 +47,7 @@ zizmor = "1.33.1"
 helm = "4.3.2"
 vendir = "0.47.0"
 cosign = "3.1.5"
-kubectl = "1.37.2"
+kubectl = "1.37.3"
 # The shared pre-commit hooks (home-operations/.github lefthook config) run
 # `shellcheck` on staged *.sh files; pin it so the hook resolves a binary.
 shellcheck = "0.11.0"
